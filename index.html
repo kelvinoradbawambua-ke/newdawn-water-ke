@@ -158,6 +158,7 @@ var fbAuth=null;
 var fbDb=null;
 var FB_DOC_REF=null;
 var FB_READY=false;
+var APP_VERSION="2026-07-02";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -281,7 +282,6 @@ function startCloudListener(){
   if(FB_UNSUB)FB_UNSUB();
   FB_UNSUB=FB_DOC_REF.onSnapshot(function(doc){
     if(!doc.exists){
-      // First ever boot — write clean slate with Director only
       var cleanSlate={
         D:{customers:[],stock:[],orders:[],offers:[],invoices:[],routes:[],complaints:[]},
         USERS:[{id:1,name:"Director",role:"director",pin:"1234",ini:"DR",col:"#1a1560"}],
@@ -293,17 +293,20 @@ function startCloudListener(){
       return;
     }
     var data=doc.data();
-    if(Date.now()-FB_LAST_LOCAL_WRITE<1500){FB_READY=true;return;}
-    if(data.D){
-      D=data.D;
-      if(!D.routes)D.routes=[];
-      if(!D.complaints)D.complaints=[];
-      if(!D.offers)D.offers=[];
+    var isOwnWrite=Date.now()-FB_LAST_LOCAL_WRITE<800;
+    if(!isOwnWrite){
+      // Remote update from another device — merge their data in
+      if(data.D){
+        D=data.D;
+        if(!D.routes)D.routes=[];
+        if(!D.complaints)D.complaints=[];
+        if(!D.offers)D.offers=[];
+      }
+      if(data.USERS&&data.USERS.length)USERS=data.USERS;
+      else USERS=[{id:1,name:"Director",role:"director",pin:"1234",ini:"DR",col:"#1a1560"}];
+      FB_SETUP_DONE=data.setupDone===true;
+      syncIdCounters();
     }
-    if(data.USERS&&data.USERS.length)USERS=data.USERS;
-    else USERS=[{id:1,name:"Director",role:"director",pin:"1234",ini:"DR",col:"#1a1560"}];
-    FB_SETUP_DONE=data.setupDone===true;
-    syncIdCounters();
     FB_READY=true;
     var c=el("cloud-status");if(c)c.innerHTML="<i class=\"ti ti-cloud-check\"></i> Online &middot; Live";
     if(CU){refreshCurrentPage();}
@@ -450,6 +453,7 @@ function renderLogin(){
       "Nyayo Estate, Gate D, Court 290<br>"+
       "<strong>0710805099</strong> / <strong>0733930568</strong> &middot; Till: <strong>824 153</strong>"+
       "<div id=\"cloud-status\" style=\"margin-top:8px;font-size:10px;color:#27ae60;font-weight:600\"><i class=\"ti ti-cloud-check\"></i> Online &middot; Live</div>"+
+      "<div style=\"margin-top:4px;font-size:9px;color:#aaa\">v"+APP_VERSION+"</div>"+
     "</div>"+
     "</div></div>";
   el("ll").innerHTML=makeLogo(180);
@@ -1185,10 +1189,32 @@ function recPay(){
   if(!amt){toast("Enter amount","err");return;}
   var rem=amt;
   D.invoices.filter(function(i){return i.cId===cId&&i.paid<i.amount;}).sort(function(a,b){return a.date>b.date?1:-1;}).forEach(function(inv){
-    if(rem<=0)return;var tap=Math.min(rem,inv.amount-inv.paid);inv.paid+=tap;rem-=tap;
-    if(!inv.payments)inv.payments=[];inv.payments.push({date:el("pay-date").value,amt:tap,method:el("pay-method").value,ref:el("pay-ref").value});
+    if(rem<=0)return;
+    var tap=Math.min(rem,inv.amount-inv.paid);
+    inv.paid+=tap;rem-=tap;
+    if(!inv.payments)inv.payments=[];
+    inv.payments.push({date:el("pay-date").value,amt:tap,method:el("pay-method").value,ref:el("pay-ref").value});
+    // Sync payment status back to the linked order
+    var ordId=inv.notes&&inv.notes.match(/#(\d+)/);
+    if(ordId){
+      var o=D.orders.find(function(x){return String(x.id)===ordId[1];});
+      if(o){
+        if(inv.paid>=inv.amount){o.paid="Paid";}
+        else if(inv.paid>0){o.paid="Partial";}
+        else{o.paid="Unpaid";}
+        o.amtPaid=inv.paid;
+      }
+    }
   });
-  cm("m-pay");rCusts(undefined,CUST_PAGE);if(el("pg-invoices")&&el("pg-invoices").classList.contains("act"))rInvs(undefined,INV_PAGE);dirty();toast("Payment recorded &mdash; KSh "+amt.toLocaleString());
+  cm("m-pay");
+  // Refresh all affected pages
+  rCusts(undefined,CUST_PAGE);
+  if(el("pg-invoices")&&el("pg-invoices").classList.contains("act"))rInvs(undefined,INV_PAGE);
+  if(el("pg-orders")&&el("pg-orders").classList.contains("act"))rOrds(undefined,ORD_PAGE);
+  if(el("pg-debts")&&el("pg-debts").classList.contains("act"))rDebts();
+  if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
+  dirty();
+  toast("Payment recorded — KSh "+amt.toLocaleString());
 }
 
 function rOrds(q,pg){
@@ -1509,7 +1535,9 @@ function delO(id){
       return true; // keep paid invoices and unrelated ones
     });
   }
-  rOrds("");dirty();toast("Order #"+id+" deleted");
+  rOrds(undefined,ORD_PAGE);
+  if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
+  dirty();toast("Order #"+id+" deleted");
 }
 
 function rDel(){
