@@ -1046,8 +1046,8 @@ function rDash(){
   var mMax=Math.max.apply(null,mRevs.concat([1]));
   var alerts=[];
   D.stock.filter(function(s){return s.qty<=s.min;}).forEach(function(s){alerts.push({t:"nw",i:"ti-alert-triangle",m:"Low stock: <strong>"+s.name+"</strong> &mdash; "+s.qty+" left (min "+s.min+")"});});
-  if(can("vDebt"))debts.slice(0,3).forEach(function(c){alerts.push({t:"nr",i:"ti-alert-circle",m:"Debt: <strong>"+c.name+"</strong> &mdash; KSh "+custDebt(c.id).toLocaleString()});});
-  D.complaints.filter(function(c){return c.status==="Open";}).slice(0,2).forEach(function(c){var cu=D.customers.find(function(x){return x.id===c.cId;});alerts.push({t:"nw",i:"ti-message-report",m:"Complaint: <strong>"+(cu?cu.name:"?")+"</strong> &mdash; "+c.type});});
+  if(can("vDebt"))debts.slice(0,3).forEach(function(c){alerts.push({t:"nr",i:"ti-alert-circle",m:"Debt: <strong>"+(can("vPhone")?c.name:maskName(c.name))+"</strong> &mdash; KSh "+custDebt(c.id).toLocaleString()});});
+  D.complaints.filter(function(c){return c.status==="Open";}).slice(0,2).forEach(function(c){var cu=D.customers.find(function(x){return x.id===c.cId;});alerts.push({t:"nw",i:"ti-message-report",m:"Complaint: <strong>"+(cu?(can("vPhone")?cu.name:maskName(cu.name)):"?")+"</strong> &mdash; "+c.type});});
   D.orders.filter(function(o){return o.status==="Pending";}).slice(0,3).forEach(function(o){alerts.push({t:"ni",i:"ti-truck",m:"Pending: <strong>#"+o.id+"</strong> &mdash; "+custName(o.cId)+": "+o.qty+"&times; "+o.prod});});
   pg.innerHTML=
     "<div class=\"ph\"><h1>Dashboard</h1><p>Welcome back, "+CU.name+" &middot; "+new Date().toLocaleDateString("en-GB",{weekday:"long",day:"numeric",month:"long",year:"numeric"})+"</p></div>"+
@@ -1190,6 +1190,7 @@ function delC(id){
   D.customers=D.customers.filter(function(x){return x.id!==id;});
   D.orders=D.orders.filter(function(o){return o.cId!==id;});
   D.invoices=D.invoices.filter(function(i){if(i.cId!==id)return true;return i.paid>0;});
+  D.complaints=D.complaints.filter(function(x){return x.cId!==id;});
   rCusts(undefined,CUST_PAGE);
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   dirty();toast("Customer removed"+(paidInvs.length?" — "+paidInvs.length+" paid invoice(s) retained":""));
@@ -1822,7 +1823,7 @@ function payI(id){
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   dirty();toast("Invoice marked paid");
 }
-function openPayInv(id){var i=D.invoices.find(function(x){return x.id===id;});if(!i)return;var c=D.customers.find(function(x){return x.id===i.cId;});el("pay-cid").value=i.cId;el("pay-info").innerHTML="<strong>"+(c?c.name:"?")+"</strong> &mdash; Invoice #"+id+"<br><span style=\"color:#c0392b;font-weight:700\">Balance: KSh "+(i.amount-i.paid).toLocaleString()+"</span>";el("pay-date").value=tday();el("pay-amt").value="";om("m-pay");}
+function openPayInv(id){var i=D.invoices.find(function(x){return x.id===id;});if(!i)return;var c=D.customers.find(function(x){return x.id===i.cId;});el("pay-cid").value=i.cId;el("pay-info").innerHTML="<strong>"+(c?(can("vPhone")?c.name:maskName(c.name)):"?")+"</strong> &mdash; Invoice #"+id+"<br><span style=\"color:#c0392b;font-weight:700\">Balance: KSh "+(i.amount-i.paid).toLocaleString()+"</span>";el("pay-date").value=tday();el("pay-amt").value="";om("m-pay");}
 
 function rDebts(){
   var pg=el("pg-debts");if(!pg)return;
@@ -1912,7 +1913,7 @@ function filterCmps(f){
 function prepCmp(){var s=el("cmp-c");if(s)s.innerHTML=D.customers.map(function(c){return "<option value=\""+c.id+"\">"+custName(c.id)+" - "+cAddr(c)+"</option>";}).join("");el("cmp-d").value=tday();om("m-cmp");}
 function saveCmp(){var det=el("cmp-det").value.trim();if(!det){toast("Details required","err");return;}D.complaints.push({id:nCId++,cId:parseInt(el("cmp-c").value),type:el("cmp-t").value,details:det,action:el("cmp-act").value,status:el("cmp-s").value,date:el("cmp-d").value});el("cmp-det").value="";el("cmp-act").value="";cm("m-cmp");rCmps(undefined,CMP_PAGE);dirty();toast("Complaint logged");}
 function resolveCmp(id){var c=D.complaints.find(function(x){return x.id===id;});if(c)c.status="Resolved";rCmps(undefined,CMP_PAGE);dirty();toast("Complaint resolved");}
-function delCmp(id){if(!confirm("Delete?"))return;D.complaints=D.complaints.filter(function(c){return c.id!==id;});rCmps(undefined,CMP_PAGE);dirty();}
+function delCmp(id){if(!can("aCmp"))return;if(!confirm("Delete complaint?"))return;D.complaints=D.complaints.filter(function(c){return c.id!==id;});rCmps(undefined,CMP_PAGE);dirty();}
 
 function rOffers(){
   var pg=el("pg-offers");if(!pg)return;
