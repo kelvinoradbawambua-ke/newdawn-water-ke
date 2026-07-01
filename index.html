@@ -218,6 +218,7 @@ function pgBar(page,pages,total,navFn){
 }
 var CUST_PAGE=0,ORD_PAGE=0,INV_PAGE=0,CMP_PAGE=0,STK_PAGE=0;
 var CUST_Q="",ORD_Q="",INV_Q="",CMP_Q="",STK_Q="";
+var CUST_SORT="recent",ORD_SORT="newest",CUST_TYPE="";
 function ia(v){return can("vInv")?"KSh "+Number(v).toLocaleString():"KSh "+String.fromCharCode(8226,8226,8226,8226);}
 function sb(s){var m={"Delivered":"bg","Pending":"ba","Out for delivery":"bp","Processing":"bb","Cancelled":"br"};return "<span class=\"badge "+(m[s]||"ba")+"\">"+s+"</span>";}
 function pb(p){return "<span class=\"badge "+(p==="Paid"?"bg":p==="Partial"?"ba":"br")+"\">"+p+"</span>";}
@@ -310,8 +311,22 @@ function startCloudListener(){
     }
     FB_READY=true;
     var c=el("cloud-status");if(c)c.innerHTML="<i class=\"ti ti-cloud-check\"></i> Online &middot; Live";
-    if(CU){refreshCurrentPage();}
-    else{renderUG();}
+    // Security check: if current user was deleted, force logout immediately
+    if(CU){
+      var stillExists=USERS.find(function(u){return u.id===CU.id;});
+      if(!stillExists){
+        toast("Your account has been removed. Logging out.","err");
+        setTimeout(function(){logout();},1500);
+        return;
+      }
+      // Also update CU in case name/role/pin was changed
+      if(stillExists.pin!==CU.pin||stillExists.role!==CU.role||stillExists.name!==CU.name){
+        CU=stillExists;
+      }
+      refreshCurrentPage();
+    }else{
+      renderUG();
+    }
   },function(err){
     var c=el("cloud-status");if(c)c.innerHTML="<i class=\"ti ti-cloud-off\"></i> Offline - changes saved locally";
   });
@@ -323,8 +338,8 @@ function refreshCurrentPage(){
   // Preserve active search queries — do NOT reset to "" on cloud refresh
   var fns={
     dashboard:rDash,
-    customers:function(){rCusts(undefined,CUST_PAGE);},
-    orders:function(){rOrds(undefined,ORD_PAGE);},
+    customers:function(){rCusts(undefined,CUST_PAGE,CUST_SORT,CUST_TYPE);},
+    orders:function(){rOrds(undefined,ORD_PAGE,ORD_SORT);},
     delivery:rDel,
     stock:function(){rStock(undefined,STK_PAGE);},
     invoices:function(){rInvs(undefined,INV_PAGE);},
@@ -1093,19 +1108,61 @@ function rDash(){
     "</div>";
 }
 
-function rCusts(q,pg){
+function rCusts(q,pg,sort,type){
   if(q!==undefined)CUST_Q=q;
   if(pg!==undefined)CUST_PAGE=pg;
-  var q2=CUST_Q||"";
+  if(sort!==undefined)CUST_SORT=sort;
+  if(type!==undefined)CUST_TYPE=type;
+  var q2=CUST_Q||"";var sort2=CUST_SORT||"recent";var type2=CUST_TYPE||"";
   var pg2=el("pg-customers");if(!pg2)return;
-  var fil=D.customers.filter(function(c){if(!q2)return true;var lq=q2.toLowerCase();return[c.name,c.phone,c.court,c.house,c.estate].some(function(v){return v&&v.toLowerCase().indexOf(lq)!==-1;});});
+  // Filter by search
+  var fil=D.customers.filter(function(c){
+    if(type2&&c.ctype!==type2)return false;
+    if(!q2)return true;
+    var lq=q2.toLowerCase();
+    return[c.name,c.phone,c.court,c.house,c.estate].some(function(v){return v&&String(v).toLowerCase().indexOf(lq)!==-1;});
+  });
+  // Sort
+  var del=D.orders.filter(function(o){return o.status==="Delivered";});
+  fil=fil.slice().sort(function(a,b){
+    if(sort2==="debt"){return custDebt(b.id)-custDebt(a.id);}
+    if(sort2==="orders"){
+      return D.orders.filter(function(o){return o.cId===b.id;}).length-
+             D.orders.filter(function(o){return o.cId===a.id;}).length;
+    }
+    if(sort2==="revenue"){
+      var ra=del.filter(function(o){return o.cId===a.id;}).reduce(function(s,o){return s+o.qty*o.price;},0);
+      var rb=del.filter(function(o){return o.cId===b.id;}).reduce(function(s,o){return s+o.qty*o.price;},0);
+      return rb-ra;
+    }
+    if(sort2==="name"){return(a.name||"").localeCompare(b.name||"");}
+    if(sort2==="nodebts"){return custDebt(a.id)-custDebt(b.id);}
+    // recent = by ID desc (most recently added)
+    return b.id-a.id;
+  });
   var paged=paginate(fil,CUST_PAGE);
+  var sortBtn=function(v,lbl){return "<button onclick=\"rCusts(undefined,0,'"+v+"')\" style=\"padding:5px 9px;font-size:11px;border:1.5px solid "+(sort2===v?"var(--nv)":"var(--bd)")+";background:"+(sort2===v?"var(--nv)":"#fff")+";color:"+(sort2===v?"#fff":"var(--tx)")+";border-radius:6px;cursor:pointer;font-weight:"+(sort2===v?"700":"400")+"\">"+lbl+"</button>";};
   pg2.innerHTML=
-    "<div class=\"ph\"><h1>Customers</h1><p>"+D.customers.length+" registered</p></div>"+
+    "<div class=\"ph\"><h1>Customers</h1><p>"+D.customers.length+" registered &middot; "+fil.length+(type2||q2?" matched":"")+"</p></div>"+
     "<div class=\"toolbar\">"+
       "<div class=\"srch\"><i class=\"ti ti-search\"></i><input type=\"text\" placeholder=\"Search name, phone, court, house...\" oninput=\"rCusts(this.value,0)\" value=\""+q2+"\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
-      "<select class=\"fsel\" onchange=\"rCustsF(this.value)\"><option value=\"\">All types</option><option>Residential</option><option>Commercial</option><option>Institution</option><option>Distributor</option></select>"+
+      "<select class=\"fsel\" onchange=\"rCusts(undefined,0,undefined,this.value)\">"+
+        "<option value=\"\" "+(type2===""?"selected":"")+">All types</option>"+
+        "<option value=\"Residential\" "+(type2==="Residential"?"selected":"")+">Residential</option>"+
+        "<option value=\"Commercial\" "+(type2==="Commercial"?"selected":"")+">Commercial</option>"+
+        "<option value=\"Institution\" "+(type2==="Institution"?"selected":"")+">Institution</option>"+
+        "<option value=\"Distributor\" "+(type2==="Distributor"?"selected":"")+">Distributor</option>"+
+      "</select>"+
       (can("aCust")?"<button class=\"btn btn-gold\" onclick=\"prepCustAdd()\"><i class=\"ti ti-plus\"></i> Add customer</button>":"")+
+    "</div>"+
+    "<div style=\"display:flex;gap:6px;flex-wrap:wrap;padding:0 2px 12px;align-items:center\">"+
+      "<span style=\"font-size:11px;color:var(--tx2);font-weight:600\">Sort by:</span>"+
+      sortBtn("recent","Recent")+" "+
+      sortBtn("name","Name A–Z")+" "+
+      sortBtn("debt","Highest Debt")+" "+
+      sortBtn("nodebts","Clear First")+" "+
+      sortBtn("orders","Most Orders")+" "+
+      (can("vRev")?sortBtn("revenue","Top Revenue")+" ":"")+
     "</div>"+
     "<div class=\"tw\"><table id=\"ctbl\">"+
       "<thead><tr><th>Name &amp; address</th><th>Phone</th><th>Type</th><th>Orders</th><th>Last order</th><th>Last payment</th><th>Balance</th><th></th></tr></thead>"+
@@ -1130,12 +1187,13 @@ function rCusts(q,pg){
               (can("dCust")?"<button class=\"btn btn-xs btn-red\" onclick=\"delC("+c.id+")\" title=\"Delete\"><i class=\"ti ti-trash\"></i></button>":"")+
             "</div></td>"+
           "</tr>";
-        }).join(""):"<tr><td colspan=\"8\"><div class=\"te\"><i class=\"ti ti-users\"></i><p>"+(q2?"No results for \""+q2+"\"":"No customers yet")+"</p></div></td></tr>")+
+        }).join(""):"<tr><td colspan=\"8\"><div class=\"te\"><i class=\"ti ti-users\"></i><p>"+(q2||type2?"No results found":"No customers yet")+"</p></div></td></tr>")+
       "</tbody>"+
     "</table></div>"+
     pgBar(paged.page,paged.pages,paged.total,"rCusts(undefined,");
 }
-function rCustsF(t){document.querySelectorAll("#ctbl tbody tr").forEach(function(r){r.style.display=t&&r.innerHTML.indexOf(t)===-1?"none":"";});}
+function rCustsF(t){rCusts(undefined,0,undefined,t);}
+
 function prepCustAdd(){
   el("c-edit-id").value="";
   ["cn","cph","cph2","cid","cestate","ccourt","chouse","croad","czone","cnotes"].forEach(function(id){el(id).value="";});
@@ -1145,6 +1203,7 @@ function prepCustAdd(){
   om("m-c");
 }
 function saveCust(){
+  if(!can("aCust")&&!can("eCust"))return;
   var n=el("cn").value.trim(),ph=el("cph").value.trim();
   if(!n||!ph){toast("Name and phone required","err");return;}
   var editId=el("c-edit-id").value;
@@ -1237,24 +1296,65 @@ function recPay(){
   toast("Payment recorded — KSh "+amt.toLocaleString());
 }
 
-function rOrds(q,pg){
+var ORD_STATUS_F="";
+function rOrds(q,pg,sort){
   if(q!==undefined)ORD_Q=q;
   if(pg!==undefined)ORD_PAGE=pg;
-  var q2=ORD_Q||"";
+  if(sort!==undefined)ORD_SORT=sort;
+  var q2=ORD_Q||"";var sort2=ORD_SORT||"newest";var sf=ORD_STATUS_F||"";
   var pgEl=el("pg-orders");if(!pgEl)return;
-  var fil=[].concat(D.orders).reverse();
-  if(q2){var lq=q2.toLowerCase();fil=fil.filter(function(o){var c=D.customers.find(function(x){return x.id===o.cId;});return(c&&(c.name.toLowerCase().indexOf(lq)!==-1||cAddr(c).toLowerCase().indexOf(lq)!==-1))||String(o.id).indexOf(q2)!==-1||o.prod.toLowerCase().indexOf(lq)!==-1||(o.driver&&o.driver.toLowerCase().indexOf(lq)!==-1);});}
+  var fil=D.orders.filter(function(o){
+    if(sf&&o.status!==sf)return false;
+    if(!q2)return true;
+    var lq=q2.toLowerCase();
+    var c=D.customers.find(function(x){return x.id===o.cId;});
+    return(c&&(c.name.toLowerCase().indexOf(lq)!==-1||cAddr(c).toLowerCase().indexOf(lq)!==-1))||
+      String(o.id).indexOf(q2)!==-1||o.prod.toLowerCase().indexOf(lq)!==-1||
+      (o.driver&&o.driver.toLowerCase().indexOf(lq)!==-1);
+  });
+  // Sort
+  fil=fil.slice().sort(function(a,b){
+    if(sort2==="oldest")return a.id-b.id;
+    if(sort2==="unpaid")return(a.paid==="Unpaid"?0:1)-(b.paid==="Unpaid"?0:1);
+    if(sort2==="partial")return(a.paid==="Partial"?0:1)-(b.paid==="Partial"?0:1);
+    if(sort2==="highval")return(b.qty*b.price)-(a.qty*a.price);
+    if(sort2==="customer"){
+      var ca=D.customers.find(function(x){return x.id===a.cId;});
+      var cb=D.customers.find(function(x){return x.id===b.cId;});
+      return((ca?ca.name:"")>=(cb?cb.name:""))?1:-1;
+    }
+    return b.id-a.id; // newest
+  });
   var paged=paginate(fil,ORD_PAGE);
+  var sBtn=function(v,lbl){return "<button onclick=\"rOrds(undefined,0,'"+v+"')\" style=\"padding:5px 9px;font-size:11px;border:1.5px solid "+(sort2===v?"var(--nv)":"var(--bd)")+";background:"+(sort2===v?"var(--nv)":"#fff")+";color:"+(sort2===v?"#fff":"var(--tx)")+";border-radius:6px;cursor:pointer;font-weight:"+(sort2===v?"700":"400")+"\">"+lbl+"</button>";};
   pgEl.innerHTML=
     "<div class=\"ph\"><h1>Orders</h1><p>"+D.orders.length+" total &middot; "+D.orders.filter(function(o){return o.status==="Pending"||o.status==="Processing";}).length+" active</p></div>"+
     "<div class=\"toolbar\">"+
       "<div class=\"srch\"><i class=\"ti ti-search\"></i><input type=\"text\" placeholder=\"Search by #, customer, product, driver, address...\" oninput=\"rOrds(this.value,0)\" value=\""+q2+"\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
-      "<select class=\"fsel\" onchange=\"filterOrds(this.value)\"><option value=\"\">All statuses</option><option>Pending</option><option>Processing</option><option>Out for delivery</option><option>Delivered</option><option>Cancelled</option></select>"+
+      "<select class=\"fsel\" onchange=\"filterOrds(this.value)\">"+
+        "<option value=\"\" "+(sf===""?"selected":"")+">All statuses</option>"+
+        "<option value=\"Pending\" "+(sf==="Pending"?"selected":"")+">Pending</option>"+
+        "<option value=\"Processing\" "+(sf==="Processing"?"selected":"")+">Processing</option>"+
+        "<option value=\"Out for delivery\" "+(sf==="Out for delivery"?"selected":"")+">Out for delivery</option>"+
+        "<option value=\"Delivered\" "+(sf==="Delivered"?"selected":"")+">Delivered</option>"+
+        "<option value=\"Cancelled\" "+(sf==="Cancelled"?"selected":"")+">Cancelled</option>"+
+      "</select>"+
       (can("aOrd")?"<button class=\"btn btn-gold\" onclick=\"prepO()\"><i class=\"ti ti-plus\"></i> New order</button>":"")+
+    "</div>"+
+    "<div style=\"display:flex;gap:6px;flex-wrap:wrap;padding:0 2px 12px\">"+
+      "<span style=\"font-size:11px;color:var(--tx2);font-weight:600\">Sort:</span>"+
+      sBtn("newest","Newest")+" "+sBtn("oldest","Oldest")+" "+
+      sBtn("unpaid","Unpaid first")+" "+sBtn("partial","Partial first")+" "+
+      (can("vRev")?sBtn("highval","Highest value")+" ":"")+
+      sBtn("customer","Customer A–Z")+
     "</div>"+
     "<div class=\"tw\"><table><thead><tr><th>#</th><th>Customer</th><th>Product</th><th>Qty</th><th>Total</th><th>Payment</th><th>Bottle</th><th>Date</th><th>Driver</th><th>Status</th><th></th></tr></thead>"+
     "<tbody id=\"otbody\">"+ordRows(paged.items)+"</tbody></table></div>"+
     pgBar(paged.page,paged.pages,paged.total,"rOrds(undefined,");
+}
+function filterOrds(f){
+  ORD_STATUS_F=f;ORD_PAGE=0;
+  rOrds(undefined,0);
 }
 function ordRows(fil){
   if(!fil.length)return "<tr><td colspan=\"11\"><div class=\"te\"><i class=\"ti ti-clipboard-list\"></i><p>No orders found</p></div></td></tr>";
@@ -1276,12 +1376,6 @@ function ordRows(fil){
         (can("dOrd")?"<button class=\"btn btn-xs btn-red\" onclick=\"delO("+o.id+")\"><i class=\"ti ti-trash\"></i></button>":"")+
       "</div></td></tr>";
   }).join("");
-}
-function filterOrds(f){
-  ORD_PAGE=0;
-  var fil=f?[].concat(D.orders).reverse().filter(function(o){return o.status===f;}):[].concat(D.orders).reverse();
-  var paged=paginate(fil,0);
-  var tb=el("otbody");if(tb)tb.innerHTML=ordRows(paged.items);
 }
 function ocSearch(q){
   var drop=el("oc-drop");if(!drop)return;
@@ -1329,7 +1423,13 @@ function ocSelect(cId,e){
   el("oc").value=cId;
   el("oc-search").value=can("vPhone")?c.name:maskName(c.name);
   var addr=cAddr(c);
-  el("oc-sel").innerHTML="<i class=\"ti ti-check\"></i> "+addr;
+  var debt=custDebt(cId);
+  var selEl=el("oc-sel");
+  if(selEl){
+    var debtTxt=debt>0?
+      " <span style=\"color:#dc3545;font-weight:800\">⚠ Owes KSh "+debt.toLocaleString()+"</span>":"";
+    selEl.innerHTML="<i class=\"ti ti-check\" style=\"color:var(--gd)\"></i> "+addr+debtTxt;
+  }
   if(el("odlvr")&&!el("odlvr").value)el("odlvr").value=addr;
   el("oc-drop").style.display="none";
 }
@@ -1372,7 +1472,13 @@ function prepO(){
   if(el("op-sel"))el("op-sel").innerHTML="";
   if(el("op-drop"))el("op-drop").style.display="none";
   var drvs=USERS.filter(function(u){return u.role==="driver"||u.role==="staff";});
-  odrv.innerHTML="<option value=\"\">Unassigned</option>"+drvs.map(function(d){return "<option>"+d.name+"</option>";}).join("");
+  odrv.innerHTML="<option value=\"\">Unassigned</option>"+drvs.map(function(d){
+    var pending=D.orders.filter(function(o){
+      return o.driver===d.name&&(o.status==="Pending"||o.status==="Processing"||o.status==="Out for delivery");
+    }).length;
+    var warn=pending>=5?" ⚠ "+pending+" pending":"";
+    return "<option value=\""+d.name+"\">"+d.name+(warn?warn:"")+"</option>";
+  }).join("");
   od.value=tday();
   el("oq").value=1;el("oamt")&&(el("oamt").value=0);el("opay")&&(el("opay").value="Unpaid");el("obtl").value="Good";el("odlvr").value="";
   // Hide payment and total fields from staff
@@ -1428,7 +1534,11 @@ function editOrdLimited(oid){
   var o=D.orders.find(function(x){return x.id===oid;});if(!o)return;
   el("oe-id").value=o.id;
   var drvs=USERS.filter(function(u){return u.role==="driver"||u.role==="staff";});
-  el("oe-drv").innerHTML="<option value=\"\">Unassigned</option>"+drvs.map(function(d){return "<option"+(d.name===o.driver?" selected":"")+">"+d.name+"</option>";}).join("");
+  el("oe-drv").innerHTML="<option value=\"\">Unassigned</option>"+drvs.map(function(d){
+    var pending=D.orders.filter(function(o){return o.driver===d.name&&(o.status==="Pending"||o.status==="Processing"||o.status==="Out for delivery");}).length;
+    var warn=pending>=5?" ⚠ "+pending+" pending":"";
+    return "<option"+(d.name===o.driver?" selected":"")+">"+d.name+warn+"</option>";
+  }).join("");
   el("oe-btl").value=o.bottle_after||o.bottle_before||"Good";
   el("oe-notes").value=o.notes||"";
   om("m-oe");
@@ -1452,6 +1562,7 @@ function calcO(){
   }
 }
 function saveOrd(){
+  if(!can("aOrd")&&!can("eOrd"))return;
   if(!D.customers.length){toast("Add a customer first","err");return;}
   if(!D.stock.length){toast("Add a product first","err");return;}
   var cId=parseInt(el("oc").value);
@@ -1459,8 +1570,42 @@ function saveOrd(){
   var opEl=el("op");var pn=opEl?opEl.value:"";
   if(!pn){toast("Please select a product","err");if(el("op-search"))el("op-search").focus();return;}
   var price=parseInt((opEl?opEl.getAttribute("data-p"):0)||0);
+  if(price<=0){if(!confirm("⚠️ Price Warning\n\nThis product has no sale price set (KSh 0).\n\nContinue with a zero-value order?"))return;}
   var qty=parseInt(el("oq").value)||1;
+  if(qty<1){toast("Quantity must be at least 1","err");return;}
   var editId=el("o-edit-id").value;
+
+  // ── DEBT ALERT (new orders only, not edits) ──
+  if(!editId){
+    var existingDebt=custDebt(cId);
+    var cust=D.customers.find(function(x){return x.id===cId;});
+    var creditLimit=cust?cust.credit||0:0;
+    var orderTotal=price*qty;
+    var projectedDebt=existingDebt+orderTotal;
+    if(existingDebt>0){
+      var debtMsg="⚠️ Debt Alert\n\n"+
+        (can("vPhone")?cust.name:"This customer")+
+        " currently owes KSh "+existingDebt.toLocaleString()+".\n\n"+
+        "This order adds KSh "+orderTotal.toLocaleString()+" bringing total to KSh "+projectedDebt.toLocaleString()+"."+
+        (creditLimit>0&&projectedDebt>creditLimit?"\n\n🚫 Credit limit of KSh "+creditLimit.toLocaleString()+" will be exceeded!":"")+
+        "\n\nContinue placing this order?";
+      if(!confirm(debtMsg))return;
+    }
+  }
+
+  // ── DRIVER WORKLOAD ALERT ──
+  if(!editId){
+    var driverName=el("odrv")&&el("odrv").value;
+    if(driverName){
+      var driverPending=D.orders.filter(function(o){
+        return o.driver===driverName&&(o.status==="Pending"||o.status==="Processing"||o.status==="Out for delivery");
+      }).length;
+      if(driverPending>=5){
+        var drvMsg="⚠️ Workload Alert\n\n"+driverName+" already has "+driverPending+" active order(s) pending.\n\nYou can still assign this order — just letting you know.\n\nContinue?";
+        if(!confirm(drvMsg))return;
+      }
+    }
+  }
 
   if(editId){
     var o=D.orders.find(function(x){return String(x.id)===String(editId);});
@@ -1470,10 +1615,14 @@ function saveOrd(){
     var newStock=D.stock.find(function(s){return s.name===pn;});
     if(oldStock===newStock){
       var netChange=qty-o.qty;
-      if(netChange>0&&newStock&&newStock.qty<netChange){toast("Only "+newStock.qty+" more units available in stock","err");return;}
+      if(netChange>0&&newStock&&newStock.qty<netChange){
+        if(!confirm("⚠️ Stock Alert\n\nOnly "+newStock.qty+" more unit(s) available for "+pn+".\n\nOrder will be updated but stock is insufficient. Please restock.\n\nContinue?"))return;
+      }
       if(newStock)newStock.qty-=netChange;
     }else{
-      if(newStock&&newStock.qty<qty){toast("Only "+newStock.qty+" units in stock for "+pn,"err");return;}
+      if(newStock&&newStock.qty<qty){
+        if(!confirm("⚠️ Stock Alert\n\nOnly "+newStock.qty+" unit(s) in stock for "+pn+".\n\nOrder will be updated. Please restock soon.\n\nContinue?"))return;
+      }
       if(oldStock)oldStock.qty+=o.qty;
       if(newStock)newStock.qty-=qty;
     }
@@ -1509,8 +1658,12 @@ function saveOrd(){
   }
 
   var st=D.stock.find(function(s){return s.name===pn;});
-  if(st&&st.qty<qty){toast("Only "+st.qty+" units in stock","err");return;}
-  if(st)st.qty-=qty;
+  if(st&&st.qty<=0){
+    if(!confirm("⚠️ Stock Alert\n\n"+pn+" is OUT OF STOCK (0 units).\n\nThe order will be recorded but cannot be fulfilled until restocked.\n\nContinue placing this order?"))return;
+  }else if(st&&st.qty<qty){
+    if(!confirm("⚠️ Stock Alert\n\n"+pn+" has only "+st.qty+" unit(s) in stock but you are ordering "+qty+".\n\nThe order will be recorded. Please restock soon.\n\nContinue?"))return;
+  }
+  if(st)st.qty=Math.max(0,st.qty-qty); // never go below zero
   var total=price*qty;
   var amtPaid=can("mPaid")?(parseFloat(el("oamt").value)||0):0;
   var payStatus=can("mPaid")?el("opay").value:"Unpaid";
@@ -1629,7 +1782,8 @@ function cancelO(id){
 }
 function rDel(){
   var pg=el("pg-delivery");if(!pg)return;
-  var pend=D.orders.filter(function(o){return o.status==="Pending"||o.status==="Processing"||o.status==="Out for delivery";});
+  var allPend=D.orders.filter(function(o){return o.status==="Pending"||o.status==="Processing"||o.status==="Out for delivery";});
+  var pend=CU&&CU.role==="driver"?allPend.filter(function(o){return o.driver===CU.name;}):allPend;
   pg.innerHTML=
     "<div class=\"ph\"><h1>Delivery Board</h1><p>"+pend.length+" pending &middot; "+D.orders.filter(function(o){return o.status==="Delivered";}).length+" total delivered</p></div>"+
     "<div class=\"stats\" style=\"grid-template-columns:repeat(4,1fr)\">"+
@@ -1693,6 +1847,7 @@ function prepStAdd(){
   om("m-s");
 }
 function saveSt(){
+  if(!can("aSt")&&!can("eSt"))return;
   var n=el("sn").value.trim();if(!n){toast("Name required","err");return;}
   var editId=el("s-edit-id").value;
   if(editId){
@@ -1719,7 +1874,7 @@ function editSt(id){
   om("m-s");
 }
 function prepRS(){var rp=el("rp");if(rp)rp.innerHTML=D.stock.map(function(x){return "<option value=\""+x.id+"\">"+x.name+" ("+x.qty+" in stock)</option>";}).join("");om("m-rs");}
-function doRS(){var id=parseInt(el("rp").value);var q=parseInt(el("rq").value)||0;var p=D.stock.find(function(s){return s.id===id;});if(p){p.qty+=q;toast(p.name+" restocked +"+q);}el("rq").value="";cm("m-rs");rStock();dirty();}
+function doRS(){var id=parseInt(el("rp").value);var q=parseInt(el("rq").value)||0;if(q<=0){toast("Enter quantity to add","err");return;}var p=D.stock.find(function(s){return s.id===id;});if(p){p.qty+=q;toast(p.name+" restocked +"+q+" — now "+p.qty+" in stock");}el("rq").value="";cm("m-rs");rStock(undefined,STK_PAGE);if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();dirty();}
 function delS(id){if(!can("dSt"))return;if(!confirm("Remove?"))return;D.stock=D.stock.filter(function(s){return s.id!==id;});rStock();dirty();}
 
 function rInvs(q,pg){
@@ -1793,6 +1948,7 @@ function editInv(id){
   om("m-iv");
 }
 function saveInv(){
+  if(!can("aInv")&&!can("eInv"))return;
   var cId=parseInt(el("ivc").value);var a=parseFloat(el("iva").value)||0;var p=parseFloat(el("ivp").value)||0;
   var editId=el("iv-edit-id").value;
   if(editId){
@@ -1956,6 +2112,7 @@ function editOff(id){
   om("m-of");
 }
 function saveOff(){
+  if(!can("aOff")&&!can("eOff"))return;
   var t=el("oft").value.trim();if(!t){toast("Title required","err");return;}
   var editId=el("of-edit-id").value;
   if(editId){
@@ -1980,7 +2137,7 @@ function rReports(){
   var cost=del.reduce(function(a,o){return a+o.qty*(o.cost||0);},0);
   var totD=D.customers.reduce(function(a,c){return a+custDebt(c.id);},0);
   var btlIss=D.orders.filter(function(o){return o.bottle_after&&o.bottle_after!=="Good";}).length;
-  var cRevs=D.customers.map(function(c){return{c:c,rev:del.filter(function(o){return o.cId===c.id;}).reduce(function(a,o){return a+o.qty*o.price;},0),ords:D.orders.filter(function(o){return o.cId===c.id;}).length,debt:custDebt(c.id)};}).sort(function(a,b){return b.rev-a.rev;});
+  var cRevs=D.customers.map(function(c){return{c:c,rev:del.filter(function(o){return o.cId===c.id;}).reduce(function(a,o){return a+o.qty*o.price;},0),ords:del.filter(function(o){return o.cId===c.id;}).length,debt:custDebt(c.id)};}).sort(function(a,b){return b.rev-a.rev;});
   var pRevs={};del.forEach(function(o){if(!pRevs[o.prod])pRevs[o.prod]={qty:0,rev:0};pRevs[o.prod].qty+=o.qty;pRevs[o.prod].rev+=o.qty*o.price;});
   var zones=[].concat([],D.customers.map(function(c){return c.estate||c.zone||"";})).filter(function(z,i,a){return z&&a.indexOf(z)===i;});
   pg.innerHTML=
@@ -2194,6 +2351,7 @@ function rUsers(){
       "</tbody></table></div></div>";
 }
 function saveU(){
+  if(!can("mUsers"))return;
   var n=el("un").value.trim();if(!n){toast("Name required","err");return;}
   var p=String(el("upin").value||"").replace(/[^0-9]/g,"").slice(0,4);
   if(p.length!==4){toast("PIN must be 4 digits e.g. 1234","err");return;}
@@ -2205,7 +2363,7 @@ function saveU(){
   el("un").value="";el("upin").value="";el("uini").value="";
   cm("m-u");rUsers();dirty();toast(n+" added as "+R[role].label);
 }
-function delU(id){if(!confirm("Remove this team member?"))return;USERS=USERS.filter(function(u){return u.id!==id;});rUsers();dirty();}
+function delU(id){if(!can("mUsers"))return;if(!confirm("Remove this team member?"))return;USERS=USERS.filter(function(u){return u.id!==id;});rUsers();dirty();}
 
 function buildBackupWB(){
   var wb=XLSX.utils.book_new();
@@ -2457,8 +2615,12 @@ function restoreXL(input){
       syncIdCounters();
 
       var rm=el("rmsg");if(rm)rm.innerHTML="<span style=\"color:#27ae60\"><i class=\"ti ti-check\"></i> Restored successfully! "+sheetsFound+" sheets loaded.</span>";
+      syncIdCounters();
+      syncPaymentStatuses();
+      FB_LAST_LOCAL_WRITE=Date.now();
+      pushToCloud();
       nav("excel",null);
-      saved();toast("Data restored from backup");
+      saved();toast("Data restored from backup — syncing to cloud...");
     }catch(err){
       var rm=el("rmsg");if(rm)rm.innerHTML="<span style=\"color:#c0392b\"><i class=\"ti ti-x\"></i> Failed: "+err.message+"</span>";
       toast("Restore failed - "+err.message,"err");
