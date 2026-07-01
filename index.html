@@ -1032,7 +1032,7 @@ function rDash(){
   var pg=el("pg-dashboard");if(!pg)return;
   var del=D.orders.filter(function(o){return o.status==="Delivered";});
   var rev=del.reduce(function(a,o){return a+o.qty*o.price;},0);
-  var cost=del.reduce(function(a,o){var s=D.stock.find(function(x){return x.name===o.prod;});return a+o.qty*(s?s.cost:0);},0);
+  var cost=del.reduce(function(a,o){return a+o.qty*(o.cost||0);},0);
   var pend=D.orders.filter(function(o){return o.status==="Pending"||o.status==="Processing";}).length;
   var low=D.stock.filter(function(s){return s.qty<=s.min;}).length;
   var td=tday();
@@ -1198,12 +1198,14 @@ function openPay(cId){
   var c=D.customers.find(function(x){return x.id===cId;});if(!c)return;
   var debt=custDebt(cId);
   el("pay-cid").value=cId;
-  el("pay-info").innerHTML="<div style=\"font-weight:800;font-size:14px;margin-bottom:4px\">"+c.name+"</div><div style=\"color:var(--tx2);font-size:12px\">"+cAddr(c)+"</div><div style=\"margin-top:7px;font-size:13px;color:#c0392b;font-weight:700\">Outstanding: KSh "+debt.toLocaleString()+"</div>";
+  el("pay-info").innerHTML="<div style=\"font-weight:800;font-size:14px;margin-bottom:4px\">"+(can("vPhone")?c.name:maskName(c.name))+"</div><div style=\"color:var(--tx2);font-size:12px\">"+cAddr(c)+"</div><div style=\"margin-top:7px;font-size:13px;color:#c0392b;font-weight:700\">Outstanding: KSh "+debt.toLocaleString()+"</div>";
   el("pay-date").value=tday();el("pay-amt").value="";el("pay-ref").value="";om("m-pay");
 }
 function recPay(){
   var cId=parseInt(el("pay-cid").value),amt=parseFloat(el("pay-amt").value)||0;
   if(!amt){toast("Enter amount","err");return;}
+  var totalDebt=D.invoices.filter(function(i){return i.cId===cId&&i.paid<i.amount;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
+  if(amt>totalDebt&&totalDebt>0){if(!confirm("Amount KSh "+amt.toLocaleString()+" exceeds total balance of KSh "+totalDebt.toLocaleString()+". Continue?"))return;amt=totalDebt;}
   var rem=amt;
   D.invoices.filter(function(i){return i.cId===cId&&i.paid<i.amount;}).sort(function(a,b){return a.date>b.date?1:-1;}).forEach(function(inv){
     if(rem<=0)return;
@@ -1474,7 +1476,8 @@ function saveOrd(){
       if(oldStock)oldStock.qty+=o.qty;
       if(newStock)newStock.qty-=qty;
     }
-    o.cId=cId;o.prod=pn;o.qty=qty;o.price=price;o.date=el("od").value;
+    var stCostE=D.stock.find(function(s){return s.name===pn;});
+    o.cId=cId;o.prod=pn;o.qty=qty;o.price=price;o.cost=stCostE?stCostE.cost:0;o.date=el("od").value;
     o.driver=el("odrv").value;o.deliver=el("odlvr").value;o.bottle_before=el("obtl").value;
     var amtPaid=parseFloat(el("oamt").value)||0;
     var total=price*qty;
@@ -1515,7 +1518,8 @@ function saveOrd(){
   else if(amtPaid>0){payStatus="Partial";}
   else{payStatus="Unpaid";}
   var newOrdId=nOId++;
-  D.orders.push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:price,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:""});
+  var stCost=D.stock.find(function(s){return s.name===pn;});var costAtSale=stCost?stCost.cost:0;
+  D.orders.push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:price,cost:costAtSale,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:""});
   if(payStatus!=="Paid"){
     D.invoices.push({id:nIId++,cId:cId,amount:total,paid:amtPaid,due:el("od").value,notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
   }
@@ -1972,7 +1976,7 @@ function rReports(){
   var pg=el("pg-reports");if(!pg)return;
   var del=D.orders.filter(function(o){return o.status==="Delivered";});
   var rev=del.reduce(function(a,o){return a+o.qty*o.price;},0);
-  var cost=del.reduce(function(a,o){var s=D.stock.find(function(x){return x.name===o.prod;});return a+o.qty*(s?s.cost:0);},0);
+  var cost=del.reduce(function(a,o){return a+o.qty*(o.cost||0);},0);
   var totD=D.customers.reduce(function(a,c){return a+custDebt(c.id);},0);
   var btlIss=D.orders.filter(function(o){return o.bottle_after&&o.bottle_after!=="Good";}).length;
   var cRevs=D.customers.map(function(c){return{c:c,rev:del.filter(function(o){return o.cId===c.id;}).reduce(function(a,o){return a+o.qty*o.price;},0),ords:D.orders.filter(function(o){return o.cId===c.id;}).length,debt:custDebt(c.id)};}).sort(function(a,b){return b.rev-a.rev;});
@@ -1991,7 +1995,7 @@ function rReports(){
       "<div class=\"card\"><div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-trophy\"></i>Top customers</div></div>"+
         (can("vRev")?
           "<div class=\"tw\"><table><thead><tr><th>Customer</th><th>Orders</th><th>Revenue</th><th>Debt</th></tr></thead><tbody>"+
-          cRevs.slice(0,8).map(function(x){return "<tr><td><div style=\"font-weight:700\">"+x.c.name+"</div><div class=\"ca\">"+(x.c.court||x.c.estate||"")+"</div></td><td>"+x.ords+"</td><td>KSh "+x.rev.toLocaleString()+"</td><td style=\"font-weight:700;color:"+(x.debt>0?"#c0392b":"#27ae60")+"\">"+(x.debt>0?"KSh "+x.debt.toLocaleString():"Clear")+"</td></tr>";}).join("")+
+          cRevs.slice(0,8).map(function(x){return "<tr><td><div style=\"font-weight:700\">"+(can("vPhone")?x.c.name:maskName(x.c.name))+"</div><div class=\"ca\">"+(x.c.court||x.c.estate||"")+"</div></td><td>"+x.ords+"</td><td>KSh "+x.rev.toLocaleString()+"</td><td style=\"font-weight:700;color:"+(x.debt>0?"#c0392b":"#27ae60")+"\">"+(x.debt>0?"KSh "+x.debt.toLocaleString():"Clear")+"</td></tr>";}).join("")+
           "</tbody></table></div>":
           "<div class=\"te\" style=\"padding:20px\"><i class=\"ti ti-eye-off\"></i><p>Hidden for your role</p></div>")+
       "</div>"+
@@ -2482,8 +2486,12 @@ function syncPaymentStatuses(){
       else if(inv.paid>0){o.paid="Partial";o.amtPaid=inv.paid;}
       else{o.paid="Unpaid";}
     }else{
-      // No invoice = fully paid or cancelled
-      if(o.paid!=="Paid"&&o.status!=="Cancelled")o.paid="Paid";
+      // No invoice: if order was explicitly set Paid at creation, keep it
+      // If order is Cancelled, keep as Cancelled
+      // Don't change Unpaid orders that just don't have invoices (shouldn't happen but be safe)
+      if(o.status!=="Cancelled"&&o.paid!=="Paid"&&o.paid!=="Unpaid"&&o.paid!=="Partial"){
+        o.paid="Paid"; // fix any corrupted status
+      }
     }
   });
 }
