@@ -820,7 +820,7 @@ function nav(p,btn){
     if((b.getAttribute("onclick")||"").indexOf("'"+p+"'")!==-1)b.classList.add("act");
   });
   el("um").classList.remove("open");
-  var fns={dashboard:rDash,customers:function(){rCusts("");},orders:function(){rOrds("");},delivery:rDel,stock:rStock,invoices:function(){rInvs("");},debts:rDebts,complaints:function(){rCmps("");},offers:rOffers,reports:rReports,excel:rExcel,users:rUsers};
+  var fns={dashboard:rDash,customers:function(){rCusts(undefined,CUST_PAGE);},orders:function(){rOrds(undefined,ORD_PAGE);},delivery:rDel,stock:function(){rStock(undefined,STK_PAGE);},invoices:function(){rInvs(undefined,INV_PAGE);},debts:rDebts,complaints:function(){rCmps(undefined,CMP_PAGE);},offers:rOffers,reports:rReports,excel:rExcel,users:rUsers};
   if(fns[p])fns[p]();
 }
 
@@ -1154,13 +1154,13 @@ function saveCust(){
       c.estate=el("cestate").value;c.court=el("ccourt").value;c.house=el("chouse").value;
       c.htype=el("chtype").value;c.road=el("croad").value;c.zone=el("czone").value;
       c.ctype=el("ctype").value;c.credit=parseFloat(el("ccl").value)||0;c.notes=el("cnotes").value;
-      cm("m-c");rCusts("");dirty();toast("Customer updated");
+      cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer updated");
       return;
     }
   }
   D.customers.push({id:uid(),name:n,phone:ph,phone2:el("cph2").value,idno:el("cid").value,estate:el("cestate").value,court:el("ccourt").value,house:el("chouse").value,htype:el("chtype").value,road:el("croad").value,zone:el("czone").value,ctype:el("ctype").value,credit:parseFloat(el("ccl").value)||0,notes:el("cnotes").value,created:tday()});
   ["cn","cph","cph2","cid","cestate","ccourt","chouse","croad","czone","cnotes"].forEach(function(id){el(id).value="";});el("ccl").value="0";
-  cm("m-c");rCusts("");dirty();toast("Customer added");
+  cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer added");
 }
 function editCust(id){
   if(!can("eCust"))return;
@@ -1176,7 +1176,7 @@ function editCust(id){
   el("m-c-save").innerHTML="<i class=\"ti ti-check\"></i> Update";
   om("m-c");
 }
-function delC(id){if(!can("dCust"))return;if(!confirm("Remove this customer?"))return;D.customers=D.customers.filter(function(c){return c.id!==id;});D.orders=D.orders.filter(function(o){return o.cId!==id;});D.invoices=D.invoices.filter(function(i){return i.cId!==id;});rCusts("");dirty();toast("Customer removed");}
+function delC(id){if(!can("dCust"))return;if(!confirm("Remove this customer?"))return;D.customers=D.customers.filter(function(c){return c.id!==id;});D.orders=D.orders.filter(function(o){return o.cId!==id;});D.invoices=D.invoices.filter(function(i){return i.cId!==id;});rCusts(undefined,CUST_PAGE);dirty();toast("Customer removed");}
 function openPay(cId){
   var c=D.customers.find(function(x){return x.id===cId;});if(!c)return;
   var debt=custDebt(cId);
@@ -1418,7 +1418,7 @@ function saveOrdEdit(){
   o.driver=el("oe-drv").value;
   if(o.status==="Delivered")o.bottle_after=el("oe-btl").value;else o.bottle_before=el("oe-btl").value;
   o.notes=el("oe-notes").value;
-  cm("m-oe");rOrds("");dirty();toast("Order #"+oid+" updated");
+  cm("m-oe");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+oid+" updated");
 }
 function calcO(){
   var opEl=el("op");
@@ -1476,7 +1476,7 @@ function saveOrd(){
     }else if(linkedInv){
       linkedInv.amount=price*qty;linkedInv.paid=price*qty;
     }
-    cm("m-o");rOrds("");dirty();toast("Order #"+o.id+" updated");
+    cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+o.id+" updated");
     return;
   }
 
@@ -1520,7 +1520,7 @@ function completeDlv(){
     o.paid=o.paid||"Unpaid"; // keep existing payment status
   }
   if(el("dlv-notes").value)o.notes=el("dlv-notes").value;
-  cm("m-dlv");rOrds(undefined,ORD_PAGE);dirty();toast("Delivery completed — payment to be confirmed by manager");
+  cm("m-dlv");rOrds(undefined,ORD_PAGE);rDel();if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();dirty();toast("Delivery completed!");
 }
 function delO(id){
   if(!can("dOrd"))return;
@@ -1714,14 +1714,28 @@ function saveInv(){
       if(i.payments&&i.payments.length){toast("Cannot edit - payments already recorded","err");return;}
       i.cId=cId;i.amount=a;i.paid=p;i.due=el("ivd").value;i.notes=el("ivn").value;
       if(p>0)i.payments=[{date:tday(),amt:p,method:"Cash",ref:"Opening (edited)"}];
-      cm("m-iv");rInvs("");dirty();toast("Invoice updated");
+      cm("m-iv");rInvs(undefined,INV_PAGE);dirty();toast("Invoice updated");
       return;
     }
   }
   D.invoices.push({id:nIId++,cId:cId,amount:a,paid:p,due:el("ivd").value,notes:el("ivn").value,date:tday(),payments:p>0?[{date:tday(),amt:p,method:"Cash",ref:"Opening"}]:[]});
-  el("iva").value="";el("ivp").value="0";el("ivn").value="";cm("m-iv");rInvs("");dirty();toast("Invoice created");
+  el("iva").value="";el("ivp").value="0";el("ivn").value="";cm("m-iv");rInvs(undefined,INV_PAGE);dirty();toast("Invoice created");
 }
-function payI(id){var i=D.invoices.find(function(x){return x.id===id;});if(i){if(!i.payments)i.payments=[];i.payments.push({date:tday(),amt:i.amount-i.paid,method:"Cash",ref:"Full payment"});i.paid=i.amount;}rInvs("");dirty();toast("Invoice marked paid");}
+function payI(id){
+  var i=D.invoices.find(function(x){return x.id===id;});
+  if(i){
+    if(!i.payments)i.payments=[];
+    i.payments.push({date:tday(),amt:i.amount-i.paid,method:"Cash",ref:"Full payment"});
+    i.paid=i.amount;
+    // Sync linked order payment status
+    var ordId=i.notes&&i.notes.match(/#(\d+)/);
+    if(ordId){var o=D.orders.find(function(x){return String(x.id)===ordId[1];});if(o){o.paid="Paid";o.amtPaid=i.amount;}}
+  }
+  rInvs(undefined,INV_PAGE);
+  if(el("pg-orders")&&el("pg-orders").classList.contains("act"))rOrds(undefined,ORD_PAGE);
+  if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
+  dirty();toast("Invoice marked paid");
+}
 function openPayInv(id){var i=D.invoices.find(function(x){return x.id===id;});if(!i)return;var c=D.customers.find(function(x){return x.id===i.cId;});el("pay-cid").value=i.cId;el("pay-info").innerHTML="<strong>"+(c?c.name:"?")+"</strong> &mdash; Invoice #"+id+"<br><span style=\"color:#c0392b;font-weight:700\">Balance: KSh "+(i.amount-i.paid).toLocaleString()+"</span>";el("pay-date").value=tday();el("pay-amt").value="";om("m-pay");}
 
 function rDebts(){
@@ -1809,10 +1823,10 @@ function filterCmps(f){
   var paged=paginate(fil,0);
   var tb=el("cmpbody");if(tb)tb.innerHTML=cmpRows(paged.items);
 }
-function prepCmp(){var s=el("cmp-c");if(s)s.innerHTML=D.customers.map(function(c){return "<option value=\""+c.id+"\">"+c.name+"</option>";}).join("");el("cmp-d").value=tday();om("m-cmp");}
-function saveCmp(){var det=el("cmp-det").value.trim();if(!det){toast("Details required","err");return;}D.complaints.push({id:nCId++,cId:parseInt(el("cmp-c").value),type:el("cmp-t").value,details:det,action:el("cmp-act").value,status:el("cmp-s").value,date:el("cmp-d").value});el("cmp-det").value="";el("cmp-act").value="";cm("m-cmp");rCmps("");dirty();toast("Complaint logged");}
-function resolveCmp(id){var c=D.complaints.find(function(x){return x.id===id;});if(c)c.status="Resolved";rCmps("");dirty();toast("Complaint resolved");}
-function delCmp(id){if(!confirm("Delete?"))return;D.complaints=D.complaints.filter(function(c){return c.id!==id;});rCmps("");dirty();}
+function prepCmp(){var s=el("cmp-c");if(s)s.innerHTML=D.customers.map(function(c){return "<option value=\""+c.id+"\">"+custName(c.id)+" - "+cAddr(c)+"</option>";}).join("");el("cmp-d").value=tday();om("m-cmp");}
+function saveCmp(){var det=el("cmp-det").value.trim();if(!det){toast("Details required","err");return;}D.complaints.push({id:nCId++,cId:parseInt(el("cmp-c").value),type:el("cmp-t").value,details:det,action:el("cmp-act").value,status:el("cmp-s").value,date:el("cmp-d").value});el("cmp-det").value="";el("cmp-act").value="";cm("m-cmp");rCmps(undefined,CMP_PAGE);dirty();toast("Complaint logged");}
+function resolveCmp(id){var c=D.complaints.find(function(x){return x.id===id;});if(c)c.status="Resolved";rCmps(undefined,CMP_PAGE);dirty();toast("Complaint resolved");}
+function delCmp(id){if(!confirm("Delete?"))return;D.complaints=D.complaints.filter(function(c){return c.id!==id;});rCmps(undefined,CMP_PAGE);dirty();}
 
 function rOffers(){
   var pg=el("pg-offers");if(!pg)return;
