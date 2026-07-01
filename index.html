@@ -306,6 +306,7 @@ function startCloudListener(){
       else USERS=[{id:1,name:"Director",role:"director",pin:"1234",ini:"DR",col:"#1a1560"}];
       FB_SETUP_DONE=data.setupDone===true;
       syncIdCounters();
+      syncPaymentStatuses();
     }
     FB_READY=true;
     var c=el("cloud-status");if(c)c.innerHTML="<i class=\"ti ti-cloud-check\"></i> Online &middot; Live";
@@ -1176,7 +1177,23 @@ function editCust(id){
   el("m-c-save").innerHTML="<i class=\"ti ti-check\"></i> Update";
   om("m-c");
 }
-function delC(id){if(!can("dCust"))return;if(!confirm("Remove this customer?"))return;D.customers=D.customers.filter(function(c){return c.id!==id;});D.orders=D.orders.filter(function(o){return o.cId!==id;});D.invoices=D.invoices.filter(function(i){return i.cId!==id;});rCusts(undefined,CUST_PAGE);dirty();toast("Customer removed");}
+function delC(id){
+  if(!can("dCust"))return;
+  var c=D.customers.find(function(x){return x.id===id;});if(!c)return;
+  var paidInvs=D.invoices.filter(function(i){return i.cId===id&&i.paid>0;});
+  var debt=custDebt(id);
+  var msg="Remove "+(can("vPhone")?c.name:"this customer")+"?\n\n";
+  if(debt>0)msg+="They have KSh "+debt.toLocaleString()+" outstanding debt — this will be written off.\n\n";
+  if(paidInvs.length)msg+=paidInvs.length+" paid invoice(s) will be kept for financial records.\n\n";
+  msg+="Their orders and unpaid invoices will be removed. Cannot be undone.";
+  if(!confirm(msg))return;
+  D.customers=D.customers.filter(function(x){return x.id!==id;});
+  D.orders=D.orders.filter(function(o){return o.cId!==id;});
+  D.invoices=D.invoices.filter(function(i){if(i.cId!==id)return true;return i.paid>0;});
+  rCusts(undefined,CUST_PAGE);
+  if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
+  dirty();toast("Customer removed"+(paidInvs.length?" — "+paidInvs.length+" paid invoice(s) retained":""));
+}
 function openPay(cId){
   var c=D.customers.find(function(x){return x.id===cId;});if(!c)return;
   var debt=custDebt(cId);
@@ -1250,8 +1267,9 @@ function ordRows(fil){
       "<td style=\"font-size:11px\">"+(o.driver||"&mdash;")+"</td>"+
       "<td>"+sb(o.status)+"</td>"+
       "<td><div class=\"ac\">"+
-        (o.status!=="Delivered"&&o.status!=="Cancelled"?"<button class=\"btn btn-xs btn-grn\" onclick=\"openDlv("+o.id+")\" title=\"Complete\"><i class=\"ti ti-check\"></i></button>":"")+
-        (can("eOrd")?"<button class=\"btn btn-xs btn-navy\" onclick=\"editOrd("+o.id+")\" title=\"Edit\"><i class=\"ti ti-edit\"></i></button>":"")+
+        (o.status!=="Delivered"&&o.status!=="Cancelled"?"<button class=\"btn btn-xs btn-grn\" onclick=\"openDlv("+o.id+")\" title=\"Complete delivery\"><i class=\"ti ti-check\"></i></button>":"")+
+        (can("eOrd")&&o.status!=="Delivered"&&o.status!=="Cancelled"?"<button class=\"btn btn-xs btn-navy\" onclick=\"editOrd("+o.id+")\" title=\"Edit\"><i class=\"ti ti-edit\"></i></button>":"")+
+        (can("eOrd")&&(o.status==="Pending"||o.status==="Processing")?"<button class=\"btn btn-xs\" onclick=\"cancelO("+o.id+")\" title=\"Cancel order\" style=\"background:#f39c12;color:#fff\"><i class=\"ti ti-x\"></i></button>":"")+
         (can("dOrd")?"<button class=\"btn btn-xs btn-red\" onclick=\"delO("+o.id+")\"><i class=\"ti ti-trash\"></i></button>":"")+
       "</div></td></tr>";
   }).join("");
@@ -1458,7 +1476,13 @@ function saveOrd(){
     }
     o.cId=cId;o.prod=pn;o.qty=qty;o.price=price;o.date=el("od").value;
     o.driver=el("odrv").value;o.deliver=el("odlvr").value;o.bottle_before=el("obtl").value;
-    var amtPaid=parseFloat(el("oamt").value)||0;var payStatus=el("opay").value;
+    var amtPaid=parseFloat(el("oamt").value)||0;
+    var total=price*qty;
+    // Auto-correct payment status based on amount paid
+    var payStatus;
+    if(amtPaid>=total){payStatus="Paid";}
+    else if(amtPaid>0){payStatus="Partial";}
+    else{payStatus="Unpaid";}
     o.paid=payStatus;o.amtPaid=amtPaid;
     var linkedInv=D.invoices.find(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+o.id)!==-1;});
     if(payStatus!=="Paid"){
@@ -1483,11 +1507,19 @@ function saveOrd(){
   var st=D.stock.find(function(s){return s.name===pn;});
   if(st&&st.qty<qty){toast("Only "+st.qty+" units in stock","err");return;}
   if(st)st.qty-=qty;
+  var total=price*qty;
   var amtPaid=can("mPaid")?(parseFloat(el("oamt").value)||0):0;
   var payStatus=can("mPaid")?el("opay").value:"Unpaid";
-  D.orders.push({id:nOId++,cId:cId,prod:pn,qty:qty,price:price,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:""});
-  if(payStatus!=="Paid")D.invoices.push({id:nIId++,cId:cId,amount:price*qty,paid:amtPaid,due:el("od").value,notes:"Order #"+(nOId-1),date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order"}]:[]});
-  cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+(nOId-1)+" placed");
+  // Auto-correct payment status based on amount paid
+  if(amtPaid>=total){payStatus="Paid";}
+  else if(amtPaid>0){payStatus="Partial";}
+  else{payStatus="Unpaid";}
+  var newOrdId=nOId++;
+  D.orders.push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:price,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:""});
+  if(payStatus!=="Paid"){
+    D.invoices.push({id:nIId++,cId:cId,amount:total,paid:amtPaid,due:el("od").value,notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
+  }
+  cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+newOrdId+" placed");
 }
 function openDlv(oid){
   var o=D.orders.find(function(x){return x.id===oid;});if(!o)return;
@@ -1508,38 +1540,88 @@ function openDlv(oid){
 function completeDlv(){
   var oid=parseInt(el("dlv-oid").value);var o=D.orders.find(function(x){return x.id===oid;});if(!o)return;
   o.status="Delivered";o.bottle_after=el("dlv-btl").value;
-  // Only set payment if staff can see those fields
   if(can("mPaid")){
-    o.paid=el("dlv-pay").value;
     var amt=parseFloat(el("dlv-amt").value)||0;
-    if(amt>0){
-      var inv=D.invoices.find(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+oid)!==-1;});
-      if(inv){inv.paid=Math.min(inv.amount,inv.paid+amt);if(!inv.payments)inv.payments=[];inv.payments.push({date:tday(),amt:amt,method:"Cash",ref:"Delivery #"+oid});}
+    var inv=D.invoices.find(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+oid)!==-1;});
+    if(amt>0&&inv){
+      inv.paid=Math.min(inv.amount,inv.paid+amt);
+      if(!inv.payments)inv.payments=[];
+      inv.payments.push({date:tday(),amt:amt,method:"Cash",ref:"Delivery #"+oid});
+    }
+    // Auto-correct payment status from invoice
+    if(inv){
+      if(inv.paid>=inv.amount){o.paid="Paid";o.amtPaid=inv.paid;}
+      else if(inv.paid>0){o.paid="Partial";o.amtPaid=inv.paid;}
+      else{o.paid="Unpaid";}
+    }else{
+      // No invoice — use dropdown value directly
+      var total=o.qty*o.price;
+      if(amt>=total){o.paid="Paid";o.amtPaid=amt;}
+      else if(amt>0){o.paid="Partial";o.amtPaid=amt;}
     }
   }else{
-    o.paid=o.paid||"Unpaid"; // keep existing payment status
+    o.paid=o.paid||"Unpaid";
   }
   if(el("dlv-notes").value)o.notes=el("dlv-notes").value;
-  cm("m-dlv");rOrds(undefined,ORD_PAGE);rDel();if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();dirty();toast("Delivery completed!");
+  cm("m-dlv");rOrds(undefined,ORD_PAGE);rDel();
+  if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
+  dirty();toast("Delivery completed!");
 }
 function delO(id){
   if(!can("dOrd"))return;
-  if(!confirm("Delete order? The linked invoice will also be removed if unpaid."))return;
-  var o=D.orders.find(function(x){return x.id===id;});
+  var o=D.orders.find(function(x){return x.id===id;});if(!o)return;
+  var hasPaid=D.invoices.some(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+id)!==-1&&i.paid>0;});
+  var msg=hasPaid?
+    "Delete order #"+id+"?\n\nThis order has payments on record. The invoice will be kept for your financial records, but the order will be removed.":
+    "Delete order #"+id+"? The linked invoice will also be removed.";
+  if(!confirm(msg))return;
+  // Restore stock
+  var st=D.stock.find(function(s){return s.name===o.prod;});
+  if(st&&o.status!=="Delivered"&&o.status!=="Cancelled")st.qty+=o.qty;
+  // Remove order
   D.orders=D.orders.filter(function(x){return x.id!==id;});
-  // Remove linked invoice only if unpaid — if paid, keep it for records
-  if(o){
-    D.invoices=D.invoices.filter(function(i){
-      var linked=i.notes&&i.notes.indexOf("#"+id)!==-1;
-      if(linked&&i.paid<i.amount)return false; // remove unpaid linked invoice
-      return true; // keep paid invoices and unrelated ones
-    });
-  }
+  // Remove unpaid invoices only — keep paid ones for records
+  D.invoices=D.invoices.filter(function(i){
+    var linked=i.notes&&i.notes.indexOf("#"+id)!==-1;
+    if(linked&&i.paid<=0)return false;
+    return true;
+  });
   rOrds(undefined,ORD_PAGE);
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   dirty();toast("Order #"+id+" deleted");
 }
 
+function cancelO(id){
+  if(!can("eOrd"))return;
+  var o=D.orders.find(function(x){return x.id===id;});if(!o)return;
+  if(o.status==="Cancelled"){toast("Already cancelled");return;}
+  if(o.status==="Delivered"){toast("Cannot cancel a delivered order — delete it if needed","err");return;}
+  var inv=D.invoices.find(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+id)!==-1;});
+  var hasPaid=inv&&inv.paid>0;
+  var msg=hasPaid?
+    "Cancel order #"+id+"?\n\nKSh "+inv.paid.toLocaleString()+" has already been paid. The invoice will stay with the paid amount recorded. Stock will be restored.":
+    "Cancel order #"+id+"? Stock will be restored and the invoice removed.";
+  if(!confirm(msg))return;
+  // Restore stock
+  var st=D.stock.find(function(s){return s.name===o.prod;});
+  if(st)st.qty+=o.qty;
+  // Update order status
+  o.status="Cancelled";
+  o.paid=hasPaid?"Partial":"Cancelled";
+  // Handle invoice
+  if(inv){
+    if(hasPaid){
+      // Keep invoice but zero the balance — only owed what was paid
+      inv.amount=inv.paid;
+    }else{
+      // Remove fully unpaid invoice
+      D.invoices=D.invoices.filter(function(i){return i.id!==inv.id;});
+    }
+  }
+  rOrds(undefined,ORD_PAGE);
+  if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
+  dirty();toast("Order #"+id+" cancelled — stock restored");
+}
 function rDel(){
   var pg=el("pg-delivery");if(!pg)return;
   var pend=D.orders.filter(function(o){return o.status==="Pending"||o.status==="Processing"||o.status==="Out for delivery";});
@@ -2388,6 +2470,22 @@ function syncIdCounters(){
   var maxI=D.invoices.reduce(function(m,i){return Math.max(m,Number(i.id)||0);},2000);
   var maxC=D.complaints.reduce(function(m,c){return Math.max(m,Number(c.id)||0);},3000);
   nOId=maxO+1;nIId=maxI+1;nCId=maxC+1;
+}
+function syncPaymentStatuses(){
+  // Fix any order whose payment badge doesn't match its invoice reality
+  D.orders.forEach(function(o){
+    var inv=D.invoices.find(function(i){
+      return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+o.id)!==-1;
+    });
+    if(inv){
+      if(inv.paid>=inv.amount){o.paid="Paid";o.amtPaid=inv.paid;}
+      else if(inv.paid>0){o.paid="Partial";o.amtPaid=inv.paid;}
+      else{o.paid="Unpaid";}
+    }else{
+      // No invoice = fully paid or cancelled
+      if(o.paid!=="Paid"&&o.status!=="Cancelled")o.paid="Paid";
+    }
+  });
 }
 
 function mergeXL(input){
