@@ -1040,7 +1040,18 @@ function buildMods(){
     "<div class=\"mbdy\" id=\"wiz-body\" style=\"min-height:260px\"></div>"+
     "<div class=\"mft\" id=\"wiz-foot\"></div>"+
   "</div></div>";
-  el("mods").innerHTML=mC+mO+mOE+mDlv+mS+mRS+mOf+mIv+mPay+mCmp+mU+mSetup;
+  var mPin="<div class=\"ov\" id=\"m-pin\"><div class=\"modal\" style=\"max-width:360px\">"+
+    "<div class=\"mhd\"><div class=\"mttl\"><i class=\"ti ti-key\" style=\"color:var(--gd);margin-right:7px\"></i><span id=\"pin-title\">Change PIN</span></div><button class=\"mcls\" onclick=\"cm('m-pin')\"><i class=\"ti ti-x\"></i></button></div>"+
+    "<div class=\"mbdy\">"+
+      "<div id=\"pin-info\" style=\"font-size:12px;color:var(--tx2);margin-bottom:16px\"></div>"+
+      "<input type=\"hidden\" id=\"pin-uid\">"+
+      "<div class=\"fg\"><label class=\"flabel\">New PIN (4 digits) *</label><input class=\"fi\" id=\"pin-new\" type=\"password\" maxlength=\"4\" placeholder=\"e.g. 5678\" inputmode=\"numeric\"></div>"+
+      "<div class=\"fg\"><label class=\"flabel\">Confirm new PIN *</label><input class=\"fi\" id=\"pin-confirm\" type=\"password\" maxlength=\"4\" placeholder=\"repeat PIN\" inputmode=\"numeric\"></div>"+
+      "<div id=\"pin-err\" style=\"color:#dc3545;font-size:12px;margin-top:6px\"></div>"+
+    "</div>"+
+    "<div class=\"mft\"><button class=\"btn\" onclick=\"cm('m-pin')\">Cancel</button><button class=\"btn btn-gold\" onclick=\"savePin()\"><i class=\"ti ti-check\"></i> Save PIN</button></div>"+
+  "</div></div>";
+  el("mods").innerHTML=mC+mO+mOE+mDlv+mS+mRS+mOf+mIv+mPay+mCmp+mU+mSetup+mPin;
 }
 
 function rDash(){
@@ -2336,7 +2347,13 @@ function rUsers(){
           (u.id===CU.id?" <span class=\"badge bgo\" style=\"font-size:9px\">You</span>":"")+"</div>"+
         "</div>"+
         "<div style=\"font-size:11px;color:"+(u.id===CU.id?"rgba(255,255,255,.4)":"var(--tx2)")+";margin-bottom:10px\">PIN: "+String.fromCharCode(9679,9679,9679,9679)+"</div>"+
-        (u.id!==CU.id?"<button class=\"btn btn-sm btn-red\" onclick=\"delU("+u.id+")\"><i class=\"ti ti-trash\"></i> Remove</button>":"<span style=\"font-size:11px;color:var(--gd);font-weight:700\">Active session</span>")+
+        "<div style=\"display:flex;gap:7px;flex-wrap:wrap\">"+
+        (u.id!==CU.id&&u.role!=="director"?
+          "<button class=\"btn btn-sm\" onclick=\"prepChangePin("+u.id+")\" style=\"background:#f0f4ff;color:var(--nv);border:1.5px solid var(--nv)\"><i class=\"ti ti-key\"></i> Change PIN</button>":"")+
+        (u.id===CU.id?
+          "<button class=\"btn btn-sm\" onclick=\"prepChangePin("+u.id+")\" style=\"background:rgba(255,255,255,.15);color:#fff;border:1.5px solid rgba(255,255,255,.3)\"><i class=\"ti ti-key\"></i> My PIN</button>":"")+
+        (u.id!==CU.id?"<button class=\"btn btn-sm btn-red\" onclick=\"delU("+u.id+")\"><i class=\"ti ti-trash\"></i> Remove</button>":"<span style=\"font-size:11px;color:var(--gd);font-weight:700;margin-top:6px;display:block\">Active session</span>")+
+        "</div>"+
       "</div>";
     }).join("")+
     "</div>"+
@@ -2360,9 +2377,49 @@ function saveU(){
   var ini=(el("uini").value||"").trim().toUpperCase().slice(0,2);
   if(!ini){var w=n.split(" ");ini=(w[0][0]+(w[1]?w[1][0]:w[0][1]||"X")).toUpperCase();}
   var cols=["#1a1560","#185FA5","#856404","#534AB7","#c0392b","#8e44ad","#16a085","#e67e22"];
+  // Check PIN not already used
+  if(USERS.find(function(u){return u.pin===p;})){toast("That PIN is already used by another team member","err");return;}
   USERS.push({id:uid(),name:n,role:role,pin:p,ini:ini.slice(0,2),col:cols[USERS.length%cols.length]});
   el("un").value="";el("upin").value="";el("uini").value="";
   cm("m-u");rUsers();dirty();toast(n+" added as "+R[role].label);
+}
+function prepChangePin(uid2){
+  if(!can("mUsers"))return;
+  var u=USERS.find(function(x){return x.id===uid2;});if(!u)return;
+  // Director can only change: their own PIN, or Staff/Manager PINs
+  // Director cannot change another Director's PIN
+  if(u.role==="director"&&u.id!==CU.id){
+    toast("You cannot change another Director's PIN","err");return;
+  }
+  el("pin-uid").value=uid2;
+  el("pin-new").value="";el("pin-confirm").value="";el("pin-err").textContent="";
+  el("pin-title").textContent=u.id===CU.id?"Change My PIN":"Change PIN — "+u.name;
+  el("pin-info").innerHTML="<strong>"+(u.id===CU.id?"Your account":"Staff member: "+u.name)+"</strong><br>"+
+    "Role: <span class=\"badge\" style=\"background:"+R[u.role].bg+";color:"+R[u.role].c+"\">"+R[u.role].label+"</span><br><br>"+
+    "Enter a new 4-digit PIN. The change takes effect immediately on all devices.";
+  om("m-pin");
+  setTimeout(function(){if(el("pin-new"))el("pin-new").focus();},200);
+}
+function savePin(){
+  if(!can("mUsers"))return;
+  var uid2=parseInt(el("pin-uid").value);
+  var u=USERS.find(function(x){return x.id===uid2;});
+  if(!u){toast("User not found","err");return;}
+  // Security: double-check director cannot change another director's PIN
+  if(u.role==="director"&&u.id!==CU.id){toast("Cannot change another Director's PIN","err");return;}
+  var p1=el("pin-new").value.replace(/[^0-9]/g,"");
+  var p2=el("pin-confirm").value.replace(/[^0-9]/g,"");
+  var errEl=el("pin-err");
+  if(p1.length!==4){errEl.textContent="PIN must be exactly 4 digits";return;}
+  if(p1!==p2){errEl.textContent="PINs do not match — try again";return;}
+  // Check not already used by someone else
+  var conflict=USERS.find(function(x){return x.pin===p1&&x.id!==uid2;});
+  if(conflict){errEl.textContent="That PIN is already used by "+conflict.name+" — choose a different one";return;}
+  u.pin=p1;
+  // If changing own PIN, update CU too
+  if(u.id===CU.id)CU.pin=p1;
+  cm("m-pin");rUsers();dirty();
+  toast(u.id===CU.id?"Your PIN updated — use it from next login":"PIN updated for "+u.name);
 }
 function delU(id){if(!can("mUsers"))return;if(!confirm("Remove this team member?"))return;USERS=USERS.filter(function(u){return u.id!==id;});rUsers();dirty();}
 
