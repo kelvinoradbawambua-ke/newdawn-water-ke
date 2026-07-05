@@ -158,7 +158,7 @@ var fbAuth=null;
 var fbDb=null;
 var FB_DOC_REF=null;
 var FB_READY=false;
-var APP_VERSION="2026-07-02";
+var APP_VERSION="2026-07-05";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -714,7 +714,14 @@ function wizStep(s){
             "<div style=\"font-weight:700;font-size:12px;color:var(--nv);margin-bottom:10px\">Add product</div>"+
             "<div class=\"fg2\">"+
               "<div class=\"fg\"><label class=\"flabel\">Product name *</label><input class=\"fi\" id=\"wiz-sname\" placeholder=\"e.g. 20ltr Refill\"></div>"+
-              "<div class=\"fg\"><label class=\"flabel\">Size</label><input class=\"fi\" id=\"wiz-ssize\" placeholder=\"e.g. 20 litres\"></div>"+
+              "<div class=\"fg\"><label class=\"flabel\">Size / Category</label>"+
+                "<input class=\"fi\" id=\"wiz-ssize\" placeholder=\"e.g. 20ltr\" list=\"wiz-size-opts\">"+
+                "<datalist id=\"wiz-size-opts\">"+
+                  "<option value=\"5ltr\"><option value=\"10ltr\"><option value=\"13ltr\">"+
+                  "<option value=\"20ltr\"><option value=\"25ltr\"><option value=\"50ltr\">"+
+                  "<option value=\"500ml\"><option value=\"1ltr\"><option value=\"1.5ltr\">"+
+                "</datalist>"+
+              "</div>"+
               "<div class=\"fg\"><label class=\"flabel\">Sale price (KSh) *</label><input class=\"fi\" id=\"wiz-sprice\" type=\"number\" placeholder=\"e.g. 150\"></div>"+
               "<div class=\"fg\"><label class=\"flabel\">Cost price (KSh)</label><input class=\"fi\" id=\"wiz-scost\" type=\"number\" placeholder=\"e.g. 80\"></div>"+
               "<div class=\"fg\"><label class=\"flabel\">Opening stock (units)</label><input class=\"fi\" id=\"wiz-sqty\" type=\"number\" placeholder=\"e.g. 50\"></div>"+
@@ -882,12 +889,33 @@ function buildMods(){
           "<input type=\"hidden\" id=\"oc\">"+
           "<div id=\"oc-sel\" style=\"font-size:11px;color:var(--gd);font-weight:700;margin-top:4px;min-height:16px\"></div>"+
         "</div>"+
-        "<div class=\"fg\" style=\"position:relative\">"+
-          "<label class=\"flabel\">Product *</label>"+
-          "<input class=\"fi\" id=\"op-search\" placeholder=\"Type product name...\" oninput=\"opSearch(this.value)\" onblur=\"setTimeout(function(){el('op-drop').style.display='none';},200)\" autocomplete=\"off\">"+
-          "<div id=\"op-drop\" style=\"display:none;position:absolute;top:100%;left:0;right:0;background:#fff;border:1.5px solid var(--gd);border-radius:0 0 8px 8px;max-height:180px;overflow-y:auto;z-index:999;box-shadow:0 4px 16px rgba(0,0,0,.15)\"></div>"+
-          "<input type=\"hidden\" id=\"op\" data-p=\"0\">"+
-          "<div id=\"op-sel\" style=\"font-size:11px;color:var(--gd);font-weight:700;margin-top:4px;min-height:16px\"></div>"+
+        "<div class=\"fg fspan\" style=\"position:relative\">"+
+          "<div style=\"display:flex;align-items:center;justify-content:space-between;margin-bottom:4px\">"+
+            "<label class=\"flabel\" style=\"margin-bottom:0\">Product *</label>"+
+            "<div style=\"display:flex;gap:0;border:1.5px solid var(--bd);border-radius:6px;overflow:hidden;font-size:11px\">"+
+              "<button id=\"o-exact-btn\" onclick=\"setOrderMode('exact')\" style=\"padding:3px 10px;border:none;cursor:pointer;background:var(--nv);color:#fff;font-weight:700\">Exact brand</button>"+
+              "<button id=\"o-cat-btn\" onclick=\"setOrderMode('category')\" style=\"padding:3px 10px;border:none;cursor:pointer;background:#fff;color:var(--tx2)\">Category only</button>"+
+            "</div>"+
+          "</div>"+
+          "<div id=\"o-exact-wrap\" style=\"position:relative\">"+
+            "<input class=\"fi\" id=\"op-search\" placeholder=\"Type product name or size...\" oninput=\"opSearch(this.value)\" onblur=\"setTimeout(function(){el('op-drop').style.display='none';},200)\" autocomplete=\"off\">"+
+            "<div id=\"op-drop\" style=\"display:none;position:absolute;top:100%;left:0;right:0;background:#fff;border:1.5px solid var(--gd);border-radius:0 0 8px 8px;max-height:200px;overflow-y:auto;z-index:999;box-shadow:0 4px 16px rgba(0,0,0,.15)\"></div>"+
+            "<input type=\"hidden\" id=\"op\" data-p=\"0\">"+
+            "<div id=\"op-sel\" style=\"font-size:11px;color:var(--gd);font-weight:700;margin-top:4px;min-height:16px\"></div>"+
+          "</div>"+
+          "<div id=\"o-cat-wrap\" style=\"display:none\">"+
+            "<select class=\"fi\" id=\"op-cat\">"+
+              "<option value=\"\">Select category...</option>"+
+              "<option value=\"6kg Gas\">6kg Gas (brand confirmed on delivery)</option>"+
+              "<option value=\"13kg Gas\">13kg Gas (brand confirmed on delivery)</option>"+
+              "<option value=\"20ltr Water\">20ltr Water (brand confirmed on delivery)</option>"+
+              "<option value=\"10ltr Water\">10ltr Water (brand confirmed on delivery)</option>"+
+              "<option value=\"5ltr Water\">5ltr Water (brand confirmed on delivery)</option>"+
+            "</select>"+
+            "<div style=\"margin-top:6px;padding:8px 10px;background:#fff8e1;border-radius:6px;border-left:3px solid #f0c040;font-size:11px;color:#856404\">"+
+              "<i class=\"ti ti-info-circle\"></i> Driver will confirm exact brand and price at delivery. Payment is collected then."+
+            "</div>"+
+          "</div>"+
         "</div>"+
         "<div class=\"fg\"><label class=\"flabel\">Quantity</label><input class=\"fi\" type=\"number\" id=\"oq\" value=\"1\" min=\"1\" oninput=\"calcO()\"></div>"+
         "<div class=\"fg\"><label class=\"flabel\">Delivery date</label><input class=\"fi\" type=\"date\" id=\"od\"></div>"+
@@ -899,6 +927,7 @@ function buildMods(){
       "</div>"+
       "<div class=\"ftot\"><span>Order total</span><span id=\"otot\">KSh 0</span></div>"+
       "<input type=\"hidden\" id=\"o-edit-id\" value=\"\">"+
+      "<input type=\"hidden\" id=\"o-mode\" value=\"exact\">"+
     "</div>"+
     "<div class=\"mft\"><button class=\"btn\" onclick=\"cm('m-o')\">Cancel</button><button class=\"btn btn-gold\" id=\"m-o-save\" onclick=\"saveOrd()\"><i class=\"ti ti-check\"></i> Place order</button></div>"+
   "</div></div>";
@@ -924,6 +953,11 @@ function buildMods(){
     "<div class=\"mhd\"><div class=\"mttl\"><i class=\"ti ti-circle-check\" style=\"color:#27ae60;margin-right:7px\"></i>Complete Delivery</div><button class=\"mcls\" onclick=\"cm('m-dlv')\"><i class=\"ti ti-x\"></i></button></div>"+
     "<div class=\"mbdy\">"+
       "<div id=\"dlv-info\" style=\"background:var(--bg);border-radius:8px;padding:11px 13px;margin-bottom:14px;font-size:12px;border-left:4px solid var(--gd)\"></div>"+
+      "<div id=\"dlv-prod-row\" style=\"display:none;background:#fff8e1;border-radius:8px;padding:12px 14px;margin-bottom:14px;border-left:4px solid #f0c040\">"+
+        "<div style=\"font-size:12px;font-weight:700;color:#856404;margin-bottom:8px\"><i class=\"ti ti-package\"></i> Confirm exact product loaded</div>"+
+        "<select class=\"fi\" id=\"dlv-prod-select\" style=\"margin-bottom:6px\"><option value=\"\">-- Select exact brand --</option></select>"+
+        "<div style=\"font-size:11px;color:#856404\">Select the exact brand you are delivering. This updates the order and sets the price.</div>"+
+      "</div>"+
       "<div class=\"fg2\">"+
         "<div class=\"fg\"><label class=\"flabel\">Bottle condition after</label><select class=\"fi\" id=\"dlv-btl\"><option>Good</option><option>Cracked</option><option>Damaged</option><option>Missing</option></select></div>"+
         "<div class=\"fg\"><label class=\"flabel\">Payment received (KSh)</label><input class=\"fi\" type=\"number\" id=\"dlv-amt\" value=\"0\"></div>"+
@@ -939,7 +973,15 @@ function buildMods(){
     "<div class=\"mhd\"><div class=\"mttl\" id=\"m-s-title\"><i class=\"ti ti-package\" style=\"color:var(--gd);margin-right:7px\"></i>Add Product</div><button class=\"mcls\" onclick=\"cm('m-s')\"><i class=\"ti ti-x\"></i></button></div>"+
     "<div class=\"mbdy\"><div class=\"fg2\">"+
       "<div class=\"fg\"><label class=\"flabel\">Product name *</label><input class=\"fi\" id=\"sn\" placeholder=\"20ltr Refill\"></div>"+
-      "<div class=\"fg\"><label class=\"flabel\">Size</label><input class=\"fi\" id=\"ss\" placeholder=\"20 litres\"></div>"+
+      "<div class=\"fg\"><label class=\"flabel\">Size / Category</label>"+
+        "<input class=\"fi\" id=\"ss\" placeholder=\"e.g. 20ltr\" list=\"size-options\">"+
+        "<datalist id=\"size-options\">"+
+          "<option value=\"5ltr\"><option value=\"10ltr\"><option value=\"13ltr\">"+
+          "<option value=\"20ltr\"><option value=\"25ltr\"><option value=\"50ltr\">"+
+          "<option value=\"500ml\"><option value=\"1ltr\"><option value=\"1.5ltr\">"+
+          "<option value=\"5kg\"><option value=\"10kg\"><option value=\"13kg\"><option value=\"20kg\">"+
+        "</datalist>"+
+      "</div>"+
       "<div class=\"fg\"><label class=\"flabel\">Sale price (KSh)</label><input class=\"fi\" type=\"number\" id=\"sp\"></div>"+
       "<div class=\"fg\"><label class=\"flabel\">Cost price (KSh)</label><input class=\"fi\" type=\"number\" id=\"sc\"></div>"+
       "<div class=\"fg\"><label class=\"flabel\">Opening stock</label><input class=\"fi\" type=\"number\" id=\"sq\"></div>"+
@@ -1373,7 +1415,7 @@ function ordRows(fil){
     var c=D.customers.find(function(x){return x.id===o.cId;});
     return "<tr><td style=\"font-weight:700\">#"+o.id+"</td>"+
       "<td><div style=\"font-weight:700\">"+(c?(can("vPhone")?c.name:maskName(c.name)):"&mdash;")+"</div><div class=\"ca\">"+(c?[c.court,c.house?"No."+c.house:""].filter(Boolean).join(" "):"")+"</div></td>"+
-      "<td>"+o.prod+"</td><td style=\"font-weight:700\">"+o.qty+"</td>"+
+      "<td>"+o.prod+(o.prodConfirmed===false?" <span style=\"background:#fff3cd;color:#856404;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:700\">TBC</span>":"")+"</td><td style=\"font-weight:700\">"+o.qty+"</td>"+
       "<td>"+kshS(o.qty*o.price)+"</td>"+
       "<td>"+(can("mPaid")?pb(o.paid):"<span style=\"color:var(--tx2);font-size:11px\">&mdash;</span>")+"</td>"+
       "<td>"+btl(o.bottle_after||o.bottle_before)+"</td>"+
@@ -1446,20 +1488,58 @@ function ocSelect(cId,e){
 }
 function opSearch(q){
   var drop=el("op-drop");if(!drop)return;
-  if(!q){drop.style.display="none";return;}
-  var lq=q.toLowerCase();
+  if(!q||q.length<1){drop.style.display="none";return;}
+  var lq=q.toLowerCase().trim();
+  // Match by name OR size
   var matches=D.stock.filter(function(s){
-    return s.name.toLowerCase().indexOf(lq)!==-1||(s.size&&s.size.toLowerCase().indexOf(lq)!==-1);
-  }).slice(0,10);
-  if(!matches.length){drop.innerHTML="<div style=\"padding:10px 14px;font-size:12px;color:var(--tx2)\">No products found</div>";drop.style.display="block";return;}
-  drop.innerHTML=matches.map(function(s){
-    var label=can("vRev")?s.name+" <span style=\"color:var(--gd);font-weight:800\">KSh "+s.price+"</span>":s.name;
-    return "<div onmousedown=\"opSelect('"+s.name.replace(/'/g,"\\'")+"',"+s.price+",event)\" "+
-      "style=\"padding:9px 14px;cursor:pointer;border-bottom:1px solid var(--bd);font-size:12px\">"+
-      label+
-      "<div style=\"font-size:11px;color:var(--tx2)\">"+s.size+(can("eSt")?" &middot; "+s.qty+" in stock":"")+"</div>"+
-    "</div>";
-  }).join("");
+    return s.name.toLowerCase().indexOf(lq)!==-1||
+      (s.size&&s.size.toLowerCase().indexOf(lq)!==-1);
+  });
+  if(!matches.length){
+    // Try numeric match — "13" finds "13kg", "6" finds "6kg"
+    var num=q.replace(/[^0-9]/g,"");
+    if(num){
+      matches=D.stock.filter(function(s){
+        return(s.size&&s.size.indexOf(num)!==-1)||s.name.indexOf(num)!==-1;
+      });
+    }
+  }
+  if(!matches.length){
+    drop.innerHTML="<div style=\"padding:10px 14px;font-size:12px;color:var(--tx2)\">No products found for \""+q+"\"</div>";
+    drop.style.display="block";return;
+  }
+  // Extract size from name if size field is empty
+  function getSize(s){
+    if(s.size&&s.size.trim())return s.size.trim().toLowerCase();
+    var m=s.name.match(/\d+\.?\d*\s*(kg|ltr|l\b|ml|KG|LTR|Ltr)/i);
+    return m?m[0].toLowerCase().replace(/\s/g,""):"";
+  }
+  // Group by size
+  var bySize={};var order=[];
+  matches.forEach(function(s){
+    var sz=getSize(s)||"Other";
+    if(!bySize[sz]){bySize[sz]=[];order.push(sz);}
+    bySize[sz].push(s);
+  });
+  var html="";
+  var multiGroup=order.length>1;
+  order.forEach(function(sz){
+    var group=bySize[sz];
+    if(multiGroup){
+      html+="<div style=\"padding:5px 14px 3px;font-size:10px;font-weight:800;color:var(--nv);background:var(--bg);text-transform:uppercase;letter-spacing:.08em;border-bottom:1px solid var(--bd)\">"+sz+"</div>";
+    }
+    group.forEach(function(s){
+      var inStock=s.qty>0;
+      var stockTxt=can("eSt")?" &middot; "+(inStock?"<span style=\"color:#27ae60\">"+s.qty+" in stock</span>":"<span style=\"color:#dc3545\">Out of stock</span>"):"";
+      var priceTxt=can("vRev")?" &nbsp;<span style=\"color:var(--gd);font-weight:800\">KSh "+s.price+"</span>":"";
+      html+="<div onmousedown=\"opSelect('"+s.name.replace(/'/g,"\\'")+"',"+s.price+",event)\" "+
+        "style=\"padding:9px 14px;cursor:pointer;border-bottom:1px solid var(--bd);font-size:12px;"+(inStock?"":"opacity:.7")+"\">"+
+        "<div style=\"font-weight:700\">"+s.name+priceTxt+"</div>"+
+        "<div style=\"font-size:11px;color:var(--tx2)\">"+sz+stockTxt+"</div>"+
+      "</div>";
+    });
+  });
+  drop.innerHTML=html;
   drop.style.display="block";
 }
 function opSelect(name,price,e){
@@ -1470,9 +1550,43 @@ function opSelect(name,price,e){
   el("op-drop").style.display="none";
   calcO();
 }
+function setOrderMode(mode){
+  el("o-mode").value=mode;
+  var exact=el("o-exact-wrap"),cat=el("o-cat-wrap");
+  var ebtn=el("o-exact-btn"),cbtn=el("o-cat-btn");
+  if(mode==="exact"){
+    if(exact)exact.style.display="";
+    if(cat)cat.style.display="none";
+    if(ebtn){ebtn.style.background="var(--nv)";ebtn.style.color="#fff";ebtn.style.fontWeight="700";}
+    if(cbtn){cbtn.style.background="#fff";cbtn.style.color="var(--tx2)";cbtn.style.fontWeight="400";}
+    // Reset category selection
+    if(el("op-cat"))el("op-cat").value="";
+    // Also hide payment fields for exact mode (will be shown if needed)
+  }else{
+    if(exact)exact.style.display="none";
+    if(cat)cat.style.display="";
+    if(cbtn){cbtn.style.background="var(--nv)";cbtn.style.color="#fff";cbtn.style.fontWeight="700";}
+    if(ebtn){ebtn.style.background="#fff";ebtn.style.color="var(--tx2)";ebtn.style.fontWeight="400";}
+    // Category mode: hide payment — collected at delivery
+    var payRow=el("opay")&&el("opay").closest?el("opay").closest(".fg"):null;
+    var amtRow=el("oamt")&&el("oamt").closest?el("oamt").closest(".fg"):null;
+    var totRow=el("otot")&&el("otot").closest?el("otot").closest(".ftot"):null;
+    if(payRow)payRow.style.display="none";
+    if(amtRow)amtRow.style.display="none";
+    if(totRow)totRow.style.display="none";
+    // Reset product search
+    if(el("op-search"))el("op-search").value="";
+    if(el("op"))el("op").value="";
+    if(el("op-sel"))el("op-sel").innerHTML="";
+  }
+  calcO();
+}
 function prepO(){
   var od=el("od"),odrv=el("odrv");if(!od||!odrv)return;
   el("o-edit-id").value="";
+  // Reset mode to exact brand
+  if(el("o-mode"))el("o-mode").value="exact";
+  setOrderMode("exact");
   // Reset autocomplete fields
   if(el("oc-search"))el("oc-search").value="";
   if(el("oc"))el("oc").value="";
@@ -1576,13 +1690,28 @@ function calcO(){
 function saveOrd(){
   if(!can("aOrd")&&!can("eOrd"))return;
   if(!D.customers.length){toast("Add a customer first","err");return;}
-  if(!D.stock.length){toast("Add a product first","err");return;}
   var cId=parseInt(el("oc").value);
   if(!cId){toast("Please select a customer","err");if(el("oc-search"))el("oc-search").focus();return;}
-  var opEl=el("op");var pn=opEl?opEl.value:"";
-  if(!pn){toast("Please select a product","err");if(el("op-search"))el("op-search").focus();return;}
-  var price=parseInt((opEl?opEl.getAttribute("data-p"):0)||0);
-  if(price<=0){if(!confirm("⚠️ Price Warning\n\nThis product has no sale price set (KSh 0).\n\nContinue with a zero-value order?"))return;}
+
+  // Determine order mode
+  var mode=el("o-mode")?el("o-mode").value:"exact";
+  var isCat=(mode==="category");
+  var pn="",price=0;
+
+  if(isCat){
+    // Category mode — product TBC at delivery
+    pn=el("op-cat")?el("op-cat").value:"";
+    if(!pn){toast("Please select a category","err");return;}
+    price=0; // price unknown until delivery
+  }else{
+    // Exact product mode
+    if(!D.stock.length){toast("Add a product first","err");return;}
+    var opEl=el("op");pn=opEl?opEl.value:"";
+    if(!pn){toast("Please select a product","err");if(el("op-search"))el("op-search").focus();return;}
+    price=parseInt((opEl?opEl.getAttribute("data-p"):0)||0);
+    if(price<=0&&!isCat){if(!confirm("⚠️ Price Warning\n\nThis product has no sale price set (KSh 0).\n\nContinue with a zero-value order?"))return;}
+  }
+
   var qty=parseInt(el("oq").value)||1;
   if(qty<1){toast("Quantity must be at least 1","err");return;}
   var editId=el("o-edit-id").value;
@@ -1598,7 +1727,7 @@ function saveOrd(){
       var debtMsg="⚠️ Debt Alert\n\n"+
         (can("vPhone")?cust.name:"This customer")+
         " currently owes KSh "+existingDebt.toLocaleString()+".\n\n"+
-        "This order adds KSh "+orderTotal.toLocaleString()+" bringing total to KSh "+projectedDebt.toLocaleString()+"."+
+        (orderTotal>0?"This order adds KSh "+orderTotal.toLocaleString()+" bringing total to KSh "+projectedDebt.toLocaleString()+".":"This is a category order — price confirmed at delivery.")+
         (creditLimit>0&&projectedDebt>creditLimit?"\n\n🚫 Credit limit of KSh "+creditLimit.toLocaleString()+" will be exceeded!":"")+
         "\n\nContinue placing this order?";
       if(!confirm(debtMsg))return;
@@ -1685,7 +1814,29 @@ function saveOrd(){
   else{payStatus="Unpaid";}
   var newOrdId=nOId++;
   var stCost=D.stock.find(function(s){return s.name===pn;});var costAtSale=stCost?stCost.cost:0;
-  D.orders.push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:price,cost:costAtSale,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:""});
+
+  if(isCat){
+    // Category order: no stock deduction, no invoice yet, payment at delivery
+    D.orders.push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:0,cost:0,date:el("od").value,status:"Pending",paid:"Unpaid",amtPaid:0,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:"",prodConfirmed:false});
+    cm("m-o");rOrds(undefined,ORD_PAGE);dirty();
+    toast("Order #"+newOrdId+" placed — driver confirms brand & collects payment at delivery");
+    return;
+  }
+
+  // Exact product order — normal flow
+  if(st&&st.qty<=0){
+    if(!confirm("⚠️ Stock Alert\n\n"+pn+" is OUT OF STOCK (0 units).\n\nThe order will be recorded but cannot be fulfilled until restocked.\n\nContinue placing this order?"))return;
+  }else if(st&&st.qty<qty){
+    if(!confirm("⚠️ Stock Alert\n\n"+pn+" has only "+st.qty+" unit(s) in stock but you are ordering "+qty+".\n\nThe order will be recorded. Please restock soon.\n\nContinue?"))return;
+  }
+  if(st)st.qty=Math.max(0,st.qty-qty);
+  var total=price*qty;
+  var amtPaid=can("mPaid")?(parseFloat(el("oamt").value)||0):0;
+  var payStatus=can("mPaid")?el("opay").value:"Unpaid";
+  if(amtPaid>=total){payStatus="Paid";}
+  else if(amtPaid>0){payStatus="Partial";}
+  else{payStatus="Unpaid";}
+  D.orders.push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:price,cost:costAtSale,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:"",prodConfirmed:true});
   if(payStatus!=="Paid"){
     D.invoices.push({id:nIId++,cId:cId,amount:total,paid:amtPaid,due:el("od").value,notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
   }
@@ -1695,12 +1846,33 @@ function openDlv(oid){
   var o=D.orders.find(function(x){return x.id===oid;});if(!o)return;
   var c=D.customers.find(function(x){return x.id===o.cId;});
   el("dlv-oid").value=oid;
+  var isCat=o.prodConfirmed===false;
   el("dlv-info").innerHTML=
     "<div style=\"font-weight:700;font-size:13px;margin-bottom:5px\">Order #"+o.id+" &middot; "+(c?(can("vPhone")?c.name:maskName(c.name)):"?")+"</div>"+
-    "<div style=\"color:var(--tx2)\">"+o.qty+"&times; "+o.prod+(can("vRev")?" &middot; KSh "+(o.qty*o.price).toLocaleString():"")+"</div>"+
+    "<div style=\"color:var(--tx2)\">"+o.qty+"&times; "+o.prod+(isCat?" <span style=\"background:#fff3cd;color:#856404;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700\">CONFIRM BRAND</span>":"")+((!isCat&&can("vRev"))?" &middot; KSh "+(o.qty*o.price).toLocaleString():"")+"</div>"+
     (c?"<div style=\"color:var(--tx2);margin-top:3px\">"+cAddr(c)+"</div>":"");
+  // Show product confirmation row for category orders
+  var prodConfRow=el("dlv-prod-row");
+  if(prodConfRow){
+    prodConfRow.style.display=isCat?"":"none";
+    if(isCat){
+      var dlvProd=el("dlv-prod-select");
+      if(dlvProd){
+        // Smart filter — match by size number in category name
+        var num=(o.prod.match(/\d+/)||[""])[0];
+        var suggestions=D.stock.filter(function(s){
+          return num&&(s.name.indexOf(num)!==-1||(s.size&&s.size.indexOf(num)!==-1));
+        });
+        if(!suggestions.length)suggestions=D.stock;
+        dlvProd.innerHTML="<option value=\"\">-- Select exact brand --</option>"+
+          suggestions.map(function(s){
+            return "<option value=\""+s.name+"|"+s.price+"\">"+s.name+(can("vRev")?" — KSh "+s.price:"")+(s.qty<=0?" (OUT OF STOCK)":"")+"</option>";
+          }).join("")+
+          "<option value=\"__other__\">Other / not listed above</option>";
+      }
+    }
+  }
   el("dlv-amt").value="";el("dlv-notes").value="";
-  // Hide payment fields from staff/driver
   var amtRow=el("dlv-amt")&&el("dlv-amt").closest(".fg");
   var payRow=el("dlv-pay")&&el("dlv-pay").closest(".fg");
   if(amtRow)amtRow.style.display=can("mPaid")?"":"none";
@@ -1708,34 +1880,74 @@ function openDlv(oid){
   om("m-dlv");
 }
 function completeDlv(){
-  var oid=parseInt(el("dlv-oid").value);var o=D.orders.find(function(x){return x.id===oid;});if(!o)return;
-  o.status="Delivered";o.bottle_after=el("dlv-btl").value;
+  var oid=parseInt(el("dlv-oid").value);
+  var o=D.orders.find(function(x){return x.id===oid;});if(!o)return;
+  var isCat=o.prodConfirmed===false;
+
+  // ── CATEGORY ORDER: confirm exact product first ──
+  if(isCat){
+    var sel=el("dlv-prod-select");
+    var selVal=sel?sel.value:"";
+    if(!selVal){toast("Please select the exact brand being delivered","err");return;}
+    if(selVal==="__other__"){
+      var customProd=prompt("Enter the exact product name:");
+      if(!customProd||!customProd.trim()){toast("Product name required","err");return;}
+      selVal=customProd.trim()+"|0";
+    }
+    var parts=selVal.split("|");
+    var confirmedProd=parts[0];
+    var confirmedPrice=parseInt(parts[1])||0;
+    // Deduct stock now
+    var st=D.stock.find(function(s){return s.name===confirmedProd;});
+    if(st){
+      if(st.qty<o.qty){
+        if(!confirm("⚠️ Only "+st.qty+" in stock but delivering "+o.qty+".\n\nStock will go to 0. Continue?"))return;
+      }
+      st.qty=Math.max(0,st.qty-o.qty);
+    }
+    var stCost=D.stock.find(function(s){return s.name===confirmedProd;});
+    // Update order with confirmed product
+    o.prod=confirmedProd;
+    o.price=confirmedPrice;
+    o.cost=stCost?stCost.cost:0;
+    o.prodConfirmed=true;
+  }
+
+  o.status="Delivered";
+  o.bottle_after=el("dlv-btl").value;
+
   if(can("mPaid")){
     var amt=parseFloat(el("dlv-amt").value)||0;
+    var total=o.qty*o.price;
+    // Find or create invoice
     var inv=D.invoices.find(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+oid)!==-1;});
+    if(isCat&&!inv&&total>0){
+      // Create invoice now for category orders (was deferred until delivery)
+      inv={id:nIId++,cId:o.cId,amount:total,paid:0,due:tday(),notes:"Order #"+oid,date:tday(),payments:[]};
+      D.invoices.push(inv);
+    }
     if(amt>0&&inv){
       inv.paid=Math.min(inv.amount,inv.paid+amt);
       if(!inv.payments)inv.payments=[];
       inv.payments.push({date:tday(),amt:amt,method:"Cash",ref:"Delivery #"+oid});
     }
-    // Auto-correct payment status from invoice
     if(inv){
       if(inv.paid>=inv.amount){o.paid="Paid";o.amtPaid=inv.paid;}
       else if(inv.paid>0){o.paid="Partial";o.amtPaid=inv.paid;}
       else{o.paid="Unpaid";}
-    }else{
-      // No invoice — use dropdown value directly
-      var total=o.qty*o.price;
+    }else if(amt>0){
       if(amt>=total){o.paid="Paid";o.amtPaid=amt;}
-      else if(amt>0){o.paid="Partial";o.amtPaid=amt;}
+      else{o.paid="Partial";o.amtPaid=amt;}
     }
   }else{
     o.paid=o.paid||"Unpaid";
   }
+
   if(el("dlv-notes").value)o.notes=el("dlv-notes").value;
   cm("m-dlv");rOrds(undefined,ORD_PAGE);rDel();
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
-  dirty();toast("Delivery completed!");
+  dirty();
+  toast(isCat?"Delivery completed — "+o.prod+" confirmed!":"Delivery completed!");
 }
 function delO(id){
   if(!can("dOrd"))return;
