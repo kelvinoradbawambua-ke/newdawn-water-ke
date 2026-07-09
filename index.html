@@ -260,6 +260,7 @@ function toast(msg,type){
 function dirty(){
   var e=el("sts");if(e){e.className="sts dirty";e.innerHTML="<i class=\"ti ti-point-filled\"></i> Syncing...";}
   scheduleCloudSync();
+  autoSaveLocal(); // local save on every mutation
 }
 function saved(){var e=el("sts");if(e){e.className="sts saved";e.innerHTML="<i class=\"ti ti-check\"></i> Saved "+new Date().toLocaleTimeString();}}
 
@@ -367,7 +368,10 @@ function startAutoBackup(){
   // Run immediately after login, then every 10 minutes check if backup needed
   setTimeout(runAutoBackup,10000);
   if(FB_BACKUP_TIMER)clearInterval(FB_BACKUP_TIMER);
-  FB_BACKUP_TIMER=setInterval(runAutoBackup,10*60*1000);
+  FB_BACKUP_TIMER=setInterval(function(){
+    runAutoBackup();
+    autoSaveLocal(); // belt-and-suspenders: also refresh local copy every 10 min
+  },10*60*1000);
 }
 function restoreFromLatestBackup(onSuccess,onFail){
   if(!FB_BACKUP_COL){if(onFail)onFail("No backup collection");return;}
@@ -434,6 +438,7 @@ function startCloudListener(){
         restoreFromLatestBackup(function(backup){
           var count=(backup.stats&&backup.stats.customers)||0;
           console.warn("Restored from Firestore backup: "+count+" customers");
+          autoSaveLocal(); // save restored data locally immediately
           setTimeout(function(){FB_LAST_LOCAL_WRITE=Date.now();pushToCloud();},1000);
           FB_READY=true;
           var c2=el("cloud-status");
@@ -716,16 +721,27 @@ function pk(k){
 function checkAutoSaveRecovery(){
   var snap=autoSaveCheckLocal();
   var hasCurrentData=D.customers.length||D.orders.length||D.invoices.length;
-  if(snap&&snap.D&&!hasCurrentData){
+  if(snap&&snap.D){
     var snapHasData=(snap.D.customers&&snap.D.customers.length)||(snap.D.orders&&snap.D.orders.length);
-    if(snapHasData){
+    var snapCusts=(snap.D.customers||[]).length;
+    var snapOrds=(snap.D.orders||[]).length;
+    var currCusts=D.customers?D.customers.length:0;
+    var currOrds=D.orders?D.orders.length:0;
+    // Offer restore if: no current data, OR snapshot has significantly more records
+    var snapIsBetter=!hasCurrentData||(snapCusts>currCusts+5)||(snapOrds>currOrds+10);
+    if(snapHasData&&snapIsBetter){
       var snapTime=snap.ts?new Date(snap.ts).toLocaleString():"earlier session";
-      if(confirm("Found an auto-saved session from "+snapTime+" on this device with "+(snap.D.customers?snap.D.customers.length:0)+" customers and "+(snap.D.orders?snap.D.orders.length:0)+" orders.\n\nRestore this data now?")){
+      var msg="Found an auto-saved session from "+snapTime+" on this device with "+snapCusts+" customers and "+snapOrds+" orders.";
+      if(hasCurrentData)msg+="\n\nCloud has "+currCusts+" customers. The local save has more data.";
+      msg+="\n\nRestore this data now?";
+      if(confirm(msg)){
         D=snap.D;
+        if(!D.routes)D.routes=[];if(!D.complaints)D.complaints=[];if(!D.offers)D.offers=[];
         if(snap.USERS&&snap.USERS.length)USERS=snap.USERS;
         nOId=snap.nOId||nOId;nIId=snap.nIId||nIId;nCId=snap.nCId||nCId;
-        syncIdCounters();
-        toast("Auto-saved session restored");
+        FB_SETUP_DONE=snap.setupDone===true||FB_SETUP_DONE;
+        syncIdCounters();syncPaymentStatuses();
+        toast("Auto-saved session restored — "+snapCusts+" customers loaded");
       }
     }
   }
@@ -2490,7 +2506,7 @@ function filterCmps(f){
   var tb=el("cmpbody");if(tb)tb.innerHTML=cmpRows(paged.items);
 }
 function prepCmp(){var s=el("cmp-c");if(s)s.innerHTML=D.customers.map(function(c){return "<option value=\""+c.id+"\">"+custName(c.id)+" - "+cAddr(c)+"</option>";}).join("");el("cmp-d").value=tday();om("m-cmp");}
-function saveCmp(){var det=el("cmp-det").value.trim();if(!det){toast("Details required","err");return;}D.complaints.push({id:nCId++,cId:parseInt(el("cmp-c").value),type:el("cmp-t").value,details:det,action:el("cmp-act").value,status:el("cmp-s").value,date:el("cmp-d").value});el("cmp-det").value="";el("cmp-act").value="";cm("m-cmp");rCmps(undefined,CMP_PAGE);dirty();toast("Complaint logged");}
+function saveCmp(){if(!can("aCmp"))return;var det=el("cmp-det").value.trim();if(!det){toast("Details required","err");return;}D.complaints.push({id:nCId++,cId:parseInt(el("cmp-c").value),type:el("cmp-t").value,details:det,action:el("cmp-act").value,status:el("cmp-s").value,date:el("cmp-d").value});el("cmp-det").value="";el("cmp-act").value="";cm("m-cmp");rCmps(undefined,CMP_PAGE);dirty();toast("Complaint logged");}
 function resolveCmp(id){if(!can("aCmp"))return;var c=D.complaints.find(function(x){return x.id===id;});if(c)c.status="Resolved";rCmps(undefined,CMP_PAGE);dirty();toast("Complaint resolved");}
 function delCmp(id){if(!can("aCmp"))return;if(!confirm("Delete complaint?"))return;D.complaints=D.complaints.filter(function(c){return c.id!==id;});rCmps(undefined,CMP_PAGE);dirty();}
 
