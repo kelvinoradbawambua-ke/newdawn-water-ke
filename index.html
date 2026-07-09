@@ -35,6 +35,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .pdots{display:flex;gap:14px;justify-content:center;margin:16px 0}
 .pdot{width:13px;height:13px;border-radius:50%;border:2px solid var(--bd);transition:all .15s}
 .pdot.on{background:var(--nv2);border-color:var(--nv2)}
+@keyframes spin{to{transform:rotate(360deg)}}
 .ppad{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
 .pkey{padding:13px;border-radius:8px;border:1.5px solid var(--bd);background:#fff;font-size:18px;font-weight:700;cursor:pointer;text-align:center;transition:all .12s;font-family:inherit}
 .pkey:hover{background:var(--nv2);color:#fff;border-color:var(--nv2)}
@@ -678,6 +679,7 @@ function renderLogin(){
   renderUG();
 }
 function renderUG(){
+  var isDefault=USERS.length===1&&USERS[0].name==="Director"&&!FB_READY;
   el("usg").innerHTML=USERS.map(function(u){
     var rl=R[u.role]||{label:u.role};
     return "<div class=\"usc"+(SU&&SU.id===u.id?" sel":"")+"\" onclick=\"selU("+u.id+")\">"+
@@ -685,7 +687,7 @@ function renderUG(){
       "<div class=\"uname\">"+u.name+"</div>"+
       "<div class=\"urole\">"+rl.label+"</div>"+
       "</div>";
-  }).join("");
+  }).join("")+(isDefault?"<div style=\"text-align:center;padding:12px;font-size:11px;color:var(--tx2)\"><i class=\"ti ti-loader\" style=\"animation:spin 1s linear infinite\"></i> Loading accounts...</div>":"");
 }
 function selU(id){
   SU=USERS.find(function(u){return u.id===id;});
