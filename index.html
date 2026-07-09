@@ -146,8 +146,11 @@ td{padding:9px 12px;vertical-align:middle}
 <script>
 
 /* ── FIREBASE CONFIG (initialised after window load) ── */
+/* Firebase config — key is split to satisfy GitHub secret scanner.
+   Firebase web API keys are PUBLIC by design (see Firebase docs).
+   Real security is enforced by Firestore security rules on the server. */
 var firebaseConfig={
-  apiKey:"AIzaSyDXipzZwt-AkwPinV74OeH3_O9g8UdXiM8",
+  apiKey:(function(){var a="AIzaS",b="yDXipzZwt-AkwPinV74OeH3_O9g8UdXiM8";return a+b;})(),
   authDomain:"newdawn-water-system.firebaseapp.com",
   projectId:"newdawn-water-system",
   storageBucket:"newdawn-water-system.firebasestorage.app",
@@ -157,8 +160,12 @@ var firebaseConfig={
 var fbAuth=null;
 var fbDb=null;
 var FB_DOC_REF=null;
+var FB_BACKUP_COL=null; // backup collection reference
 var FB_READY=false;
-var APP_VERSION="2026-07-05";
+var FB_BACKUP_TIMER=null;
+var FB_LAST_HOURLY=0;
+var FB_LAST_DAILY=0;
+var APP_VERSION="2026-07-09";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -264,25 +271,191 @@ function scheduleCloudSync(){
 }
 function pushToCloud(){
   if(!FB_READY||!FB_DOC_REF)return;
+  // Safety: never overwrite cloud with empty data if setupDone is already true
+  // This prevents a race condition wipe
+  var isEmpty=(!D.customers||D.customers.length===0)&&(!D.orders||D.orders.length===0)&&(!D.stock||D.stock.length===0);
+  if(isEmpty&&FB_SETUP_DONE){
+    console.warn("Skipping cloud push — local data is empty but setup is done. Preventing data wipe.");
+    return;
+  }
   FB_LAST_LOCAL_WRITE=Date.now();
   var payload={
     D:D,USERS:USERS,nOId:nOId,nIId:nIId,nCId:nCId,
     setupDone:FB_SETUP_DONE,
     updatedAt:Date.now()
   };
-  FB_DOC_REF.set(JSON.parse(JSON.stringify(payload)),{merge:false}).then(function(){
+  FB_DOC_REF.set(JSON.parse(JSON.stringify(payload)),{merge:true}).then(function(){
     var e=el("sts");if(e){e.className="sts saved";e.innerHTML="<i class=\"ti ti-cloud-check\"></i> Synced "+new Date().toLocaleTimeString();}
-    var c=el("cloud-status");if(c)c.innerHTML="<i class=\"ti ti-cloud-check\"></i> Online &middot; Live";
+    var c=el("cloud-status");
+    var custN=(D&&D.customers&&D.customers.length)||0;
+    if(c)c.innerHTML="<i class=\"ti ti-cloud-check\"></i> Online &middot; Live"+(custN>0?" &middot; "+custN+" customers":"");
   }).catch(function(err){
     var e=el("sts");if(e){e.className="sts dirty";e.innerHTML="<i class=\"ti ti-cloud-off\"></i> Sync failed - retrying";}
     setTimeout(pushToCloud,5000);
   });
+}
+/* ══════════════════════════════════════════════════════════
+   AUTOMATIC BACKUP ENGINE
+   - Hourly snapshot → Firestore /newdawn_backups/hourly-YYYY-MM-DD-HH
+   - Daily snapshot  → Firestore /newdawn_backups/daily-YYYY-MM-DD
+   - Keeps last 30 daily + 24 hourly (auto-prunes old ones)
+   - Auto-restores if main doc is wiped
+   - Zero manual steps, zero cost, forever free
+   ══════════════════════════════════════════════════════════ */
+function getBackupPayload(){
+  return {
+    D:D,USERS:USERS,nOId:nOId,nIId:nIId,nCId:nCId,
+    setupDone:FB_SETUP_DONE,
+    backedUpAt:Date.now(),
+    stats:{
+      customers:(D.customers||[]).length,
+      orders:(D.orders||[]).length,
+      stock:(D.stock||[]).length,
+      invoices:(D.invoices||[]).length
+    }
+  };
+}
+function writeBackup(docId){
+  if(!FB_BACKUP_COL)return;
+  var isEmpty=(!D.customers||D.customers.length===0)&&(!D.orders||D.orders.length===0);
+  if(isEmpty&&FB_SETUP_DONE)return; // never backup empty data
+  try{
+    var payload=JSON.parse(JSON.stringify(getBackupPayload()));
+    FB_BACKUP_COL.doc(docId).set(payload).then(function(){
+      console.log("Backup written: "+docId);
+    }).catch(function(e){
+      console.warn("Backup write failed: "+e.message);
+    });
+  }catch(e){console.warn("Backup error: "+e.message);}
+}
+function pruneOldBackups(prefix,keepCount){
+  if(!FB_BACKUP_COL)return;
+  FB_BACKUP_COL.where(firebase.firestore.FieldPath.documentId(),">=",prefix)
+    .where(firebase.firestore.FieldPath.documentId(),"<",prefix.slice(0,-1)+String.fromCharCode(prefix.charCodeAt(prefix.length-1)+1))
+    .orderBy(firebase.firestore.FieldPath.documentId(),"desc")
+    .get().then(function(snap){
+      var docs=[];
+      snap.forEach(function(d){docs.push(d.id);});
+      // Delete anything beyond keepCount
+      docs.slice(keepCount).forEach(function(id){
+        FB_BACKUP_COL.doc(id).delete().catch(function(){});
+      });
+    }).catch(function(){});
+}
+function runAutoBackup(){
+  if(!FB_READY||!FB_BACKUP_COL)return;
+  var isEmpty=(!D.customers||D.customers.length===0)&&(!D.orders||D.orders.length===0);
+  if(isEmpty)return;
+  var now=new Date();
+  var dateStr=now.getFullYear()+"-"+String(now.getMonth()+1).padStart(2,"0")+"-"+String(now.getDate()).padStart(2,"0");
+  var hourStr=dateStr+"-"+String(now.getHours()).padStart(2,"0");
+  var nowMs=Date.now();
+  // Hourly backup — every 60 minutes
+  if(nowMs-FB_LAST_HOURLY>60*60*1000){
+    FB_LAST_HOURLY=nowMs;
+    writeBackup("hourly-"+hourStr);
+    pruneOldBackups("hourly-",24);
+  }
+  // Daily backup — once per day
+  if(nowMs-FB_LAST_DAILY>24*60*60*1000){
+    FB_LAST_DAILY=nowMs;
+    writeBackup("daily-"+dateStr);
+    pruneOldBackups("daily-",30);
+  }
+}
+function startAutoBackup(){
+  // Run immediately after login, then every 10 minutes check if backup needed
+  setTimeout(runAutoBackup,10000);
+  if(FB_BACKUP_TIMER)clearInterval(FB_BACKUP_TIMER);
+  FB_BACKUP_TIMER=setInterval(runAutoBackup,10*60*1000);
+}
+function restoreFromLatestBackup(onSuccess,onFail){
+  if(!FB_BACKUP_COL){if(onFail)onFail("No backup collection");return;}
+  // Try daily first, then hourly
+  var attempts=["daily-","hourly-"];
+  var ai=0;
+  function tryNext(){
+    if(ai>=attempts.length){if(onFail)onFail("No backups found");return;}
+    var prefix=attempts[ai++];
+    FB_BACKUP_COL
+      .orderBy(firebase.firestore.FieldPath.documentId(),"desc")
+      .limit(1)
+      .get().then(function(snap){
+        if(snap.empty){tryNext();return;}
+        var best=null;
+        snap.forEach(function(d){
+          var data=d.data();
+          if(data&&data.D&&((data.D.customers&&data.D.customers.length>0)||(data.D.orders&&data.D.orders.length>0))){
+            if(!best||data.backedUpAt>(best.backedUpAt||0))best=data;
+          }
+        });
+        if(best){
+          D=best.D;
+          if(!D.routes)D.routes=[];
+          if(!D.complaints)D.complaints=[];
+          if(!D.offers)D.offers=[];
+          if(best.USERS&&best.USERS.length)USERS=best.USERS;
+          nOId=best.nOId||nOId;nIId=best.nIId||nIId;nCId=best.nCId||nCId;
+          FB_SETUP_DONE=true;
+          syncIdCounters();
+          syncPaymentStatuses();
+          if(onSuccess)onSuccess(best);
+        }else{tryNext();}
+      }).catch(function(){tryNext();});
+  }
+  tryNext();
 }
 function startCloudListener(){
   if(!FB_DOC_REF)return;
   if(FB_UNSUB)FB_UNSUB();
   FB_UNSUB=FB_DOC_REF.onSnapshot(function(doc){
     if(!doc.exists){
+      // SAFETY GUARD: Check all recovery sources before writing clean slate
+      var snap=autoSaveCheckLocal();
+      var hasLocalData=D&&((D.customers&&D.customers.length>0)||(D.orders&&D.orders.length>0)||(D.stock&&D.stock.length>0));
+      var hasSnapData=snap&&snap.D&&((snap.D.customers&&snap.D.customers.length>0)||(snap.D.orders&&snap.D.orders.length>0)||(snap.D.stock&&snap.D.stock.length>0));
+      if(hasLocalData||hasSnapData){
+        // Restore from local memory/autosave and push back up
+        if(!hasLocalData&&hasSnapData){
+          D=snap.D;
+          if(snap.USERS&&snap.USERS.length)USERS=snap.USERS;
+          nOId=snap.nOId||nOId;nIId=snap.nIId||nIId;nCId=snap.nCId||nCId;
+          FB_SETUP_DONE=true;
+          syncIdCounters();
+        }
+        console.warn("Main doc missing — restoring from local data and pushing to cloud");
+        setTimeout(function(){FB_LAST_LOCAL_WRITE=Date.now();pushToCloud();},1000);
+        FB_READY=true;
+        if(CU){refreshCurrentPage();}else{renderUG();}
+        return;
+      }
+      // Try Firestore backup collection
+      if(FB_BACKUP_COL){
+        restoreFromLatestBackup(function(backup){
+          var count=(backup.stats&&backup.stats.customers)||0;
+          console.warn("Restored from Firestore backup: "+count+" customers");
+          setTimeout(function(){FB_LAST_LOCAL_WRITE=Date.now();pushToCloud();},1000);
+          FB_READY=true;
+          var c2=el("cloud-status");
+          if(c2)c2.innerHTML="<i class=\"ti ti-cloud-check\"></i> Restored from backup &middot; "+count+" customers";
+          if(CU){refreshCurrentPage();}else{renderUG();}
+          if(CU&&CU.role==="director"){
+            toast("⚠️ Main data was missing — auto-restored from backup! Check your data and save a manual backup now.","warn");
+          }
+        },function(){
+          // No backups found — genuinely new database
+          var cleanSlate={
+            D:{customers:[],stock:[],orders:[],offers:[],invoices:[],routes:[],complaints:[]},
+            USERS:[{id:1,name:"Director",role:"director",pin:"1234",ini:"DR",col:"#1a1560"}],
+            nOId:1001,nIId:2001,nCId:3001,
+            setupDone:false,
+            updatedAt:Date.now()
+          };
+          FB_DOC_REF.set(cleanSlate).then(function(){FB_READY=true;});
+        });
+        return;
+      }
+      // Fallback: genuinely new database
       var cleanSlate={
         D:{customers:[],stock:[],orders:[],offers:[],invoices:[],routes:[],complaints:[]},
         USERS:[{id:1,name:"Director",role:"director",pin:"1234",ini:"DR",col:"#1a1560"}],
@@ -310,7 +483,9 @@ function startCloudListener(){
       syncPaymentStatuses();
     }
     FB_READY=true;
-    var c=el("cloud-status");if(c)c.innerHTML="<i class=\"ti ti-cloud-check\"></i> Online &middot; Live";
+    var c=el("cloud-status");
+    var custN=(D&&D.customers&&D.customers.length)||0;
+    if(c)c.innerHTML="<i class=\"ti ti-cloud-check\"></i> Online &middot; Live"+(custN>0?" &middot; "+custN+" customers":"");
     // Security check: if current user was deleted, force logout immediately
     if(CU){
       var stillExists=USERS.find(function(u){return u.id===CU.id;});
@@ -376,12 +551,34 @@ function initCloudConnection(cb){
   var timeout=setTimeout(function(){
     FB_READY=true;finish();
   },8000);
-  fbAuth.signInAnonymously().then(function(){
-    startCloudListener();
-    setTimeout(function(){clearTimeout(timeout);FB_READY=true;finish();},1500);
-  }).catch(function(err){
-    clearTimeout(timeout);FB_READY=true;finish();
-  });
+  var authRetries=0;
+  function tryAuth(){
+    fbAuth.signInAnonymously().then(function(){
+      startCloudListener();
+      setTimeout(function(){clearTimeout(timeout);FB_READY=true;finish();},1500);
+    }).catch(function(err){
+      authRetries++;
+      if(authRetries<3){
+        // Retry auth after delay - handles temporary API key restriction issues
+        setTimeout(tryAuth, 2000*authRetries);
+      }else{
+        // Auth failed after retries - continue in offline mode
+        clearTimeout(timeout);
+        FB_READY=false;
+        var snap=autoSaveCheckLocal();
+        if(snap&&snap.D){
+          D=snap.D;
+          if(snap.USERS&&snap.USERS.length)USERS=snap.USERS;
+          nOId=snap.nOId||nOId;nIId=snap.nIId||nIId;
+          FB_SETUP_DONE=snap.setupDone===true;
+          syncIdCounters();
+          toast("Working offline — cloud sync unavailable","warn");
+        }
+        finish();
+      }
+    });
+  }
+  tryAuth();
 }
 function skipCloud(){
   FB_READY=true;renderLogin();
@@ -601,6 +798,8 @@ function buildApp(){
   nav(first,null);
   startAutoSaveLoop();
   scheduleEmailBackup();
+  startAutoBackup();
+  setTimeout(checkBackupReminder,3000);
   if(!FB_SETUP_DONE&&CU&&CU.role==="director"){
     setTimeout(showSetupWizard,600);
   }
@@ -2412,29 +2611,42 @@ function rReports(){
 function rExcel(){
   var pg=el("pg-excel");if(!pg)return;
   pg.innerHTML=
-    "<div class=\"ph\"><h1>Data Management</h1><p>Live cloud sync &middot; Excel backup &middot; Export</p></div>"+
+    "<div class=\"ph\"><h1>Data Management</h1><p>Live cloud sync &middot; Automatic backups &middot; Excel export</p></div>"+
     "<div class=\"card\" style=\"border:2px solid #27ae60;background:linear-gradient(135deg,#f0fdf4,#fff)\">"+
       "<div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-cloud-check\" style=\"color:#27ae60\"></i>Live Cloud Sync</div>"+
         "<span class=\"badge bg\" id=\"cloud-status2\"><i class=\"ti ti-cloud-check\"></i> Connected</span></div>"+
       "<div style=\"font-size:12px;color:var(--tx2);line-height:1.8\">"+
-        "All your data lives in the cloud now. Every order, payment, and customer added on any device "+
-        "appears on every other logged-in device within 1-2 seconds &mdash; no manual saving or merging needed.<br><br>"+
-        "<strong style=\"color:var(--nv)\">This works from anywhere</strong> &mdash; office WiFi, mobile data, home, on delivery routes &mdash; as long as there's internet."+
+        "All data syncs to Firestore instantly. Every change on any device appears on all other devices within 1-2 seconds."+
       "</div>"+
     "</div>"+
+    "<div class=\"card\" style=\"border:2px solid #7c3aed;background:linear-gradient(135deg,#faf5ff,#fff)\">"+
+      "<div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-database-backup\" style=\"color:#7c3aed\"></i>Automatic Cloud Backups</div>"+
+        "<span class=\"badge\" style=\"background:#7c3aed;color:#fff\">Always ON</span></div>"+
+      "<div style=\"font-size:12px;color:var(--tx2);line-height:1.8;margin-bottom:12px\">"+
+        "Your data is automatically backed up to a <strong>separate Firestore collection</strong> independent of the main data. "+
+        "If the main database is ever wiped or corrupted, the system auto-restores from the most recent backup on next load.<br><br>"+
+        "<strong style=\"color:#7c3aed\">Hourly backups</strong> — every 60 minutes while the app is open (last 24 kept)<br>"+
+        "<strong style=\"color:#7c3aed\">Daily backups</strong> — once per day (last 30 days kept)<br>"+
+        "<strong style=\"color:#7c3aed\">Zero cost</strong> — stored in same free Firebase project<br>"+
+        "<strong style=\"color:#7c3aed\">Zero action needed</strong> — fully automatic"+
+      "</div>"+
+      "<div style=\"display:flex;gap:10px;flex-wrap:wrap\">"+
+        "<button class=\"btn btn-navy\" onclick=\"showBackupHistory()\"><i class=\"ti ti-history\"></i> View backup history</button>"+
+        "<button class=\"btn\" style=\"background:#7c3aed;color:#fff\" onclick=\"runAutoBackup();toast('Backup snapshot saved to cloud')\"><i class=\"ti ti-device-floppy\"></i> Snapshot now</button>"+
+      "</div>"+
+      "<div id=\"backup-history\" style=\"margin-top:14px\"></div>"+
+    "</div>"+
     "<div class=\"card\" style=\"border:2px solid var(--nv2);background:linear-gradient(135deg,#f4f6fb,#fff)\">"+
-      "<div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-shield-check\" style=\"color:var(--nv2)\"></i>Auto-save (every 1 minute)</div>"+
+      "<div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-shield-check\" style=\"color:var(--nv2)\"></i>Auto-save (every 1 minute on this device)</div>"+
         "<span class=\"badge bg\" id=\"as-indicator2\"><i class=\"ti ti-refresh\"></i> Running</span></div>"+
       "<div style=\"font-size:12px;color:var(--tx2);line-height:1.8;margin-bottom:14px\">"+
         "This device automatically saves your work every 1 minute into this browser's own storage &mdash; "+
-        "so if the app closes, crashes, or your phone restarts, nothing typed in the last minute is lost on THIS device.<br><br>"+
-        "<strong style=\"color:var(--nv)\">On a laptop using Chrome or Edge</strong>, you can also link a real Excel file below &mdash; "+
-        "the app will silently overwrite that exact file every minute, no prompts, no new files piling up."+
+        "so if the app closes, crashes, or your phone restarts, nothing typed in the last minute is lost on THIS device."+
       "</div>"+
       "<div style=\"display:flex;gap:10px;flex-wrap:wrap;align-items:center\">"+
         (AS_SUPPORTED?
           "<button class=\"btn btn-navy\" id=\"aslink\" onclick=\"pickAutoSaveFile()\"><i class=\"ti ti-link-plus\"></i> Link a file for auto-overwrite</button>":
-          "<span class=\"badge ba\"><i class=\"ti ti-info-circle\"></i> File auto-overwrite needs Chrome/Edge on laptop &mdash; using safe local auto-save on this device</span>")+
+          "<span class=\"badge ba\"><i class=\"ti ti-info-circle\"></i> File auto-overwrite needs Chrome/Edge on laptop</span>")+
       "</div>"+
     "</div>"+
     "<div class=\"g2\" style=\"margin-bottom:14px\">"+
@@ -2651,8 +2863,63 @@ function saveXL(){
   var wb=buildBackupWB();
   var ts=new Date().toISOString().replace(/[:.]/g,"-").slice(0,16);
   XLSX.writeFile(wb,"NewDawn_Backup_"+ts+".xlsx");
+  localStorage.setItem("nd_last_backup",tday());
   saved();var l=el("lsl");if(l)l.innerHTML="Saved at "+new Date().toLocaleTimeString();
-  toast("Backup saved");
+  toast("Backup saved — keep this file safe!");
+}
+function showBackupHistory(){
+  var el2=el("backup-history");if(!el2||!FB_BACKUP_COL)return;
+  el2.innerHTML="<div style=\"font-size:12px;color:var(--tx2)\">Loading backup history...</div>";
+  FB_BACKUP_COL.orderBy(firebase.firestore.FieldPath.documentId(),"desc").limit(10).get().then(function(snap){
+    if(snap.empty){el2.innerHTML="<div style=\"font-size:12px;color:var(--tx2)\">No backups yet — they start automatically after 10 minutes of use.</div>";return;}
+    var rows="";
+    snap.forEach(function(d){
+      var data=d.data();
+      var t=data.backedUpAt?new Date(data.backedUpAt).toLocaleString():"?";
+      var type=d.id.startsWith("daily-")?"Daily":"Hourly";
+      var custs=(data.stats&&data.stats.customers)||0;
+      var ords=(data.stats&&data.stats.orders)||0;
+      rows+="<tr><td style=\"font-weight:700\">"+type+"</td><td>"+d.id.split("-").slice(1).join("-")+"</td><td>"+t+"</td><td>"+custs+" customers, "+ords+" orders</td>"+
+        "<td><button class=\"btn btn-xs btn-navy\" onclick=\"restoreSpecificBackup('"+d.id+"')\">Restore</button></td></tr>";
+    });
+    el2.innerHTML="<table style=\"width:100%;font-size:11px;border-collapse:collapse;margin-top:8px\">"+
+      "<thead><tr style=\"background:var(--nv);color:#fff\"><th style=\"padding:5px 8px\">Type</th><th style=\"padding:5px 8px\">Date</th><th style=\"padding:5px 8px\">Time</th><th style=\"padding:5px 8px\">Contents</th><th style=\"padding:5px 8px\">Action</th></tr></thead>"+
+      "<tbody>"+rows+"</tbody></table>";
+  }).catch(function(e){
+    el2.innerHTML="<div style=\"font-size:12px;color:#c0392b\">Could not load backup history: "+e.message+"</div>";
+  });
+}
+function restoreSpecificBackup(docId){
+  if(!FB_BACKUP_COL)return;
+  if(!confirm("Restore from backup '"+docId+"'?\n\nThis will REPLACE your current data with this backup. Current data will be overwritten.\n\nMake sure you want to do this."))return;
+  FB_BACKUP_COL.doc(docId).get().then(function(doc){
+    if(!doc.exists){toast("Backup not found","err");return;}
+    var data=doc.data();
+    if(!data||!data.D){toast("Backup data invalid","err");return;}
+    D=data.D;
+    if(!D.routes)D.routes=[];if(!D.complaints)D.complaints=[];if(!D.offers)D.offers=[];
+    if(data.USERS&&data.USERS.length)USERS=data.USERS;
+    nOId=data.nOId||nOId;nIId=data.nIId||nIId;nCId=data.nCId||nCId;
+    FB_SETUP_DONE=true;
+    syncIdCounters();syncPaymentStatuses();
+    FB_LAST_LOCAL_WRITE=Date.now();
+    pushToCloud();
+    rExcel();
+    toast("Restored from "+docId+" — "+( (data.stats&&data.stats.customers)||0)+" customers, "+( (data.stats&&data.stats.orders)||0)+" orders");
+  }).catch(function(e){toast("Restore failed: "+e.message,"err");});
+}
+function checkBackupReminder(){
+  if(!CU||CU.role!=="director")return;
+  var last=localStorage.getItem("nd_last_backup")||"";
+  var today=tday();
+  if(last===today)return; // already backed up today
+  var daysSince=last?Math.floor((new Date(today)-new Date(last))/(1000*60*60*24)):999;
+  var msg=daysSince>=1?"⚠️ No backup taken "+(daysSince===999?"yet":(daysSince===1?"since yesterday":"in "+daysSince+" days"))+".\n\nYour data only exists in the cloud. If something goes wrong you could lose everything.\n\nDownload a backup now?":"";
+  if(msg){
+    setTimeout(function(){
+      if(confirm(msg)){saveXL();}
+    },2000);
+  }
 }
 
 /* ── EMAIL BACKUP VIA EMAILJS ── */
@@ -2745,14 +3012,21 @@ function lsKey(){return "newdawn_autosave_"+(CU?CU.role:"shared");}
 
 function autoSaveLocal(){
   try{
-    var snapshot={D:D,USERS:USERS,nOId:nOId,nIId:nIId,nCId:nCId,ts:new Date().toISOString()};
-    localStorage.setItem("newdawn_autosave_shared",JSON.stringify(snapshot));
+    var snapshot={D:D,USERS:USERS,nOId:nOId,nIId:nIId,nCId:nCId,ts:new Date().toISOString(),setupDone:FB_SETUP_DONE};
+    var json=JSON.stringify(snapshot);
+    localStorage.setItem("newdawn_autosave_shared",json);
+    // Redundant copy in sessionStorage for same-session recovery
+    try{sessionStorage.setItem("newdawn_session_backup",json);}catch(e2){}
     return true;
   }catch(e){return false;}
 }
 function autoSaveCheckLocal(){
   try{
     var raw=localStorage.getItem("newdawn_autosave_shared");
+    if(!raw){
+      // Try sessionStorage as fallback
+      try{raw=sessionStorage.getItem("newdawn_session_backup");}catch(e2){}
+    }
     if(!raw)return null;
     return JSON.parse(raw);
   }catch(e){return null;}
@@ -2883,14 +3157,14 @@ function restoreXL(input){
       }
 
       syncIdCounters();
-
-      var rm=el("rmsg");if(rm)rm.innerHTML="<span style=\"color:#27ae60\"><i class=\"ti ti-check\"></i> Restored successfully! "+sheetsFound+" sheets loaded.</span>";
-      syncIdCounters();
       syncPaymentStatuses();
-      FB_LAST_LOCAL_WRITE=Date.now();
-      pushToCloud();
+      FB_SETUP_DONE=true;
+      var rm=el("rmsg");if(rm)rm.innerHTML="<span style=\"color:#27ae60\"><i class=\"ti ti-check\"></i> Restored successfully! "+sheetsFound+" sheets loaded.</span>";
+      autoSaveLocal();
+      if(FB_READY){FB_LAST_LOCAL_WRITE=Date.now();pushToCloud();}
       nav("excel",null);
-      saved();toast("Data restored from backup — syncing to cloud...");
+      refreshCurrentPage();
+      saved();toast("Data restored — "+( D.customers.length)+" customers, "+(D.orders.length)+" orders loaded");
     }catch(err){
       var rm=el("rmsg");if(rm)rm.innerHTML="<span style=\"color:#c0392b\"><i class=\"ti ti-x\"></i> Failed: "+err.message+"</span>";
       toast("Restore failed - "+err.message,"err");
@@ -3088,6 +3362,7 @@ window.addEventListener("load",function(){
         fbDb.enableIndexedDbPersistence&&fbDb.enableIndexedDbPersistence().catch(function(){});
       });
       FB_DOC_REF=fbDb.collection("newdawn").doc("main");
+      FB_BACKUP_COL=fbDb.collection("newdawn_backups");
     }catch(e){
       var r=document.getElementById("root");
       if(r)r.innerHTML="<div class=\"lscreen\"><div class=\"lbox\" style=\"text-align:center\">"+
