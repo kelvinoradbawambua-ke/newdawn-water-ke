@@ -36,6 +36,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .pdot{width:13px;height:13px;border-radius:50%;border:2px solid var(--bd);transition:all .15s}
 .pdot.on{background:var(--nv2);border-color:var(--nv2)}
 @keyframes spin{to{transform:rotate(360deg)}}
+@media print{
+  #tnav,#sts,.toolbar,.btn,.ac,.mft,#um,.pg:not(.print-target){display:none!important}
+  .print-target{display:block!important}
+  body{background:#fff!important}
+  .card{box-shadow:none!important;border:1px solid #ddd!important}
+}
 .ppad{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
 .pkey{padding:13px;border-radius:8px;border:1.5px solid var(--bd);background:#fff;font-size:18px;font-weight:700;cursor:pointer;text-align:center;transition:all .12s;font-family:inherit}
 .pkey:hover{background:var(--nv2);color:#fff;border-color:var(--nv2)}
@@ -179,6 +185,9 @@ var FB_UNSUB=null;
 var FB_SYNC_TIMER=null;
 var FB_LAST_LOCAL_WRITE=0;
 var FB_SETUP_DONE=false;
+// Write queue — prevents race condition when multiple users write simultaneously
+var FB_WRITE_QUEUE=[];
+var FB_WRITING=false;
 
 var R={
   director:{label:"Director",c:"#1a1560",bg:"#e2d9f3",p:{dashboard:1,customers:1,orders:1,delivery:1,stock:1,invoices:1,debts:1,complaints:1,offers:1,reports:1,excel:1,users:1,vRev:1,vProfit:1,vCost:1,vInv:1,vDebt:1,aCust:1,eCust:1,dCust:1,aOrd:1,eOrd:1,dOrd:1,aSt:1,eSt:1,dSt:1,aOff:1,eOff:1,dOff:1,aInv:1,eInv:1,mPaid:1,ePrice:1,exp:1,rest:1,mUsers:1,aCmp:1,vPhone:1}},
@@ -187,7 +196,9 @@ var R={
   driver:{label:"Driver",c:"#534AB7",bg:"#ede9f8",p:{dashboard:0,customers:0,orders:0,delivery:1,stock:0,invoices:0,debts:0,complaints:1,offers:0,reports:0,excel:0,users:0,vRev:0,vProfit:0,vCost:0,vInv:0,vDebt:0,aCust:0,eCust:0,dCust:0,aOrd:0,eOrd:0,dOrd:0,aSt:0,eSt:0,dSt:0,aOff:0,eOff:0,dOff:0,aInv:0,eInv:0,mPaid:0,ePrice:0,exp:0,rest:0,mUsers:0,aCmp:1,vPhone:0}}
 };
 var USERS=[{id:1,name:"Director",role:"director",pin:"1234",ini:"DR",col:"#1a1560"}];
-var D={customers:[],stock:[],orders:[],offers:[],invoices:[],routes:[],complaints:[]};
+var D={customers:[],stock:[],orders:[],offers:[],invoices:[],routes:[],complaints:[],
+  auditLog:[]
+};
 var nOId=1001,nIId=2001,nCId=3001;
 var CU=null,SU=null,PE="";
 
@@ -261,7 +272,20 @@ function toast(msg,type){
 function dirty(){
   var e=el("sts");if(e){e.className="sts dirty";e.innerHTML="<i class=\"ti ti-point-filled\"></i> Syncing...";}
   scheduleCloudSync();
-  autoSaveLocal(); // local save on every mutation
+  autoSaveLocal();
+}
+function auditLog(action,details){
+  if(!CU)return;
+  if(!D.auditLog)D.auditLog=[];
+  D.auditLog.push({
+    ts:new Date().toISOString(),
+    user:CU.name,
+    role:CU.role,
+    action:action,
+    details:details||""
+  });
+  // Keep last 500 audit entries to stay within Firestore doc size
+  if(D.auditLog.length>500)D.auditLog=D.auditLog.slice(-500);
 }
 function saved(){var e=el("sts");if(e){e.className="sts saved";e.innerHTML="<i class=\"ti ti-check\"></i> Saved "+new Date().toLocaleTimeString();}}
 
@@ -273,25 +297,32 @@ function scheduleCloudSync(){
 }
 function pushToCloud(){
   if(!FB_READY||!FB_DOC_REF)return;
-  // Safety: never overwrite cloud with empty data if setupDone is already true
-  // This prevents a race condition wipe
   var isEmpty=(!D.customers||D.customers.length===0)&&(!D.orders||D.orders.length===0)&&(!D.stock||D.stock.length===0);
-  if(isEmpty&&FB_SETUP_DONE){
-    console.warn("Skipping cloud push — local data is empty but setup is done. Preventing data wipe.");
-    return;
-  }
+  if(isEmpty&&FB_SETUP_DONE){console.warn("Skipping — empty data guard");return;}
+  // Queue the write — process one at a time to prevent race conditions
+  FB_WRITE_QUEUE.push(Date.now());
+  if(!FB_WRITING)processWriteQueue();
+}
+function processWriteQueue(){
+  if(!FB_WRITE_QUEUE.length){FB_WRITING=false;return;}
+  FB_WRITING=true;
+  FB_WRITE_QUEUE=[];// collapse multiple pending writes into one
   FB_LAST_LOCAL_WRITE=Date.now();
   var payload={
     D:D,USERS:USERS,nOId:nOId,nIId:nIId,nCId:nCId,
     setupDone:FB_SETUP_DONE,
-    updatedAt:Date.now()
+    updatedAt:FB_LAST_LOCAL_WRITE
   };
   FB_DOC_REF.set(JSON.parse(JSON.stringify(payload)),{merge:true}).then(function(){
+    FB_WRITING=false;
     var e=el("sts");if(e){e.className="sts saved";e.innerHTML="<i class=\"ti ti-cloud-check\"></i> Synced "+new Date().toLocaleTimeString();}
-    var c=el("cloud-status");
+    var cs=el("cloud-status");
     var custN=(D&&D.customers&&D.customers.length)||0;
-    if(c)c.innerHTML="<i class=\"ti ti-cloud-check\"></i> Online &middot; Live"+(custN>0?" &middot; "+custN+" customers":"");
+    if(cs)cs.innerHTML="<i class=\"ti ti-cloud-check\"></i> Online &middot; Live"+(custN>0?" &middot; "+custN+" customers":"");
+    // Process any writes that came in while we were writing
+    if(FB_WRITE_QUEUE.length)processWriteQueue();
   }).catch(function(err){
+    FB_WRITING=false;
     var e=el("sts");if(e){e.className="sts dirty";e.innerHTML="<i class=\"ti ti-cloud-off\"></i> Sync failed - retrying";}
     setTimeout(pushToCloud,5000);
   });
@@ -474,7 +505,10 @@ function startCloudListener(){
     }
     var data=doc.data();
     var isOwnWrite=Date.now()-FB_LAST_LOCAL_WRITE<800;
-    if(!isOwnWrite){
+    // Conflict detection: if server has newer data than our last write, always accept it
+    var serverTime=data.updatedAt||0;
+    var weAreNewer=FB_LAST_LOCAL_WRITE>serverTime+1000;
+    if(!isOwnWrite||!weAreNewer){
       // Remote update from another device — merge their data in
       if(data.D){
         D=data.D;
@@ -738,7 +772,7 @@ function checkAutoSaveRecovery(){
       msg+="\n\nRestore this data now?";
       if(confirm(msg)){
         D=snap.D;
-        if(!D.routes)D.routes=[];if(!D.complaints)D.complaints=[];if(!D.offers)D.offers=[];
+        if(!D.routes)D.routes=[];if(!D.complaints)D.complaints=[];if(!D.offers)D.offers=[];if(!D.auditLog)D.auditLog=[];
         if(snap.USERS&&snap.USERS.length)USERS=snap.USERS;
         nOId=snap.nOId||nOId;nIId=snap.nIId||nIId;nCId=snap.nCId||nCId;
         FB_SETUP_DONE=snap.setupDone===true||FB_SETUP_DONE;
@@ -823,6 +857,24 @@ function buildApp(){
   }
 }
 function toggleUM(){el("um").classList.toggle("open");}
+// ── KEYBOARD SHORTCUTS ──
+document.addEventListener("keydown",function(e){
+  if(!CU)return; // not logged in
+  var tag=(document.activeElement||{}).tagName||"";
+  var inInput=tag==="INPUT"||tag==="TEXTAREA"||tag==="SELECT";
+  if(e.key==="Escape"){
+    // Close any open modal
+    document.querySelectorAll(".ov").forEach(function(m){if(m.style.display!=="none")cm(m.id);});
+    return;
+  }
+  if(inInput)return; // don't fire shortcuts when typing
+  if(e.key==="n"&&can("aOrd")){e.preventDefault();prepO();} // N = new order
+  if(e.key==="c"&&can("aCust")){e.preventDefault();prepCustAdd();} // C = new customer
+  if(e.key==="f"){e.preventDefault();nav("customers",null);setTimeout(function(){var s=document.querySelector(".srch input");if(s)s.focus();},200);} // F = find customer
+  if(e.key==="o"){e.preventDefault();nav("orders",null);} // O = orders
+  if(e.key==="d"){e.preventDefault();nav("delivery",null);} // D = delivery
+  if(e.key==="s"&&can("aSt")){e.preventDefault();nav("stock",null);} // S = stock
+});
 
 /* ── SETUP WIZARD ── */
 var WIZ_STEP=0;
@@ -1330,6 +1382,17 @@ function rDash(){
   var mRevs=mns.map(function(_,i){var m2=String(i+1).padStart(2,"0");return del.filter(function(o){return o.date&&o.date.startsWith(yr+"-"+m2);}).reduce(function(a,o){return a+o.qty*o.price;},0);});
   var mMax=Math.max.apply(null,mRevs.concat([1]));
   var alerts=[];
+  var now2=new Date();
+  var thisMonth=now2.getFullYear()+"-"+String(now2.getMonth()+1).padStart(2,"0");
+  var lastMonthD=new Date(now2.getFullYear(),now2.getMonth()-1,1);
+  var lastMonth=lastMonthD.getFullYear()+"-"+String(lastMonthD.getMonth()+1).padStart(2,"0");
+  var thisRev=del.filter(function(o){return o.date&&o.date.startsWith(thisMonth);}).reduce(function(s,o){return s+o.qty*o.price;},0);
+  var lastRev=del.filter(function(o){return o.date&&o.date.startsWith(lastMonth);}).reduce(function(s,o){return s+o.qty*o.price;},0);
+  if(can("vRev")&&lastRev>0){var tp=Math.round((thisRev-lastRev)/lastRev*100);if(Math.abs(tp)>=10){var tc=tp>0?"#27ae60":"#c0392b";alerts.push("<div class=\"alt\" style=\"border-left-color:"+tc+"\"><i class=\"ti "+(tp>0?"ti-trending-up":"ti-trending-down")+"\" style=\"color:"+tc+"\"></i> Revenue "+(tp>0?"+":"")+tp+"% vs last month</div>");}}
+  var churnDate=new Date(Date.now()-30*86400000).toISOString().slice(0,10);
+  var churned=D.customers.filter(function(cu){var lo=D.orders.filter(function(o){return o.cId===cu.id&&o.status==="Delivered";}).sort(function(a,b){return b.date>a.date?1:-1;})[0];return lo&&lo.date<churnDate;}).length;
+  if(churned>0)alerts.push("<div class=\"alt\" style=\"border-left-color:#f0c040\"><i class=\"ti ti-user-exclamation\" style=\"color:#f0c040\"></i> "+churned+" customer(s) no order in 30+ days</div>");
+
   D.stock.filter(function(s){return s.qty<=s.min;}).forEach(function(s){alerts.push({t:"nw",i:"ti-alert-triangle",m:"Low stock: <strong>"+s.name+"</strong> &mdash; "+s.qty+" left (min "+s.min+")"});});
   if(can("vDebt"))debts.slice(0,3).forEach(function(c){alerts.push({t:"nr",i:"ti-alert-circle",m:"Debt: <strong>"+(can("vPhone")?c.name:maskName(c.name))+"</strong> &mdash; KSh "+custDebt(c.id).toLocaleString()});});
   D.complaints.filter(function(c){return c.status==="Open";}).slice(0,2).forEach(function(c){var cu=D.customers.find(function(x){return x.id===c.cId;});alerts.push({t:"nw",i:"ti-message-report",m:"Complaint: <strong>"+(cu?(can("vPhone")?cu.name:maskName(cu.name)):"?")+"</strong> &mdash; "+c.type});});
@@ -1452,7 +1515,7 @@ function rCusts(q,pg,sort,type){
             "<td style=\"font-size:11px\">"+(can("vRev")?(lp?"<div>"+fmt(lp.date)+"</div><div class=\"ca\">KSh "+lp.amt.toLocaleString()+" &middot; "+lp.method+"</div>":"-"):"<span style=\"color:var(--tx2)\">—</span>")+"</td>"+
             "<td><span style=\"font-weight:800;color:"+(debt>0?"#c0392b":"#27ae60")+"\">"+(can("vDebt")?(debt>0?"KSh "+debt.toLocaleString():"Nil"):"&bull;&bull;&bull;&bull;")+"</span></td>"+
             "<td><div class=\"ac\">"+
-              "<button class=\"btn btn-xs btn-gold\" onclick=\"openPay("+c.id+")\" title=\"Record payment\"><i class=\"ti ti-cash\"></i></button>"+
+              "<button class=\"btn btn-xs btn-gold\" onclick=\"openPay("+c.id+")\" title=\"Record payment\"><i class=\"ti ti-cash\"></i></button>"+(can("vRev")?"<button class=\"btn btn-xs\" onclick=\"printStatement("+c.id+")\" title=\"Customer statement\" style=\"background:#7c3aed;color:#fff\"><i class=\"ti ti-file-text\"></i></button>":"")+
               (can("eCust")?"<button class=\"btn btn-xs btn-navy\" onclick=\"editCust("+c.id+")\" title=\"Edit\"><i class=\"ti ti-edit\"></i></button>":"")+
               (can("dCust")?"<button class=\"btn btn-xs btn-red\" onclick=\"delC("+c.id+")\" title=\"Delete\"><i class=\"ti ti-trash\"></i></button>":"")+
             "</div></td>"+
@@ -2057,6 +2120,7 @@ function saveOrd(){
   if(payStatus!=="Paid"){
     D.invoices.push({id:nIId++,cId:cId,amount:total,paid:amtPaid,due:el("od").value,notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
   }
+  auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty);
   cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+newOrdId+" placed");
 }
 function openDlv(oid){
@@ -2356,7 +2420,8 @@ function invRows(fil){
         (can("eInv")&&(!i.payments||!i.payments.length)?"<button class=\"btn btn-xs btn-navy\" onclick=\"editInv("+i.id+")\" title=\"Edit\"><i class=\"ti ti-edit\"></i></button>":"")+
         (can("mPaid")&&bal>0?"<button class=\"btn btn-xs btn-grn\" onclick=\"payI("+i.id+")\" title=\"Mark paid\"><i class=\"ti ti-check\"></i></button>":"")+
         (can("mPaid")&&bal>0?"<button class=\"btn btn-xs btn-gold\" onclick=\"openPayInv("+i.id+")\" title=\"Partial payment\"><i class=\"ti ti-cash\"></i></button>":"")+
-      "</div></td></tr>";
+      "<button class=\"btn btn-xs\" onclick=\"printInvoice("+i.id+")\" style=\"background:#7c3aed;color:#fff\" title=\"Print\"><i class=\"ti ti-printer\"></i></button>"+
+    "</div></td></tr>";
   }).join("");
 }
 function filterInvs(f){
@@ -2422,6 +2487,20 @@ function payI(id){
 }
 function openPayInv(id){var i=D.invoices.find(function(x){return x.id===id;});if(!i)return;var c=D.customers.find(function(x){return x.id===i.cId;});el("pay-cid").value=i.cId;el("pay-info").innerHTML="<strong>"+(c?(can("vPhone")?c.name:maskName(c.name)):"?")+"</strong> &mdash; Invoice #"+id+"<br><span style=\"color:#c0392b;font-weight:700\">Balance: KSh "+(i.amount-i.paid).toLocaleString()+"</span>";el("pay-date").value=tday();el("pay-amt").value="";om("m-pay");}
 
+function ageing(cId){
+  var td=tday();
+  var invs=D.invoices.filter(function(i){return i.cId===cId&&i.paid<i.amount;});
+  var d30=invs.filter(function(i){return i.due>=td||(new Date(td)-new Date(i.due))<=30*86400000;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
+  var d60=invs.filter(function(i){var diff=new Date(td)-new Date(i.due);return diff>30*86400000&&diff<=60*86400000;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
+  var d90=invs.filter(function(i){var diff=new Date(td)-new Date(i.due);return diff>60*86400000&&diff<=90*86400000;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
+  var d90p=invs.filter(function(i){return (new Date(td)-new Date(i.due))>90*86400000;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
+  var parts=[];
+  if(d30>0)parts.push("<span style='color:#f0c040;font-size:10px'>0-30d: "+d30.toLocaleString()+"</span>");
+  if(d60>0)parts.push("<span style='color:#e67e22;font-size:10px'>31-60d: "+d60.toLocaleString()+"</span>");
+  if(d90>0)parts.push("<span style='color:#c0392b;font-size:10px'>61-90d: "+d90.toLocaleString()+"</span>");
+  if(d90p>0)parts.push("<span style='color:#7b0000;font-size:10px;font-weight:800'>90d+: "+d90p.toLocaleString()+"</span>");
+  return parts.length?"<td style='font-size:10px'>"+parts.join(" ")+"</td>":"<td></td>";
+}
 function rDebts(){
   var pg=el("pg-debts");if(!pg)return;
   if(!can("vDebt")){pg.innerHTML="<div style=\"padding:60px;text-align:center\"><i class=\"ti ti-lock\" style=\"font-size:38px;color:var(--bd);display:block;margin-bottom:12px\"></i><p style=\"font-size:14px;font-weight:700;color:var(--tx2)\">Access restricted</p></div>";return;}
@@ -2571,9 +2650,10 @@ function saveOff(){
 function togOf(id){var o=D.offers.find(function(x){return x.id===id;});if(o)o.active=!o.active;rOffers();dirty();}
 function delOf(id){if(!can("dOff"))return;if(!confirm("Delete?"))return;D.offers=D.offers.filter(function(o){return o.id!==id;});rOffers();dirty();}
 
+var RPT_FROM="";var RPT_TO="";
 function rReports(){
   var pg=el("pg-reports");if(!pg)return;
-  var del=D.orders.filter(function(o){return o.status==="Delivered";});
+  var del=D.orders.filter(function(o){if(o.status!=="Delivered")return false;if(RPT_FROM&&o.date<RPT_FROM)return false;if(RPT_TO&&o.date>RPT_TO)return false;return true;});
   var rev=del.reduce(function(a,o){return a+o.qty*o.price;},0);
   var cost=del.reduce(function(a,o){return a+o.qty*(o.cost||0);},0);
   var totD=D.customers.reduce(function(a,c){return a+custDebt(c.id);},0);
@@ -2582,7 +2662,14 @@ function rReports(){
   var pRevs={};del.forEach(function(o){if(!pRevs[o.prod])pRevs[o.prod]={qty:0,rev:0};pRevs[o.prod].qty+=o.qty;pRevs[o.prod].rev+=o.qty*o.price;});
   var zones=[].concat([],D.customers.map(function(c){return c.estate||c.zone||"";})).filter(function(z,i,a){return z&&a.indexOf(z)===i;});
   pg.innerHTML=
-    "<div class=\"ph\"><h1>Business Reports</h1><p>Analytics &amp; performance overview</p></div>"+
+    "<div class=\"ph\"><h1>Business Reports</h1>"+
+    "<div style=\"display:flex;gap:8px;align-items:center;margin:8px 0;flex-wrap:wrap\">"+
+    "<span style=\"font-size:12px;font-weight:700;color:var(--nv)\">Period:</span>"+
+    "<input type=\"date\" class=\"fi\" style=\"width:130px;padding:5px 8px\" value=\""+RPT_FROM+"\" onchange=\"RPT_FROM=this.value;rReports()\">"+
+    "<span style=\"font-size:11px;color:var(--tx2)\">to</span>"+
+    "<input type=\"date\" class=\"fi\" style=\"width:130px;padding:5px 8px\" value=\""+RPT_TO+"\" onchange=\"RPT_TO=this.value;rReports()\">"+
+    "<button class=\"btn btn-sm\" onclick=\"RPT_FROM='';RPT_TO='';rReports()\">All time</button>"+
+    "</div><p>Analytics &amp; performance overview</p></div>"+
     "<div class=\"stats\">"+
       "<div class=\"stat sg\"><div class=\"sl\">Total revenue</div><div class=\"sv\">"+ksh(rev)+"</div><div class=\"ss\">"+del.length+" orders</div></div>"+
       "<div class=\"stat sn\"><div class=\"sl\">Gross profit</div><div class=\"sv\">"+(can("vProfit")?"KSh "+(rev-cost).toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>")+"</div><div class=\"ss\">"+(can("vProfit")&&rev>0?Math.round((rev-cost)/rev*100)+"% margin":"&mdash;&mdash;")+"</div></div>"+
@@ -2896,6 +2983,88 @@ function saveXL(){
   saved();var l=el("lsl");if(l)l.innerHTML="Saved at "+new Date().toLocaleTimeString();
   toast("Backup saved — keep this file safe!");
 }
+function printInvoice(invId){
+  var i=D.invoices.find(function(x){return x.id===invId;});if(!i)return;
+  var cu=D.customers.find(function(x){return x.id===i.cId;});
+  var pays=(i.payments||[]).map(function(p){
+    return "<tr><td>"+fmt(p.date)+"</td><td>"+p.method+"</td><td>"+( p.ref||"")+"</td><td style='text-align:right'>KSh "+p.amt.toLocaleString()+"</td></tr>";
+  }).join("");
+  var w=window.open("","_blank","width=700,height=900");
+  w.document.write("<!DOCTYPE html><html><head><title>Invoice #"+invId+"</title>"+
+    "<style>body{font-family:Calibri,Arial,sans-serif;padding:40px;color:#111;max-width:600px;margin:0 auto}"+
+    ".hdr{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:30px;padding-bottom:20px;border-bottom:3px solid #1a1560}"+
+    ".co{font-size:22px;font-weight:800;color:#1a1560}.sub{color:#666;font-size:12px}"+
+    ".inv-no{font-size:28px;font-weight:800;color:#c8a951}.lbl{font-size:11px;color:#666;font-weight:700;margin-bottom:2px}"+
+    ".val{font-size:14px;margin-bottom:12px}table{width:100%;border-collapse:collapse;margin:20px 0}"+
+    "th{background:#1a1560;color:#fff;padding:8px;text-align:left;font-size:12px}"+
+    "td{padding:8px;border-bottom:1px solid #eee;font-size:12px}"+
+    ".total{font-size:18px;font-weight:800;color:#1a1560;text-align:right;padding:12px 0}"+
+    ".bal{color:"+(i.paid>=i.amount?"#27ae60":"#c0392b")+";font-size:16px;font-weight:800}"+
+    ".footer{margin-top:40px;padding-top:20px;border-top:1px solid #eee;font-size:11px;color:#999;text-align:center}"+
+    "@media print{button{display:none}}</style></head><body>"+
+    "<div class='hdr'>"+
+      "<div><div class='co'>NEW DAWN PURE DRINKING WATER</div>"+
+      "<div class='sub'>Nyayo Estate, Gate D, Court 290</div>"+
+      "<div class='sub'>Tel: 0710805099 / 0733930568</div></div>"+
+      "<div style='text-align:right'><div class='inv-no'>INVOICE #"+invId+"</div>"+
+      "<div class='sub'>Date: "+fmt(i.date)+"</div>"+
+      "<div class='sub'>Due: "+fmt(i.due)+"</div></div>"+
+    "</div>"+
+    "<div class='lbl'>BILL TO</div>"+
+    "<div class='val'><strong>"+(cu?cu.name:"Customer")+"</strong><br>"+
+      (cu?cAddr(cu):"")+"</div>"+
+    "<table><thead><tr><th>Description</th><th style='text-align:right'>Amount</th></tr></thead>"+
+    "<tbody><tr><td>"+(i.notes||"Services")+"</td><td style='text-align:right'>KSh "+i.amount.toLocaleString()+"</td></tr></tbody></table>"+
+    (pays?"<div class='lbl' style='margin-top:16px'>PAYMENTS RECEIVED</div>"+
+    "<table><thead><tr><th>Date</th><th>Method</th><th>Reference</th><th style='text-align:right'>Amount</th></tr></thead>"+
+    "<tbody>"+pays+"</tbody></table>":"")+
+    "<div class='total'>Total: KSh "+i.amount.toLocaleString()+"</div>"+
+    "<div class='total'>Paid: KSh "+i.paid.toLocaleString()+"</div>"+
+    "<div class='bal'>Balance: KSh "+(i.amount-i.paid).toLocaleString()+"</div>"+
+    "<div class='footer'>Thank you for your business &bull; New Dawn Pure Drinking Water</div>"+
+    "<br><button onclick='window.print()' style='padding:10px 24px;background:#1a1560;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px'>Print / Save PDF</button>"+
+    "</body></html>");
+  w.document.close();
+}
+function printStatement(cId){
+  var cu=D.customers.find(function(x){return x.id===cId;});if(!cu)return;
+  var invs=D.invoices.filter(function(i){return i.cId===cId;}).sort(function(a,b){return a.date>b.date?1:-1;});
+  var totalAmt=invs.reduce(function(s,i){return s+i.amount;},0);
+  var totalPaid=invs.reduce(function(s,i){return s+i.paid;},0);
+  var rows=invs.map(function(i){
+    var bal=i.amount-i.paid;
+    var status=i.paid>=i.amount?"Paid":i.paid>0?"Partial":"Unpaid";
+    var color=i.paid>=i.amount?"#27ae60":i.paid>0?"#f0c040":"#c0392b";
+    return "<tr><td>"+fmt(i.date)+"</td><td>#"+i.id+"</td><td>"+(i.notes||"")+"</td>"+
+      "<td style='text-align:right'>KSh "+i.amount.toLocaleString()+"</td>"+
+      "<td style='text-align:right'>KSh "+i.paid.toLocaleString()+"</td>"+
+      "<td style='text-align:right;color:"+color+";font-weight:700'>KSh "+bal.toLocaleString()+"</td>"+
+      "<td style='color:"+color+";font-weight:700'>"+status+"</td></tr>";
+  }).join("");
+  var w=window.open("","_blank","width=800,height=900");
+  w.document.write("<!DOCTYPE html><html><head><title>Statement — "+cu.name+"</title>"+
+    "<style>body{font-family:Calibri,Arial,sans-serif;padding:40px;max-width:750px;margin:0 auto}"+
+    "h1{color:#1a1560;border-bottom:3px solid #c8a951;padding-bottom:10px}"+
+    "table{width:100%;border-collapse:collapse}th{background:#1a1560;color:#fff;padding:8px;font-size:12px}"+
+    "td{padding:8px;border-bottom:1px solid #eee;font-size:12px}"+
+    ".summary{background:#f4f6fb;padding:16px;border-radius:8px;margin:20px 0;display:flex;gap:30px}"+
+    ".sm{text-align:center}.sl{font-size:11px;color:#666}.sv{font-size:18px;font-weight:800;color:#1a1560}"+
+    "@media print{button{display:none}}</style></head><body>"+
+    "<h1>CUSTOMER STATEMENT</h1>"+
+    "<div><strong>"+cu.name+"</strong> &bull; "+cAddr(cu)+"<br>"+
+    "Statement date: "+new Date().toLocaleDateString()+"<br>"+
+    "Period: All time</div>"+
+    "<div class='summary'>"+
+      "<div class='sm'><div class='sl'>Total Invoiced</div><div class='sv'>KSh "+totalAmt.toLocaleString()+"</div></div>"+
+      "<div class='sm'><div class='sl'>Total Paid</div><div class='sv' style='color:#27ae60'>KSh "+totalPaid.toLocaleString()+"</div></div>"+
+      "<div class='sm'><div class='sl'>Balance Due</div><div class='sv' style='color:#c0392b'>KSh "+(totalAmt-totalPaid).toLocaleString()+"</div></div>"+
+    "</div>"+
+    "<table><thead><tr><th>Date</th><th>Invoice</th><th>Description</th><th>Amount</th><th>Paid</th><th>Balance</th><th>Status</th></tr></thead>"+
+    "<tbody>"+rows+"</tbody></table>"+
+    "<br><button onclick='window.print()' style='padding:10px 24px;background:#1a1560;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px'>Print / Save PDF</button>"+
+    "</body></html>");
+  w.document.close();
+}
 function showBackupHistory(){
   var el2=el("backup-history");if(!el2||!FB_BACKUP_COL)return;
   el2.innerHTML="<div style=\"font-size:12px;color:var(--tx2)\">Loading backup history...</div>";
@@ -2926,7 +3095,7 @@ function restoreSpecificBackup(docId){
     var data=doc.data();
     if(!data||!data.D){toast("Backup data invalid","err");return;}
     D=data.D;
-    if(!D.routes)D.routes=[];if(!D.complaints)D.complaints=[];if(!D.offers)D.offers=[];
+    if(!D.routes)D.routes=[];if(!D.complaints)D.complaints=[];if(!D.offers)D.offers=[];if(!D.auditLog)D.auditLog=[];
     if(data.USERS&&data.USERS.length)USERS=data.USERS;
     nOId=data.nOId||nOId;nIId=data.nIId||nIId;nCId=data.nCId||nCId;
     FB_SETUP_DONE=true;
