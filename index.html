@@ -181,9 +181,9 @@ var FB_SETUP_DONE=false;
 
 var R={
   director:{label:"Director",c:"#1a1560",bg:"#e2d9f3",p:{dashboard:1,customers:1,orders:1,delivery:1,stock:1,invoices:1,debts:1,complaints:1,offers:1,reports:1,excel:1,users:1,vRev:1,vProfit:1,vCost:1,vInv:1,vDebt:1,aCust:1,eCust:1,dCust:1,aOrd:1,eOrd:1,dOrd:1,aSt:1,eSt:1,dSt:1,aOff:1,eOff:1,dOff:1,aInv:1,eInv:1,mPaid:1,ePrice:1,exp:1,rest:1,mUsers:1,aCmp:1,vPhone:1}},
-  manager:{label:"Manager",c:"#185FA5",bg:"#d1ecf1",p:{dashboard:1,customers:1,orders:1,delivery:1,stock:1,invoices:1,debts:1,complaints:1,offers:1,reports:1,excel:1,users:0,vRev:1,vProfit:0,vCost:0,vInv:1,vDebt:1,aCust:1,eCust:1,dCust:0,aOrd:1,eOrd:1,dOrd:0,aSt:1,eSt:1,dSt:0,aOff:1,eOff:1,dOff:0,aInv:1,eInv:1,mPaid:1,ePrice:0,exp:1,rest:0,mUsers:0,aCmp:1,vPhone:1}},
-  staff:{label:"Staff",c:"#856404",bg:"#fff3cd",p:{dashboard:1,customers:1,orders:1,delivery:1,stock:1,invoices:0,debts:0,complaints:1,offers:0,reports:0,excel:1,users:0,vRev:0,vProfit:0,vCost:0,vInv:0,vDebt:0,aCust:0,eCust:0,dCust:0,aOrd:1,eOrd:0,dOrd:0,aSt:0,eSt:0,dSt:0,aOff:0,eOff:0,dOff:0,aInv:0,eInv:0,mPaid:0,ePrice:0,exp:1,rest:0,mUsers:0,aCmp:1,vPhone:0}},
-  driver:{label:"Driver",c:"#534AB7",bg:"#ede9f8",p:{dashboard:0,customers:0,orders:0,delivery:1,stock:0,invoices:0,debts:0,complaints:1,offers:0,reports:0,excel:1,users:0,vRev:0,vProfit:0,vCost:0,vInv:0,vDebt:0,aCust:0,eCust:0,dCust:0,aOrd:0,eOrd:0,dOrd:0,aSt:0,eSt:0,dSt:0,aOff:0,eOff:0,dOff:0,aInv:0,eInv:0,mPaid:0,ePrice:0,exp:1,rest:0,mUsers:0,aCmp:1,vPhone:0}}
+  manager:{label:"Manager",c:"#185FA5",bg:"#d1ecf1",p:{dashboard:1,customers:1,orders:1,delivery:1,stock:1,invoices:1,debts:1,complaints:1,offers:1,reports:1,excel:0,users:0,vRev:1,vProfit:0,vCost:0,vInv:1,vDebt:1,aCust:1,eCust:1,dCust:0,aOrd:1,eOrd:1,dOrd:0,aSt:1,eSt:1,dSt:0,aOff:1,eOff:1,dOff:0,aInv:1,eInv:1,mPaid:1,ePrice:0,exp:0,rest:0,mUsers:0,aCmp:1,vPhone:1}},
+  staff:{label:"Staff",c:"#856404",bg:"#fff3cd",p:{dashboard:1,customers:1,orders:1,delivery:1,stock:1,invoices:0,debts:0,complaints:1,offers:0,reports:0,excel:0,users:0,vRev:0,vProfit:0,vCost:0,vInv:0,vDebt:0,aCust:0,eCust:0,dCust:0,aOrd:1,eOrd:0,dOrd:0,aSt:0,eSt:0,dSt:0,aOff:0,eOff:0,dOff:0,aInv:0,eInv:0,mPaid:0,ePrice:0,exp:0,rest:0,mUsers:0,aCmp:1,vPhone:0}},
+  driver:{label:"Driver",c:"#534AB7",bg:"#ede9f8",p:{dashboard:0,customers:0,orders:0,delivery:1,stock:0,invoices:0,debts:0,complaints:1,offers:0,reports:0,excel:0,users:0,vRev:0,vProfit:0,vCost:0,vInv:0,vDebt:0,aCust:0,eCust:0,dCust:0,aOrd:0,eOrd:0,dOrd:0,aSt:0,eSt:0,dSt:0,aOff:0,eOff:0,dOff:0,aInv:0,eInv:0,mPaid:0,ePrice:0,exp:0,rest:0,mUsers:0,aCmp:1,vPhone:0}}
 };
 var USERS=[{id:1,name:"Director",role:"director",pin:"1234",ini:"DR",col:"#1a1560"}];
 var D={customers:[],stock:[],orders:[],offers:[],invoices:[],routes:[],complaints:[]};
@@ -2626,6 +2626,15 @@ function rReports(){
 
 function rExcel(){
   var pg=el("pg-excel");if(!pg)return;
+  if(!can("exp")){
+    pg.innerHTML="<div class=\"ph\"><h1>Data</h1></div>"+
+      "<div class=\"card\" style=\"text-align:center;padding:40px\">"+
+        "<i class=\"ti ti-lock\" style=\"font-size:40px;color:#dc3545;display:block;margin-bottom:14px\"></i>"+
+        "<div style=\"font-weight:700;font-size:16px;color:#dc3545;margin-bottom:8px\">Access Restricted</div>"+
+        "<div style=\"font-size:13px;color:var(--tx2)\">Data backup and export is available to Directors only.<br>Contact your Director for a copy of business data.</div>"+
+      "</div>";
+    return;
+  }
   pg.innerHTML=
     "<div class=\"ph\"><h1>Data Management</h1><p>Live cloud sync &middot; Automatic backups &middot; Excel export</p></div>"+
     "<div class=\"card\" style=\"border:2px solid #27ae60;background:linear-gradient(135deg,#f0fdf4,#fff)\">"+
@@ -2864,6 +2873,7 @@ function savePin(){
 function delU(id){if(!can("mUsers"))return;if(!confirm("Remove this team member?"))return;USERS=USERS.filter(function(u){return u.id!==id;});rUsers();dirty();}
 
 function buildBackupWB(){
+  if(!can("exp"))return null;
   var wb=XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(D.customers.map(function(c){return{ID:c.id,Name:c.name,Phone:c.phone,Phone2:c.phone2||"",IDNo:c.idno||"",Estate:c.estate||"",Court:c.court||"",HouseNo:c.house||"",HouseType:c.htype||"",Road:c.road||"",Zone:c.zone||"",Type:c.ctype,CreditLimit:c.credit||0,Notes:c.notes||"",Created:c.created||""};})),"Customers");
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(D.orders.map(function(o){var c=D.customers.find(function(x){return x.id===o.cId;});return{ID:o.id,CustomerID:o.cId,CustomerName:c?c.name:"",Product:o.prod,Qty:o.qty,UnitPrice:o.price,Total:o.qty*o.price,Date:o.date,Status:o.status,Payment:o.paid,AmtPaid:o.amtPaid||0,Driver:o.driver||"",DeliveryAddr:o.deliver||"",BottleBefore:o.bottle_before||"",BottleAfter:o.bottle_after||"",Notes:o.notes||""};})),"Orders");
@@ -2876,6 +2886,7 @@ function buildBackupWB(){
   return wb;
 }
 function saveXL(){
+  if(!can("exp")){toast("Only Directors can download backups","err");return;}
   var wb=buildBackupWB();
   var ts=new Date().toISOString().replace(/[:.]/g,"-").slice(0,16);
   XLSX.writeFile(wb,"NewDawn_Backup_"+ts+".xlsx");
@@ -2925,7 +2936,7 @@ function restoreSpecificBackup(docId){
   }).catch(function(e){toast("Restore failed: "+e.message,"err");});
 }
 function checkBackupReminder(){
-  if(!CU||CU.role!=="director")return;
+  if(!CU||CU.role!=="director"||!can("exp"))return;
   var last=localStorage.getItem("nd_last_backup")||"";
   var today=tday();
   if(last===today)return; // already backed up today
@@ -3134,6 +3145,7 @@ function xSheet(name){
   toast(name+" exported");
 }
 function restoreXL(input){
+  if(!can("rest")){toast("Only Directors can restore data","err");return;}
   var file=input.files[0];if(!file)return;
   var reader=new FileReader();
   reader.onload=function(e){
@@ -3220,6 +3232,7 @@ function syncPaymentStatuses(){
 }
 
 function mergeXL(input){
+  if(!can("rest")){toast("Only Directors can merge data","err");return;}
   var file=input.files[0];if(!file)return;
   var reader=new FileReader();
   reader.onload=function(e){
