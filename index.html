@@ -626,57 +626,110 @@ function skipCloud(){
 }
 
 function makeLogo(sz){
-  var cx=sz/2,cy=sz/2,Rv=sz*0.44,sun=sz*0.255,rays="",pi=Math.PI;
-  for(var i=0;i<16;i++){
-    var a=(i*22.5-90)*pi/180,r1=sun+sz*0.07,r2=sun+sz*0.21,thick=i%2===0;
-    rays+="<line x1=\""+(cx+Math.cos(a)*r1).toFixed(1)+"\" y1=\""+(cy+Math.sin(a)*r1).toFixed(1)+"\" x2=\""+(cx+Math.cos(a)*r2).toFixed(1)+"\" y2=\""+(cy+Math.sin(a)*r2).toFixed(1)+"\" stroke=\"#f0d070\" stroke-width=\""+(thick?2.5:1.2)+"\" stroke-linecap=\"round\" opacity=\""+(thick?0.7:0.4)+"\"/>";
-  }
-  var id="g"+sz;
-  var fs1=Math.round(sz*0.148),fs2=Math.round(sz*0.27),fs3=Math.round(sz*0.062),fs4=Math.round(sz*0.053);
-  return "<svg width=\""+sz+"\" height=\""+sz+"\" viewBox=\"0 0 "+sz+" "+sz+"\" xmlns=\"http://www.w3.org/2000/svg\">"+
-    "<defs>"+
-    "<linearGradient id=\"bg"+id+"\" x1=\"0%\" y1=\"0%\" x2=\"60%\" y2=\"100%\"><stop offset=\"0%\" stop-color=\"#2a2090\"/><stop offset=\"55%\" stop-color=\"#1a1560\"/><stop offset=\"100%\" stop-color=\"#0f0f3d\"/></linearGradient>"+
-    "<linearGradient id=\"sn"+id+"\" x1=\"0%\" y1=\"0%\" x2=\"0%\" y2=\"100%\"><stop offset=\"0%\" stop-color=\"#f5e070\"/><stop offset=\"50%\" stop-color=\"#c8a951\"/><stop offset=\"100%\" stop-color=\"#a07828\"/></linearGradient>"+
-    "<linearGradient id=\"gl"+id+"\" x1=\"0%\" y1=\"0%\" x2=\"0%\" y2=\"100%\"><stop offset=\"0%\" stop-color=\"#f0d070\"/><stop offset=\"100%\" stop-color=\"#a07828\"/></linearGradient>"+
-    "<clipPath id=\"cp"+id+"\"><circle cx=\""+cx+"\" cy=\""+cy+"\" r=\""+Rv+"\"/></clipPath>"+
-    "</defs>"+
-    "<circle cx=\""+cx+"\" cy=\""+(cy+sz*0.014).toFixed(1)+"\" r=\""+Rv+"\" fill=\"rgba(0,0,0,0.2)\"/>"+
-    "<circle cx=\""+cx+"\" cy=\""+cy+"\" r=\""+Rv+"\" fill=\"url(#bg"+id+")\"/>"+
-    "<circle cx=\""+cx+"\" cy=\""+cy+"\" r=\""+Rv+"\" fill=\"none\" stroke=\"url(#gl"+id+")\" stroke-width=\""+(sz*0.018).toFixed(1)+"\"/>"+
-    "<circle cx=\""+cx+"\" cy=\""+cy+"\" r=\""+(Rv-sz*0.012).toFixed(1)+"\" fill=\"none\" stroke=\"rgba(255,255,255,0.12)\" stroke-width=\""+(sz*0.005).toFixed(1)+"\"/>"+
-    "<g clip-path=\"url(#cp"+id+")\">"+rays+"</g>"+
-    "<rect x=\""+(sz*0.08).toFixed(1)+"\" y=\""+(cy+sz*0.04).toFixed(1)+"\" width=\""+(sz*0.84).toFixed(1)+"\" height=\""+(sz*0.012).toFixed(1)+"\" fill=\"rgba(200,169,81,0.15)\" clip-path=\"url(#cp"+id+")\"/>"+
-    "<circle cx=\""+cx+"\" cy=\""+(cy+sz*0.34).toFixed(1)+"\" r=\""+(sun*1.68).toFixed(1)+"\" fill=\"rgba(20,16,80,0.28)\" clip-path=\"url(#cp"+id+")\"/>"+
-    "<circle cx=\""+cx+"\" cy=\""+(cy+sz*0.34).toFixed(1)+"\" r=\""+sun.toFixed(1)+"\" fill=\"url(#sn"+id+")\"/>"+
-    "<circle cx=\""+cx+"\" cy=\""+(cy+sz*0.34).toFixed(1)+"\" r=\""+sun.toFixed(1)+"\" fill=\"none\" stroke=\"#f0d070\" stroke-width=\""+(sz*0.011).toFixed(1)+"\"/>"+
-    "<text x=\""+cx+"\" y=\""+(cy-sz*0.065).toFixed(1)+"\" text-anchor=\"middle\" font-family=\"Georgia,serif\" font-style=\"italic\" font-weight=\"700\" font-size=\""+fs1+"\" fill=\"#fff\" letter-spacing=\"2\">New</text>"+
-    "<text x=\""+cx+"\" y=\""+(cy+sz*0.13).toFixed(1)+"\" text-anchor=\"middle\" font-family=\"Arial Black,Impact,sans-serif\" font-weight=\"900\" font-size=\""+fs2+"\" fill=\"#1a1560\" letter-spacing=\"3\">DAWN</text>"+
-    "<line x1=\""+(cx-sun*0.7).toFixed(1)+"\" y1=\""+(cy+sz*0.175).toFixed(1)+"\" x2=\""+(cx+sun*0.7).toFixed(1)+"\" y2=\""+(cy+sz*0.175).toFixed(1)+"\" stroke=\"#c8a951\" stroke-width=\""+(sz*0.009).toFixed(1)+"\"/>"+
-    "<text x=\""+cx+"\" y=\""+(cy+sz*0.255).toFixed(1)+"\" text-anchor=\"middle\" font-family=\"Georgia,serif\" font-style=\"italic\" font-size=\""+fs3+"\" fill=\"rgba(200,192,240,0.9)\">Water is Life</text>"+
-    "<text x=\""+cx+"\" y=\""+(cy+sz*0.315).toFixed(1)+"\" text-anchor=\"middle\" font-family=\"Georgia,serif\" font-style=\"italic\" font-size=\""+fs4+"\" fill=\"rgba(200,192,240,0.75)\">Take water All the time</text>"+
-    "</svg>";
+  /* Enterprise sunrise emblem — mathematically fitted to avoid circle edge squeezing */
+  var id="nd"+sz;
+  var R=sz*0.455;
+  var cx=sz/2,cy=sz/2;
+  var hy=cy+sz*0.06;   // horizon line — higher up = wider chord for DAWN
+  var dTop=cy-sz*0.35,dBot=cy-sz*0.02; // drop sits in upper half
+  var dW=sz*0.16;
+  var fsNew=Math.round(sz*0.088);
+  var fsDawn=Math.round(sz*0.17); // sized to fit chord width at DAWN y
+  var newY=hy+sz*0.12;            // NEW baseline
+  var dawnY=hy+sz*0.26;           // DAWN baseline — in the wider chord zone
+  var s='<svg width="'+sz+'" height="'+sz+'" viewBox="0 0 '+sz+' '+sz+'" xmlns="http://www.w3.org/2000/svg">';
+  s+='<defs>';
+  s+='<radialGradient id="rg'+id+'" cx="38%" cy="32%" r="68%"><stop offset="0%" stop-color="#312aa0"/><stop offset="50%" stop-color="#1a1560"/><stop offset="100%" stop-color="#080620"/></radialGradient>';
+  s+='<linearGradient id="gg'+id+'" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#fff4b0"/><stop offset="45%" stop-color="#d4a840"/><stop offset="100%" stop-color="#8a6018"/></linearGradient>';
+  s+='<linearGradient id="sr'+id+'" x1="0%" y1="100%" x2="0%" y2="0%"><stop offset="0%" stop-color="#c85000" stop-opacity="0"/><stop offset="35%" stop-color="#ff7020" stop-opacity="0.38"/><stop offset="75%" stop-color="#ffa040" stop-opacity="0.26"/><stop offset="100%" stop-color="#ffd060" stop-opacity="0.16"/></linearGradient>';
+  s+='<linearGradient id="wt'+id+'" x1="15%" y1="0%" x2="85%" y2="100%"><stop offset="0%" stop-color="#c8eeff"/><stop offset="45%" stop-color="#50b8f0"/><stop offset="100%" stop-color="#1060b8"/></linearGradient>';
+  s+='<clipPath id="cp'+id+'"><circle cx="'+cx+'" cy="'+cy+'" r="'+R.toFixed(1)+'"/></clipPath>';
+  s+='</defs>';
+  s+='<circle cx="'+(cx+sz*0.013)+'" cy="'+(cy+sz*0.018)+'" r="'+R.toFixed(1)+'" fill="rgba(0,0,0,0.28)"/>';
+  s+='<circle cx="'+cx+'" cy="'+cy+'" r="'+R.toFixed(1)+'" fill="url(#rg'+id+')"/>';
+  s+='<circle cx="'+cx+'" cy="'+cy+'" r="'+R.toFixed(1)+'" fill="none" stroke="url(#gg'+id+')" stroke-width="'+(sz*0.022).toFixed(1)+'"/>';
+  s+='<circle cx="'+cx+'" cy="'+cy+'" r="'+(R-sz*0.03).toFixed(1)+'" fill="none" stroke="rgba(255,255,255,0.07)" stroke-width="0.7"/>';
+  // Clock ticks
+  s+='<g clip-path="url(#cp'+id+')" stroke="#c8a951" stroke-linecap="round">';
+  [[0,2.5,0.8],[90,2.5,0.8],[180,2.5,0.8],[270,2.5,0.8],[45,1.2,0.38],[135,1.2,0.38],[225,1.2,0.38],[315,1.2,0.38],[30,1,0.28],[60,1,0.28],[120,1,0.28],[150,1,0.28],[210,1,0.28],[240,1,0.28],[300,1,0.28],[330,1,0.28]].forEach(function(t){
+    var a=t[0]*Math.PI/180,r1=R-sz*0.025,r2=r1+(t[1]>1.5?sz*0.07:sz*0.04);
+    s+='<line x1="'+(cx+Math.cos(a)*r1).toFixed(1)+'" y1="'+(cy+Math.sin(a)*r1).toFixed(1)+'" x2="'+(cx+Math.cos(a)*r2).toFixed(1)+'" y2="'+(cy+Math.sin(a)*r2).toFixed(1)+'" stroke-width="'+t[1]+'" opacity="'+t[2]+'"/>';
+  });
+  s+='</g>';
+  // Sunrise rays
+  s+='<g clip-path="url(#cp'+id+')">';
+  s+='<ellipse cx="'+cx+'" cy="'+hy+'" rx="'+(sz*0.42).toFixed(1)+'" ry="'+(sz*0.08).toFixed(1)+'" fill="rgba(200,80,0,0.06)"/>';
+  [[cx,cy-R+sz*0.02,2],[cx-sz*0.17,cy-R+sz*0.05,1.5],[cx+sz*0.17,cy-R+sz*0.05,1.5],[cx-sz*0.32,cy-R+sz*0.15,1.2],[cx+sz*0.32,cy-R+sz*0.15,1.2],[cx-sz*0.43,cy-R+sz*0.32,0.9],[cx+sz*0.43,cy-R+sz*0.32,0.9],[cx-sz*0.46,cy,0.7],[cx+sz*0.46,cy,0.7]].forEach(function(p){
+    s+='<line x1="'+cx+'" y1="'+hy.toFixed(1)+'" x2="'+p[0].toFixed(1)+'" y2="'+p[1].toFixed(1)+'" stroke="url(#sr'+id+')" stroke-width="'+p[2]+'"/>';
+  });
+  s+='</g>';
+  // Water drop
+  var dp='M'+cx+','+dTop.toFixed(1)+' C'+(cx+dW)+','+(cy-sz*0.15).toFixed(1)+' '+(cx+dW)+','+(cy-sz*0.05).toFixed(1)+' '+cx+','+dBot.toFixed(1)+' C'+(cx-dW)+','+(cy-sz*0.05).toFixed(1)+' '+(cx-dW)+','+(cy-sz*0.15).toFixed(1)+' '+cx+','+dTop.toFixed(1)+' Z';
+  s+='<path d="'+dp+'" fill="url(#wt'+id+')"/>';
+  s+='<ellipse cx="'+(cx-sz*0.04).toFixed(1)+'" cy="'+(cy-sz*0.17).toFixed(1)+'" rx="'+(sz*0.035).toFixed(1)+'" ry="'+(sz*0.062).toFixed(1)+'" fill="rgba(255,255,255,0.3)" transform="rotate(-16,'+(cx-sz*0.04).toFixed(1)+','+(cy-sz*0.17).toFixed(1)+')"/>';
+  s+='<path d="'+dp+'" fill="none" stroke="rgba(180,230,255,0.22)" stroke-width="0.8"/>';
+  // Horizon line
+  s+='<line x1="'+(cx-R*0.88).toFixed(1)+'" y1="'+hy.toFixed(1)+'" x2="'+(cx+R*0.88).toFixed(1)+'" y2="'+hy.toFixed(1)+'" stroke="#c8a951" stroke-width="'+(sz*0.009).toFixed(1)+'" clip-path="url(#cp'+id+')" opacity="0.88"/>';
+  s+='<line x1="'+(cx-R*0.88).toFixed(1)+'" y1="'+(hy+sz*0.012).toFixed(1)+'" x2="'+(cx+R*0.88).toFixed(1)+'" y2="'+(hy+sz*0.012).toFixed(1)+'" stroke="#c8a951" stroke-width="0.5" clip-path="url(#cp'+id+')" opacity="0.28"/>';
+  // Sun orb — oval sunrise sitting on horizon line, sunset warmth
+  s+='<defs><radialGradient id="sun'+id+'" cx="50%" cy="50%" r="50%">'+
+    '<stop offset="0%" stop-color="#fff5a0" stop-opacity="1"/>'+
+    '<stop offset="25%" stop-color="#ffcc30" stop-opacity="0.96"/>'+
+    '<stop offset="55%" stop-color="#ff8800" stop-opacity="0.82"/>'+
+    '<stop offset="100%" stop-color="#cc4400" stop-opacity="0"/>'+
+    '</radialGradient></defs>';
+  // Outer warm glow — wide and low, like atmosphere on horizon
+  s+='<ellipse cx="'+cx+'" cy="'+hy.toFixed(1)+'" rx="'+(sz*0.18).toFixed(1)+'" ry="'+(sz*0.07).toFixed(1)+'" fill="rgba(255,100,20,0.13)" clip-path="url(#cp'+id+')"/>';
+  s+='<ellipse cx="'+cx+'" cy="'+hy.toFixed(1)+'" rx="'+(sz*0.13).toFixed(1)+'" ry="'+(sz*0.052).toFixed(1)+'" fill="rgba(255,140,30,0.18)" clip-path="url(#cp'+id+')"/>';
+  // Sun oval — wider than tall like a sunrise on horizon
+  s+='<ellipse cx="'+cx+'" cy="'+hy.toFixed(1)+'" rx="'+(sz*0.075).toFixed(1)+'" ry="'+(sz*0.045).toFixed(1)+'" fill="url(#sun'+id+')" clip-path="url(#cp'+id+')"/>';
+  // Bright core — small oval
+  s+='<ellipse cx="'+cx+'" cy="'+hy.toFixed(1)+'" rx="'+(sz*0.028).toFixed(1)+'" ry="'+(sz*0.016).toFixed(1)+'" fill="rgba(255,255,220,0.9)" clip-path="url(#cp'+id+')"/>';
+  // NEW italic gold — sits just below horizon in the centre
+  s+='<text x="'+cx+'" y="'+newY.toFixed(1)+'" text-anchor="middle" font-family="Georgia,serif" font-style="italic" font-weight="700" font-size="'+fsNew+'" fill="#c8a951" letter-spacing="'+(sz*0.038).toFixed(0)+'">NEW</text>';
+  // DAWN bold white — positioned in wider chord zone, letter-spacing=2 to prevent squeezing
+  s+='<text x="'+cx+'" y="'+dawnY.toFixed(1)+'" text-anchor="middle" font-family="Arial Black,Impact,sans-serif" font-weight="900" font-size="'+fsDawn+'" fill="#ffffff" letter-spacing="2">DAWN</text>';
+  s+='</svg>';
+  return s;
+}
+function makeLogoHTML(sz){
+  /* Full logo with HTML text below disc — call this for login/connect screens */
+  var fsSub=Math.max(9,Math.round(sz*0.072));
+  var fsTag=Math.max(8,Math.round(sz*0.056));
+  return '<div style="display:flex;flex-direction:column;align-items:center;gap:0">'+
+    makeLogo(sz)+
+    '<div style="margin-top:8px;font-family:Georgia,serif;font-size:'+fsSub+'px;color:#c8a951;letter-spacing:2px;text-align:center;opacity:0.92">PURE DRINKING WATER</div>'+
+    '<div style="margin-top:3px;font-family:Georgia,serif;font-style:italic;font-size:'+fsTag+'px;color:rgba(200,169,81,0.52);letter-spacing:1px;text-align:center">Water is Life \xb7 Take water All the time</div>'+
+    '</div>';
 }
 function makeLogoMini(){
-  var rays="",pi=Math.PI;
-  [0,30,60,90,120,150,180,210,240,270,300,330].forEach(function(deg){
-    var a=deg*pi/180;
-    rays+="<line x1=\""+(19+Math.cos(a)*9).toFixed(1)+"\" y1=\""+(19+Math.sin(a)*9).toFixed(1)+"\" x2=\""+(19+Math.cos(a)*15).toFixed(1)+"\" y2=\""+(19+Math.sin(a)*15).toFixed(1)+"\" stroke=\"#f0d070\" stroke-width=\"1.2\" stroke-linecap=\"round\" opacity=\".55\"/>";
-  });
-  return "<svg width=\"38\" height=\"38\" viewBox=\"0 0 38 38\" xmlns=\"http://www.w3.org/2000/svg\">"+
-    "<defs><linearGradient id=\"mibg\" x1=\"0%\" y1=\"0%\" x2=\"0%\" y2=\"100%\"><stop offset=\"0%\" stop-color=\"#2a2090\"/><stop offset=\"100%\" stop-color=\"#0f0f3d\"/></linearGradient>"+
-    "<linearGradient id=\"misn\" x1=\"0%\" y1=\"0%\" x2=\"0%\" y2=\"100%\"><stop offset=\"0%\" stop-color=\"#f5e070\"/><stop offset=\"100%\" stop-color=\"#a07828\"/></linearGradient></defs>"+
-    "<circle cx=\"19\" cy=\"19\" r=\"18\" fill=\"url(#mibg)\"/>"+
-    "<circle cx=\"19\" cy=\"19\" r=\"18\" fill=\"none\" stroke=\"#c8a951\" stroke-width=\"1.5\"/>"+
-    rays+
-    "<circle cx=\"19\" cy=\"23\" r=\"7\" fill=\"url(#misn)\"/>"+
-    "<text x=\"19\" y=\"13.5\" text-anchor=\"middle\" font-family=\"Georgia,serif\" font-style=\"italic\" font-weight=\"700\" font-size=\"7\" fill=\"#fff\">New</text>"+
-    "<text x=\"19\" y=\"26.5\" text-anchor=\"middle\" font-family=\"Arial Black,sans-serif\" font-weight=\"900\" font-size=\"8\" fill=\"#1a1560\" letter-spacing=\"1\">DWN</text>"+
-    "</svg>";
+  /* 38px navbar icon — drop + horizon + DWN only, clean at tiny size */
+  return '<svg width="38" height="38" viewBox="0 0 180 180" xmlns="http://www.w3.org/2000/svg">'+
+    '<defs>'+
+    '<radialGradient id="mibg" cx="38%" cy="32%" r="68%"><stop offset="0%" stop-color="#312aa0"/><stop offset="100%" stop-color="#080620"/></radialGradient>'+
+    '<linearGradient id="misr" x1="0%" y1="100%" x2="0%" y2="0%"><stop offset="0%" stop-color="#c85000" stop-opacity="0"/><stop offset="100%" stop-color="#ffd060" stop-opacity="0.42"/></linearGradient>'+
+    '<linearGradient id="miwt" x1="15%" y1="0%" x2="85%" y2="100%"><stop offset="0%" stop-color="#c8eeff"/><stop offset="100%" stop-color="#1060b8"/></linearGradient>'+
+    '<clipPath id="micp"><circle cx="90" cy="90" r="82"/></clipPath>'+
+    '</defs>'+
+    '<circle cx="90" cy="90" r="82" fill="url(#mibg)"/>'+
+    '<circle cx="90" cy="90" r="82" fill="none" stroke="#c8a951" stroke-width="5"/>'+
+    '<g clip-path="url(#micp)">'+
+      '<line x1="90" y1="108" x2="90"  y2="8"  stroke="url(#misr)" stroke-width="2.5"/>'+
+      '<line x1="90" y1="108" x2="50"  y2="12" stroke="url(#misr)" stroke-width="1.8"/>'+
+      '<line x1="90" y1="108" x2="130" y2="12" stroke="url(#misr)" stroke-width="1.8"/>'+
+      '<line x1="90" y1="108" x2="22"  y2="34" stroke="url(#misr)" stroke-width="1.3"/>'+
+      '<line x1="90" y1="108" x2="158" y2="34" stroke="url(#misr)" stroke-width="1.3"/>'+
+    '</g>'+
+    '<path d="M90,30 C98,43 108,57 108,67 C108,81 100,90 90,90 C80,90 72,81 72,67 C72,57 82,43 90,30 Z" fill="url(#miwt)"/>'+
+    '<ellipse cx="83" cy="51" rx="6" ry="10" fill="rgba(255,255,255,0.3)" transform="rotate(-16,83,51)"/>'+
+    '<line x1="14" y1="108" x2="166" y2="108" stroke="#c8a951" stroke-width="2.5" clip-path="url(#micp)" opacity="0.9"/>'+
+    '<text x="90" y="148" text-anchor="middle" font-family="Arial Black,sans-serif" font-weight="900" font-size="36" fill="#ffffff" letter-spacing="1">DWN</text>'+
+    '</svg>';
 }
 
 function renderConnecting(){
   el("root").innerHTML="<div class=\"lscreen\"><div class=\"lbox\" style=\"text-align:center\">"+
-    "<div style=\"display:flex;justify-content:center;margin-bottom:16px\">"+makeLogo(140)+"</div>"+
+    "<div style=\"display:flex;justify-content:center;margin-bottom:16px\">"+makeLogoHTML(140)+"</div>"+
     "<div style=\"font-size:13px;color:var(--tx2);font-weight:600;margin-bottom:10px\"><i class=\"ti ti-cloud-upload\" style=\"font-size:20px;display:block;margin-bottom:10px;color:var(--gd)\"></i>Connecting to live data...</div>"+
     "<div style=\"font-size:11px;color:var(--tx2);margin-top:6px;line-height:1.8\">"+
       "Auto-continues in 8 seconds &mdash; or<br>"+
@@ -709,7 +762,7 @@ function renderLogin(){
       "<div style=\"margin-top:4px;font-size:9px;color:#aaa\">v"+APP_VERSION+"</div>"+
     "</div>"+
     "</div></div>";
-  el("ll").innerHTML=makeLogo(180);
+  el("ll").innerHTML=makeLogoHTML(180);
   renderUG();
 }
 function renderUG(){
@@ -735,23 +788,79 @@ function selU(id){
   el("perr").textContent="";
   rDots();rPad();
 }
-function backToU(){SU=null;PE="";el("usg").style.display="";el("pinsec").style.display="none";renderUG();}
+function backToU(){SU=null;PE="";el("usg").style.display="";el("pinsec").style.display="none";el("perr").textContent="";renderUG();}
 function rDots(){el("pdots").innerHTML=[0,1,2,3].map(function(i){return "<div class=\"pdot"+(i<PE.length?" on":"")+"\">"+"</div>";}).join("");}
 function rPad(){
   el("ppad").innerHTML=["1","2","3","4","5","6","7","8","9","","0","&#x232B;"].map(function(k){
     return k===""?"<div></div>":"<button class=\"pkey\" onclick=\"pk(this.textContent.trim())\">" +k+"</button>";
   }).join("");
 }
+/* ── PIN LOCKOUT — rate limiting, no system effect ── */
+var PIN_ATTEMPTS={};   // {userId: {count, lockedUntil}}
+var PIN_MAX=5;         // attempts before lockout
+var PIN_LOCKOUT=30;    // seconds locked out
+var PIN_RESET=300;     // seconds before attempt counter resets (5 min)
+function pinAttemptsKey(){return SU?'pin_atm_'+SU.id:null;}
+function getPinState(){
+  var key=pinAttemptsKey();if(!key)return{count:0,lockedUntil:0,lastAttempt:0};
+  try{var raw=sessionStorage.getItem(key);return raw?JSON.parse(raw):{count:0,lockedUntil:0,lastAttempt:0};}catch(e){return{count:0,lockedUntil:0,lastAttempt:0};}
+}
+function setPinState(s){
+  var key=pinAttemptsKey();if(!key)return;
+  try{sessionStorage.setItem(key,JSON.stringify(s));}catch(e){}
+}
+function clearPinState(){
+  var key=pinAttemptsKey();if(!key)return;
+  try{sessionStorage.removeItem(key);}catch(e){}
+}
+function pinLockRemaining(){
+  var s=getPinState();
+  if(!s.lockedUntil)return 0;
+  var rem=Math.ceil((s.lockedUntil-Date.now())/1000);
+  return rem>0?rem:0;
+}
 function pk(k){
   if(k==="⌫"||k.charCodeAt(0)===9003){PE=PE.slice(0,-1);rDots();return;}
   if(PE.length>=4)return;
+  // Check lockout
+  var rem=pinLockRemaining();
+  if(rem>0){
+    el("perr").textContent="Too many attempts. Wait "+rem+"s.";
+    PE="";rDots();return;
+  }
   PE+=k;rDots();
   if(PE.length===4){
     if(PE===SU.pin){
+      // Correct — clear lockout state and proceed
+      clearPinState();
+      el("perr").textContent="";
       CU=SU;
       checkAutoSaveRecovery();
+    }else{
+      // Wrong PIN — increment counter
+      var s=getPinState();
+      var now=Date.now();
+      // Reset counter if last attempt was more than PIN_RESET seconds ago
+      if(s.lastAttempt&&now-s.lastAttempt>PIN_RESET*1000){s.count=0;s.lockedUntil=0;}
+      s.count=(s.count||0)+1;
+      s.lastAttempt=now;
+      if(s.count>=PIN_MAX){
+        s.lockedUntil=now+PIN_LOCKOUT*1000;
+        setPinState(s);
+        el("perr").textContent="Too many wrong attempts. Locked for "+PIN_LOCKOUT+"s.";
+        // Start countdown display
+        var countdown=setInterval(function(){
+          var r=pinLockRemaining();
+          if(r>0){el("perr").textContent="Too many wrong attempts. Locked for "+r+"s.";}
+          else{clearInterval(countdown);el("perr").textContent="Enter your PIN.";}
+        },1000);
+      }else{
+        setPinState(s);
+        var left=PIN_MAX-s.count;
+        el("perr").textContent="Wrong PIN. "+left+" attempt"+(left===1?"":"s")+" remaining.";
+      }
+      PE="";setTimeout(rDots,350);
     }
-    else{el("perr").textContent="Wrong PIN. Try again.";PE="";setTimeout(rDots,350);}
   }
 }
 function checkAutoSaveRecovery(){
