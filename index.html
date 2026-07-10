@@ -1449,6 +1449,7 @@ function buildMods(){
       "<div class=\"fg\"><label class=\"flabel\">Status</label><select class=\"fi\" id=\"cmp-s\"><option>Open</option><option>In progress</option><option>Resolved</option></select></div>"+
       "<div class=\"fg fspan\"><label class=\"flabel\">Details *</label><textarea class=\"fi\" id=\"cmp-det\" rows=\"3\" style=\"resize:none\"></textarea></div>"+
       "<div class=\"fg fspan\"><label class=\"flabel\">Action taken</label><textarea class=\"fi\" id=\"cmp-act\" rows=\"2\" style=\"resize:none\"></textarea></div>"+
+      "<input type=\"hidden\" id=\"cmp-id\" value=\"\">"+
     "</div></div>"+
     "<div class=\"mft\"><button class=\"btn\" onclick=\"cm('m-cmp')\">Cancel</button><button class=\"btn btn-gold\" onclick=\"saveCmp()\"><i class=\"ti ti-check\"></i> Log</button></div>"+
   "</div></div>";
@@ -2122,6 +2123,8 @@ function saveOrd(){
 
   var qty=parseInt(el("oq").value)||1;
   if(qty<1){toast("Quantity must be at least 1","err");return;}
+  var delivDate=el("od")?el("od").value:"";
+  if(!delivDate){toast("Please set a delivery date","err");if(el("od"))el("od").focus();return;}
   var editId=el("o-edit-id").value;
 
   // ── DEBT ALERT (new orders only, not edits) ──
@@ -2508,7 +2511,16 @@ function editSt(id){
 }
 function prepRS(){var rp=el("rp");if(rp)rp.innerHTML=D.stock.map(function(x){return "<option value=\""+x.id+"\">"+x.name+" ("+x.qty+" in stock)</option>";}).join("");om("m-rs");}
 function doRS(){var id=parseInt(el("rp").value);var q=parseInt(el("rq").value)||0;if(q<=0){toast("Enter quantity to add","err");return;}var p=D.stock.find(function(s){return s.id===id;});if(p){p.qty+=q;toast(p.name+" restocked +"+q+" — now "+p.qty+" in stock");}el("rq").value="";cm("m-rs");rStock(undefined,STK_PAGE);if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();dirty();}
-function delS(id){if(!can("dSt"))return;if(!confirm("Remove?"))return;D.stock=D.stock.filter(function(s){return s.id!==id;});rStock();dirty();}
+function delS(id){
+  if(!can("dSt"))return;
+  var s=D.stock.find(function(x){return x.id===id;});if(!s)return;
+  var activeOrds=D.orders.filter(function(o){return o.prod===s.name&&o.status!=="Delivered"&&o.status!=="Cancelled";});
+  var msg="Remove "+s.name+"?";
+  if(activeOrds.length)msg+="\n\n⚠ "+activeOrds.length+" active order(s) reference this product.";
+  msg+="\n\nThis cannot be undone.";
+  if(!confirm(msg))return;
+  D.stock=D.stock.filter(function(x){return x.id!==id;});rStock();dirty();toast(s.name+" removed from stock");
+}
 
 function rInvs(q,pg){
   if(q!==undefined)INV_Q=q;
@@ -2584,6 +2596,8 @@ function editInv(id){
 function saveInv(){
   if(!can("aInv")&&!can("eInv"))return;
   var cId=parseInt(el("ivc").value);var a=parseFloat(el("iva").value)||0;var p=parseFloat(el("ivp").value)||0;
+  if(!a||a<=0){toast("Amount must be greater than 0","err");return;}
+  if(p>a){toast("Amount paid cannot exceed invoice total","err");return;}
   var editId=el("iv-edit-id").value;
   if(editId){
     var i=D.invoices.find(function(x){return String(x.id)===String(editId);});
@@ -2715,7 +2729,20 @@ function filterCmps(f){
   var tb=el("cmpbody");if(tb)tb.innerHTML=cmpRows(paged.items);
 }
 function prepCmp(){var s=el("cmp-c");if(s)s.innerHTML=D.customers.map(function(c){return "<option value=\""+c.id+"\">"+custName(c.id)+" - "+cAddr(c)+"</option>";}).join("");el("cmp-d").value=tday();om("m-cmp");}
-function saveCmp(){if(!can("aCmp"))return;var det=el("cmp-det").value.trim();if(!det){toast("Details required","err");return;}D.complaints.push({id:nCId++,cId:parseInt(el("cmp-c").value),type:el("cmp-t").value,details:det,action:el("cmp-act").value,status:el("cmp-s").value,date:el("cmp-d").value});el("cmp-det").value="";el("cmp-act").value="";cm("m-cmp");rCmps(undefined,CMP_PAGE);dirty();toast("Complaint logged");}
+function saveCmp(){
+  if(!can("aCmp"))return;
+  var det=el("cmp-det").value.trim();if(!det){toast("Details required","err");return;}
+  var editIdEl=el("cmp-id");var editId=editIdEl?editIdEl.value:"";
+  if(editId){
+    var ex=D.complaints.find(function(x){return x.id===parseInt(editId);});
+    if(ex){
+      ex.cId=parseInt(el("cmp-c").value);ex.type=el("cmp-t").value;
+      ex.details=det;ex.action=el("cmp-act").value;ex.status=el("cmp-s").value;
+      if(el("cmp-c"))el("cmp-c").disabled=false;
+      if(editIdEl)editIdEl.value="";
+      cm("m-cmp");rCmps(undefined,CMP_PAGE);dirty();toast("Complaint updated");return;
+    }
+  }D.complaints.push({id:nCId++,cId:parseInt(el("cmp-c").value),type:el("cmp-t").value,details:det,action:el("cmp-act").value,status:el("cmp-s").value,date:el("cmp-d").value});el("cmp-det").value="";el("cmp-act").value="";cm("m-cmp");rCmps(undefined,CMP_PAGE);dirty();toast("Complaint logged");}
 function editCmp(id){
   if(!can("aCmp"))return;
   var cmp=D.complaints.find(function(x){return x.id===id;});if(!cmp)return;
