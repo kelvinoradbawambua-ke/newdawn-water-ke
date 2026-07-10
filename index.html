@@ -267,7 +267,7 @@ var CUST_Q="",ORD_Q="",INV_Q="",CMP_Q="",STK_Q="";
 var CUST_SORT="recent",ORD_SORT="newest",CUST_TYPE="";
 function ia(v){return can("vInv")?"KSh "+Number(v).toLocaleString():"KSh "+String.fromCharCode(8226,8226,8226,8226);}
 function sb(s){var m={"Delivered":"bg","Pending":"ba","Out for delivery":"bp","Processing":"bb","Cancelled":"br"};var ic={"Delivered":"ti-circle-check","Pending":"ti-clock","Out for delivery":"ti-truck","Processing":"ti-loader","Cancelled":"ti-x"};return "<span class=\"badge "+(m[s]||"ba")+"\"><i class=\"ti "+(ic[s]||"ti-circle")+"\" style=\"font-size:10px;margin-right:2px\"></i>"+s+"</span>";}
-function pb(p){var ic=p==="Paid"?"ti-check":p==="Partial"?"ti-clock":"ti-alert-circle";return "<span class=\"badge "+(p==="Paid"?"bg":p==="Partial"?"ba":"br")+"\"><i class=\"ti "+ic+"\" style=\"font-size:10px;margin-right:2px\"></i>"+p+"</span>";}
+function pb(p){if(p==="Cancelled")return "<span class=\"badge\" style=\"background:#f0f0f0;color:#999;border:1px solid #ddd\"><i class=\"ti ti-x\" style=\"font-size:10px;margin-right:2px\"></i>Cancelled</span>";var ic=p==="Paid"?"ti-check":p==="Partial"?"ti-clock":"ti-alert-circle";return "<span class=\"badge "+(p==="Paid"?"bg":p==="Partial"?"ba":"br")+"\"><i class=\"ti "+ic+"\" style=\"font-size:10px;margin-right:2px\"></i>"+p+"</span>";}
 function btl(v){if(!v||v==="Good")return "<span class=\"badge bg\">Good</span>";if(v==="Damaged")return "<span class=\"badge br\">Damaged</span>";if(v==="Cracked")return "<span class=\"badge ba\">Cracked</span>";return "<span class=\"badge bgr\">"+v+"</span>";}
 function custDebt(id){
   return D.invoices.filter(function(i){
@@ -1532,8 +1532,14 @@ function rDash(){
   var churned=D.customers.filter(function(cu){var lo=D.orders.filter(function(o){return o.cId===cu.id&&o.status==="Delivered";}).sort(function(a,b){return b.date>a.date?1:-1;})[0];return lo&&lo.date<churnDate;}).length;
   if(churned>0)alerts.push({t:"nw",i:"ti-user-exclamation",m:churned+" customer(s) have not ordered in 30+ days",dest:"customers"});
 
-  D.stock.filter(function(s){return s.qty<=s.min;}).forEach(function(s){alerts.push({t:"nw",i:"ti-alert-triangle",m:"Low stock: <strong>"+s.name+"</strong> &mdash; "+s.qty+" left (min "+s.min+")",dest:"stock"});});
-  if(can("vDebt")){var topDebts=[].concat(debts).sort(function(a,b){return custDebt(b.id)-custDebt(a.id);});topDebts.slice(0,3).forEach(function(c){alerts.push({t:"nr",i:"ti-alert-circle",m:"Debt: <strong>"+(can("vPhone")?c.name:maskName(c.name))+"</strong> &mdash; KSh "+custDebt(c.id).toLocaleString(),dest:"debts"});});}
+  var lowStock=D.stock.filter(function(s){return s.qty<=s.min;});
+  lowStock.slice(0,3).forEach(function(s){alerts.push({t:"nw",i:"ti-alert-triangle",m:"Low stock: <strong>"+s.name+"</strong> &mdash; "+s.qty+" left (min "+s.min+")",dest:"stock"});});
+  if(lowStock.length>3)alerts.push({t:"nw",i:"ti-package",m:(lowStock.length-3)+" more product(s) below minimum stock level",dest:"stock"});
+  if(can("vDebt")){
+    var topDebts=[].concat(debts).sort(function(a,b){return custDebt(b.id)-custDebt(a.id);});
+    topDebts.slice(0,3).forEach(function(c){alerts.push({t:"nr",i:"ti-alert-circle",m:"Debt: <strong>"+(can("vPhone")?c.name:maskName(c.name))+"</strong> &mdash; KSh "+custDebt(c.id).toLocaleString(),dest:"debts"});});
+    if(topDebts.length>3)alerts.push({t:"nr",i:"ti-users",m:(topDebts.length-3)+" more customer(s) with outstanding balances — KSh "+(totD-topDebts.slice(0,3).reduce(function(s,cc){return s+custDebt(cc.id);},0)).toLocaleString()+" remaining",dest:"debts"});
+  }
   D.complaints.filter(function(c){return c.status==="Open";}).slice(0,2).forEach(function(c){var cu=D.customers.find(function(x){return x.id===c.cId;});alerts.push({t:"nw",i:"ti-message-report",m:"Complaint: <strong>"+(cu?(can("vPhone")?cu.name:maskName(cu.name)):"?")+"</strong> &mdash; "+c.type,dest:"complaints"});});
   D.orders.filter(function(o){return o.status==="Pending";}).slice(0,3).forEach(function(o){alerts.push({t:"ni",i:"ti-truck",m:"Pending: <strong>#"+o.id+"</strong> &mdash; "+custName(o.cId)+": "+o.qty+"&times; "+o.prod,dest:"orders"});});
   pg.innerHTML=
@@ -2246,9 +2252,8 @@ function saveOrd(){
   else if(amtPaid>0){payStatus="Partial";}
   else{payStatus="Unpaid";}
   D.orders.push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:price,cost:costAtSale,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:"",prodConfirmed:true});
-  if(payStatus!=="Paid"){
-    D.invoices.push({id:nIId++,cId:cId,amount:total,paid:amtPaid,due:el("od").value,notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
-  }
+  // Always create invoice for exact orders — provides full financial trail
+  D.invoices.push({id:nIId++,cId:cId,amount:total,paid:amtPaid,due:el("od").value,notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:el("opay-method")&&el("opay-method").value?el("opay-method").value:"Cash",ref:"Order #"+newOrdId}]:[]});
   auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty);
   cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+newOrdId+" placed");
 }
@@ -3183,9 +3188,19 @@ function printInvoice(invId){
     ".footer{margin-top:40px;padding-top:20px;border-top:1px solid #eee;font-size:11px;color:#999;text-align:center}"+
     "@media print{button{display:none}}</style></head><body>"+
     "<div class='hdr'>"+
+      "<div style='display:flex;align-items:center;gap:14px'>"+
+      "<svg width='52' height='52' viewBox='0 0 52 52' xmlns='http://www.w3.org/2000/svg'>"+
+      "<defs><radialGradient id='bg' cx='50%' cy='60%' r='55%'><stop offset='0%' stop-color='#1e2a6e'/><stop offset='100%' stop-color='#0f0f3d'/></radialGradient></defs>"+
+      "<circle cx='26' cy='26' r='26' fill='url(%23bg)'/>"+
+      "<circle cx='26' cy='26' r='24' fill='none' stroke='%23c8a951' stroke-width='1.5'/>"+
+      "<line x1='26' y1='28' x2='26' y2='14' stroke='%23c8a951' stroke-width='1'/>"+
+      "<line x1='13' y1='28' x2='39' y2='28' stroke='%23c8a951' stroke-width='1.2'/>"+
+      "<ellipse cx='26' cy='26.5' rx='7' ry='4.5' fill='%23c8a951' opacity='0.9'/>"+
+      "<path d='M26 32 Q23 38 26 42 Q29 38 26 32Z' fill='%2363b3ed'/>"+
+      "</svg>"+
       "<div><div class='co'>NEW DAWN PURE DRINKING WATER</div>"+
       "<div class='sub'>Nyayo Estate, Gate D, Court 290</div>"+
-      "<div class='sub'>Tel: 0710805099 / 0733930568</div></div>"+
+      "<div class='sub'>Tel: 0710805099 / 0733930568</div></div></div>"+
       "<div style='text-align:right'><div class='inv-no'>INVOICE #"+invId+"</div>"+
       "<div class='sub'>Date: "+fmt(i.date)+"</div>"+
       "<div class='sub'>Due: "+fmt(i.due)+"</div></div>"+
@@ -3230,6 +3245,18 @@ function printStatement(cId){
     ".summary{background:#f4f6fb;padding:16px;border-radius:8px;margin:20px 0;display:flex;gap:30px}"+
     ".sm{text-align:center}.sl{font-size:11px;color:#666}.sv{font-size:18px;font-weight:800;color:#1a1560}"+
     "@media print{button{display:none}}</style></head><body>"+
+    "<div style='display:flex;align-items:center;gap:14px;margin-bottom:20px;padding-bottom:16px;border-bottom:3px solid #1a1560'>"+
+    "<svg width='48' height='48' viewBox='0 0 52 52' xmlns='http://www.w3.org/2000/svg'>"+
+    "<defs><radialGradient id='bg' cx='50%' cy='60%' r='55%'><stop offset='0%' stop-color='#1e2a6e'/><stop offset='100%' stop-color='#0f0f3d'/></radialGradient></defs>"+
+    "<circle cx='26' cy='26' r='26' fill='url(%23bg)'/>"+
+    "<circle cx='26' cy='26' r='24' fill='none' stroke='%23c8a951' stroke-width='1.5'/>"+
+    "<line x1='26' y1='28' x2='26' y2='14' stroke='%23c8a951' stroke-width='1'/>"+
+    "<line x1='13' y1='28' x2='39' y2='28' stroke='%23c8a951' stroke-width='1.2'/>"+
+    "<ellipse cx='26' cy='26.5' rx='7' ry='4.5' fill='%23c8a951' opacity='0.9'/>"+
+    "<path d='M26 32 Q23 38 26 42 Q29 38 26 32Z' fill='%2363b3ed'/>"+
+    "</svg>"+
+    "<div><div style='font-size:20px;font-weight:800;color:#1a1560'>NEW DAWN PURE DRINKING WATER</div>"+
+    "<div style='color:#666;font-size:12px'>Nyayo Estate, Gate D, Court 290 &bull; Tel: 0710805099 / 0733930568</div></div></div>"+
     "<h1>CUSTOMER STATEMENT</h1>"+
     "<div><strong>"+cu.name+"</strong> &bull; "+cAddr(cu)+"<br>"+
     "Statement date: "+new Date().toLocaleDateString()+"<br>"+
