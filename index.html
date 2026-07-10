@@ -51,6 +51,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .pdot{width:13px;height:13px;border-radius:50%;border:2px solid var(--bd);transition:all .15s}
 .pdot.on{background:var(--nv2);border-color:var(--nv2)}
 @keyframes spin{to{transform:rotate(360deg)}}
+@media(max-width:600px){
+  .btn-xs{padding:6px 10px;font-size:12px;min-height:36px}
+  .btn-sm{padding:7px 12px;font-size:12px;min-height:38px}
+  .ac{gap:6px}
+  .ac .btn-xs{min-width:32px;display:flex;align-items:center;justify-content:center}
+}
 @media print{
   #tnav,#sts,.toolbar,.btn,.ac,.mft,#um,.pg:not(.print-target){display:none!important}
   .print-target{display:block!important}
@@ -191,7 +197,7 @@ var FB_READY=false;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-09";
+var APP_VERSION="2026-07-10";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -259,7 +265,7 @@ var CUST_Q="",ORD_Q="",INV_Q="",CMP_Q="",STK_Q="";
 var CUST_SORT="recent",ORD_SORT="newest",CUST_TYPE="";
 function ia(v){return can("vInv")?"KSh "+Number(v).toLocaleString():"KSh "+String.fromCharCode(8226,8226,8226,8226);}
 function sb(s){var m={"Delivered":"bg","Pending":"ba","Out for delivery":"bp","Processing":"bb","Cancelled":"br"};var ic={"Delivered":"ti-circle-check","Pending":"ti-clock","Out for delivery":"ti-truck","Processing":"ti-loader","Cancelled":"ti-x"};return "<span class=\"badge "+(m[s]||"ba")+"\"><i class=\"ti "+(ic[s]||"ti-circle")+"\" style=\"font-size:10px;margin-right:2px\"></i>"+s+"</span>";}
-function pb(p){var ic=p==="Paid"?"ti-check":p==="Partial"?"ti-clock-hour-3":"ti-alert-circle";return "<span class=\"badge "+(p==="Paid"?"bg":p==="Partial"?"ba":"br")+"\"><i class=\"ti "+ic+"\" style=\"font-size:10px;margin-right:2px\"></i>"+p+"</span>";}
+function pb(p){var ic=p==="Paid"?"ti-check":p==="Partial"?"ti-clock":"ti-alert-circle";return "<span class=\"badge "+(p==="Paid"?"bg":p==="Partial"?"ba":"br")+"\"><i class=\"ti "+ic+"\" style=\"font-size:10px;margin-right:2px\"></i>"+p+"</span>";}
 function btl(v){if(!v||v==="Good")return "<span class=\"badge bg\">Good</span>";if(v==="Damaged")return "<span class=\"badge br\">Damaged</span>";if(v==="Cracked")return "<span class=\"badge ba\">Cracked</span>";return "<span class=\"badge bgr\">"+v+"</span>";}
 function custDebt(id){
   return D.invoices.filter(function(i){
@@ -374,7 +380,6 @@ function writeBackup(docId){
   try{
     var payload=JSON.parse(JSON.stringify(getBackupPayload()));
     FB_BACKUP_COL.doc(docId).set(payload).then(function(){
-      console.log("Backup written: "+docId);
     }).catch(function(e){
       console.warn("Backup write failed: "+e.message);
     });
@@ -876,7 +881,7 @@ function pk(k){
       }else{
         setPinState(s);
         var left=PIN_MAX-s.count;
-        el("perr").textContent="Wrong PIN. "+left+" attempt"+(left===1?"":"s")+" remaining.";
+        el("perr").textContent="Incorrect PIN — "+left+" attempt"+(left===1?"":"s")+" remaining before lockout.";
       }
       PE="";setTimeout(rDots,350);
     }
@@ -913,6 +918,8 @@ function checkAutoSaveRecovery(){
 }
 
 function buildApp(){
+  // Add ARIA role to main app container
+  var root=el("root");if(root)root.setAttribute("role","application");
   var pages=[
     {k:"dashboard",ic:"ti-layout-dashboard",lb:"Dashboard"},
     {k:"customers",ic:"ti-users",lb:"Customers"},
@@ -1358,7 +1365,7 @@ function buildMods(){
       "<div class=\"fg2\">"+
         "<div class=\"fg\"><label class=\"flabel\">Bottle condition after</label><select class=\"fi\" id=\"dlv-btl\"><option>Good</option><option>Cracked</option><option>Damaged</option><option>Missing</option></select></div>"+
         "<div class=\"fg\"><label class=\"flabel\">Payment received (KSh)</label><input class=\"fi\" type=\"number\" id=\"dlv-amt\" value=\"0\"></div>"+
-        "<div class=\"fg\"><label class=\"flabel\">Payment status</label><select class=\"fi\" id=\"dlv-pay\"><option>Paid</option><option>Partial</option><option>Unpaid</option></select></div>"+
+        "<div class=\"fg\"><label class=\"flabel\">Payment status</label><select class=\"fi\" id=\"dlv-pay\"><option>Paid</option><option>Partial</option><option>Unpaid</option></select></div>"+"<div class=\"fg\"><label class=\"flabel\">Payment method</label><select class=\"fi\" id=\"dlv-method\"><option>Cash</option><option>M-Pesa</option><option>Bank transfer</option><option>Cheque</option></select></div>"+
         "<div class=\"fg\"><label class=\"flabel\">Notes</label><input class=\"fi\" id=\"dlv-notes\"></div>"+
       "</div>"+
       "<input type=\"hidden\" id=\"dlv-oid\">"+
@@ -2341,7 +2348,8 @@ function completeDlv(){
     if(amt>0&&inv){
       inv.paid=Math.min(inv.amount,inv.paid+amt);
       if(!inv.payments)inv.payments=[];
-      inv.payments.push({date:tday(),amt:amt,method:"Cash",ref:"Delivery #"+oid});
+      var dlvMethod=el("dlv-method")?el("dlv-method").value:"Cash";
+      inv.payments.push({date:tday(),amt:amt,method:dlvMethod,ref:"Delivery #"+oid});
     }
     if(inv){
       if(inv.paid>=inv.amount){o.paid="Paid";o.amtPaid=inv.paid;}
@@ -2369,9 +2377,10 @@ function delO(id){
     "Delete order #"+id+"?\n\nThis order has payments on record. The invoice will be kept for your financial records, but the order will be removed.":
     "Delete order #"+id+"? The linked invoice will also be removed.";
   if(!confirm(msg))return;
-  // Restore stock
+  // Restore stock — skip for category orders (prodConfirmed===false means no stock was deducted)
   var st=D.stock.find(function(s){return s.name===o.prod;});
-  if(st&&o.status!=="Delivered"&&o.status!=="Cancelled")st.qty+=o.qty;
+  var wasStockDeducted=(o.prodConfirmed!==false);
+  if(st&&o.status!=="Delivered"&&o.status!=="Cancelled"&&wasStockDeducted)st.qty+=o.qty;
   // Remove order
   D.orders=D.orders.filter(function(x){return x.id!==id;});
   // Remove unpaid invoices only — keep paid ones for records
@@ -2397,8 +2406,9 @@ function cancelO(id){
     "Cancel order #"+id+"? Stock will be restored and the invoice removed.";
   if(!confirm(msg))return;
   // Restore stock
+  var skipStockRestore=(o.prodConfirmed===false);
   var st=D.stock.find(function(s){return s.name===o.prod;});
-  if(st)st.qty+=o.qty;
+  if(st&&!skipStockRestore)st.qty+=o.qty;
   // Update order status
   o.status="Cancelled";
   o.paid=hasPaid?"Partial":"Cancelled";
@@ -2414,7 +2424,7 @@ function cancelO(id){
   }
   rOrds(undefined,ORD_PAGE);
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
-  dirty();toast("Order #"+id+" cancelled — stock restored");
+  dirty();toast("Order #"+id+" cancelled"+(skipStockRestore?" — category order":" — stock restored"));
 }
 function rDel(){
   var pg=el("pg-delivery");if(!pg)return;
@@ -2597,6 +2607,8 @@ function saveInv(){
   if(!can("aInv")&&!can("eInv"))return;
   var cId=parseInt(el("ivc").value);var a=parseFloat(el("iva").value)||0;var p=parseFloat(el("ivp").value)||0;
   if(!a||a<=0){toast("Amount must be greater than 0","err");return;}
+  // Default due date to 30 days from today if not set
+  if(el("ivd")&&!el("ivd").value){var d30=new Date();d30.setDate(d30.getDate()+30);el("ivd").value=d30.toISOString().split("T")[0];}
   if(p>a){toast("Amount paid cannot exceed invoice total","err");return;}
   var editId=el("iv-edit-id").value;
   if(editId){
@@ -2750,8 +2762,8 @@ function editCmp(id){
   var cc=el("cmp-c");if(cc){cc.value=cmp.cId;cc.disabled=true;}
   var cd=el("cmp-det");if(cd)cd.value=cmp.details||"";
   var ca=el("cmp-act");if(ca)ca.value=cmp.action||"";
-  var cs=el("cmp-sts");if(cs)cs.value=cmp.status||"Open";
-  var ct=el("cmp-type");if(ct)ct.value=cmp.ctype||"Other";
+  var cs=el("cmp-s");if(cs)cs.value=cmp.status||"Open";
+  var ct=el("cmp-t");if(ct)ct.value=cmp.type||"Water quality";
   om("m-cmp");
 }
 function resolveCmp(id){if(!can("aCmp"))return;var c=D.complaints.find(function(x){return x.id===id;});if(c)c.status="Resolved";rCmps(undefined,CMP_PAGE);dirty();toast("Complaint resolved");}
@@ -2779,7 +2791,7 @@ function rOffers(){
       }).join(""):"<div style=\"grid-column:1/-1\"><div class=\"te\"><i class=\"ti ti-tag\"></i><p>No promotions yet</p></div></div>")+
     "</div>";
 }
-function prepOf(){
+function prepOf(){if(el("of-edit-id"))el("of-edit-id").value="";if(el("m-of-title"))el("m-of-title").innerHTML="<i class=\"ti ti-tag\" style=\"color:var(--gd);margin-right:7px\"></i>New Promotion";
   el("of-edit-id").value="";
   var s=el("ofp");if(s)s.innerHTML="<option>All products</option>"+D.stock.map(function(x){return "<option>"+x.name+"</option>";}).join("");
   el("oft").value="";el("ofd").value="";el("ofmq").value="1";el("ofs").value="";el("ofe").value="";el("ofdesc").value="";
@@ -2787,17 +2799,7 @@ function prepOf(){
   el("m-of-save").innerHTML="<i class=\"ti ti-check\"></i> Save";
   om("m-of");
 }
-function editOff(id){
-  if(!can("eOff"))return;
-  var o=D.offers.find(function(x){return x.id===id;});if(!o)return;
-  var s=el("ofp");if(s)s.innerHTML="<option>All products</option>"+D.stock.map(function(x){return "<option"+(x.name===o.prod?" selected":"")+">"+x.name+"</option>";}).join("");
-  el("of-edit-id").value=o.id;
-  el("oft").value=o.title||"";el("ofd").value=o.disc||0;el("ofmq").value=o.minqty||1;
-  el("ofs").value=o.start||"";el("ofe").value=o.end||"";el("ofdesc").value=o.desc||"";
-  el("m-of-title").innerHTML="<i class=\"ti ti-edit\" style=\"color:var(--gd);margin-right:7px\"></i>Edit Promotion";
-  el("m-of-save").innerHTML="<i class=\"ti ti-check\"></i> Update";
-  om("m-of");
-}
+function editOff(id){editOf(id);}
 function saveOff(){
   if(!can("aOff")&&!can("eOff"))return;
   var t=el("oft").value.trim();if(!t){toast("Title required","err");return;}
@@ -2818,6 +2820,7 @@ function togOf(id){var o=D.offers.find(function(x){return x.id===id;});if(o)o.ac
 function editOf(id){
   if(!can("eOff"))return;
   var o=D.offers.find(function(x){return x.id===id;});if(!o)return;
+  if(el("m-of-title"))el("m-of-title").innerHTML="<i class=\"ti ti-edit\" style=\"color:var(--gd);margin-right:7px\"></i>Edit Promotion";
   el("of-id").value=id;
   if(el("of-name"))el("of-name").value=o.name||"";
   if(el("of-desc"))el("of-desc").value=o.desc||"";
@@ -3369,7 +3372,6 @@ function scheduleEmailBackup(){
       sendEmailBackup(false);
     }
   },60000);
-  console.log("Email backup scheduler running — will send at midnight");
 }
 
 /* ───────────────────────────────────────────────────
@@ -3383,7 +3385,7 @@ var AS_TIMER=null;
 var AS_INTERVAL_MS=60000; // 1 minute
 var AS_SUPPORTED=(typeof window.showSaveFilePicker==="function");
 
-function lsKey(){return "newdawn_autosave_"+(CU?CU.role:"shared");}
+function lsKey(){return "newdawn_autosave_"+(CU?CU.id+"_"+CU.role:"shared");}
 
 function autoSaveLocal(){
   try{
@@ -3555,8 +3557,9 @@ function restoreXL(input){
 function syncIdCounters(){
   var maxO=D.orders.reduce(function(m,o){return Math.max(m,Number(o.id)||0);},1000);
   var maxI=D.invoices.reduce(function(m,i){return Math.max(m,Number(i.id)||0);},2000);
-  var maxC=D.complaints.reduce(function(m,c){return Math.max(m,Number(c.id)||0);},3000);
-  nOId=maxO+1;nIId=maxI+1;nCId=maxC+1;
+  // nCId tracks customers (starting 3001), not complaints
+  var maxCust=D.customers.reduce(function(m,cu){return Math.max(m,Number(cu.id)||0);},3000);
+  nOId=maxO+1;nIId=maxI+1;nCId=maxCust+1;
 }
 function syncPaymentStatuses(){
   // Fix any order whose payment badge doesn't match its invoice reality
