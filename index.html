@@ -72,10 +72,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .stat::before{content:'';position:absolute;top:0;left:0;right:0;height:3px}
 .sg::before{background:var(--gd)}.sn::before{background:var(--nv2)}.sr::before{background:#e74c3c}.sk::before{background:#27ae60}.sb::before{background:#3498db}.sa::before{background:#f39c12}
 .sl{font-size:10px;color:var(--tx2);font-weight:700;text-transform:uppercase;letter-spacing:.07em;margin-bottom:7px}
-.sic{width:28px;height:28px;border-radius:7px;display:flex;align-items:center;justify-content:center;margin-bottom:7px;font-size:14px}
-.srch{position:relative;display:inline-flex;align-items:center;width:100%}
-.srch .fi{padding-left:30px;width:100%}
-.srch i{position:absolute;left:9px;font-size:13px;color:var(--tx2);pointer-events:none;z-index:1}
 .sv{font-size:22px;font-weight:800;line-height:1}.ss{font-size:11px;color:var(--tx2);margin-top:4px}
 .hv{font-size:22px;font-weight:800;letter-spacing:4px;color:var(--bd)}
 .g2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
@@ -243,8 +239,8 @@ var CUST_PAGE=0,ORD_PAGE=0,INV_PAGE=0,CMP_PAGE=0,STK_PAGE=0;
 var CUST_Q="",ORD_Q="",INV_Q="",CMP_Q="",STK_Q="";
 var CUST_SORT="recent",ORD_SORT="newest",CUST_TYPE="";
 function ia(v){return can("vInv")?"KSh "+Number(v).toLocaleString():"KSh "+String.fromCharCode(8226,8226,8226,8226);}
-function sb(s){var m={"Delivered":"bg","Pending":"ba","Out for delivery":"bp","Processing":"bb","Cancelled":"br"};var ic={"Delivered":"ti-circle-check","Pending":"ti-clock","Out for delivery":"ti-truck","Processing":"ti-loader","Cancelled":"ti-x"};return "<span class=\"badge "+(m[s]||"ba")+"\"><i class=\"ti "+(ic[s]||"ti-circle")+"\" style=\"font-size:10px;margin-right:2px\"></i>"+s+"</span>";}
-function pb(p){var ic=p==="Paid"?"ti-check":p==="Partial"?"ti-clock-hour-3":"ti-alert-circle";return "<span class=\"badge "+(p==="Paid"?"bg":p==="Partial"?"ba":"br")+"\"><i class=\"ti "+ic+"\" style=\"font-size:10px;margin-right:2px\"></i>"+p+"</span>";}
+function sb(s){var m={"Delivered":"bg","Pending":"ba","Out for delivery":"bp","Processing":"bb","Cancelled":"br"};return "<span class=\"badge "+(m[s]||"ba")+"\">"+s+"</span>";}
+function pb(p){return "<span class=\"badge "+(p==="Paid"?"bg":p==="Partial"?"ba":"br")+"\">"+p+"</span>";}
 function btl(v){if(!v||v==="Good")return "<span class=\"badge bg\">Good</span>";if(v==="Damaged")return "<span class=\"badge br\">Damaged</span>";if(v==="Cracked")return "<span class=\"badge ba\">Cracked</span>";return "<span class=\"badge bgr\">"+v+"</span>";}
 function custDebt(id){
   return D.invoices.filter(function(i){
@@ -1513,12 +1509,12 @@ function rDash(){
   pg.innerHTML=
     "<div class=\"ph\"><h1>Dashboard</h1><p>Welcome back, "+CU.name+" &middot; "+new Date().toLocaleDateString("en-GB",{weekday:"long",day:"numeric",month:"long",year:"numeric"})+"</p></div>"+
     "<div class=\"stats\">"+
-      "<div class=\"stat sg\"><div class=\"sic\" style=\"background:#e8faf2;color:#27ae60\"><i class=\"ti ti-trending-up\"></i></div><div class=\"sl\">Revenue</div><div class=\"sv\">"+ksh(rev)+"</div><div class=\"ss\">"+del.length+" delivered</div></div>"+
-      "<div class=\"stat sn\"><div class=\"sic\" style=\"background:#eef2ff;color:#534AB7\"><i class=\"ti ti-chart-pie\"></i></div><div class=\"sl\">Gross profit</div><div class=\"sv\">"+(can("vProfit")?"KSh "+(rev-cost).toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>")+"</div><div class=\"ss\">"+(can("vProfit")&&rev>0?Math.round((rev-cost)/rev*100)+"% margin":"&mdash;&mdash;")+"</div></div>"+
-      "<div class=\"stat sb\"><div class=\"sic\" style=\"background:#eaf0ff;color:#185FA5\"><i class=\"ti ti-users\"></i></div><div class=\"sl\">Customers</div><div class=\"sv\">"+D.customers.length+"</div><div class=\"ss\">"+D.customers.filter(function(c){return c.ctype==="Distributor";}).length+" distributors</div></div>"+
-      "<div class=\"stat sa\"><div class=\"sic\" style=\"background:#fff8e1;color:#f39c12\"><i class=\"ti ti-clipboard-list\"></i></div><div class=\"sl\">Active orders</div><div class=\"sv\">"+pend+"</div><div class=\"ss\">pending / processing</div></div>"+
-      "<div class=\"stat sr\"><div class=\"sic\" style=\"background:#fff0f0;color:#c0392b\"><i class=\"ti ti-alert-circle\"></i></div><div class=\"sl\">Total debts</div><div class=\"sv\">"+(can("vDebt")?"KSh "+totD.toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>")+"</div><div class=\"ss\">"+(can("vDebt")?debts.length+" customers":"&mdash;&mdash;")+"</div></div>"+
-      "<div class=\"stat sk\"><div class=\"sic\" style=\"background:#fff8e1;color:#e67e22\"><i class=\"ti ti-package\"></i></div><div class=\"sl\">Stock alerts</div><div class=\"sv\">"+low+"</div><div class=\"ss\">below minimum</div></div>"+
+      "<div class=\"stat sg\"><div class=\"sl\">Revenue</div><div class=\"sv\">"+ksh(rev)+"</div><div class=\"ss\">"+del.length+" delivered</div></div>"+
+      "<div class=\"stat sn\"><div class=\"sl\">Gross profit</div><div class=\"sv\">"+(can("vProfit")?"KSh "+(rev-cost).toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>")+"</div><div class=\"ss\">"+(can("vProfit")&&rev>0?Math.round((rev-cost)/rev*100)+"% margin":"&mdash;&mdash;")+"</div></div>"+
+      "<div class=\"stat sb\"><div class=\"sl\">Customers</div><div class=\"sv\">"+D.customers.length+"</div><div class=\"ss\">"+D.customers.filter(function(c){return c.ctype==="Distributor";}).length+" distributors</div></div>"+
+      "<div class=\"stat sa\"><div class=\"sl\">Active orders</div><div class=\"sv\">"+pend+"</div><div class=\"ss\">pending / processing</div></div>"+
+      "<div class=\"stat sr\"><div class=\"sl\">Total debts</div><div class=\"sv\">"+(can("vDebt")?"KSh "+totD.toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>")+"</div><div class=\"ss\">"+(can("vDebt")?debts.length+" customers":"&mdash;&mdash;")+"</div></div>"+
+      "<div class=\"stat sk\"><div class=\"sl\">Stock alerts</div><div class=\"sv\">"+low+"</div><div class=\"ss\">below minimum</div></div>"+
     "</div>"+
     "<div class=\"g2\">"+
       "<div>"+
