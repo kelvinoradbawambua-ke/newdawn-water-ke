@@ -944,7 +944,7 @@ function buildApp(){
         "<div id=\"tbml\" style=\"width:38px;height:38px;flex-shrink:0\"></div>"+
         "<div><div class=\"tb-name\">NEW DAWN PURE WATER</div><div class=\"tb-sub\">Enterprise Management</div></div>"+
       "</div>"+
-      "<div class=\"tnav\" id=\"tnav\">"+
+      "<div class=\"tnav\" id=\"tnav\" role=\"navigation\" aria-label=\"Main navigation\">"+
         pages.map(function(n,i){
           var nb="";
           if(n.k==="orders"&&pO>0)nb=" <span class=\"nb\">"+pO+"</span>";
@@ -1155,6 +1155,7 @@ function wizSavePin(){
   var err=el("wiz-pin-err");
   if(!p1||p1.length!==4||!/^\d{4}$/.test(p1)){err.textContent="PIN must be exactly 4 digits";return;}
   if(p1!==p2){err.textContent="PINs do not match";return;}
+  if(p1==="1234"){err.textContent="⚠ 1234 is the default PIN — choose something more secure.";return;}
   var director=USERS.find(function(u){return u.role==="director";});
   if(director){director.name=name;director.pin=p1;director.ini=ini.slice(0,2);}
   CU=director;
@@ -1236,7 +1237,7 @@ function wizFinish(){
     setTimeout(wizFinish,3000);
   });
 }
-function logout(){stopAutoSaveLoop();CU=null;SU=null;PE="";renderLogin();}
+function logout(){stopAutoSaveLoop();if(FB_UNSUB){FB_UNSUB();FB_UNSUB=null;}FB_READY=false;CU=null;SU=null;PE="";renderLogin();}
 function nav(p,btn){
   if(!can(p))return;
   document.querySelectorAll(".pg").forEach(function(x){x.classList.remove("act");});
@@ -1524,10 +1525,10 @@ function rDash(){
   var lastMonth=lastMonthD.getFullYear()+"-"+String(lastMonthD.getMonth()+1).padStart(2,"0");
   var thisRev=del.filter(function(o){return o.date&&o.date.startsWith(thisMonth);}).reduce(function(s,o){return s+o.qty*o.price;},0);
   var lastRev=del.filter(function(o){return o.date&&o.date.startsWith(lastMonth);}).reduce(function(s,o){return s+o.qty*o.price;},0);
-  if(can("vRev")&&lastRev>0){var tp=Math.round((thisRev-lastRev)/lastRev*100);if(Math.abs(tp)>=10){var tc=tp>0?"#27ae60":"#c0392b";alerts.push("<div class=\"alt\" style=\"border-left-color:"+tc+"\"><i class=\"ti "+(tp>0?"ti-trending-up":"ti-trending-down")+"\" style=\"color:"+tc+"\"></i> Revenue "+(tp>0?"+":"")+tp+"% vs last month</div>");}}
+  if(can("vRev")&&lastRev>0){var tp=Math.round((thisRev-lastRev)/lastRev*100);if(Math.abs(tp)>=10){var tc=tp>0?"#27ae60":"#c0392b";alerts.push({t:"ni",i:(tp>0?"ti-trending-up":"ti-trending-down"),m:"Revenue "+(tp>0?"+":"")+tp+"% vs last month — KSh "+thisRev.toLocaleString()+" this month"});}}
   var churnDate=new Date(Date.now()-30*86400000).toISOString().slice(0,10);
   var churned=D.customers.filter(function(cu){var lo=D.orders.filter(function(o){return o.cId===cu.id&&o.status==="Delivered";}).sort(function(a,b){return b.date>a.date?1:-1;})[0];return lo&&lo.date<churnDate;}).length;
-  if(churned>0)alerts.push("<div class=\"alt\" style=\"border-left-color:#f0c040\"><i class=\"ti ti-user-exclamation\" style=\"color:#f0c040\"></i> "+churned+" customer(s) no order in 30+ days</div>");
+  if(churned>0)alerts.push({t:"nw",i:"ti-user-exclamation",m:churned+" customer(s) have not ordered in 30+ days"});
 
   D.stock.filter(function(s){return s.qty<=s.min;}).forEach(function(s){alerts.push({t:"nw",i:"ti-alert-triangle",m:"Low stock: <strong>"+s.name+"</strong> &mdash; "+s.qty+" left (min "+s.min+")"});});
   if(can("vDebt"))debts.slice(0,3).forEach(function(c){alerts.push({t:"nr",i:"ti-alert-circle",m:"Debt: <strong>"+(can("vPhone")?c.name:maskName(c.name))+"</strong> &mdash; KSh "+custDebt(c.id).toLocaleString()});});
@@ -1593,6 +1594,7 @@ function rCusts(q,pg,sort,type){
   });
   // Sort
   var del=D.orders.filter(function(o){return o.status==="Delivered";});
+  var revMap={};var delCusts=D.orders.filter(function(o){return o.status==="Delivered";});delCusts.forEach(function(o){revMap[o.cId]=(revMap[o.cId]||0)+o.qty*o.price;});
   fil=fil.slice().sort(function(a,b){
     if(sort2==="debt"){return custDebt(b.id)-custDebt(a.id);}
     if(sort2==="orders"){
@@ -1600,9 +1602,7 @@ function rCusts(q,pg,sort,type){
              D.orders.filter(function(o){return o.cId===a.id;}).length;
     }
     if(sort2==="revenue"){
-      var ra=del.filter(function(o){return o.cId===a.id;}).reduce(function(s,o){return s+o.qty*o.price;},0);
-      var rb=del.filter(function(o){return o.cId===b.id;}).reduce(function(s,o){return s+o.qty*o.price;},0);
-      return rb-ra;
+      return (revMap[b.id]||0)-(revMap[a.id]||0);
     }
     if(sort2==="name"){return(a.name||"").localeCompare(b.name||"");}
     if(sort2==="nodebts"){return custDebt(a.id)-custDebt(b.id);}
@@ -2401,9 +2401,10 @@ function cancelO(id){
   if(o.status==="Delivered"){toast("Cannot cancel a delivered order — delete it if needed","err");return;}
   var inv=D.invoices.find(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+id)!==-1;});
   var hasPaid=inv&&inv.paid>0;
+  var isCatOrder=(o.prodConfirmed===false);
   var msg=hasPaid?
-    "Cancel order #"+id+"?\n\nKSh "+inv.paid.toLocaleString()+" has already been paid. The invoice will stay with the paid amount recorded. Stock will be restored.":
-    "Cancel order #"+id+"? Stock will be restored and the invoice removed.";
+    "Cancel order #"+id+"?\n\nKSh "+inv.paid.toLocaleString()+" has already been paid. The invoice will stay with the paid amount recorded."+(isCatOrder?" No stock to restore.":"\ Stock will be restored."):
+    "Cancel order #"+id+"?"+(isCatOrder?" Category order — no stock to restore. Invoice will be removed.":" Stock will be restored and the invoice removed.");
   if(!confirm(msg))return;
   // Restore stock
   var skipStockRestore=(o.prodConfirmed===false);
@@ -2449,7 +2450,7 @@ function rDel(){
           "<td>"+btl(o.bottle_before)+"</td>"+
           "<td style=\"font-size:11px\">"+(o.driver||"&mdash;")+"</td>"+
           "<td>"+pb(o.paid)+"</td><td>"+sb(o.status)+"</td>"+
-          "<td><button class=\"btn btn-xs btn-grn\" onclick=\"openDlv("+o.id+")\"><i class=\"ti ti-check\"></i> Done</button></td></tr>";
+          "<td><button class=\"btn btn-xs btn-grn\" onclick=\"openDlv("+o.id+")\" title=\"Complete delivery\"><i class=\"ti ti-check\"></i> Done</button></td></tr>";
       }).join(""):"<tr><td colspan=\"10\"><div class=\"te\"><i class=\"ti ti-circle-check\"></i><p>All deliveries complete!</p></div></td></tr>")+
     "</tbody></table></div>";
 }
@@ -2643,7 +2644,7 @@ function openPayInv(id){var i=D.invoices.find(function(x){return x.id===id;});if
 
 function ageing(cId){
   var td=tday();
-  var invs=D.invoices.filter(function(i){return i.cId===cId&&i.paid<i.amount;});
+  var invs=D.invoices.filter(function(i){return i.cId===cId&&i.paid<i.amount&&i.due;});
   var d30=invs.filter(function(i){return i.due>=td||(new Date(td)-new Date(i.due))<=30*86400000;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
   var d60=invs.filter(function(i){var diff=new Date(td)-new Date(i.due);return diff>30*86400000&&diff<=60*86400000;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
   var d90=invs.filter(function(i){var diff=new Date(td)-new Date(i.due);return diff>60*86400000&&diff<=90*86400000;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
@@ -2675,13 +2676,13 @@ function rDebts(){
       "<div class=\"stat sa\"><div class=\"sl\">Overdue invoices</div><div class=\"sv\">"+D.invoices.filter(function(i){return i.paid<i.amount&&i.due<td;}).length+"</div></div>"+
       "<div class=\"stat sn\"><div class=\"sl\">Largest debt</div><div class=\"sv\">"+(debtors.length?"KSh "+debtors[0].debt.toLocaleString():"KSh 0")+"</div><div class=\"ss\">"+(debtors.length?debtors[0].c.name:"")+"</div></div>"+
     "</div>"+
-    "<div class=\"tw\"><table><thead><tr><th>Customer</th><th>Contact &amp; address</th><th>Balance owed</th><th>Invoices</th><th>Overdue</th><th>Oldest due</th><th>Last order</th><th></th></tr></thead>"+
+    "<div class=\"tw\"><table><thead><tr><th>Customer</th><th>Contact &amp; address</th><th>Balance owed</th><th>Ageing</th><th>Invoices</th><th>Overdue</th><th>Oldest due</th><th>Last order</th><th></th></tr></thead>"+
     "<tbody>"+
       (debtors.length?debtors.map(function(x){
         return "<tr class=\"dr\">"+
           "<td><div style=\"font-weight:800;font-size:13px\">"+(can("vPhone")?x.c.name:maskName(x.c.name))+"</div></td>"+
           "<td><div>"+(can("vPhone")?x.c.phone:maskPhone(x.c.phone))+"</div><div class=\"ca\">"+cAddr(x.c)+"</div></td>"+
-          "<td><div style=\"font-size:18px;font-weight:900;color:#c0392b\">KSh "+x.debt.toLocaleString()+"</div></td>"+
+          "<td><div style=\"font-size:18px;font-weight:900;color:#c0392b\">KSh "+x.debt.toLocaleString()+"</div></td>"+"<td style=\"font-size:11px\">"+ageing(c.id)+"</td>"+
           "<td>"+x.invCount+"</td>"+
           "<td>"+(x.ov>0?"<span class=\"badge br\">"+x.ov+" overdue</span>":"<span class=\"badge bg\">None</span>")+"</td>"+
           "<td style=\"font-weight:700;color:"+(x.oldest&&x.oldest<td?"#c0392b":"var(--tx)")+"\">"+fmt(x.oldest)+"</td>"+
