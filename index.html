@@ -263,7 +263,7 @@ function pgBar(page,pages,total,navFn){
   "</div>";
 }
 var CUST_PAGE=0,ORD_PAGE=0,INV_PAGE=0,CMP_PAGE=0,STK_PAGE=0;
-var CUST_Q="",ORD_Q="",INV_Q="",CMP_Q="",STK_Q="";
+var CUST_Q="",ORD_Q="",INV_Q="",CMP_Q="",STK_Q="",DEL_Q="";
 var CUST_SORT="recent",ORD_SORT="newest",CUST_TYPE="";
 function ia(v){return can("vInv")?"KSh "+Number(v).toLocaleString():"KSh "+String.fromCharCode(8226,8226,8226,8226);}
 function sb(s){var m={"Delivered":"bg","Pending":"ba","Out for delivery":"bp","Processing":"bb","Cancelled":"br"};var ic={"Delivered":"ti-circle-check","Pending":"ti-clock","Out for delivery":"ti-truck","Processing":"ti-loader","Cancelled":"ti-x"};return "<span class=\"badge "+(m[s]||"ba")+"\"><i class=\"ti "+(ic[s]||"ti-circle")+"\" style=\"font-size:10px;margin-right:2px\"></i>"+s+"</span>";}
@@ -581,7 +581,7 @@ function refreshCurrentPage(){
     dashboard:rDash,
     customers:function(){rCusts(undefined,CUST_PAGE,CUST_SORT,CUST_TYPE);},
     orders:function(){rOrds(undefined,ORD_PAGE,ORD_SORT);},
-    delivery:rDel,
+    delivery:function(){DEL_Q="";rDel();},
     stock:function(){rStock(undefined,STK_PAGE);},
     invoices:function(){rInvs(undefined,INV_PAGE);},
     debts:rDebts,
@@ -1250,7 +1250,7 @@ function nav(p,btn){
     if((b.getAttribute("onclick")||"").indexOf("'"+p+"'")!==-1)b.classList.add("act");
   });
   el("um").classList.remove("open");
-  var fns={dashboard:rDash,customers:function(){rCusts(undefined,CUST_PAGE);},orders:function(){ORD_STATUS_F="";ORD_DATE_F="";rOrds(undefined,ORD_PAGE);},delivery:rDel,stock:function(){rStock(undefined,STK_PAGE);},invoices:function(){rInvs(undefined,INV_PAGE);},debts:rDebts,complaints:function(){rCmps(undefined,CMP_PAGE);},offers:rOffers,reports:rReports,excel:rExcel,users:rUsers};
+  var fns={dashboard:rDash,customers:function(){rCusts(undefined,CUST_PAGE);},orders:function(){ORD_STATUS_F="";ORD_DATE_F="";rOrds(undefined,ORD_PAGE);},delivery:function(){DEL_Q="";rDel();},stock:function(){rStock(undefined,STK_PAGE);},invoices:function(){rInvs(undefined,INV_PAGE);},debts:rDebts,complaints:function(){rCmps(undefined,CMP_PAGE);},offers:rOffers,reports:rReports,excel:rExcel,users:rUsers};
   if(fns[p])fns[p]();
 }
 
@@ -2434,14 +2434,15 @@ function cancelO(id){
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   dirty();toast("Order #"+id+" cancelled"+(skipStockRestore?" — category order":" — stock restored"));
 }
-function rDel(){
+function rDel(q){
+  if(q!==undefined)DEL_Q=q;
   var pg=el("pg-delivery");if(!pg)return;
   var allPend=D.orders.filter(function(o){return o.status==="Pending"||o.status==="Processing"||o.status==="Out for delivery";});
   var pend=CU&&CU.role==="driver"?allPend.filter(function(o){return o.driver===CU.name;}):allPend;
   var todayDel=D.orders.filter(function(o){return o.status==="Delivered"&&(o.deliveredAt===tday()||(!o.deliveredAt&&o.date===tday()));}).length;
   var totalDel=D.orders.filter(function(o){return o.status==="Delivered";}).length;
-  var DEL_Q=el("del-srch")?el("del-srch").value:"";
-  var pendFil=DEL_Q?pend.filter(function(o){var cu=D.customers.find(function(x){return x.id===o.cId;});var lq=DEL_Q.toLowerCase();return(cu&&(cu.name.toLowerCase().indexOf(lq)!==-1||cAddr(cu).toLowerCase().indexOf(lq)!==-1))||String(o.id).indexOf(DEL_Q)!==-1||o.prod.toLowerCase().indexOf(lq)!==-1||(o.driver&&o.driver.toLowerCase().indexOf(lq)!==-1);}):pend;
+  var q2=DEL_Q||"";
+  var pendFil=q2?pend.filter(function(o){var cu=D.customers.find(function(x){return x.id===o.cId;});var lq=q2.toLowerCase();return(cu&&(cu.name.toLowerCase().indexOf(lq)!==-1||cAddr(cu).toLowerCase().indexOf(lq)!==-1))||String(o.id).indexOf(DEL_Q)!==-1||o.prod.toLowerCase().indexOf(lq)!==-1||(o.driver&&o.driver.toLowerCase().indexOf(lq)!==-1);}):pend;
   pg.innerHTML=
     "<div class=\"ph\"><h1>Delivery Board</h1><p>"+pend.length+" pending &middot; "+totalDel+" total delivered</p></div>"+
     "<div class=\"stats\" style=\"grid-template-columns:repeat(4,1fr)\">"+
@@ -2451,7 +2452,7 @@ function rDel(){
       "<div class=\"stat sb\"><div class=\"sl\">Routes</div><div class=\"sv\">"+D.routes.length+"</div></div>"+
     "</div>"+
     "<div class=\"toolbar\" style=\"margin-bottom:10px\">"+
-      "<div class=\"srch\"><i class=\"ti ti-search\"></i><input id=\"del-srch\" type=\"text\" placeholder=\"Search by order #, customer, product, driver...\" oninput=\"rDel()\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
+      "<div class=\"srch\"><i class=\"ti ti-search\"></i><input id=\"del-srch\" type=\"text\" placeholder=\"Search by order #, customer, product, driver...\" value=\""+q2+"\" oninput=\"rDel(this.value)\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
     "</div>"+
     "<div class=\"tw\"><table><thead><tr><th>#</th><th>Customer</th><th>Full address</th><th>Product</th><th>Qty</th><th>Bottle before</th><th>Driver</th><th>Payment</th><th>Status</th><th></th></tr></thead>"+
     "<tbody>"+
