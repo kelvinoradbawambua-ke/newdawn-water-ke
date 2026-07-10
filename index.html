@@ -13,7 +13,22 @@
 <link rel="dns-prefetch" href="https://firestore.googleapis.com">
 <link rel="dns-prefetch" href="https://cdnjs.cloudflare.com">
 <link rel="dns-prefetch" href="https://cdn.jsdelivr.net">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.0.0/tabler-icons.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.19.0/dist/tabler-icons.min.css" id="tabler-css" onerror="loadIconFallback()">
+<script>
+function loadIconFallback(){
+  // Try cdnjs as fallback
+  var l=document.createElement('link');
+  l.rel='stylesheet';
+  l.href='https://cdnjs.cloudflare.com/ajax/libs/tabler-icons/3.19.0/tabler-icons.min.css';
+  l.onerror=function(){
+    // Final fallback: inject minimal icon CSS with Unicode symbols
+    var s=document.createElement('style');
+    s.textContent='.ti{font-family:Arial,sans-serif;font-style:normal}.ti-check::before{content:"✓"}.ti-x::before{content:"✕"}.ti-edit::before{content:"✎"}.ti-trash::before{content:"🗑"}.ti-plus::before{content:"+"}.ti-search::before{content:"⌕"}.ti-truck::before{content:"🚚"}.ti-clock::before{content:"⏱"}.ti-alert-circle::before{content:"⚠"}.ti-cash::before{content:"$"}.ti-printer::before{content:"🖨"}.ti-users::before{content:"👥"}.ti-lock::before{content:"🔒"}.ti-key::before{content:"🔑"}';
+    document.head.appendChild(s);
+  };
+  document.head.appendChild(l);
+}
+</script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js"></script>
 <style>
@@ -72,6 +87,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .stat::before{content:'';position:absolute;top:0;left:0;right:0;height:3px}
 .sg::before{background:var(--gd)}.sn::before{background:var(--nv2)}.sr::before{background:#e74c3c}.sk::before{background:#27ae60}.sb::before{background:#3498db}.sa::before{background:#f39c12}
 .sl{font-size:10px;color:var(--tx2);font-weight:700;text-transform:uppercase;letter-spacing:.07em;margin-bottom:7px}
+.sic{width:28px;height:28px;border-radius:7px;display:flex;align-items:center;justify-content:center;margin-bottom:7px;font-size:14px}
+.srch{position:relative;display:inline-flex;align-items:center;width:100%}
+.srch .fi{padding-left:30px;width:100%}
+.srch i{position:absolute;left:9px;font-size:13px;color:var(--tx2);pointer-events:none;z-index:1}
 .sv{font-size:22px;font-weight:800;line-height:1}.ss{font-size:11px;color:var(--tx2);margin-top:4px}
 .hv{font-size:22px;font-weight:800;letter-spacing:4px;color:var(--bd)}
 .g2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
@@ -239,8 +258,8 @@ var CUST_PAGE=0,ORD_PAGE=0,INV_PAGE=0,CMP_PAGE=0,STK_PAGE=0;
 var CUST_Q="",ORD_Q="",INV_Q="",CMP_Q="",STK_Q="";
 var CUST_SORT="recent",ORD_SORT="newest",CUST_TYPE="";
 function ia(v){return can("vInv")?"KSh "+Number(v).toLocaleString():"KSh "+String.fromCharCode(8226,8226,8226,8226);}
-function sb(s){var m={"Delivered":"bg","Pending":"ba","Out for delivery":"bp","Processing":"bb","Cancelled":"br"};return "<span class=\"badge "+(m[s]||"ba")+"\">"+s+"</span>";}
-function pb(p){return "<span class=\"badge "+(p==="Paid"?"bg":p==="Partial"?"ba":"br")+"\">"+p+"</span>";}
+function sb(s){var m={"Delivered":"bg","Pending":"ba","Out for delivery":"bp","Processing":"bb","Cancelled":"br"};var ic={"Delivered":"ti-circle-check","Pending":"ti-clock","Out for delivery":"ti-truck","Processing":"ti-loader","Cancelled":"ti-x"};return "<span class=\"badge "+(m[s]||"ba")+"\"><i class=\"ti "+(ic[s]||"ti-circle")+"\" style=\"font-size:10px;margin-right:2px\"></i>"+s+"</span>";}
+function pb(p){var ic=p==="Paid"?"ti-check":p==="Partial"?"ti-clock-hour-3":"ti-alert-circle";return "<span class=\"badge "+(p==="Paid"?"bg":p==="Partial"?"ba":"br")+"\"><i class=\"ti "+ic+"\" style=\"font-size:10px;margin-right:2px\"></i>"+p+"</span>";}
 function btl(v){if(!v||v==="Good")return "<span class=\"badge bg\">Good</span>";if(v==="Damaged")return "<span class=\"badge br\">Damaged</span>";if(v==="Cracked")return "<span class=\"badge ba\">Cracked</span>";return "<span class=\"badge bgr\">"+v+"</span>";}
 function custDebt(id){
   return D.invoices.filter(function(i){
@@ -1509,12 +1528,12 @@ function rDash(){
   pg.innerHTML=
     "<div class=\"ph\"><h1>Dashboard</h1><p>Welcome back, "+CU.name+" &middot; "+new Date().toLocaleDateString("en-GB",{weekday:"long",day:"numeric",month:"long",year:"numeric"})+"</p></div>"+
     "<div class=\"stats\">"+
-      "<div class=\"stat sg\"><div class=\"sl\">Revenue</div><div class=\"sv\">"+ksh(rev)+"</div><div class=\"ss\">"+del.length+" delivered</div></div>"+
-      "<div class=\"stat sn\"><div class=\"sl\">Gross profit</div><div class=\"sv\">"+(can("vProfit")?"KSh "+(rev-cost).toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>")+"</div><div class=\"ss\">"+(can("vProfit")&&rev>0?Math.round((rev-cost)/rev*100)+"% margin":"&mdash;&mdash;")+"</div></div>"+
-      "<div class=\"stat sb\"><div class=\"sl\">Customers</div><div class=\"sv\">"+D.customers.length+"</div><div class=\"ss\">"+D.customers.filter(function(c){return c.ctype==="Distributor";}).length+" distributors</div></div>"+
-      "<div class=\"stat sa\"><div class=\"sl\">Active orders</div><div class=\"sv\">"+pend+"</div><div class=\"ss\">pending / processing</div></div>"+
-      "<div class=\"stat sr\"><div class=\"sl\">Total debts</div><div class=\"sv\">"+(can("vDebt")?"KSh "+totD.toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>")+"</div><div class=\"ss\">"+(can("vDebt")?debts.length+" customers":"&mdash;&mdash;")+"</div></div>"+
-      "<div class=\"stat sk\"><div class=\"sl\">Stock alerts</div><div class=\"sv\">"+low+"</div><div class=\"ss\">below minimum</div></div>"+
+      "<div class=\"stat sg\"><div class=\"sic\" style=\"background:#e8faf2;color:#27ae60\"><i class=\"ti ti-trending-up\"></i></div><div class=\"sl\">Revenue</div><div class=\"sv\">"+ksh(rev)+"</div><div class=\"ss\">"+del.length+" delivered</div></div>"+
+      "<div class=\"stat sn\"><div class=\"sic\" style=\"background:#eef2ff;color:#534AB7\"><i class=\"ti ti-chart-pie\"></i></div><div class=\"sl\">Gross profit</div><div class=\"sv\">"+(can("vProfit")?"KSh "+(rev-cost).toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>")+"</div><div class=\"ss\">"+(can("vProfit")&&rev>0?Math.round((rev-cost)/rev*100)+"% margin":"&mdash;&mdash;")+"</div></div>"+
+      "<div class=\"stat sb\"><div class=\"sic\" style=\"background:#eaf0ff;color:#185FA5\"><i class=\"ti ti-users\"></i></div><div class=\"sl\">Customers</div><div class=\"sv\">"+D.customers.length+"</div><div class=\"ss\">"+D.customers.filter(function(c){return c.ctype==="Distributor";}).length+" distributors</div></div>"+
+      "<div class=\"stat sa\"><div class=\"sic\" style=\"background:#fff8e1;color:#f39c12\"><i class=\"ti ti-clipboard-list\"></i></div><div class=\"sl\">Active orders</div><div class=\"sv\">"+pend+"</div><div class=\"ss\">pending / processing</div></div>"+
+      "<div class=\"stat sr\"><div class=\"sic\" style=\"background:#fff0f0;color:#c0392b\"><i class=\"ti ti-alert-circle\"></i></div><div class=\"sl\">Total debts</div><div class=\"sv\">"+(can("vDebt")?"KSh "+totD.toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>")+"</div><div class=\"ss\">"+(can("vDebt")?debts.length+" customers":"&mdash;&mdash;")+"</div></div>"+
+      "<div class=\"stat sk\"><div class=\"sic\" style=\"background:#fff8e1;color:#e67e22\"><i class=\"ti ti-package\"></i></div><div class=\"sl\">Stock alerts</div><div class=\"sv\">"+low+"</div><div class=\"ss\">below minimum</div></div>"+
     "</div>"+
     "<div class=\"g2\">"+
       "<div>"+
@@ -1815,7 +1834,7 @@ function ordRows(fil){
         (o.status!=="Delivered"&&o.status!=="Cancelled"?"<button class=\"btn btn-xs btn-grn\" onclick=\"openDlv("+o.id+")\" title=\"Complete delivery\"><i class=\"ti ti-check\"></i></button>":"")+
         (can("eOrd")&&o.status!=="Delivered"&&o.status!=="Cancelled"?"<button class=\"btn btn-xs btn-navy\" onclick=\"editOrd("+o.id+")\" title=\"Edit\"><i class=\"ti ti-edit\"></i></button>":"")+
         (can("eOrd")&&(o.status==="Pending"||o.status==="Processing")?"<button class=\"btn btn-xs\" onclick=\"cancelO("+o.id+")\" title=\"Cancel order\" style=\"background:#f39c12;color:#fff\"><i class=\"ti ti-x\"></i></button>":"")+
-        (can("dOrd")?"<button class=\"btn btn-xs btn-red\" onclick=\"delO("+o.id+")\"><i class=\"ti ti-trash\"></i></button>":"")+
+        (can("dOrd")?"<button class=\"btn btn-xs btn-red\" onclick=\"delO("+o.id+")\" title=\"Delete order\"><i class=\"ti ti-trash\"></i></button>":"")+
       "</div></td></tr>";
   }).join("");
 }
@@ -2448,7 +2467,7 @@ function rStock(q,pg){
           "<td><div style=\"font-weight:800;color:"+(low?"#c0392b":"var(--tx)")+"\">"+s.qty+"</div><div class=\"prog\" style=\"width:56px;margin-top:3px\"><div class=\"progb\" style=\"width:"+pct+"%;background:"+col+"\"></div></div></td>"+
           "<td>"+s.min+"</td>"+
           "<td>"+(low?"<span class=\"badge br\"><i class=\"ti ti-alert-triangle\"></i> Low</span>":"<span class=\"badge bg\"><i class=\"ti ti-check\"></i> OK</span>")+"</td>"+
-          "<td><div class=\"ac\">"+(can("eSt")?"<button class=\"btn btn-xs btn-navy\" onclick=\"editSt("+s.id+")\"><i class=\"ti ti-edit\"></i></button>":"")+(can("dSt")?"<button class=\"btn btn-xs btn-red\" onclick=\"delS("+s.id+")\"><i class=\"ti ti-trash\"></i></button>":"")+"</div></td></tr>";
+          "<td><div class=\"ac\">"+(can("eSt")?"<button class=\"btn btn-xs btn-navy\" onclick=\"editSt("+s.id+")\" title=\"Edit product\"><i class=\"ti ti-edit\"></i></button>":"")+(can("dSt")?"<button class=\"btn btn-xs btn-red\" onclick=\"delS("+s.id+")\" title=\"Delete product\"><i class=\"ti ti-trash\"></i></button>":"")+"</div></td></tr>";
       }).join(""):"<tr><td colspan=\"8\"><div class=\"te\"><i class=\"ti ti-package\"></i><p>"+(q2?"No results for \""+q2+"\"":"No products yet")+"</p></div></td></tr>")+
     "</tbody></table></div>"+
     pgBar(paged.page,paged.pages,paged.total,"rStock(undefined,");
@@ -2684,8 +2703,8 @@ function cmpRows(fil){
       "<td style=\"font-size:11px\">"+fmt(c.date)+"</td>"+
       "<td><span class=\"badge "+(sm[c.status]||"ba")+"\">"+c.status+"</span></td>"+
       "<td><div class=\"ac\">"+
-        (c.status!=="Resolved"?"<button class=\"btn btn-xs btn-grn\" onclick=\"resolveCmp("+c.id+")\"><i class=\"ti ti-check\"></i></button>":"")+
-        "<button class=\"btn btn-xs btn-red\" onclick=\"delCmp("+c.id+")\"><i class=\"ti ti-trash\"></i></button>"+
+        (can("aCmp")?"<button class=\"btn btn-xs btn-navy\" onclick=\"editCmp("+c.id+")\" title=\"Edit complaint\"><i class=\"ti ti-edit\"></i></button>":"")+(c.status!=="Resolved"?"<button class=\"btn btn-xs btn-grn\" onclick=\"resolveCmp("+c.id+")\" title=\"Mark resolved\"><i class=\"ti ti-check\"></i></button>":"")+
+        "<button class=\"btn btn-xs btn-red\" onclick=\"delCmp("+c.id+")\" title=\"Delete complaint\"><i class=\"ti ti-trash\"></i></button>"+
       "</div></td></tr>";
   }).join("");
 }
@@ -2697,6 +2716,17 @@ function filterCmps(f){
 }
 function prepCmp(){var s=el("cmp-c");if(s)s.innerHTML=D.customers.map(function(c){return "<option value=\""+c.id+"\">"+custName(c.id)+" - "+cAddr(c)+"</option>";}).join("");el("cmp-d").value=tday();om("m-cmp");}
 function saveCmp(){if(!can("aCmp"))return;var det=el("cmp-det").value.trim();if(!det){toast("Details required","err");return;}D.complaints.push({id:nCId++,cId:parseInt(el("cmp-c").value),type:el("cmp-t").value,details:det,action:el("cmp-act").value,status:el("cmp-s").value,date:el("cmp-d").value});el("cmp-det").value="";el("cmp-act").value="";cm("m-cmp");rCmps(undefined,CMP_PAGE);dirty();toast("Complaint logged");}
+function editCmp(id){
+  if(!can("aCmp"))return;
+  var cmp=D.complaints.find(function(x){return x.id===id;});if(!cmp)return;
+  var ci=el("cmp-id");if(ci)ci.value=id;
+  var cc=el("cmp-c");if(cc){cc.value=cmp.cId;cc.disabled=true;}
+  var cd=el("cmp-det");if(cd)cd.value=cmp.details||"";
+  var ca=el("cmp-act");if(ca)ca.value=cmp.action||"";
+  var cs=el("cmp-sts");if(cs)cs.value=cmp.status||"Open";
+  var ct=el("cmp-type");if(ct)ct.value=cmp.ctype||"Other";
+  om("m-cmp");
+}
 function resolveCmp(id){if(!can("aCmp"))return;var c=D.complaints.find(function(x){return x.id===id;});if(c)c.status="Resolved";rCmps(undefined,CMP_PAGE);dirty();toast("Complaint resolved");}
 function delCmp(id){if(!can("aCmp"))return;if(!confirm("Delete complaint?"))return;D.complaints=D.complaints.filter(function(c){return c.id!==id;});rCmps(undefined,CMP_PAGE);dirty();}
 
@@ -2714,9 +2744,10 @@ function rOffers(){
           "<div style=\"font-size:11px;color:"+(o.active?"rgba(255,255,255,.6)":"var(--tx2)")+";margin-bottom:12px\">"+o.prod+(o.minqty>1?" &middot; Min "+o.minqty:"")+"</div>"+
           "<div style=\"font-size:10px;color:"+(o.active?"rgba(255,255,255,.45)":"var(--tx2)")+";margin-bottom:13px\">"+o.start+" &rarr; "+o.end+"</div>"+
           "<div style=\"display:flex;gap:7px\">"+
-            (can("aOff")?"<button class=\"btn btn-sm\" style=\""+(o.active?"background:rgba(255,255,255,.15);color:#fff;border-color:rgba(255,255,255,.3)":"")+"\" onclick=\"togOf("+o.id+")\">"+(o.active?"Deactivate":"Activate")+"</button>":"")+
+            (can("aOff")?"<button class=\"btn btn-sm\" style=\""+(o.active?"background:rgba(255,255,255,.15);color:#fff;border-color:rgba(255,255,255,.3)":"")+"\" onclick=\"togOf("+o.id+")\" title=\"Toggle offer\"><i class=\"ti ti-"+(o.active?"toggle-right":"toggle-left")+"\" style=\"margin-right:3px\"></i>"+(o.active?"Deactivate":"Activate")+"</button>":"")+
             (can("eOff")?"<button class=\"btn btn-sm\" style=\""+(o.active?"background:rgba(255,255,255,.15);color:#fff;border-color:rgba(255,255,255,.3)":"")+"\" onclick=\"editOff("+o.id+")\"><i class=\"ti ti-edit\"></i></button>":"")+
-            (can("dOff")?"<button class=\"btn btn-sm btn-red\" onclick=\"delOf("+o.id+")\"><i class=\"ti ti-trash\"></i></button>":"")+
+            (can("eOff")?"<button class=\"btn btn-sm btn-navy\" onclick=\"editOf("+o.id+")\" title=\"Edit offer\"><i class=\"ti ti-edit\"></i></button>":"")+
+            (can("dOff")?"<button class=\"btn btn-sm btn-red\" onclick=\"delOf("+o.id+")\" title=\"Delete offer\"><i class=\"ti ti-trash\"></i></button>":"")+
           "</div></div>";
       }).join(""):"<div style=\"grid-column:1/-1\"><div class=\"te\"><i class=\"ti ti-tag\"></i><p>No promotions yet</p></div></div>")+
     "</div>";
@@ -2757,6 +2788,16 @@ function saveOff(){
   el("oft").value="";el("ofd").value="";el("ofmq").value="1";el("ofdesc").value="";cm("m-of");rOffers();dirty();toast("Offer created");
 }
 function togOf(id){var o=D.offers.find(function(x){return x.id===id;});if(o)o.active=!o.active;rOffers();dirty();}
+function editOf(id){
+  if(!can("eOff"))return;
+  var o=D.offers.find(function(x){return x.id===id;});if(!o)return;
+  el("of-id").value=id;
+  if(el("of-name"))el("of-name").value=o.name||"";
+  if(el("of-desc"))el("of-desc").value=o.desc||"";
+  if(el("of-disc"))el("of-disc").value=o.disc||0;
+  if(el("of-type"))el("of-type").value=o.type||"percent";
+  om("m-of");
+}
 function delOf(id){if(!can("dOff"))return;if(!confirm("Delete?"))return;D.offers=D.offers.filter(function(o){return o.id!==id;});rOffers();dirty();}
 
 var RPT_FROM="";var RPT_TO="";
@@ -2999,7 +3040,7 @@ function rUsers(){
           "<button class=\"btn btn-sm\" onclick=\"prepChangePin("+u.id+")\" style=\"background:#f0f4ff;color:var(--nv);border:1.5px solid var(--nv)\"><i class=\"ti ti-key\"></i> Change PIN</button>":"")+
         (u.id===CU.id?
           "<button class=\"btn btn-sm\" onclick=\"prepChangePin("+u.id+")\" style=\"background:rgba(255,255,255,.15);color:#fff;border:1.5px solid rgba(255,255,255,.3)\"><i class=\"ti ti-key\"></i> My PIN</button>":"")+
-        (u.id!==CU.id?"<button class=\"btn btn-sm btn-red\" onclick=\"delU("+u.id+")\"><i class=\"ti ti-trash\"></i> Remove</button>":"<span style=\"font-size:11px;color:var(--gd);font-weight:700;margin-top:6px;display:block\">Active session</span>")+
+        (u.id!==CU.id?"<button class=\"btn btn-sm btn-red\" onclick=\"delU("+u.id+")\" title=\"Remove team member\"><i class=\"ti ti-trash\"></i> Remove</button>":"<span style=\"font-size:11px;color:var(--gd);font-weight:700;margin-top:6px;display:block\">Active session</span>")+
         "</div>"+
       "</div>";
     }).join("")+
@@ -3187,7 +3228,7 @@ function showBackupHistory(){
       var custs=(data.stats&&data.stats.customers)||0;
       var ords=(data.stats&&data.stats.orders)||0;
       rows+="<tr><td style=\"font-weight:700\">"+type+"</td><td>"+d.id.split("-").slice(1).join("-")+"</td><td>"+t+"</td><td>"+custs+" customers, "+ords+" orders</td>"+
-        "<td><button class=\"btn btn-xs btn-navy\" onclick=\"restoreSpecificBackup('"+d.id+"')\">Restore</button></td></tr>";
+        "<td><button class=\"btn btn-xs btn-navy\" onclick=\"restoreSpecificBackup('"+d.id+"')\" title=\"Restore to this point\"><i class=\"ti ti-history\" style=\"margin-right:3px\"></i>Restore</button></td></tr>";
     });
     el2.innerHTML="<table style=\"width:100%;font-size:11px;border-collapse:collapse;margin-top:8px\">"+
       "<thead><tr style=\"background:var(--nv);color:#fff\"><th style=\"padding:5px 8px\">Type</th><th style=\"padding:5px 8px\">Date</th><th style=\"padding:5px 8px\">Time</th><th style=\"padding:5px 8px\">Contents</th><th style=\"padding:5px 8px\">Action</th></tr></thead>"+
