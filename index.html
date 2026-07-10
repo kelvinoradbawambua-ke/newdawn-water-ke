@@ -2631,6 +2631,7 @@ function saveInv(){
   el("iva").value="";el("ivp").value="0";el("ivn").value="";cm("m-iv");rInvs(undefined,INV_PAGE);dirty();toast("Invoice created");
 }
 function payI(id){
+  if(!can("mPaid")){toast("No permission to record payments","err");return;}
   var i=D.invoices.find(function(x){return x.id===id;});
   if(i){
     if(!i.payments)i.payments=[];
@@ -2797,9 +2798,9 @@ function rOffers(){
       }).join(""):"<div style=\"grid-column:1/-1\"><div class=\"te\"><i class=\"ti ti-tag\"></i><p>No promotions yet</p></div></div>")+
     "</div>";
 }
-function prepOf(){if(el("of-edit-id"))el("of-edit-id").value="";if(el("m-of-title"))el("m-of-title").innerHTML="<i class=\"ti ti-tag\" style=\"color:var(--gd);margin-right:7px\"></i>New Promotion";
-  el("of-edit-id").value="";
+function prepOf(){
   var s=el("ofp");if(s)s.innerHTML="<option>All products</option>"+D.stock.map(function(x){return "<option>"+x.name+"</option>";}).join("");
+  el("of-edit-id").value="";
   el("oft").value="";el("ofd").value="";el("ofmq").value="1";el("ofs").value="";el("ofe").value="";el("ofdesc").value="";
   el("m-of-title").innerHTML="<i class=\"ti ti-tag\" style=\"color:var(--gd);margin-right:7px\"></i>New Promotion";
   el("m-of-save").innerHTML="<i class=\"ti ti-check\"></i> Save";
@@ -2822,16 +2823,21 @@ function saveOff(){
   D.offers.push({id:uid(),title:t,disc:parseInt(el("ofd").value)||0,minqty:parseInt(el("ofmq").value)||1,prod:el("ofp").value,start:el("ofs").value,end:el("ofe").value,desc:el("ofdesc").value,active:true});
   el("oft").value="";el("ofd").value="";el("ofmq").value="1";el("ofdesc").value="";cm("m-of");rOffers();dirty();toast("Offer created");
 }
-function togOf(id){var o=D.offers.find(function(x){return x.id===id;});if(o)o.active=!o.active;rOffers();dirty();}
+function togOf(id){if(!can("aOff"))return;var o=D.offers.find(function(x){return x.id===id;});if(o)o.active=!o.active;rOffers();dirty();}
 function editOf(id){
   if(!can("eOff"))return;
   var o=D.offers.find(function(x){return x.id===id;});if(!o)return;
+  // Populate product dropdown first
+  var sp=el("ofp");if(sp)sp.innerHTML="<option>All products</option>"+D.stock.map(function(x){return "<option"+(o.prod===x.name?" selected":"")+">"+ x.name+"</option>";}).join("");
   if(el("m-of-title"))el("m-of-title").innerHTML="<i class=\"ti ti-edit\" style=\"color:var(--gd);margin-right:7px\"></i>Edit Promotion";
-  el("of-id").value=id;
-  if(el("of-name"))el("of-name").value=o.name||"";
-  if(el("of-desc"))el("of-desc").value=o.desc||"";
-  if(el("of-disc"))el("of-disc").value=o.disc||0;
-  if(el("of-type"))el("of-type").value=o.type||"percent";
+  el("of-edit-id").value=id;
+  el("oft").value=o.title||"";
+  el("ofd").value=o.disc||0;
+  el("ofmq").value=o.minqty||1;
+  el("ofs").value=o.start||"";
+  el("ofe").value=o.end||"";
+  el("ofdesc").value=o.desc||"";
+  el("m-of-save").innerHTML="<i class=\"ti ti-check\"></i> Update";
   om("m-of");
 }
 function delOf(id){if(!can("dOff"))return;if(!confirm("Delete?"))return;D.offers=D.offers.filter(function(o){return o.id!==id;});rOffers();dirty();}
