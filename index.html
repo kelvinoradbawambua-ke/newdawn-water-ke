@@ -1605,6 +1605,7 @@ function rCusts(q,pg,sort,type){
   // Sort
   var del=D.orders.filter(function(o){return o.status==="Delivered";});
   var revMap={};var delCusts=D.orders.filter(function(o){return o.status==="Delivered";});delCusts.forEach(function(o){revMap[o.cId]=(revMap[o.cId]||0)+o.qty*o.price;});
+  var debtMap={};D.customers.forEach(function(cu){debtMap[cu.id]=custDebt(cu.id);});
   fil=fil.slice().sort(function(a,b){
     if(sort2==="debt"){return custDebt(b.id)-custDebt(a.id);}
     if(sort2==="orders"){
@@ -1647,7 +1648,7 @@ function rCusts(q,pg,sort,type){
       "<thead><tr><th>Name &amp; address</th><th>Phone</th><th>Type</th><th>Orders</th><th>Last order</th><th>Last payment</th><th>Balance</th><th></th></tr></thead>"+
       "<tbody>"+
         (paged.items.length?paged.items.map(function(c){
-          var debt=custDebt(c.id);
+          var debt=(debtMap[c.id]||0);
           var ords=D.orders.filter(function(o){return o.cId===c.id;});
           var lastOrd=ords.filter(function(o){return o.status==="Delivered";}).sort(function(a,b){return b.date>a.date?1:-1;})[0];
           var allPays=D.invoices.filter(function(i){return i.cId===c.id&&i.payments&&i.payments.length;}).reduce(function(a,i){return a.concat(i.payments);},[]).sort(function(a,b){return b.date>a.date?1:-1;});
@@ -1743,6 +1744,7 @@ function openPay(cId){
 function recPay(){
   if(!can("mPaid")){toast("No permission to record payments","err");return;}
   var cId=parseInt(el("pay-cid").value),amt=parseFloat(el("pay-amt").value)||0;
+  if(!cId||isNaN(cId)){toast("Invalid customer","err");return;}
   if(!amt){toast("Enter amount","err");return;}
   var totalDebt=D.invoices.filter(function(i){return i.cId===cId&&i.paid<i.amount;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
   if(amt>totalDebt&&totalDebt>0){if(!confirm("Amount KSh "+amt.toLocaleString()+" exceeds total balance of KSh "+totalDebt.toLocaleString()+". Continue?"))return;amt=totalDebt;}
@@ -1776,15 +1778,17 @@ function recPay(){
   toast("Payment recorded — KSh "+amt.toLocaleString());
 }
 
-var ORD_STATUS_F="";
+var ORD_STATUS_F="";var ORD_DATE_F="";
 function rOrds(q,pg,sort){
   if(q!==undefined)ORD_Q=q;
   if(pg!==undefined)ORD_PAGE=pg;
   if(sort!==undefined)ORD_SORT=sort;
   var q2=ORD_Q||"";var sort2=ORD_SORT||"newest";var sf=ORD_STATUS_F||"";
   var pgEl=el("pg-orders");if(!pgEl)return;
+  var df=ORD_DATE_F||"";
   var fil=D.orders.filter(function(o){
     if(sf&&o.status!==sf)return false;
+    if(df){var dd=o.deliveredAt||o.date;if(!dd||!dd.startsWith(df))return false;}
     if(!q2)return true;
     var lq=q2.toLowerCase();
     var c=D.customers.find(function(x){return x.id===o.cId;});
@@ -1833,7 +1837,7 @@ function rOrds(q,pg,sort){
     pgBar(paged.page,paged.pages,paged.total,"rOrds(undefined,");
 }
 function filterOrds(f){
-  ORD_STATUS_F=f;ORD_PAGE=0;
+  ORD_STATUS_F=f;ORD_DATE_F="";ORD_PAGE=0;
   rOrds(undefined,0);
 }
 function ordRows(fil){
@@ -2253,7 +2257,7 @@ function saveOrd(){
   else{payStatus="Unpaid";}
   D.orders.push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:price,cost:costAtSale,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:"",prodConfirmed:true});
   // Always create invoice for exact orders — provides full financial trail
-  D.invoices.push({id:nIId++,cId:cId,amount:total,paid:amtPaid,due:el("od").value,notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:el("opay-method")&&el("opay-method").value?el("opay-method").value:"Cash",ref:"Order #"+newOrdId}]:[]});
+  D.invoices.push({id:nIId++,cId:cId,amount:total,paid:amtPaid,due:el("od").value,notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
   auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty);
   cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+newOrdId+" placed");
 }
@@ -2428,17 +2432,24 @@ function rDel(){
   var pg=el("pg-delivery");if(!pg)return;
   var allPend=D.orders.filter(function(o){return o.status==="Pending"||o.status==="Processing"||o.status==="Out for delivery";});
   var pend=CU&&CU.role==="driver"?allPend.filter(function(o){return o.driver===CU.name;}):allPend;
+  var todayDel=D.orders.filter(function(o){return o.status==="Delivered"&&(o.deliveredAt===tday()||(!o.deliveredAt&&o.date===tday()));}).length;
+  var totalDel=D.orders.filter(function(o){return o.status==="Delivered";}).length;
+  var DEL_Q=(el("del-srch")&&document.activeElement!==el("del-srch"))?el("del-srch").value:"";
+  var pendFil=DEL_Q?pend.filter(function(o){var cu=D.customers.find(function(x){return x.id===o.cId;});var lq=DEL_Q.toLowerCase();return(cu&&(cu.name.toLowerCase().indexOf(lq)!==-1||cAddr(cu).toLowerCase().indexOf(lq)!==-1))||String(o.id).indexOf(DEL_Q)!==-1||o.prod.toLowerCase().indexOf(lq)!==-1||(o.driver&&o.driver.toLowerCase().indexOf(lq)!==-1);}):pend;
   pg.innerHTML=
-    "<div class=\"ph\"><h1>Delivery Board</h1><p>"+pend.length+" pending &middot; "+D.orders.filter(function(o){return o.status==="Delivered";}).length+" total delivered</p></div>"+
+    "<div class=\"ph\"><h1>Delivery Board</h1><p>"+pend.length+" pending &middot; "+totalDel+" total delivered</p></div>"+
     "<div class=\"stats\" style=\"grid-template-columns:repeat(4,1fr)\">"+
-      "<div class=\"stat sa\"><div class=\"sl\">Pending</div><div class=\"sv\">"+pend.length+"</div></div>"+
-      "<div class=\"stat sk\"><div class=\"sl\">Delivered today</div><div class=\"sv\">"+D.orders.filter(function(o){return o.status==="Delivered"&&(o.deliveredAt===tday()||(!o.deliveredAt&&o.date===tday()));}).length+"</div></div>"+
-      "<div class=\"stat sn\"><div class=\"sl\">Total delivered</div><div class=\"sv\">"+D.orders.filter(function(o){return o.status==="Delivered";}).length+"</div></div>"+
+      "<div class=\"stat sa\" style=\"cursor:pointer\" title=\"View all pending in Orders tab\" onclick=\"nav('orders',null);setTimeout(function(){filterOrds('Pending');},80)\"><div class=\"sl\">Pending</div><div class=\"sv\">"+pend.length+"</div><div class=\"ss\">view all &rarr;</div></div>"+
+      "<div class=\"stat sk\" style=\"cursor:pointer\" title=\"View today's deliveries in Orders tab\" onclick=\"nav('orders',null);setTimeout(function(){ORD_STATUS_F='Delivered';ORD_DATE_F=tday();rOrds(undefined,0);},80)\"><div class=\"sl\">Delivered today</div><div class=\"sv\">"+todayDel+"</div><div class=\"ss\">view &rarr;</div></div>"+
+      "<div class=\"stat sn\" style=\"cursor:pointer\" title=\"View all delivered orders\" onclick=\"nav('orders',null);setTimeout(function(){filterOrds('Delivered');},80)\"><div class=\"sl\">Total delivered</div><div class=\"sv\">"+totalDel+"</div><div class=\"ss\">view all &rarr;</div></div>"+
       "<div class=\"stat sb\"><div class=\"sl\">Routes</div><div class=\"sv\">"+D.routes.length+"</div></div>"+
+    "</div>"+
+    "<div class=\"toolbar\" style=\"margin-bottom:10px\">"+
+      "<div class=\"srch\"><i class=\"ti ti-search\"></i><input id=\"del-srch\" type=\"text\" placeholder=\"Search by order #, customer, product, driver...\" oninput=\"rDel()\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
     "</div>"+
     "<div class=\"tw\"><table><thead><tr><th>#</th><th>Customer</th><th>Full address</th><th>Product</th><th>Qty</th><th>Bottle before</th><th>Driver</th><th>Payment</th><th>Status</th><th></th></tr></thead>"+
     "<tbody>"+
-      (pend.length?pend.map(function(o){
+      (pendFil.length?pendFil.map(function(o){
         var c=D.customers.find(function(x){return x.id===o.cId;});
         return "<tr><td style=\"font-weight:700\">#"+o.id+"</td>"+
           "<td><div style=\"font-weight:700\">"+(c?(can("vPhone")?c.name:maskName(c.name)):"&mdash;")+"</div><div class=\"ca\">"+(c&&can("vPhone")?c.phone:"")+"</div></td>"+
@@ -2558,7 +2569,7 @@ function invRows(fil){
     var lp=(i.payments||[]).slice().sort(function(a,b){return b.date>a.date?1:-1;})[0];
     return "<tr class=\""+(ov&&bal>0?"dr":"")+"\">"+
       "<td style=\"font-weight:700\">#"+i.id+"</td>"+
-      "<td><div style=\"font-weight:700\">"+(c?c.name:"&mdash;")+"</div><div class=\"ca\">"+(c?c.phone:"")+"</div></td>"+
+      "<td><div style=\"font-weight:700\">"+(c?c.name:"&mdash;")+"</div><div class=\"ca\">"+(c?(can("vPhone")?c.phone:maskPhone(c.phone)):"")+"</div></td>"+
       "<td>"+ia(i.amount)+"</td><td>"+ia(i.paid)+"</td>"+
       "<td style=\"font-weight:800;color:"+(bal>0?"#c0392b":"#27ae60")+"\">"+ia(bal)+"</td>"+
       "<td style=\"font-size:11px\">"+fmt(i.due)+"</td>"+
@@ -3189,14 +3200,15 @@ function printInvoice(invId){
     "@media print{button{display:none}}</style></head><body>"+
     "<div class='hdr'>"+
       "<div style='display:flex;align-items:center;gap:14px'>"+
-      "<svg width='52' height='52' viewBox='0 0 52 52' xmlns='http://www.w3.org/2000/svg'>"+
-      "<defs><radialGradient id='bg' cx='50%' cy='60%' r='55%'><stop offset='0%' stop-color='#1e2a6e'/><stop offset='100%' stop-color='#0f0f3d'/></radialGradient></defs>"+
-      "<circle cx='26' cy='26' r='26' fill='url(%23bg)'/>"+
-      "<circle cx='26' cy='26' r='24' fill='none' stroke='%23c8a951' stroke-width='1.5'/>"+
-      "<line x1='26' y1='28' x2='26' y2='14' stroke='%23c8a951' stroke-width='1'/>"+
-      "<line x1='13' y1='28' x2='39' y2='28' stroke='%23c8a951' stroke-width='1.2'/>"+
-      "<ellipse cx='26' cy='26.5' rx='7' ry='4.5' fill='%23c8a951' opacity='0.9'/>"+
-      "<path d='M26 32 Q23 38 26 42 Q29 38 26 32Z' fill='%2363b3ed'/>"+
+      "<svg width='56' height='56' viewBox='0 0 56 56' xmlns='http://www.w3.org/2000/svg'>"+
+      "<circle cx='28' cy='28' r='28' fill='#1a1560'/>"+
+      "<circle cx='28' cy='28' r='26' fill='none' stroke='#c8a951' stroke-width='2'/>"+
+      "<line x1='28' y1='30' x2='28' y2='14' stroke='#c8a951' stroke-width='1.5'/>"+
+      "<line x1='14' y1='30' x2='42' y2='30' stroke='#c8a951' stroke-width='1.5'/>"+
+      "<ellipse cx='28' cy='28' rx='8' ry='5' fill='#c8a951'/>"+
+      "<path d='M28 35 Q24 42 28 46 Q32 42 28 35Z' fill='#63b3ed'/>"+
+      "<path d='M20 30 Q14 26 14 30' fill='none' stroke='#c8a951' stroke-width='1' opacity='0.6'/>"+
+      "<path d='M36 30 Q42 26 42 30' fill='none' stroke='#c8a951' stroke-width='1' opacity='0.6'/>"+
       "</svg>"+
       "<div><div class='co'>NEW DAWN PURE DRINKING WATER</div>"+
       "<div class='sub'>Nyayo Estate, Gate D, Court 290</div>"+
@@ -3248,12 +3260,12 @@ function printStatement(cId){
     "<div style='display:flex;align-items:center;gap:14px;margin-bottom:20px;padding-bottom:16px;border-bottom:3px solid #1a1560'>"+
     "<svg width='48' height='48' viewBox='0 0 52 52' xmlns='http://www.w3.org/2000/svg'>"+
     "<defs><radialGradient id='bg' cx='50%' cy='60%' r='55%'><stop offset='0%' stop-color='#1e2a6e'/><stop offset='100%' stop-color='#0f0f3d'/></radialGradient></defs>"+
-    "<circle cx='26' cy='26' r='26' fill='url(%23bg)'/>"+
-    "<circle cx='26' cy='26' r='24' fill='none' stroke='%23c8a951' stroke-width='1.5'/>"+
-    "<line x1='26' y1='28' x2='26' y2='14' stroke='%23c8a951' stroke-width='1'/>"+
-    "<line x1='13' y1='28' x2='39' y2='28' stroke='%23c8a951' stroke-width='1.2'/>"+
-    "<ellipse cx='26' cy='26.5' rx='7' ry='4.5' fill='%23c8a951' opacity='0.9'/>"+
-    "<path d='M26 32 Q23 38 26 42 Q29 38 26 32Z' fill='%2363b3ed'/>"+
+    "<circle cx='26' cy='26' r='26' fill='url(#bg)'/>"+
+    "<circle cx='26' cy='26' r='24' fill='none' stroke='#c8a951' stroke-width='1.5'/>"+
+    "<line x1='26' y1='28' x2='26' y2='14' stroke='#c8a951' stroke-width='1'/>"+
+    "<line x1='13' y1='28' x2='39' y2='28' stroke='#c8a951' stroke-width='1.2'/>"+
+    "<ellipse cx='26' cy='26.5' rx='7' ry='4.5' fill='#c8a951' opacity='0.9'/>"+
+    "<path d='M26 32 Q23 38 26 42 Q29 38 26 32Z' fill='#63b3ed'/>"+
     "</svg>"+
     "<div><div style='font-size:20px;font-weight:800;color:#1a1560'>NEW DAWN PURE DRINKING WATER</div>"+
     "<div style='color:#666;font-size:12px'>Nyayo Estate, Gate D, Court 290 &bull; Tel: 0710805099 / 0733930568</div></div></div>"+
