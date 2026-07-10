@@ -226,7 +226,7 @@ var USERS=[{id:1,name:"Director",role:"director",pin:"1234",ini:"DR",col:"#1a156
 var D={customers:[],stock:[],orders:[],offers:[],invoices:[],routes:[],complaints:[],
   auditLog:[]
 };
-var nOId=1001,nIId=2001,nCId=3001;
+var nOId=1001,nIId=2001,nCId=3001,nCmpId=4001;
 var CU=null,SU=null,PE="";
 
 function can(p){return !!(CU&&R[CU.role]&&R[CU.role].p[p]);}
@@ -1518,22 +1518,22 @@ function rDash(){
   var yr=new Date().getFullYear();
   var mo=new Date().getMonth();
   var mns=["J","F","M","A","M","J","J","A","S","O","N","D"];
-  var mRevs=mns.map(function(_,i){var m2=String(i+1).padStart(2,"0");return del.filter(function(o){return o.date&&o.date.startsWith(yr+"-"+m2);}).reduce(function(a,o){return a+o.qty*o.price;},0);});
+  var mRevs=mns.map(function(_,i){var m2=String(i+1).padStart(2,"0");return del.filter(function(o){var dd=o.deliveredAt||o.date;return dd&&dd.startsWith(yr+"-"+m2);}).reduce(function(a,o){return a+o.qty*o.price;},0);});
   var mMax=Math.max.apply(null,mRevs.concat([1]));
   var alerts=[];
   var now2=new Date();
   var thisMonth=now2.getFullYear()+"-"+String(now2.getMonth()+1).padStart(2,"0");
   var lastMonthD=new Date(now2.getFullYear(),now2.getMonth()-1,1);
   var lastMonth=lastMonthD.getFullYear()+"-"+String(lastMonthD.getMonth()+1).padStart(2,"0");
-  var thisRev=del.filter(function(o){return o.date&&o.date.startsWith(thisMonth);}).reduce(function(s,o){return s+o.qty*o.price;},0);
-  var lastRev=del.filter(function(o){return o.date&&o.date.startsWith(lastMonth);}).reduce(function(s,o){return s+o.qty*o.price;},0);
+  var thisRev=del.filter(function(o){var dd=o.deliveredAt||o.date;return dd&&dd.startsWith(thisMonth);}).reduce(function(s,o){return s+o.qty*o.price;},0);
+  var lastRev=del.filter(function(o){var dd=o.deliveredAt||o.date;return dd&&dd.startsWith(lastMonth);}).reduce(function(s,o){return s+o.qty*o.price;},0);
   if(can("vRev")&&lastRev>0){var tp=Math.round((thisRev-lastRev)/lastRev*100);if(Math.abs(tp)>=10){var tc=tp>0?"#27ae60":"#c0392b";alerts.push({t:"ni",i:(tp>0?"ti-trending-up":"ti-trending-down"),m:"Revenue "+(tp>0?"+":"")+tp+"% vs last month — KSh "+thisRev.toLocaleString()+" this month",dest:"reports"});}}
   var churnDate=new Date(Date.now()-30*86400000).toISOString().slice(0,10);
   var churned=D.customers.filter(function(cu){var lo=D.orders.filter(function(o){return o.cId===cu.id&&o.status==="Delivered";}).sort(function(a,b){return b.date>a.date?1:-1;})[0];return lo&&lo.date<churnDate;}).length;
   if(churned>0)alerts.push({t:"nw",i:"ti-user-exclamation",m:churned+" customer(s) have not ordered in 30+ days",dest:"customers"});
 
   D.stock.filter(function(s){return s.qty<=s.min;}).forEach(function(s){alerts.push({t:"nw",i:"ti-alert-triangle",m:"Low stock: <strong>"+s.name+"</strong> &mdash; "+s.qty+" left (min "+s.min+")",dest:"stock"});});
-  if(can("vDebt"))debts.slice(0,3).forEach(function(c){alerts.push({t:"nr",i:"ti-alert-circle",m:"Debt: <strong>"+(can("vPhone")?c.name:maskName(c.name))+"</strong> &mdash; KSh "+custDebt(c.id).toLocaleString(),dest:"debts"});});
+  if(can("vDebt")){var topDebts=[].concat(debts).sort(function(a,b){return custDebt(b.id)-custDebt(a.id);});topDebts.slice(0,3).forEach(function(c){alerts.push({t:"nr",i:"ti-alert-circle",m:"Debt: <strong>"+(can("vPhone")?c.name:maskName(c.name))+"</strong> &mdash; KSh "+custDebt(c.id).toLocaleString(),dest:"debts"});});}
   D.complaints.filter(function(c){return c.status==="Open";}).slice(0,2).forEach(function(c){var cu=D.customers.find(function(x){return x.id===c.cId;});alerts.push({t:"nw",i:"ti-message-report",m:"Complaint: <strong>"+(cu?(can("vPhone")?cu.name:maskName(cu.name)):"?")+"</strong> &mdash; "+c.type,dest:"complaints"});});
   D.orders.filter(function(o){return o.status==="Pending";}).slice(0,3).forEach(function(o){alerts.push({t:"ni",i:"ti-truck",m:"Pending: <strong>#"+o.id+"</strong> &mdash; "+custName(o.cId)+": "+o.qty+"&times; "+o.prod,dest:"orders"});});
   pg.innerHTML=
@@ -1655,7 +1655,7 @@ function rCusts(q,pg,sort,type){
             "<td style=\"font-size:11px\">"+(can("vRev")?(lp?"<div>"+fmt(lp.date)+"</div><div class=\"ca\">KSh "+lp.amt.toLocaleString()+" &middot; "+lp.method+"</div>":"-"):"<span style=\"color:var(--tx2)\">—</span>")+"</td>"+
             "<td><span style=\"font-weight:800;color:"+(debt>0?"#c0392b":"#27ae60")+"\">"+(can("vDebt")?(debt>0?"KSh "+debt.toLocaleString():"Nil"):"&bull;&bull;&bull;&bull;")+"</span></td>"+
             "<td><div class=\"ac\">"+
-              "<button class=\"btn btn-xs btn-gold\" onclick=\"openPay("+c.id+")\" title=\"Record payment\"><i class=\"ti ti-cash\"></i></button>"+(can("vRev")?"<button class=\"btn btn-xs\" onclick=\"printStatement("+c.id+")\" title=\"Customer statement\" style=\"background:#7c3aed;color:#fff\"><i class=\"ti ti-file-text\"></i></button>":"")+
+              (can("mPaid")?"<button class=\"btn btn-xs btn-gold\" onclick=\"openPay("+c.id+")\" title=\"Record payment\"><i class=\"ti ti-cash\"></i></button>":"")+(can("vRev")?"<button class=\"btn btn-xs\" onclick=\"printStatement("+c.id+")\" title=\"Customer statement\" style=\"background:#7c3aed;color:#fff\"><i class=\"ti ti-file-text\"></i></button>":"")+
               (can("eCust")?"<button class=\"btn btn-xs btn-navy\" onclick=\"editCust("+c.id+")\" title=\"Edit\"><i class=\"ti ti-edit\"></i></button>":"")+
               (can("dCust")?"<button class=\"btn btn-xs btn-red\" onclick=\"delC("+c.id+")\" title=\"Delete\"><i class=\"ti ti-trash\"></i></button>":"")+
             "</div></td>"+
@@ -2221,20 +2221,6 @@ function saveOrd(){
     return;
   }
 
-  var st=D.stock.find(function(s){return s.name===pn;});
-  if(st&&st.qty<=0){
-    if(!confirm("⚠️ Stock Alert\n\n"+pn+" is OUT OF STOCK (0 units).\n\nThe order will be recorded but cannot be fulfilled until restocked.\n\nContinue placing this order?"))return;
-  }else if(st&&st.qty<qty){
-    if(!confirm("⚠️ Stock Alert\n\n"+pn+" has only "+st.qty+" unit(s) in stock but you are ordering "+qty+".\n\nThe order will be recorded. Please restock soon.\n\nContinue?"))return;
-  }
-  if(st)st.qty=Math.max(0,st.qty-qty); // never go below zero
-  var total=price*qty;
-  var amtPaid=can("mPaid")?(parseFloat(el("oamt").value)||0):0;
-  var payStatus=can("mPaid")?el("opay").value:"Unpaid";
-  // Auto-correct payment status based on amount paid
-  if(amtPaid>=total){payStatus="Paid";}
-  else if(amtPaid>0){payStatus="Partial";}
-  else{payStatus="Unpaid";}
   var newOrdId=nOId++;
   var stCost=D.stock.find(function(s){return s.name===pn;});var costAtSale=stCost?stCost.cost:0;
 
@@ -2338,6 +2324,7 @@ function completeDlv(){
   }
 
   o.status="Delivered";
+  o.deliveredAt=tday(); // stamp actual delivery date
   o.bottle_after=el("dlv-btl").value;
 
   if(can("mPaid")){
@@ -2440,7 +2427,7 @@ function rDel(){
     "<div class=\"ph\"><h1>Delivery Board</h1><p>"+pend.length+" pending &middot; "+D.orders.filter(function(o){return o.status==="Delivered";}).length+" total delivered</p></div>"+
     "<div class=\"stats\" style=\"grid-template-columns:repeat(4,1fr)\">"+
       "<div class=\"stat sa\"><div class=\"sl\">Pending</div><div class=\"sv\">"+pend.length+"</div></div>"+
-      "<div class=\"stat sk\"><div class=\"sl\">Delivered today</div><div class=\"sv\">"+D.orders.filter(function(o){return o.status==="Delivered"&&o.date===tday();}).length+"</div></div>"+
+      "<div class=\"stat sk\"><div class=\"sl\">Delivered today</div><div class=\"sv\">"+D.orders.filter(function(o){return o.status==="Delivered"&&(o.deliveredAt===tday()||(!o.deliveredAt&&o.date===tday()));}).length+"</div></div>"+
       "<div class=\"stat sn\"><div class=\"sl\">Total delivered</div><div class=\"sv\">"+D.orders.filter(function(o){return o.status==="Delivered";}).length+"</div></div>"+
       "<div class=\"stat sb\"><div class=\"sl\">Routes</div><div class=\"sv\">"+D.routes.length+"</div></div>"+
     "</div>"+
@@ -2561,7 +2548,7 @@ function rInvs(q,pg){
 function invRows(fil){
   var td=tday();if(!fil.length)return "<tr><td colspan=\"9\"><div class=\"te\"><i class=\"ti ti-receipt\"></i><p>No invoices found</p></div></td></tr>";
   return fil.map(function(i){
-    var c=D.customers.find(function(x){return x.id===i.cId;});var bal=i.amount-i.paid;var ov=bal>0&&i.due<td;
+    var c=D.customers.find(function(x){return x.id===i.cId;});var bal=i.amount-i.paid;var ov=bal>0&&i.due&&i.due<td;
     var st=bal<=0?"<span class=\"badge bg\"><i class=\"ti ti-check\"></i>Paid</span>":ov?"<span class=\"badge br\"><i class=\"ti ti-alert-circle\"></i>Overdue</span>":"<span class=\"badge ba\">Unpaid</span>";
     var lp=(i.payments||[]).slice().sort(function(a,b){return b.date>a.date?1:-1;})[0];
     return "<tr class=\""+(ov&&bal>0?"dr":"")+"\">"+
@@ -2584,8 +2571,8 @@ function filterInvs(f){
   INV_PAGE=0;var td=tday();
   var fil=[].concat(D.invoices).reverse();
   if(f==="Paid")fil=fil.filter(function(i){return i.paid>=i.amount;});
-  else if(f==="Unpaid")fil=fil.filter(function(i){return i.paid<i.amount&&i.due>=td;});
-  else if(f==="Overdue")fil=fil.filter(function(i){return i.paid<i.amount&&i.due<td;});
+  else if(f==="Unpaid")fil=fil.filter(function(i){return i.paid<i.amount&&(!i.due||i.due>=td);});
+  else if(f==="Overdue")fil=fil.filter(function(i){return i.paid<i.amount&&i.due&&i.due<td;});
   var paged=paginate(fil,0);
   var tb=el("itbody");if(tb)tb.innerHTML=invRows(paged.items);
 }
@@ -2761,7 +2748,7 @@ function saveCmp(){
       if(editIdEl)editIdEl.value="";
       cm("m-cmp");rCmps(undefined,CMP_PAGE);dirty();toast("Complaint updated");return;
     }
-  }D.complaints.push({id:nCId++,cId:parseInt(el("cmp-c").value),type:el("cmp-t").value,details:det,action:el("cmp-act").value,status:el("cmp-s").value,date:el("cmp-d").value});el("cmp-det").value="";el("cmp-act").value="";cm("m-cmp");rCmps(undefined,CMP_PAGE);dirty();toast("Complaint logged");}
+  }D.complaints.push({id:nCmpId++,cId:parseInt(el("cmp-c").value),type:el("cmp-t").value,details:det,action:el("cmp-act").value,status:el("cmp-s").value,date:el("cmp-d").value});el("cmp-det").value="";el("cmp-act").value="";cm("m-cmp");rCmps(undefined,CMP_PAGE);dirty();toast("Complaint logged");}
 function editCmp(id){
   if(!can("aCmp"))return;
   var cmp=D.complaints.find(function(x){return x.id===id;});if(!cmp)return;
@@ -2791,7 +2778,6 @@ function rOffers(){
           "<div style=\"font-size:10px;color:"+(o.active?"rgba(255,255,255,.45)":"var(--tx2)")+";margin-bottom:13px\">"+o.start+" &rarr; "+o.end+"</div>"+
           "<div style=\"display:flex;gap:7px\">"+
             (can("aOff")?"<button class=\"btn btn-sm\" style=\""+(o.active?"background:rgba(255,255,255,.15);color:#fff;border-color:rgba(255,255,255,.3)":"")+"\" onclick=\"togOf("+o.id+")\" title=\"Toggle offer\"><i class=\"ti ti-"+(o.active?"toggle-right":"toggle-left")+"\" style=\"margin-right:3px\"></i>"+(o.active?"Deactivate":"Activate")+"</button>":"")+
-            (can("eOff")?"<button class=\"btn btn-sm\" style=\""+(o.active?"background:rgba(255,255,255,.15);color:#fff;border-color:rgba(255,255,255,.3)":"")+"\" onclick=\"editOff("+o.id+")\"><i class=\"ti ti-edit\"></i></button>":"")+
             (can("eOff")?"<button class=\"btn btn-sm btn-navy\" onclick=\"editOf("+o.id+")\" title=\"Edit offer\"><i class=\"ti ti-edit\"></i></button>":"")+
             (can("dOff")?"<button class=\"btn btn-sm btn-red\" onclick=\"delOf("+o.id+")\" title=\"Delete offer\"><i class=\"ti ti-trash\"></i></button>":"")+
           "</div></div>";
@@ -2845,12 +2831,14 @@ function delOf(id){if(!can("dOff"))return;if(!confirm("Delete?"))return;D.offers
 var RPT_FROM="";var RPT_TO="";
 function rReports(){
   var pg=el("pg-reports");if(!pg)return;
-  var del=D.orders.filter(function(o){if(o.status!=="Delivered")return false;if(RPT_FROM&&o.date<RPT_FROM)return false;if(RPT_TO&&o.date>RPT_TO)return false;return true;});
+  var del=D.orders.filter(function(o){if(o.status!=="Delivered")return false;var dDate=o.deliveredAt||o.date; // use actual delivery date for reporting
+  if(RPT_FROM&&dDate<RPT_FROM)return false;if(RPT_TO&&dDate>RPT_TO)return false;return true;});
   var rev=del.reduce(function(a,o){return a+o.qty*o.price;},0);
   var cost=del.reduce(function(a,o){return a+o.qty*(o.cost||0);},0);
   var totD=D.customers.reduce(function(a,c){return a+custDebt(c.id);},0);
   var btlIss=D.orders.filter(function(o){return o.bottle_after&&o.bottle_after!=="Good";}).length;
-  var cRevs=D.customers.map(function(c){return{c:c,rev:del.filter(function(o){return o.cId===c.id;}).reduce(function(a,o){return a+o.qty*o.price;},0),ords:del.filter(function(o){return o.cId===c.id;}).length,debt:custDebt(c.id)};}).sort(function(a,b){return b.rev-a.rev;});
+  var cRevMap={};del.forEach(function(o){if(!cRevMap[o.cId])cRevMap[o.cId]={rev:0,ords:0};cRevMap[o.cId].rev+=o.qty*o.price;cRevMap[o.cId].ords++;});
+  var cRevs=D.customers.map(function(c){var cm=cRevMap[c.id]||{rev:0,ords:0};return{c:c,rev:cm.rev,ords:cm.ords,debt:custDebt(c.id)};}).sort(function(a,b){return b.rev-a.rev;});
   var pRevs={};del.forEach(function(o){if(!pRevs[o.prod])pRevs[o.prod]={qty:0,rev:0};pRevs[o.prod].qty+=o.qty;pRevs[o.prod].rev+=o.qty*o.price;});
   var zones=[].concat([],D.customers.map(function(c){return c.estate||c.zone||"";})).filter(function(z,i,a){return z&&a.indexOf(z)===i;});
   pg.innerHTML=
@@ -2888,7 +2876,7 @@ function rReports(){
         "<div class=\"tw\"><table><thead><tr><th>Area</th><th>Customers</th><th>Orders</th></tr></thead><tbody>"+
         (zones.length?zones.map(function(z){
           var cu=D.customers.filter(function(c){return c.estate===z||c.zone===z;}).length;
-          var or=D.orders.filter(function(o){var c=D.customers.find(function(x){return x.id===o.cId;});return c&&(c.estate===z||c.zone===z);}).length;
+          var or=D.orders.filter(function(o){var c=D.customers.find(function(x){return x.id===o.cId;});return c&&o.status==="Delivered"&&(c.estate===z||c.zone===z);}).length;
           return "<tr><td>"+z+"</td><td>"+cu+"</td><td>"+or+"</td></tr>";
         }).join(""):"<tr><td colspan=\"3\" style=\"text-align:center;padding:18px;color:var(--tx2)\">No area data yet</td></tr>")+
         "</tbody></table></div>"+
@@ -3569,9 +3557,9 @@ function restoreXL(input){
 function syncIdCounters(){
   var maxO=D.orders.reduce(function(m,o){return Math.max(m,Number(o.id)||0);},1000);
   var maxI=D.invoices.reduce(function(m,i){return Math.max(m,Number(i.id)||0);},2000);
-  // nCId tracks customers (starting 3001), not complaints
   var maxCust=D.customers.reduce(function(m,cu){return Math.max(m,Number(cu.id)||0);},3000);
-  nOId=maxO+1;nIId=maxI+1;nCId=maxCust+1;
+  var maxCmp=D.complaints.reduce(function(m,x){return Math.max(m,Number(x.id)||0);},4000);
+  nOId=maxO+1;nIId=maxI+1;nCId=maxCust+1;nCmpId=maxCmp+1;
 }
 function syncPaymentStatuses(){
   // Fix any order whose payment badge doesn't match its invoice reality
