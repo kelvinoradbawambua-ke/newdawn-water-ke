@@ -2434,7 +2434,7 @@ function rDel(){
   var pend=CU&&CU.role==="driver"?allPend.filter(function(o){return o.driver===CU.name;}):allPend;
   var todayDel=D.orders.filter(function(o){return o.status==="Delivered"&&(o.deliveredAt===tday()||(!o.deliveredAt&&o.date===tday()));}).length;
   var totalDel=D.orders.filter(function(o){return o.status==="Delivered";}).length;
-  var DEL_Q=(el("del-srch")&&document.activeElement!==el("del-srch"))?el("del-srch").value:"";
+  var DEL_Q=el("del-srch")?el("del-srch").value:"";
   var pendFil=DEL_Q?pend.filter(function(o){var cu=D.customers.find(function(x){return x.id===o.cId;});var lq=DEL_Q.toLowerCase();return(cu&&(cu.name.toLowerCase().indexOf(lq)!==-1||cAddr(cu).toLowerCase().indexOf(lq)!==-1))||String(o.id).indexOf(DEL_Q)!==-1||o.prod.toLowerCase().indexOf(lq)!==-1||(o.driver&&o.driver.toLowerCase().indexOf(lq)!==-1);}):pend;
   pg.innerHTML=
     "<div class=\"ph\"><h1>Delivery Board</h1><p>"+pend.length+" pending &middot; "+totalDel+" total delivered</p></div>"+
@@ -3200,16 +3200,7 @@ function printInvoice(invId){
     "@media print{button{display:none}}</style></head><body>"+
     "<div class='hdr'>"+
       "<div style='display:flex;align-items:center;gap:14px'>"+
-      "<svg width='56' height='56' viewBox='0 0 56 56' xmlns='http://www.w3.org/2000/svg'>"+
-      "<circle cx='28' cy='28' r='28' fill='#1a1560'/>"+
-      "<circle cx='28' cy='28' r='26' fill='none' stroke='#c8a951' stroke-width='2'/>"+
-      "<line x1='28' y1='30' x2='28' y2='14' stroke='#c8a951' stroke-width='1.5'/>"+
-      "<line x1='14' y1='30' x2='42' y2='30' stroke='#c8a951' stroke-width='1.5'/>"+
-      "<ellipse cx='28' cy='28' rx='8' ry='5' fill='#c8a951'/>"+
-      "<path d='M28 35 Q24 42 28 46 Q32 42 28 35Z' fill='#63b3ed'/>"+
-      "<path d='M20 30 Q14 26 14 30' fill='none' stroke='#c8a951' stroke-width='1' opacity='0.6'/>"+
-      "<path d='M36 30 Q42 26 42 30' fill='none' stroke='#c8a951' stroke-width='1' opacity='0.6'/>"+
-      "</svg>"+
+      makeLogo(64)+
       "<div><div class='co'>NEW DAWN PURE DRINKING WATER</div>"+
       "<div class='sub'>Nyayo Estate, Gate D, Court 290</div>"+
       "<div class='sub'>Tel: 0710805099 / 0733930568</div></div></div>"+
@@ -3258,15 +3249,7 @@ function printStatement(cId){
     ".sm{text-align:center}.sl{font-size:11px;color:#666}.sv{font-size:18px;font-weight:800;color:#1a1560}"+
     "@media print{button{display:none}}</style></head><body>"+
     "<div style='display:flex;align-items:center;gap:14px;margin-bottom:20px;padding-bottom:16px;border-bottom:3px solid #1a1560'>"+
-    "<svg width='48' height='48' viewBox='0 0 52 52' xmlns='http://www.w3.org/2000/svg'>"+
-    "<defs><radialGradient id='bg' cx='50%' cy='60%' r='55%'><stop offset='0%' stop-color='#1e2a6e'/><stop offset='100%' stop-color='#0f0f3d'/></radialGradient></defs>"+
-    "<circle cx='26' cy='26' r='26' fill='url(#bg)'/>"+
-    "<circle cx='26' cy='26' r='24' fill='none' stroke='#c8a951' stroke-width='1.5'/>"+
-    "<line x1='26' y1='28' x2='26' y2='14' stroke='#c8a951' stroke-width='1'/>"+
-    "<line x1='13' y1='28' x2='39' y2='28' stroke='#c8a951' stroke-width='1.2'/>"+
-    "<ellipse cx='26' cy='26.5' rx='7' ry='4.5' fill='#c8a951' opacity='0.9'/>"+
-    "<path d='M26 32 Q23 38 26 42 Q29 38 26 32Z' fill='#63b3ed'/>"+
-    "</svg>"+
+    makeLogo(60)+
     "<div><div style='font-size:20px;font-weight:800;color:#1a1560'>NEW DAWN PURE DRINKING WATER</div>"+
     "<div style='color:#666;font-size:12px'>Nyayo Estate, Gate D, Court 290 &bull; Tel: 0710805099 / 0733930568</div></div></div>"+
     "<h1>CUSTOMER STATEMENT</h1>"+
