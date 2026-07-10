@@ -238,7 +238,7 @@ function vName(){return can("vPhone");}
 var _uidOffset=Math.floor(Math.random()*90000)+1000;
 var _uidCounter=0;
 function uid(){_uidCounter=(_uidCounter+1)%1000;return Math.floor(Date.now()/1000)*100000+_uidOffset+_uidCounter;}
-function fmt(d){return d?new Date(d).toLocaleDateString("en-GB",{day:"2-digit",month:"short",year:"numeric"}):"-";}
+function fmt(d){if(!d)return"-";var s=String(d);if(s.length===10)s+="T12:00:00";return new Date(s).toLocaleDateString("en-GB",{day:"2-digit",month:"short",year:"numeric"});}
 function ksh(v){return can("vRev")?"KSh "+Number(v).toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>";}
 function kshS(v){return can("vRev")?"KSh "+Number(v).toLocaleString():"KSh "+String.fromCharCode(8226,8226,8226,8226);}
 var PAGE_SIZE=50;
@@ -485,7 +485,7 @@ function startCloudListener(){
           FB_SETUP_DONE=true;
           syncIdCounters();
         }
-        console.warn("Main doc missing — restoring from local data and pushing to cloud");
+        /* Main doc missing — restoring from local data and pushing to cloud */
         setTimeout(function(){FB_LAST_LOCAL_WRITE=Date.now();pushToCloud();},1000);
         FB_READY=true;
         if(CU){refreshCurrentPage();}else{renderUG();}
@@ -495,7 +495,7 @@ function startCloudListener(){
       if(FB_BACKUP_COL){
         restoreFromLatestBackup(function(backup){
           var count=(backup.stats&&backup.stats.customers)||0;
-          console.warn("Restored from Firestore backup: "+count+" customers");
+          /* Restored from Firestore backup */
           autoSaveLocal(); // save restored data locally immediately
           setTimeout(function(){FB_LAST_LOCAL_WRITE=Date.now();pushToCloud();},1000);
           FB_READY=true;
@@ -1512,8 +1512,9 @@ function rDash(){
   var pend=D.orders.filter(function(o){return o.status==="Pending"||o.status==="Processing";}).length;
   var low=D.stock.filter(function(s){return s.qty<=s.min;}).length;
   var td=tday();
-  var debts=D.customers.filter(function(c){return custDebt(c.id)>0;});
-  var totD=debts.reduce(function(a,c){return a+custDebt(c.id);},0);
+  var dashDebtMap={};D.customers.forEach(function(cu){dashDebtMap[cu.id]=custDebt(cu.id);});
+  var debts=D.customers.filter(function(c){return dashDebtMap[c.id]>0;});
+  var totD=debts.reduce(function(a,c){return a+dashDebtMap[c.id];},0);
   var oCmp=D.complaints.filter(function(c){return c.status!=="Resolved";}).length;
   var yr=new Date().getFullYear();
   var mo=new Date().getMonth();
@@ -1536,8 +1537,8 @@ function rDash(){
   lowStock.slice(0,3).forEach(function(s){alerts.push({t:"nw",i:"ti-alert-triangle",m:"Low stock: <strong>"+s.name+"</strong> &mdash; "+s.qty+" left (min "+s.min+")",dest:"stock"});});
   if(lowStock.length>3)alerts.push({t:"nw",i:"ti-package",m:(lowStock.length-3)+" more product(s) below minimum stock level",dest:"stock"});
   if(can("vDebt")){
-    var topDebts=[].concat(debts).sort(function(a,b){return custDebt(b.id)-custDebt(a.id);});
-    topDebts.slice(0,3).forEach(function(c){alerts.push({t:"nr",i:"ti-alert-circle",m:"Debt: <strong>"+(can("vPhone")?c.name:maskName(c.name))+"</strong> &mdash; KSh "+custDebt(c.id).toLocaleString(),dest:"debts"});});
+    var topDebts=[].concat(debts).sort(function(a,b){return (dashDebtMap[b.id]||0)-(dashDebtMap[a.id]||0);});
+    topDebts.slice(0,3).forEach(function(c){alerts.push({t:"nr",i:"ti-alert-circle",m:"Debt: <strong>"+(can("vPhone")?c.name:maskName(c.name))+"</strong> &mdash; KSh "+(dashDebtMap[c.id]||0).toLocaleString(),dest:"debts"});});
     if(topDebts.length>3)alerts.push({t:"nr",i:"ti-users",m:(topDebts.length-3)+" more customer(s) with outstanding balances — KSh "+(totD-topDebts.slice(0,3).reduce(function(s,cc){return s+custDebt(cc.id);},0)).toLocaleString()+" remaining",dest:"debts"});
   }
   D.complaints.filter(function(c){return c.status==="Open";}).slice(0,2).forEach(function(c){var cu=D.customers.find(function(x){return x.id===c.cId;});alerts.push({t:"nw",i:"ti-message-report",m:"Complaint: <strong>"+(cu?(can("vPhone")?cu.name:maskName(cu.name)):"?")+"</strong> &mdash; "+c.type,dest:"complaints"});});
@@ -1726,6 +1727,11 @@ function delC(id){
   if(paidInvs.length)msg+=paidInvs.length+" paid invoice(s) will be kept for financial records.\n\n";
   msg+="Their orders and unpaid invoices will be removed. Cannot be undone.";
   if(!confirm(msg))return;
+  // Restore stock for any pending orders before removing customer
+  D.orders.filter(function(o){return o.cId===id&&o.status!=="Delivered"&&o.status!=="Cancelled"&&o.prodConfirmed!==false;}).forEach(function(o){
+    var st=D.stock.find(function(s){return s.name===o.prod;});
+    if(st)st.qty+=o.qty;
+  });
   D.customers=D.customers.filter(function(x){return x.id!==id;});
   D.orders=D.orders.filter(function(o){return o.cId!==id;});
   D.invoices=D.invoices.filter(function(i){if(i.cId!==id)return true;return i.paid>0;});
