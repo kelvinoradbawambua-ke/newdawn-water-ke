@@ -1250,7 +1250,7 @@ function nav(p,btn){
     if((b.getAttribute("onclick")||"").indexOf("'"+p+"'")!==-1)b.classList.add("act");
   });
   el("um").classList.remove("open");
-  var fns={dashboard:rDash,customers:function(){rCusts(undefined,CUST_PAGE);},orders:function(){rOrds(undefined,ORD_PAGE);},delivery:rDel,stock:function(){rStock(undefined,STK_PAGE);},invoices:function(){rInvs(undefined,INV_PAGE);},debts:rDebts,complaints:function(){rCmps(undefined,CMP_PAGE);},offers:rOffers,reports:rReports,excel:rExcel,users:rUsers};
+  var fns={dashboard:rDash,customers:function(){rCusts(undefined,CUST_PAGE);},orders:function(){ORD_STATUS_F="";ORD_DATE_F="";rOrds(undefined,ORD_PAGE);},delivery:rDel,stock:function(){rStock(undefined,STK_PAGE);},invoices:function(){rInvs(undefined,INV_PAGE);},debts:rDebts,complaints:function(){rCmps(undefined,CMP_PAGE);},offers:rOffers,reports:rReports,excel:rExcel,users:rUsers};
   if(fns[p])fns[p]();
 }
 
@@ -2257,7 +2257,7 @@ function saveOrd(){
   else{payStatus="Unpaid";}
   D.orders.push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:price,cost:costAtSale,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:"",prodConfirmed:true});
   // Always create invoice for exact orders — provides full financial trail
-  D.invoices.push({id:nIId++,cId:cId,amount:total,paid:amtPaid,due:el("od").value,notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
+  D.invoices.push({id:nIId++,cId:cId,amount:total,paid:amtPaid,due:(function(){var dd=new Date((el("od").value||tday())+"T00:00:00");dd.setDate(dd.getDate()+7);return dd.toISOString().split("T")[0];})(),notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
   auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty);
   cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+newOrdId+" placed");
 }
@@ -2595,7 +2595,7 @@ function filterInvs(f){
 function prepIv(){
   el("iv-edit-id").value="";
   var s=el("ivc");if(s)s.innerHTML=D.customers.map(function(c){return "<option value=\""+c.id+"\">"+c.name+"</option>";}).join("");
-  var d=el("ivd");if(d)d.value=new Date(Date.now()+7*86400000).toISOString().split("T")[0];
+  var d=el("ivd");if(d)d.value=new Date(Date.now()+30*86400000).toISOString().split("T")[0];
   el("iva").value="";el("ivp").value="0";el("ivn").value="";
   el("m-iv-title").innerHTML="<i class=\"ti ti-receipt\" style=\"color:var(--gd);margin-right:7px\"></i>New Invoice";
   el("m-iv-save").innerHTML="<i class=\"ti ti-check\"></i> Save";
@@ -3205,8 +3205,8 @@ function printInvoice(invId){
       "<div class='sub'>Nyayo Estate, Gate D, Court 290</div>"+
       "<div class='sub'>Tel: 0710805099 / 0733930568</div></div></div>"+
       "<div style='text-align:right'><div class='inv-no'>INVOICE #"+invId+"</div>"+
-      "<div class='sub'>Date: "+fmt(i.date)+"</div>"+
-      "<div class='sub'>Due: "+fmt(i.due)+"</div></div>"+
+      "<div class='sub' style='margin-top:6px'><span style='color:#888'>Invoice date:</span> "+fmt(i.date)+"</div>"+
+      "<div class='sub' style='font-weight:700;color:#1a1560'><span style='color:#888'>Payment due:</span> "+fmt(i.due)+"</div></div>"+
     "</div>"+
     "<div class='lbl'>BILL TO</div>"+
     "<div class='val'><strong>"+(cu?cu.name:"Customer")+"</strong><br>"+
