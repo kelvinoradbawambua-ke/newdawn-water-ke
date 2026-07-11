@@ -263,7 +263,7 @@ function pgBar(page,pages,total,navFn){
   "</div>";
 }
 var CUST_PAGE=0,ORD_PAGE=0,INV_PAGE=0,CMP_PAGE=0,STK_PAGE=0,DEBT_PAGE=0;
-var CUST_Q="",ORD_Q="",INV_Q="",CMP_Q="",STK_Q="",DEL_Q="",DEBT_Q="",DEBT_SORT="amount",AUDIT_Q="",AUDIT_TYPE="";
+var CUST_Q="",ORD_Q="",INV_Q="",CMP_Q="",STK_Q="",DEL_Q="",DEBT_Q="",DEBT_SORT="amount",AUDIT_Q="",AUDIT_TYPE="",AUDIT_PAGE=0;
 var CUST_SORT="recent",ORD_SORT="newest",CUST_TYPE="";
 function ia(v){return can("vInv")?"KSh "+Number(v).toLocaleString():"KSh "+String.fromCharCode(8226,8226,8226,8226);}
 function sb(s){var m={"Delivered":"bg","Pending":"ba","Out for delivery":"bp","Processing":"bb","Cancelled":"br"};var ic={"Delivered":"ti-circle-check","Pending":"ti-clock","Out for delivery":"ti-truck","Processing":"ti-loader","Cancelled":"ti-x"};return "<span class=\"badge "+(m[s]||"ba")+"\"><i class=\"ti "+(ic[s]||"ti-circle")+"\" style=\"font-size:10px;margin-right:2px\"></i>"+s+"</span>";}
@@ -679,7 +679,7 @@ function refreshCurrentPage(){
     complaints:function(){rCmps(undefined,CMP_PAGE);},
     offers:rOffers,
     reports:rReports,
-    excel:rExcel,
+    excel:function(){AUDIT_PAGE=0;AUDIT_Q="";AUDIT_TYPE="";rExcel();},
     users:rUsers
   };
   if(fns[pid])fns[pid]();
@@ -3198,89 +3198,158 @@ function rReports(){
 }
 
 
-function rAuditLog(){
-  var pg=el("pg-excel");if(!pg||!can("exp"))return;
+function exportAuditCSV(){
+  if(!can("exp")){toast("Director only","err");return;}
   var logs=[].concat(D.auditLog||[]).reverse();
-  var q2=AUDIT_Q||"";
-  var tf=AUDIT_TYPE||"";
-  // Filter
-  if(q2){var lq=q2.toLowerCase();logs=logs.filter(function(e){return(e.user&&e.user.toLowerCase().indexOf(lq)!==-1)||(e.action&&e.action.toLowerCase().indexOf(lq)!==-1)||(e.details&&e.details.toLowerCase().indexOf(lq)!==-1)||(e.role&&e.role.toLowerCase().indexOf(lq)!==-1);});}
-  if(tf)logs=logs.filter(function(e){return e.action&&e.action.startsWith(tf);});
-  // Action type icons and colours
+  if(!logs.length){toast("No audit entries to export");return;}
+  var rows=["Timestamp,User,Role,Action,Details"];
+  logs.forEach(function(e){
+    var dt=e.ts?new Date(e.ts).toISOString().replace("T"," ").slice(0,19):"";
+    var det=(e.details||"").replace(/,/g,";").replace(/"/g,"'");
+    rows.push('"'+dt+'","'+(e.user||"")+'","'+(e.role||"")+'","'+(e.action||"")+'","'+det+'"');
+  });
+  var csv=rows.join("\n");
+  var blob=new Blob([csv],{type:"text/csv"});
+  var a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);
+  a.download="newdawn_audit_"+new Date().toISOString().slice(0,10)+".csv";
+  a.click();
+  toast("Exported "+logs.length+" entries to CSV");
+}
+function rAuditLog(pg){
+  var pg0=el("pg-excel");if(!pg0||!can("exp"))return;
+  if(pg!==undefined)AUDIT_PAGE=pg;
+  var q2=AUDIT_Q||"";var tf=AUDIT_TYPE||"";
   var typeMap={
-    "ORDER_PLACED":   {ic:"ti-clipboard-list",col:"#185FA5",bg:"#eaf0ff",label:"Order placed"},
-    "ORDER_UPDATED":  {ic:"ti-edit",col:"#7c3aed",bg:"#faf5ff",label:"Order edited"},
-    "DELIVERY_COMPLETE":{ic:"ti-truck",col:"#27ae60",bg:"#f0fdf4",label:"Delivery"},
-    "PAYMENT_RECORDED":{ic:"ti-cash",col:"#c8a951",bg:"#fffbf0",label:"Payment"},
-    "CASH_PENDING":   {ic:"ti-clock",col:"#f39c12",bg:"#fff8e1",label:"Cash pending"},
-    "CASH_ACKNOWLEDGED":{ic:"ti-circle-check",col:"#27ae60",bg:"#f0fdf4",label:"Cash acked"},
-    "COMPLAINT_LOGGED":{ic:"ti-message-report",col:"#e74c3c",bg:"#fff0f0",label:"Complaint"},
+    "ORDER_PLACED":     {ic:"ti-clipboard-list",col:"#185FA5",bg:"#eaf0ff",label:"Order placed"},
+    "ORDER_UPDATED":    {ic:"ti-edit",col:"#7c3aed",bg:"#faf5ff",label:"Order edited"},
+    "ORDER_CANCELLED":  {ic:"ti-x",col:"#e74c3c",bg:"#fff0f0",label:"Order cancelled"},
+    "ORDER_DELETED":    {ic:"ti-trash",col:"#c0392b",bg:"#fff0f0",label:"Order deleted"},
+    "DELIVERY_COMPLETE":{ic:"ti-truck",col:"#27ae60",bg:"#f0fdf4",label:"Delivery completed"},
+    "PAYMENT_RECORDED": {ic:"ti-cash",col:"#c8a951",bg:"#fffbf0",label:"Payment recorded"},
+    "CASH_PENDING":     {ic:"ti-clock",col:"#f39c12",bg:"#fff8e1",label:"Cash pending"},
+    "CASH_ACKNOWLEDGED":{ic:"ti-circle-check",col:"#27ae60",bg:"#f0fdf4",label:"Cash acknowledged"},
+    "COMPLAINT_LOGGED": {ic:"ti-message-report",col:"#e74c3c",bg:"#fff0f0",label:"Complaint logged"},
     "COMPLAINT_UPDATED":{ic:"ti-message-report",col:"#e67e22",bg:"#fff8f0",label:"Complaint updated"},
-    "ORDER_CANCELLED":{ic:"ti-x",col:"#e74c3c",bg:"#fff0f0",label:"Order cancelled"},
-    "ORDER_DELETED":  {ic:"ti-trash",col:"#c0392b",bg:"#fff0f0",label:"Order deleted"},
-    "CUSTOMER_DELETED":{ic:"ti-user-x",col:"#c0392b",bg:"#fff0f0",label:"Customer deleted"},
-    "CUSTOMER_UPDATED":{ic:"ti-user-edit",col:"#7c3aed",bg:"#faf5ff",label:"Customer updated"},
-    "USER_CREATED":   {ic:"ti-user-plus",col:"#185FA5",bg:"#eaf0ff",label:"Team member added"},
-    "PIN_CHANGED":    {ic:"ti-key",col:"#c0392b",bg:"#fff0f0",label:"PIN changed"},
-    "STOCK_UPDATED":  {ic:"ti-package",col:"#856404",bg:"#fff8e1",label:"Stock updated"},
-    "STOCK_RESTOCKED":{ic:"ti-package-import",col:"#27ae60",bg:"#f0fdf4",label:"Restocked"},
-    "UNAUTHORISED_DLV_ATTEMPT":{ic:"ti-shield-x",col:"#e74c3c",bg:"#fff0f0",label:"Unauth attempt"},
-    "SECURITY_VIOLATION":{ic:"ti-shield-x",col:"#c0392b",bg:"#fff0f0",label:"Security block"},
+    "CUSTOMER_UPDATED": {ic:"ti-user-edit",col:"#7c3aed",bg:"#faf5ff",label:"Customer updated"},
+    "CUSTOMER_DELETED": {ic:"ti-user-x",col:"#c0392b",bg:"#fff0f0",label:"Customer deleted"},
+    "USER_CREATED":     {ic:"ti-user-plus",col:"#185FA5",bg:"#eaf0ff",label:"Team member added"},
+    "USER_DELETED":     {ic:"ti-user-minus",col:"#c0392b",bg:"#fff0f0",label:"Team member removed"},
+    "PIN_CHANGED":      {ic:"ti-key",col:"#c0392b",bg:"#fff0f0",label:"PIN changed"},
+    "STOCK_UPDATED":    {ic:"ti-package",col:"#856404",bg:"#fff8e1",label:"Stock updated"},
+    "STOCK_RESTOCKED":  {ic:"ti-package-import",col:"#27ae60",bg:"#f0fdf4",label:"Restocked"},
+    "UNAUTHORISED_DLV_ATTEMPT":{ic:"ti-shield-x",col:"#e74c3c",bg:"#fff0f0",label:"Unauthorised attempt"},
+    "SECURITY_VIOLATION":{ic:"ti-shield-exclamation",col:"#c0392b",bg:"#fff0f0",label:"Security block"},
   };
   var allTypes=Object.keys(typeMap);
+  var allLogs=[].concat(D.auditLog||[]).reverse();
+  var logs=allLogs;
+  if(q2){var lq=q2.toLowerCase();logs=logs.filter(function(e){return(e.user&&e.user.toLowerCase().indexOf(lq)!==-1)||(e.action&&e.action.toLowerCase().indexOf(lq)!==-1)||(e.details&&e.details.toLowerCase().indexOf(lq)!==-1)||(e.role&&e.role.toLowerCase().indexOf(lq)!==-1);});}
+  if(tf)logs=logs.filter(function(e){return e.action===tf;});
+  var APAGE=25;
+  var totalLogs=logs.length;
+  var totalPages=Math.max(1,Math.ceil(totalLogs/APAGE));
+  AUDIT_PAGE=Math.max(0,Math.min(AUDIT_PAGE,totalPages-1));
+  var pageLogs=logs.slice(AUDIT_PAGE*APAGE,(AUDIT_PAGE+1)*APAGE);
+  function fmtLog(ts){
+    if(!ts)return"—";
+    var d=new Date(ts);
+    var dd=String(d.getDate()).padStart(2,"0");
+    var mo=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][d.getMonth()];
+    var hh=String(d.getHours()).padStart(2,"0");
+    var mm=String(d.getMinutes()).padStart(2,"0");
+    return dd+" "+mo+" "+d.getFullYear()+" "+hh+":"+mm;
+  }
+  var cats={Orders:0,Delivery:0,Payment:0,People:0,Stock:0,Security:0};
+  allLogs.forEach(function(e){
+    if(!e.action)return;
+    if(e.action.indexOf("ORDER")===0)cats.Orders++;
+    else if(e.action.indexOf("DELIVERY")===0)cats.Delivery++;
+    else if(e.action.indexOf("PAYMENT")===0||e.action.indexOf("CASH")===0)cats.Payment++;
+    else if(e.action.indexOf("USER")===0||e.action==="PIN_CHANGED"||e.action.indexOf("CUSTOMER")===0)cats.People++;
+    else if(e.action.indexOf("STOCK")===0)cats.Stock++;
+    else if(e.action.indexOf("SECURITY")===0||e.action.indexOf("UNAUTHORISED")===0)cats.Security++;
+  });
   var auditSection=el("audit-log-section");
   if(!auditSection)return;
-  auditSection.innerHTML=
-    "<div class=\"toolbar\" style=\"flex-wrap:wrap;gap:8px\">"+
-      "<div class=\"srch\"><i class=\"ti ti-search\"></i>"+
-        "<input type=\"text\" placeholder=\"Search by user, action, details...\" value=\""+q2+"\" oninput=\"AUDIT_Q=this.value;rAuditLog()\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\">"+
+  if(!el("audit-srch")){
+    auditSection.innerHTML=
+      "<div style=\"display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px\">"+
+        "<div class=\"srch\" style=\"flex:1;min-width:180px\"><i class=\"ti ti-search\"></i>"+
+          "<input id=\"audit-srch\" type=\"text\" placeholder=\"Search user, action, detail...\" value=\""+q2+"\""+
+          " autocomplete=\"off\" autocorrect=\"off\" autocapitalize=\"off\" spellcheck=\"false\" inputmode=\"search\""+
+          " oninput=\"AUDIT_Q=this.value;AUDIT_PAGE=0;rAuditLog()\""+
+          " style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\">"+
+        "</div>"+
+        "<select id=\"audit-type-sel\" style=\"padding:8px 12px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;font-family:inherit\""+
+          " onchange=\"AUDIT_TYPE=this.value;AUDIT_PAGE=0;rAuditLog()\">"+
+          "<option value=\"\">All actions</option>"+
+          allTypes.map(function(t){return"<option value=\""+t+"\">"+(typeMap[t].label)+"</option>";}).join("")+
+        "</select>"+
+        "<button class=\"btn btn-xs\" onclick=\"AUDIT_Q='';AUDIT_TYPE='';AUDIT_PAGE=0;rAuditLog()\" style=\"white-space:nowrap\"><i class=\"ti ti-x\"></i> Clear</button>"+
+        "<button class=\"btn btn-xs\" onclick=\"rAuditLogWithArchives()\" style=\"background:#7c3aed;color:#fff;white-space:nowrap\"><i class=\"ti ti-archive\"></i> Archives</button>"+
+        "<button class=\"btn btn-xs\" onclick=\"exportAuditCSV()\" style=\"background:#27ae60;color:#fff;white-space:nowrap\"><i class=\"ti ti-download\"></i> CSV</button>"+
+        "<button class=\"btn btn-xs\" onclick=\"if(confirm('Purge entries older than 30 days?'))manualPurgeAuditLog(30)\" style=\"background:#e67e22;color:#fff;white-space:nowrap\"><i class=\"ti ti-trash\"></i> Purge 30d</button>"+
       "</div>"+
-      "<select style=\"padding:8px 12px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;font-family:inherit\" onchange=\"AUDIT_TYPE=this.value;rAuditLog()\">"+
-        "<option value=\"\">All actions</option>"+
-        allTypes.map(function(t){return "<option value=\""+t+"\"\>"+(typeMap[t].label)+"</option>";}).join("")+
-      "</select>"+
+      "<div id=\"audit-stats\"></div>"+
+      "<div id=\"audit-results\"></div>";
+  }
+  var selEl=el("audit-type-sel");if(selEl&&selEl.value!==tf)selEl.value=tf;
+  var srchEl=el("audit-srch");if(srchEl&&srchEl.value!==q2)srchEl.value=q2;
+  var statsEl=el("audit-stats");
+  if(statsEl)statsEl.innerHTML=
+    "<div style=\"display:flex;gap:6px;flex-wrap:wrap;align-items:center;padding:6px 0 10px;border-bottom:1px solid var(--bd);margin-bottom:10px\">"+
+    "<span style=\"font-size:11px;color:var(--tx2);font-weight:600\">"+allLogs.length+" total &middot;</span>"+
+    Object.keys(cats).filter(function(k){return cats[k]>0;}).map(function(k){
+      return"<span style=\"background:var(--bg);color:var(--tx2);padding:2px 8px;border-radius:99px;font-size:11px;font-weight:600\">"+k+": <strong>"+cats[k]+"</strong></span>";
+    }).join("")+
+    (q2||tf?"<span style=\"background:#fff3cd;color:#856404;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:700\">"+totalLogs+" matched</span>":"")+
+    "</div>";
+  var resEl=el("audit-results");if(!resEl)return;
+  if(!pageLogs.length){
+    resEl.innerHTML="<div class=\"te\"><i class=\"ti ti-activity\" style=\"font-size:28px;opacity:.4\"></i>"+
+      "<p>"+(q2||tf?"No matching entries":"No activity logged yet")+"</p>"+
+      (q2||tf?"<span><a href=\"#\" onclick=\"AUDIT_Q='';AUDIT_TYPE='';AUDIT_PAGE=0;rAuditLog();return false\" style=\"color:var(--gd)\">Clear filters</a></span>":"")+"</div>";
+    return;
+  }
+  function auditPgBar(){
+    if(totalPages<=1)return"<div style=\"font-size:11px;color:var(--tx2);padding:6px 2px\">"+totalLogs+" entries</div>";
+    var from=AUDIT_PAGE*APAGE+1,to=Math.min((AUDIT_PAGE+1)*APAGE,totalLogs);
+    var btns="";
+    if(AUDIT_PAGE>0)btns+="<button class=\"btn btn-xs\" onclick=\"rAuditLog("+(AUDIT_PAGE-1)+")\">&#8249;</button>";
+    for(var i=Math.max(0,AUDIT_PAGE-2);i<=Math.min(totalPages-1,AUDIT_PAGE+2);i++){
+      btns+="<button class=\"btn btn-xs"+(i===AUDIT_PAGE?" btn-navy":"")+"\" onclick=\"rAuditLog("+i+")\">"+String(i+1)+"</button>";
+    }
+    if(AUDIT_PAGE<totalPages-1)btns+="<button class=\"btn btn-xs\" onclick=\"rAuditLog("+(AUDIT_PAGE+1)+")\">&#8250;</button>";
+    return"<div style=\"display:flex;align-items:center;justify-content:space-between;padding:8px 2px;flex-wrap:wrap;gap:6px\">"+
+      "<span style=\"font-size:11px;color:var(--tx2)\">"+from+"–"+to+" of "+totalLogs+"</span>"+
+      "<div style=\"display:flex;gap:3px\">"+btns+"</div></div>";
+  }
+  resEl.innerHTML=
+    auditPgBar()+
+    "<div style=\"display:flex;flex-direction:column;gap:6px\">"+
+    pageLogs.map(function(e){
+      var t=typeMap[e.action]||{ic:"ti-activity",col:"#888",bg:"#f5f5f5",label:(e.action||"Event").replace(/_/g," ")};
+      var rCol=e.role==="director"?"var(--nv)":e.role==="manager"?"#185FA5":e.role==="staff"?"#856404":"#534AB7";
+      return"<div style=\"display:flex;align-items:flex-start;gap:11px;background:#fff;border:1px solid var(--bd);border-radius:10px;padding:10px 12px;border-left:4px solid "+t.col+"\">"+
+        "<div style=\"width:32px;height:32px;border-radius:50%;background:"+t.bg+";display:flex;align-items:center;justify-content:center;flex-shrink:0\">"+
+          "<i class=\"ti "+t.ic+"\" style=\"color:"+t.col+";font-size:14px\"></i>"+
+        "</div>"+
+        "<div style=\"flex:1;min-width:0\">"+
+          "<div style=\"display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:2px\">"+
+            "<span style=\"font-weight:800;font-size:12px;color:"+t.col+"\">"+t.label+"</span>"+
+            "<span style=\"background:"+rCol+";color:#fff;font-size:10px;padding:1px 6px;border-radius:99px;font-weight:700\">"+(e.role||"system")+"</span>"+
+            "<span style=\"font-weight:700;font-size:12px\">"+(e.user||"System")+"</span>"+
+          "</div>"+
+          "<div style=\"font-size:11px;color:var(--tx);line-height:1.5;word-break:break-word\">"+e.details+"</div>"+
+        "</div>"+
+        "<div style=\"font-size:10px;color:var(--tx2);white-space:nowrap;flex-shrink:0;text-align:right\">"+fmtLog(e.ts)+"</div>"+
+      "</div>";
+    }).join("")+
     "</div>"+
-    "<div style=\"display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:12px\">"+
-    "<div style=\"font-size:12px;color:var(--tx2)\">"+
-      "<strong>"+(D.auditLog?D.auditLog.length:0)+"</strong> entries in hot log &middot; "+
-      "Auto-archives at "+AUDIT_HOT_MAX+" &middot; Archives kept 90 days"+
-    "</div>"+
-    "<div style=\"display:flex;gap:7px;flex-wrap:wrap\">"+
-      "<button class=\"btn btn-xs\" onclick=\"rAuditLogWithArchives()\" style=\"background:#7c3aed;color:#fff\" title=\"Load older archived entries from cloud\">"+
-        "<i class=\"ti ti-archive\"></i> Load archives</button>"+
-      "<button class=\"btn btn-xs\" onclick=\"if(confirm('Purge hot log entries older than 30 days? Archived entries are unaffected.'))manualPurgeAuditLog(30)\" style=\"background:#e67e22;color:#fff\">"+
-        "<i class=\"ti ti-trash\"></i> Purge &gt;30 days</button>"+
-      "<button class=\"btn btn-xs\" onclick=\"if(confirm('Purge ALL entries in hot log? Cannot be undone.'))manualPurgeAuditLog(0)\" style=\"background:#c0392b;color:#fff\">"+
-        "<i class=\"ti ti-trash\"></i> Purge all</button>"+
-    "</div>"+
-    "</div>"+
-    (logs.length?
-      "<div style=\"display:flex;flex-direction:column;gap:7px\">"+
-        logs.map(function(e){
-          var t=typeMap[e.action]||{ic:"ti-activity",col:"#666",bg:"#f5f5f5",label:e.action||"Event"};
-          var dt=e.ts?new Date(e.ts):null;
-          var dateStr=dt?dt.toLocaleDateString("en-GB",{day:"2-digit",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit"}):"—";
-          // Role badge colours
-          var rCol=e.role==="director"?"var(--nv)":e.role==="manager"?"#185FA5":e.role==="staff"?"#856404":"#27ae60";
-          return "<div style=\"display:flex;align-items:flex-start;gap:12px;background:#fff;border:1px solid var(--bd);border-radius:10px;padding:11px 13px;border-left:4px solid "+t.col+"\">"+
-            "<div style=\"width:34px;height:34px;border-radius:50%;background:"+t.bg+";display:flex;align-items:center;justify-content:center;flex-shrink:0\">"+
-              "<i class=\"ti "+t.ic+"\" style=\"color:"+t.col+";font-size:15px\"></i>"+
-            "</div>"+
-            "<div style=\"flex:1;min-width:0\">"+
-              "<div style=\"display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-bottom:3px\">"+
-                "<span style=\"font-weight:800;font-size:12px;color:"+t.col+"\">"+t.label+"</span>"+
-                "<span style=\"background:"+rCol+";color:#fff;font-size:10px;padding:2px 7px;border-radius:99px;font-weight:700\">"+(e.role||"unknown")+"</span>"+
-                "<span style=\"font-weight:700;font-size:12px\">"+(e.user||"System")+"</span>"+
-              "</div>"+
-              "<div style=\"font-size:12px;color:var(--tx);line-height:1.5\">"+e.details+"</div>"+
-            "</div>"+
-            "<div style=\"font-size:10px;color:var(--tx2);white-space:nowrap;flex-shrink:0\">"+dateStr+"</div>"+
-          "</div>";
-        }).join("")+
-      "</div>":
-      "<div class=\"te\"><i class=\"ti ti-activity\" style=\"font-size:28px;opacity:.4\"></i><p>"+(q2||tf?"No matching log entries":"No activity logged yet")+"</p></div>"
-    );
+    auditPgBar();
 }
+
 
 function rAuditLogWithArchives(){
   var btn=event&&event.target;
@@ -3300,6 +3369,7 @@ function rAuditLogWithArchives(){
     // Re-render with combined data
     var PREV=D.auditLog;
     D.auditLog=combined;
+    AUDIT_PAGE=0;
     rAuditLog();
     D.auditLog=PREV; // restore — archives stay in Firestore, not in hot log
   });
