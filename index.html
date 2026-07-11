@@ -262,8 +262,8 @@ function pgBar(page,pages,total,navFn){
     "<div style=\"display:flex;gap:3px;flex-wrap:wrap\">"+btns+"</div>"+
   "</div>";
 }
-var CUST_PAGE=0,ORD_PAGE=0,INV_PAGE=0,CMP_PAGE=0,STK_PAGE=0;
-var CUST_Q="",ORD_Q="",INV_Q="",CMP_Q="",STK_Q="",DEL_Q="";
+var CUST_PAGE=0,ORD_PAGE=0,INV_PAGE=0,CMP_PAGE=0,STK_PAGE=0,DEBT_PAGE=0;
+var CUST_Q="",ORD_Q="",INV_Q="",CMP_Q="",STK_Q="",DEL_Q="",DEBT_Q="",DEBT_SORT="amount";
 var CUST_SORT="recent",ORD_SORT="newest",CUST_TYPE="";
 function ia(v){return can("vInv")?"KSh "+Number(v).toLocaleString():"KSh "+String.fromCharCode(8226,8226,8226,8226);}
 function sb(s){var m={"Delivered":"bg","Pending":"ba","Out for delivery":"bp","Processing":"bb","Cancelled":"br"};var ic={"Delivered":"ti-circle-check","Pending":"ti-clock","Out for delivery":"ti-truck","Processing":"ti-loader","Cancelled":"ti-x"};return "<span class=\"badge "+(m[s]||"ba")+"\"><i class=\"ti "+(ic[s]||"ti-circle")+"\" style=\"font-size:10px;margin-right:2px\"></i>"+s+"</span>";}
@@ -584,7 +584,7 @@ function refreshCurrentPage(){
     delivery:function(){DEL_Q="";rDel();},
     stock:function(){rStock(undefined,STK_PAGE);},
     invoices:function(){rInvs(undefined,INV_PAGE);},
-    debts:rDebts,
+    debts:function(){DEBT_Q="";DEBT_PAGE=0;rDebts();},
     complaints:function(){rCmps(undefined,CMP_PAGE);},
     offers:rOffers,
     reports:rReports,
@@ -1250,7 +1250,7 @@ function nav(p,btn){
     if((b.getAttribute("onclick")||"").indexOf("'"+p+"'")!==-1)b.classList.add("act");
   });
   el("um").classList.remove("open");
-  var fns={dashboard:rDash,customers:function(){rCusts(undefined,CUST_PAGE);},orders:function(){ORD_STATUS_F="";ORD_DATE_F="";rOrds(undefined,ORD_PAGE);},delivery:function(){DEL_Q="";rDel();},stock:function(){rStock(undefined,STK_PAGE);},invoices:function(){rInvs(undefined,INV_PAGE);},debts:rDebts,complaints:function(){rCmps(undefined,CMP_PAGE);},offers:rOffers,reports:rReports,excel:rExcel,users:rUsers};
+  var fns={dashboard:rDash,customers:function(){rCusts(undefined,CUST_PAGE);},orders:function(){ORD_STATUS_F="";ORD_DATE_F="";rOrds(undefined,ORD_PAGE);},delivery:function(){DEL_Q="";rDel();},stock:function(){rStock(undefined,STK_PAGE);},invoices:function(){rInvs(undefined,INV_PAGE);},debts:function(){DEBT_Q="";DEBT_PAGE=0;rDebts();},complaints:function(){rCmps(undefined,CMP_PAGE);},offers:rOffers,reports:rReports,excel:rExcel,users:rUsers};
   if(fns[p])fns[p]();
 }
 
@@ -2660,11 +2660,12 @@ function openPayInv(id){var i=D.invoices.find(function(x){return x.id===id;});if
 
 function ageing(cId){
   var td=tday();
+  var tdMs=new Date(td+"T12:00:00").getTime();
   var invs=D.invoices.filter(function(i){return i.cId===cId&&i.paid<i.amount&&i.due;});
-  var d30=invs.filter(function(i){return i.due>=td||(new Date(td)-new Date(i.due))<=30*86400000;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
-  var d60=invs.filter(function(i){var diff=new Date(td)-new Date(i.due);return diff>30*86400000&&diff<=60*86400000;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
-  var d90=invs.filter(function(i){var diff=new Date(td)-new Date(i.due);return diff>60*86400000&&diff<=90*86400000;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
-  var d90p=invs.filter(function(i){return (new Date(td)-new Date(i.due))>90*86400000;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
+  var d30=invs.filter(function(i){var dMs=new Date(i.due+"T12:00:00").getTime();return dMs>=tdMs||(tdMs-dMs)<=30*86400000;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
+  var d60=invs.filter(function(i){var dMs=new Date(i.due+"T12:00:00").getTime();var diff=tdMs-dMs;return diff>30*86400000&&diff<=60*86400000;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
+  var d90=invs.filter(function(i){var dMs=new Date(i.due+"T12:00:00").getTime();var diff=tdMs-dMs;return diff>60*86400000&&diff<=90*86400000;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
+  var d90p=invs.filter(function(i){var dMs=new Date(i.due+"T12:00:00").getTime();return (tdMs-dMs)>90*86400000;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
   var parts=[];
   if(d30>0)parts.push("<span style='color:#f0c040;font-size:10px'>0-30d: "+d30.toLocaleString()+"</span>");
   if(d60>0)parts.push("<span style='color:#e67e22;font-size:10px'>31-60d: "+d60.toLocaleString()+"</span>");
@@ -2672,7 +2673,9 @@ function ageing(cId){
   if(d90p>0)parts.push("<span style='color:#7b0000;font-size:10px;font-weight:800'>90d+: "+d90p.toLocaleString()+"</span>");
   return parts.length?"<td style='font-size:10px'>"+parts.join(" ")+"</td>":"<td></td>";
 }
-function rDebts(){
+function rDebts(q,pg){
+  if(q!==undefined)DEBT_Q=q;
+  if(pg!==undefined)DEBT_PAGE=pg;
   var pg=el("pg-debts");if(!pg)return;
   if(!can("vDebt")){pg.innerHTML="<div style=\"padding:60px;text-align:center\"><i class=\"ti ti-lock\" style=\"font-size:38px;color:var(--bd);display:block;margin-bottom:12px\"></i><p style=\"font-size:14px;font-weight:700;color:var(--tx2)\">Access restricted</p></div>";return;}
   var td=tday();
@@ -2680,11 +2683,17 @@ function rDebts(){
     var debt=custDebt(c.id);
     var lastOrd=[].concat(D.orders).filter(function(o){return o.cId===c.id;}).sort(function(a,b){return b.date>a.date?1:-1;})[0];
     var invs=D.invoices.filter(function(i){return i.cId===c.id&&i.paid<i.amount;});
-    var ov=invs.filter(function(i){return i.due<td;}).length;
+    var ov=invs.filter(function(i){return i.due&&i.due<td;}).length;
     var old=invs.length?invs.map(function(i){return i.due;}).sort()[0]:null;
     return{c:c,debt:debt,lastOrd:lastOrd,invCount:invs.length,ov:ov,oldest:old};
-  }).filter(function(x){return x.debt>0;}).sort(function(a,b){return b.debt-a.debt;});
+  }).filter(function(x){return x.debt>0;});
   var total=debtors.reduce(function(a,x){return a+x.debt;},0);
+  var q2=DEBT_Q||"";
+  if(q2){var lq=q2.toLowerCase();debtors=debtors.filter(function(x){return x.c.name.toLowerCase().indexOf(lq)!==-1||cAddr(x.c).toLowerCase().indexOf(lq)!==-1||(can("vPhone")&&x.c.phone&&x.c.phone.indexOf(q2)!==-1);});}
+  if(DEBT_SORT==="name")debtors.sort(function(a,b){return a.c.name.localeCompare(b.c.name);});
+  else if(DEBT_SORT==="overdue")debtors.sort(function(a,b){return b.ov-a.ov;});
+  else debtors.sort(function(a,b){return b.debt-a.debt;});
+  var debtPaged=paginate(debtors,DEBT_PAGE);
   pg.innerHTML=
     "<div class=\"ph\"><h1>Debt Tracker</h1><p>"+debtors.length+" customers with outstanding balances</p></div>"+
     "<div class=\"stats\">"+
@@ -2692,9 +2701,20 @@ function rDebts(){
       "<div class=\"stat sa\"><div class=\"sl\">Overdue invoices</div><div class=\"sv\">"+D.invoices.filter(function(i){return i.paid<i.amount&&i.due<td;}).length+"</div></div>"+
       "<div class=\"stat sn\"><div class=\"sl\">Largest debt</div><div class=\"sv\">"+(debtors.length?"KSh "+debtors[0].debt.toLocaleString():"KSh 0")+"</div><div class=\"ss\">"+(debtors.length?debtors[0].c.name:"")+"</div></div>"+
     "</div>"+
+    "<div class=\"toolbar\">"+
+    "<div class=\"srch\"><i class=\"ti ti-search\"></i>"+
+    "<input type=\"text\" placeholder=\"Search customer name, address, phone...\" value=\""+q2+"\" oninput=\"DEBT_Q=this.value;DEBT_PAGE=0;rDebts()\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\">"+
+    "</div>"+
+    "</div>"+
+    "<div style=\"display:flex;gap:6px;margin:8px 0;align-items:center;flex-wrap:wrap\">"+
+    "<span style=\"font-size:11px;color:var(--tx2);font-weight:700\">Sort by:</span>"+
+    "<button class=\"btn btn-xs"+(DEBT_SORT==='amount'?' btn-navy':'')+"\" onclick=\"DEBT_SORT='amount';DEBT_PAGE=0;rDebts()\">Highest debt</button>"+
+    "<button class=\"btn btn-xs"+(DEBT_SORT==='overdue'?' btn-navy':'')+"\" onclick=\"DEBT_SORT='overdue';DEBT_PAGE=0;rDebts()\">Most overdue</button>"+
+    "<button class=\"btn btn-xs"+(DEBT_SORT==='name'?' btn-navy':'')+"\" onclick=\"DEBT_SORT='name';DEBT_PAGE=0;rDebts()\">A-Z name</button>"+
+    "</div>"+
     "<div class=\"tw\"><table><thead><tr><th>Customer</th><th>Contact &amp; address</th><th>Balance owed</th><th>Ageing</th><th>Invoices</th><th>Overdue</th><th>Oldest due</th><th>Last order</th><th></th></tr></thead>"+
     "<tbody>"+
-      (debtors.length?debtors.map(function(x){
+      (debtPaged.items.length?debtPaged.items.map(function(x){
         return "<tr class=\"dr\">"+
           "<td><div style=\"font-weight:800;font-size:13px\">"+(can("vPhone")?x.c.name:maskName(x.c.name))+"</div></td>"+
           "<td><div>"+(can("vPhone")?x.c.phone:maskPhone(x.c.phone))+"</div><div class=\"ca\">"+cAddr(x.c)+"</div></td>"+
@@ -2703,9 +2723,9 @@ function rDebts(){
           "<td>"+(x.ov>0?"<span class=\"badge br\">"+x.ov+" overdue</span>":"<span class=\"badge bg\">None</span>")+"</td>"+
           "<td style=\"font-weight:700;color:"+(x.oldest&&x.oldest<td?"#c0392b":"var(--tx)")+"\">"+fmt(x.oldest)+"</td>"+
           "<td style=\"font-size:11px\">"+(x.lastOrd?fmt(x.lastOrd.date):"&mdash;")+"</td>"+
-          "<td><button class=\"btn btn-xs btn-gold\" onclick=\"openPay("+x.c.id+")\"><i class=\"ti ti-cash\"></i> Pay</button></td></tr>";
-      }).join(""):"<tr><td colspan=\"8\"><div class=\"te\"><i class=\"ti ti-circle-check\"></i><p>No outstanding debts!</p></div></td></tr>")+
-    "</tbody></table></div>";
+          "<td>"+(can("mPaid")?"<button class=\"btn btn-xs btn-gold\" onclick=\"openPay("+x.c.id+")\"><i class=\"ti ti-cash\"></i> Pay</button>":"")+"</td></tr>";
+      }).join(""):"<tr><td colspan=\"8\"><div class=\"te\"><i class=\"ti ti-circle-check\"></i><p>"+(q2?"No debtors match your search":"No outstanding debts!")+"</p></div></td></tr>")+
+    "</tbody></table></div>"+pgBar(debtPaged.page,debtPaged.pages,debtPaged.total,"rDebts(undefined,");
 }
 
 function rCmps(q,pg){
