@@ -297,12 +297,19 @@ function toast(msg,type){
   setTimeout(function(){if(t.parentNode)t.parentNode.removeChild(t);},2800);
 }
 // Restore focus and cursor position after innerHTML re-render (Chrome desktop fix)
+var _isTouchDevice=(function(){try{return"ontouchstart"in window||navigator.maxTouchPoints>0;}catch(e){return false;}})();
 function refocus(inputId,val){
+  // On touch devices, focus() reopens soft keyboard causing flash — skip.
+  // The value= attribute already preserves content; mobile handles cursor natively.
+  if(_isTouchDevice)return;
   setTimeout(function(){
     var inp=el(inputId);
     if(!inp)return;
+    // Only focus if user was already in a search field (not after clicking elsewhere)
+    var active=document.activeElement;
+    var wasSearching=active&&(active.tagName==="BODY"||active===inp||active.id===inputId);
+    if(!wasSearching&&active&&active!==document.body)return;
     inp.focus();
-    // Restore cursor to end of text
     var len=inp.value?inp.value.length:0;
     try{inp.setSelectionRange(len,len);}catch(e){}
   },0);
@@ -1648,7 +1655,8 @@ function rDash(){
     if(pendingPay.length){
       pendingPay.slice(0,3).forEach(function(p){
         var oc=D.customers.find(function(x){return x.id===p.cId;});
-        alerts.push({t:"nw",i:"ti-cash",m:"<strong>Cash to acknowledge:</strong> KSh "+p.amt.toLocaleString()+" from "+(oc?oc.name:"customer")+" — collected by "+p.collectedBy,dest:"invoices"});
+        alerts.push({t:"nw",i:"ti-cash",m:"<strong>Cash to acknowledge:</strong> KSh "+p.amt.toLocaleString()+" from "+(oc?oc.name:"customer")+" — collected by "+p.collectedBy+
+          " <button onclick=\"ackPendingPay("+p.id+");event.stopPropagation()\" class=\"btn btn-xs btn-gold\" style=\"margin-left:8px\"><i class=\"ti ti-check\"></i> Acknowledge</button>"});
       });
       if(pendingPay.length>3)alerts.push({t:"nw",i:"ti-cash",m:(pendingPay.length-3)+" more pending cash collection(s) awaiting acknowledgement",dest:"invoices"});
     }
@@ -1808,6 +1816,7 @@ function saveCust(){
       c.estate=el("cestate").value;c.court=el("ccourt").value;c.house=el("chouse").value;
       c.htype=el("chtype").value;c.road=el("croad").value;c.zone=el("czone").value;
       c.ctype=el("ctype").value;c.credit=parseFloat(el("ccl").value)||0;c.notes=el("cnotes").value;
+      auditLog("CUSTOMER_UPDATED","Customer updated by "+CU.name+" ("+CU.role+"): "+n);
       cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer updated");
       return;
     }
@@ -1849,6 +1858,7 @@ function delC(id){
   D.orders=D.orders.filter(function(o){return o.cId!==id;});
   D.invoices=D.invoices.filter(function(i){if(i.cId!==id)return true;return i.paid>0;});
   D.complaints=D.complaints.filter(function(x){return x.cId!==id;});
+  auditLog("CUSTOMER_DELETED","Customer deleted by "+CU.name+" ("+CU.role+"): "+(can("vPhone")?c.name:"[masked]")+". "+D.orders.length+" orders, "+paidInvs.length+" paid invoices retained.");
   rCusts(undefined,CUST_PAGE);
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   dirty();toast("Customer removed"+(paidInvs.length?" — "+paidInvs.length+" paid invoice(s) retained":""));
@@ -2569,6 +2579,7 @@ function delO(id){
     if(linked&&i.paid<=0)return false;
     return true;
   });
+  auditLog("ORDER_DELETED","Order #"+id+" deleted by "+CU.name+" ("+CU.role+"). Product: "+o.prod+", Qty: "+o.qty+", Status was: "+o.status);
   rOrds(undefined,ORD_PAGE);
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   dirty();toast("Order #"+id+" deleted");
@@ -2603,6 +2614,7 @@ function cancelO(id){
       D.invoices=D.invoices.filter(function(i){return i.id!==inv.id;});
     }
   }
+  auditLog("ORDER_CANCELLED","Order #"+id+" cancelled by "+CU.name+" ("+CU.role+"). Product: "+o.prod+", Qty: "+o.qty+(hasPaid?", KSh "+inv.paid+" already paid — invoice kept":""));
   rOrds(undefined,ORD_PAGE);
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   dirty();toast("Order #"+id+" cancelled"+(skipStockRestore?" — category order":" — stock restored"));
@@ -2712,6 +2724,7 @@ function saveSt(){
     if(s){
       s.name=n;s.size=el("ss").value;s.price=parseFloat(el("sp").value)||0;
       s.cost=parseFloat(el("sc").value)||0;s.qty=parseInt(el("sq").value)||0;s.min=parseInt(el("sm").value)||10;
+      auditLog("STOCK_UPDATED","Product saved by "+CU.name+" ("+CU.role+"): "+n);
       cm("m-s");rStock();dirty();toast(n+" updated");
       return;
     }
@@ -2731,7 +2744,7 @@ function editSt(id){
   om("m-s");
 }
 function prepRS(){var rp=el("rp");if(rp)rp.innerHTML=D.stock.map(function(x){return "<option value=\""+x.id+"\">"+x.name+" ("+x.qty+" in stock)</option>";}).join("");om("m-rs");}
-function doRS(){var id=parseInt(el("rp").value);var q=parseInt(el("rq").value)||0;if(q<=0){toast("Enter quantity to add","err");return;}var p=D.stock.find(function(s){return s.id===id;});if(p){p.qty+=q;toast(p.name+" restocked +"+q+" — now "+p.qty+" in stock");}el("rq").value="";cm("m-rs");rStock(undefined,STK_PAGE);if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();dirty();}
+function doRS(){var id=parseInt(el("rp").value);var q=parseInt(el("rq").value)||0;if(q<=0){toast("Enter quantity to add","err");return;}var p=D.stock.find(function(s){return s.id===id;});if(p){p.qty+=q;auditLog("STOCK_RESTOCKED","+"+q+" units of "+p.name+" by "+CU.name+" ("+CU.role+"). Now: "+p.qty);toast(p.name+" restocked +"+q+" — now "+p.qty+" in stock");}el("rq").value="";cm("m-rs");rStock(undefined,STK_PAGE);if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();dirty();}
 function delS(id){
   if(!can("dSt"))return;
   var s=D.stock.find(function(x){return x.id===id;});if(!s)return;
@@ -2874,7 +2887,12 @@ function ackPendingPay(id){
   auditLog("CASH_ACKNOWLEDGED","Director "+CU.name+" acknowledged KSh "+pp.amt+" cash collected by "+pp.collectedBy+" for Order #"+pp.ordId);
   dirty();
   toast("Payment of KSh "+pp.amt.toLocaleString()+" acknowledged and applied");
+  // Refresh ALL affected views so changes appear immediately
   rInvs(undefined,INV_PAGE);
+  if(el("pg-orders")&&el("pg-orders").classList.contains("act"))rOrds(undefined,ORD_PAGE);
+  if(el("pg-debts")&&el("pg-debts").classList.contains("act"))rDebts();
+  if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
+  if(el("pg-customers")&&el("pg-customers").classList.contains("act"))rCusts(undefined,CUST_PAGE);
 }
 function payI(id){
   if(!can("mPaid")){toast("No permission to record payments","err");return;}
@@ -3194,6 +3212,16 @@ function rAuditLog(){
     "CASH_ACKNOWLEDGED":{ic:"ti-circle-check",col:"#27ae60",bg:"#f0fdf4",label:"Cash acked"},
     "COMPLAINT_LOGGED":{ic:"ti-message-report",col:"#e74c3c",bg:"#fff0f0",label:"Complaint"},
     "COMPLAINT_UPDATED":{ic:"ti-message-report",col:"#e67e22",bg:"#fff8f0",label:"Complaint updated"},
+    "ORDER_CANCELLED":{ic:"ti-x",col:"#e74c3c",bg:"#fff0f0",label:"Order cancelled"},
+    "ORDER_DELETED":  {ic:"ti-trash",col:"#c0392b",bg:"#fff0f0",label:"Order deleted"},
+    "CUSTOMER_DELETED":{ic:"ti-user-x",col:"#c0392b",bg:"#fff0f0",label:"Customer deleted"},
+    "CUSTOMER_UPDATED":{ic:"ti-user-edit",col:"#7c3aed",bg:"#faf5ff",label:"Customer updated"},
+    "USER_CREATED":   {ic:"ti-user-plus",col:"#185FA5",bg:"#eaf0ff",label:"Team member added"},
+    "PIN_CHANGED":    {ic:"ti-key",col:"#c0392b",bg:"#fff0f0",label:"PIN changed"},
+    "STOCK_UPDATED":  {ic:"ti-package",col:"#856404",bg:"#fff8e1",label:"Stock updated"},
+    "STOCK_RESTOCKED":{ic:"ti-package-import",col:"#27ae60",bg:"#f0fdf4",label:"Restocked"},
+    "UNAUTHORISED_DLV_ATTEMPT":{ic:"ti-shield-x",col:"#e74c3c",bg:"#fff0f0",label:"Unauth attempt"},
+    "SECURITY_VIOLATION":{ic:"ti-shield-x",col:"#c0392b",bg:"#fff0f0",label:"Security block"},
   };
   var allTypes=Object.keys(typeMap);
   var auditSection=el("audit-log-section");
@@ -3505,7 +3533,9 @@ function saveU(){
   if(USERS.find(function(u){return u.pin===p;})){toast("That PIN is already used by another team member","err");return;}
   USERS.push({id:uid(),name:n,role:role,pin:p,ini:ini.slice(0,2),col:cols[USERS.length%cols.length]});
   el("un").value="";el("upin").value="";el("uini").value="";
-  cm("m-u");rUsers();dirty();toast(n+" added as "+R[role].label);
+  cm("m-u");rUsers();
+  auditLog("USER_CREATED","New user: "+n+" as "+(R[role]?R[role].label:role)+" — added by "+CU.name+" ("+CU.role+")");
+  dirty();toast(n+" added as "+R[role].label);
 }
 function prepChangePin(uid2){
   if(!can("mUsers"))return;
@@ -3542,10 +3572,12 @@ function savePin(){
   u.pin=p1;
   // If changing own PIN, update CU too
   if(u.id===CU.id)CU.pin=p1;
-  cm("m-pin");rUsers();dirty();
+  cm("m-pin");rUsers();
+  auditLog("PIN_CHANGED","PIN changed by "+CU.name+" ("+CU.role+") for: "+u.name);
+  dirty();
   toast(u.id===CU.id?"Your PIN updated — use it from next login":"PIN updated for "+u.name);
 }
-function delU(id){if(!can("mUsers"))return;if(!confirm("Remove this team member?"))return;USERS=USERS.filter(function(u){return u.id!==id;});rUsers();dirty();}
+function delU(id){if(!can("mUsers"))return;var toDel=USERS.find(function(u){return u.id===id;});if(!confirm("Remove this team member?"))return;auditLog("USER_DELETED","Team member removed by "+CU.name+" ("+CU.role+"): "+(toDel?toDel.name:"unknown"));USERS=USERS.filter(function(u){return u.id!==id;});rUsers();dirty();}
 
 function buildBackupWB(){
   if(!can("exp"))return null;
@@ -3567,7 +3599,8 @@ function saveXL(){
   XLSX.writeFile(wb,"NewDawn_Backup_"+ts+".xlsx");
   localStorage.setItem("nd_last_backup",tday());
   saved();var l=el("lsl");if(l)l.innerHTML="Saved at "+new Date().toLocaleTimeString();
-  toast("Backup saved — keep this file safe!");
+  auditLog("USER_DELETED","Team member removed by "+CU.name+" ("+CU.role+")");
+toast("Backup saved — keep this file safe!");
 }
 function printInvoice(invId){
   var i=D.invoices.find(function(x){return x.id===invId;});if(!i)return;
