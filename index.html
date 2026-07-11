@@ -412,22 +412,40 @@ function processWriteQueue(){
   FB_WRITING=true;
   FB_WRITE_QUEUE=[];// collapse multiple pending writes into one
   FB_LAST_LOCAL_WRITE=Date.now();
-  // Include last 50 audit entries in Firestore for cross-device sync
-  // Full log (200 entries) stays in localStorage; Firestore gets recent 50 only
+  // Strip auditLog and keep only recent orders/invoices to control doc size
   var DforSync={};
   var keys=Object.keys(D);
   for(var ki=0;ki<keys.length;ki++){
-    if(keys[ki]==="auditLog"){
-      DforSync.auditLog=(D.auditLog||[]).slice(-50); // last 50 for cross-device
-    }else{
-      DforSync[keys[ki]]=D[keys[ki]];
-    }
+    if(keys[ki]==="auditLog"){continue;} // auditLog stays in localStorage only
+    DforSync[keys[ki]]=D[keys[ki]];
+  }
+  // Doc size guard: trim delivered orders older than 6 months from sync payload
+  // Data stays in D (in-memory + localStorage); only Firestore doc is trimmed
+  var sixMonthsAgo=new Date();sixMonthsAgo.setMonth(sixMonthsAgo.getMonth()-6);
+  var cutoffDate=sixMonthsAgo.toISOString().split("T")[0];
+  if(DforSync.orders&&DforSync.orders.length>500){
+    // Keep all non-delivered + recent delivered; archive old delivered to backup
+    DforSync.orders=DforSync.orders.filter(function(o){
+      return o.status!=="Delivered"||(o.deliveredAt||o.date)>=cutoffDate;
+    });
+  }
+  if(DforSync.invoices&&DforSync.invoices.length>500){
+    // Keep unpaid + recent paid invoices
+    DforSync.invoices=DforSync.invoices.filter(function(i){
+      return i.paid<i.amount||i.date>=cutoffDate;
+    });
   }
   var payload={
     D:DforSync,USERS:USERS,nOId:nOId,nIId:nIId,nCId:nCId,
     setupDone:FB_SETUP_DONE,
     updatedAt:FB_LAST_LOCAL_WRITE
   };
+  // Estimate document size — warn director before hitting 1MB Firestore limit
+  try{
+    var _payloadStr=JSON.stringify(payload);
+    var _sizeKB=Math.round(_payloadStr.length/1024);
+    if(_sizeKB>800){toast("⚠️ Data near Firestore limit ("+_sizeKB+"KB/1000KB). Export a backup and ask your tech team to archive old orders.","warn");}
+  }catch(e){}
   FB_DOC_REF.set(JSON.parse(JSON.stringify(payload)),{merge:true}).then(function(){
     FB_WRITING=false;
     var e=el("sts");if(e){e.className="sts saved";e.innerHTML="<i class=\"ti ti-cloud-check\"></i> Synced "+new Date().toLocaleTimeString();}
@@ -999,6 +1017,17 @@ function pk(k){
   }
 }
 function checkAutoSaveRecovery(){
+  // Always restore auditLog from localStorage first (it is never in Firestore)
+  var _localSnap=autoSaveCheckLocal();
+  if(_localSnap&&_localSnap.D&&_localSnap.D.auditLog&&_localSnap.D.auditLog.length){
+    var _existing={};
+    (D.auditLog||[]).forEach(function(e){if(e.ts)_existing[e.ts]=true;});
+    if(!D.auditLog)D.auditLog=[];
+    _localSnap.D.auditLog.forEach(function(e){
+      if(e.ts&&!_existing[e.ts])D.auditLog.push(e);
+    });
+    D.auditLog.sort(function(a,b){return a.ts>b.ts?1:-1;});
+  }
   var snap=autoSaveCheckLocal();
   var hasCurrentData=D.customers.length||D.orders.length||D.invoices.length;
   if(snap&&snap.D){
