@@ -1959,7 +1959,7 @@ function ordRows(fil){
       "<td>"+(can("mPaid")?pb(o.paid):"<span style=\"color:var(--tx2);font-size:11px\">&mdash;</span>")+"</td>"+
       "<td>"+btl(o.bottle_after||o.bottle_before)+"</td>"+
       "<td style=\"font-size:11px\">"+fmt(o.date)+"</td>"+
-      "<td style=\"font-size:11px\">"+(o.driver||"&mdash;")+"</td>"+
+      "<td style=\"font-size:11px\">"+(o.driver||"&mdash;")+(o.completedBy&&o.completedBy!==o.driver?'<span style=\"font-size:9px;color:#27ae60\" title=\"Completed by this person\"> ✓'+o.completedBy+"</span>":"")+"</td>"+
       "<td>"+sb(o.status)+"</td>"+
       "<td><div class=\"ac\">"+
         (o.status!=="Delivered"&&o.status!=="Cancelled"?"<button class=\"btn btn-xs btn-grn\" onclick=\"openDlv("+o.id+")\" title=\"Complete delivery\"><i class=\"ti ti-check\"></i></button>":"")+
@@ -2372,6 +2372,14 @@ function saveOrd(){
 }
 function openDlv(oid){
   var o=D.orders.find(function(x){return x.id===oid;});if(!o)return;
+  // Ownership enforcement: driver/staff can only open their own assigned orders
+  if(!can("eOrd")){
+    if(o.driver&&o.driver!==CU.name){
+      toast("This order is assigned to "+o.driver+" — only they can complete it","err");
+      auditLog("UNAUTHORISED_DLV_ATTEMPT",""+CU.name+" ("+CU.role+") tried to complete Order #"+oid+" assigned to "+o.driver);
+      return;
+    }
+  }
   var c=D.customers.find(function(x){return x.id===o.cId;});
   el("dlv-oid").value=oid;
   var isCat=o.prodConfirmed===false;
@@ -2432,6 +2440,12 @@ function openDlv(oid){
 function completeDlv(){
   var oid=parseInt(el("dlv-oid").value);
   var o=D.orders.find(function(x){return x.id===oid;});if(!o)return;
+  // Triple-enforced ownership check — cannot be bypassed
+  if(!can("eOrd")&&o.driver&&o.driver!==CU.name){
+    toast("Security: you are not assigned to Order #"+oid,"err");
+    auditLog("SECURITY_VIOLATION",""+CU.name+" ("+CU.role+") attempted to complete Order #"+oid+" assigned to "+o.driver+" — blocked at completeDlv()");
+    return;
+  }
   var isCat=o.prodConfirmed===false;
 
   // ── CATEGORY ORDER: confirm exact product first ──
@@ -2465,6 +2479,8 @@ function completeDlv(){
 
   o.status="Delivered";
   o.deliveredAt=tday(); // stamp actual delivery date
+  o.completedBy=CU.name;  // who physically completed — for audit accountability
+  o.completedRole=CU.role;
   o.bottle_after=el("dlv-btl").value;
 
   if(can("mPaid")){
@@ -2507,7 +2523,8 @@ function completeDlv(){
     }
   }
   if(el("dlv-notes").value)o.notes=el("dlv-notes").value;
-  auditLog("DELIVERY_COMPLETE","Order #"+o.id+" delivered by "+CU.name+" ("+CU.role+"). Product: "+o.prod+", Qty: "+o.qty);
+  var assignedStr=o.driver&&o.driver!==CU.name?" (assigned to "+o.driver+")":" (self-assigned)";
+  auditLog("DELIVERY_COMPLETE","Order #"+o.id+" completed by "+CU.name+" ("+CU.role+")"+assignedStr+". Product: "+o.prod+", Qty: "+o.qty+". Cash collected: "+(el("dlv-amt")&&el("dlv-amt").value>0?"KSh "+el("dlv-amt").value:"none"));
   cm("m-dlv");rOrds(undefined,ORD_PAGE);rDel();
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   dirty();
@@ -2600,9 +2617,24 @@ function rDel(q){
           "<td style=\"font-size:11px\">"+(c?[c.estate,c.court,c.house?"No."+c.house:"",c.htype].filter(Boolean).join(", "):(o.deliver||"&mdash;"))+"</td>"+
           "<td>"+o.prod+"</td><td style=\"font-weight:700\">"+o.qty+"</td>"+
           "<td>"+btl(o.bottle_before)+"</td>"+
-          "<td style=\"font-size:11px\">"+(o.driver||"&mdash;")+"</td>"+
+          "<td style=\"font-size:11px\">"+
+          (o.driver?(
+            o.driver===CU.name
+            ?"<span style=\"color:#27ae60;font-weight:700\"><i class=\"ti ti-user-check\" style=\"font-size:10px\"></i> "+o.driver+"</span>"
+            :"<span style=\"color:#185FA5\">"+o.driver+"</span>"
+          ):"<span style=\"color:#999\">Unassigned</span>")+
+          "</td>"+
           "<td>"+pb(o.paid)+"</td><td>"+sb(o.status)+"</td>"+
-          "<td><button class=\"btn btn-xs btn-grn\" onclick=\"openDlv("+o.id+")\" title=\"Complete delivery\"><i class=\"ti ti-check\"></i> Done</button></td></tr>";
+          (function(){
+            var isOwner=!o.driver||o.driver===CU.name; // unassigned or mine
+            var canComplete=can("eOrd")||isOwner; // manager/director always can
+            if(canComplete){
+              return "<td><button class=\"btn btn-xs btn-grn\" onclick=\"openDlv("+o.id+")\" title=\"Complete delivery\"><i class=\"ti ti-check\"></i> Done</button></td></tr>";
+            }else{
+              return "<td><div title=\"Assigned to "+o.driver+" — only they can complete this delivery\" style=\"display:inline-flex;align-items:center;gap:5px;background:#f5f5f5;border:1.5px solid #ddd;border-radius:7px;padding:5px 10px;font-size:11px;color:#999;cursor:not-allowed\">"+
+                "<i class=\"ti ti-lock\" style=\"font-size:11px\"></i> "+o.driver.split(" ")[0]+" - assigned</div></td></tr>";
+            }
+          })()
       }).join(""):"<tr><td colspan=\"10\"><div class=\"te\"><i class=\"ti ti-circle-check\"></i><p>All deliveries complete!</p></div></td></tr>")+
     "</tbody></table></div>";
 }
