@@ -2558,7 +2558,7 @@ function rInvs(q,pg){
   if(q2){var lq=q2.toLowerCase();fil=fil.filter(function(i){var c=D.customers.find(function(x){return x.id===i.cId;});return(c&&c.name.toLowerCase().indexOf(lq)!==-1)||String(i.id).indexOf(q2)!==-1||String(i.amount).indexOf(q2)!==-1;});}
   var paged=paginate(fil,INV_PAGE);
   pgEl.innerHTML=
-    "<div class=\"ph\"><h1>Invoices</h1><p>"+D.invoices.length+" total &middot; "+D.invoices.filter(function(i){return i.paid>=i.amount;}).length+" paid &middot; "+D.invoices.filter(function(i){return i.paid<i.amount&&i.due<td;}).length+" overdue</p></div>"+
+    "<div class=\"ph\"><h1>Invoices</h1><p>"+D.invoices.length+" total &middot; "+D.invoices.filter(function(i){return i.paid>=i.amount;}).length+" paid &middot; "+D.invoices.filter(function(i){return i.paid<i.amount&&i.due&&i.due<td;}).length+" overdue</p></div>"+
     "<div class=\"toolbar\">"+
       "<div class=\"srch\"><i class=\"ti ti-search\"></i><input type=\"text\" placeholder=\"Search invoice #, customer, amount...\" oninput=\"rInvs(this.value,0)\" value=\""+q2+"\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
       "<select class=\"fsel\" onchange=\"filterInvs(this.value)\"><option value=\"\">All</option><option>Paid</option><option>Unpaid</option><option>Overdue</option></select>"+
