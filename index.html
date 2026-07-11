@@ -296,6 +296,17 @@ function toast(msg,type){
   document.body.appendChild(t);
   setTimeout(function(){if(t.parentNode)t.parentNode.removeChild(t);},2800);
 }
+// Restore focus and cursor position after innerHTML re-render (Chrome desktop fix)
+function refocus(inputId,val){
+  setTimeout(function(){
+    var inp=el(inputId);
+    if(!inp)return;
+    inp.focus();
+    // Restore cursor to end of text
+    var len=inp.value?inp.value.length:0;
+    try{inp.setSelectionRange(len,len);}catch(e){}
+  },0);
+}
 function dirty(){
   var e=el("sts");if(e){e.className="sts dirty";e.innerHTML="<i class=\"ti ti-point-filled\"></i> Syncing...";}
   scheduleCloudSync();
@@ -1727,7 +1738,7 @@ function rCusts(q,pg,sort,type){
   pg2.innerHTML=
     "<div class=\"ph\"><h1>Customers</h1><p>"+D.customers.length+" registered &middot; "+fil.length+(type2||q2?" matched":"")+"</p></div>"+
     "<div class=\"toolbar\">"+
-      "<div class=\"srch\"><i class=\"ti ti-search\"></i><input type=\"text\" placeholder=\"Search name, phone, court, house...\" oninput=\"rCusts(this.value,0)\" value=\""+q2+"\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
+      "<div class=\"srch\"><i class=\"ti ti-search\"></i><input id=\"cust-srch\" type=\"text\" placeholder=\"Search name, phone, court, house...\" oninput=\"rCusts(this.value,0)\" value=\""+q2+"\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
       "<select class=\"fsel\" onchange=\"rCusts(undefined,0,undefined,this.value)\">"+
         "<option value=\"\" "+(type2===""?"selected":"")+">All types</option>"+
         "<option value=\"Residential\" "+(type2==="Residential"?"selected":"")+">Residential</option>"+
@@ -1773,6 +1784,7 @@ function rCusts(q,pg,sort,type){
       "</tbody>"+
     "</table></div>"+
     pgBar(paged.page,paged.pages,paged.total,"rCusts(undefined,");
+  if(q2)refocus("cust-srch",q2);
 }
 function rCustsF(t){rCusts(undefined,0,undefined,t);}
 
@@ -1922,7 +1934,7 @@ function rOrds(q,pg,sort){
   pgEl.innerHTML=
     "<div class=\"ph\"><h1>Orders</h1><p>"+D.orders.length+" total &middot; "+D.orders.filter(function(o){return o.status==="Pending"||o.status==="Processing";}).length+" active</p></div>"+
     "<div class=\"toolbar\">"+
-      "<div class=\"srch\"><i class=\"ti ti-search\"></i><input type=\"text\" placeholder=\"Search by #, customer, product, driver, address...\" oninput=\"rOrds(this.value,0)\" value=\""+q2+"\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
+      "<div class=\"srch\"><i class=\"ti ti-search\"></i><input id=\"ords-srch\" type=\"text\" placeholder=\"Search by #, customer, product, driver, address...\" oninput=\"rOrds(this.value,0)\" value=\""+q2+"\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
       "<select class=\"fsel\" onchange=\"filterOrds(this.value)\">"+
         "<option value=\"\" "+(sf===""?"selected":"")+">All statuses</option>"+
         "<option value=\"Pending\" "+(sf==="Pending"?"selected":"")+">Pending</option>"+
@@ -1943,6 +1955,7 @@ function rOrds(q,pg,sort){
     "<div class=\"tw\"><table><thead><tr><th>#</th><th>Customer</th><th>Product</th><th>Qty</th><th>Total</th><th>Payment</th><th>Bottle</th><th>Date</th><th>Driver</th><th>Status</th><th></th></tr></thead>"+
     "<tbody id=\"otbody\">"+ordRows(paged.items)+"</tbody></table></div>"+
     pgBar(paged.page,paged.pages,paged.total,"rOrds(undefined,");
+  if(q2)refocus("ords-srch",q2);
 }
 function filterOrds(f){
   ORD_STATUS_F=f;ORD_DATE_F="";ORD_PAGE=0;
@@ -2386,7 +2399,13 @@ function openDlv(oid){
   el("dlv-info").innerHTML=
     "<div style=\"font-weight:700;font-size:13px;margin-bottom:5px\">Order #"+o.id+" &middot; "+(c?(can("vPhone")?c.name:maskName(c.name)):"?")+"</div>"+
     "<div style=\"color:var(--tx2)\">"+o.qty+"&times; "+o.prod+(isCat?" <span style=\"background:#fff3cd;color:#856404;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700\">CONFIRM BRAND</span>":"")+((!isCat&&can("vRev"))?" &middot; KSh "+(o.qty*o.price).toLocaleString():"")+"</div>"+
-    (c?"<div style=\"color:var(--tx2);margin-top:3px\">"+cAddr(c)+"</div>":"");
+    (c?"<div style=\"color:var(--tx2);margin-top:3px\">"+cAddr(c)+"</div>":"")+
+    // Delivery instructions (from order)
+    (o.deliver?"<div style=\"margin-top:7px;padding:7px 9px;background:#eaf0ff;border-radius:6px;border-left:3px solid #185FA5;font-size:11px\"><i class=\"ti ti-map-pin\" style=\"color:#185FA5;margin-right:4px\"></i><strong>Instructions:</strong> "+o.deliver+"</div>":"")+
+    // Order notes (from order placement)
+    (o.notes?"<div style=\"margin-top:6px;padding:7px 9px;background:#f0fdf4;border-radius:6px;border-left:3px solid #27ae60;font-size:11px\"><i class=\"ti ti-note\" style=\"color:#27ae60;margin-right:4px\"></i><strong>Order notes:</strong> "+o.notes+"</div>":"")+
+    // Customer notes (from customer profile)
+    (c&&c.notes?"<div style=\"margin-top:6px;padding:7px 9px;background:#fff8e1;border-radius:6px;border-left:3px solid #f39c12;font-size:11px\"><i class=\"ti ti-user\" style=\"color:#f39c12;margin-right:4px\"></i><strong>Customer note:</strong> "+c.notes+"</div>":"");
   // Show product confirmation row for category orders
   var prodConfRow=el("dlv-prod-row");
   if(prodConfRow){
@@ -2590,6 +2609,7 @@ function cancelO(id){
 }
 function rDel(q){
   if(q!==undefined)DEL_Q=q;
+  var prevFocus=document.activeElement&&document.activeElement.id==="del-srch";
   var pg=el("pg-delivery");if(!pg)return;
   var allPend=D.orders.filter(function(o){return o.status==="Pending"||o.status==="Processing"||o.status==="Out for delivery";});
   var pend=CU&&CU.role==="driver"?allPend.filter(function(o){return o.driver===CU.name;}):allPend;
@@ -2608,7 +2628,7 @@ function rDel(q){
     "<div class=\"toolbar\" style=\"margin-bottom:10px\">"+
       "<div class=\"srch\"><i class=\"ti ti-search\"></i><input id=\"del-srch\" type=\"text\" placeholder=\"Search by order #, customer, product, driver...\" value=\""+q2+"\" oninput=\"rDel(this.value)\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
     "</div>"+
-    "<div class=\"tw\"><table><thead><tr><th>#</th><th>Customer</th><th>Full address</th><th>Product</th><th>Qty</th><th>Bottle before</th><th>Driver</th><th>Payment</th><th>Status</th><th></th></tr></thead>"+
+    "<div class=\"tw\"><table><thead><tr><th>#</th><th>Customer</th><th>Full address</th><th>Product</th><th>Qty</th><th>Bottle before</th><th>Driver</th><th>Payment</th><th>Status</th><th style=\"width:30px\" title=\"Notes/Instructions\">&#128196;</th><th></th></tr></thead>"+
     "<tbody>"+
       (pendFil.length?pendFil.map(function(o){
         var c=D.customers.find(function(x){return x.id===o.cId;});
@@ -2625,6 +2645,10 @@ function rDel(q){
           ):"<span style=\"color:#999\">Unassigned</span>")+
           "</td>"+
           "<td>"+pb(o.paid)+"</td><td>"+sb(o.status)+"</td>"+
+          "<td style=\"font-size:10px\">"+
+            (o.deliver?"<div title=\""+o.deliver+"\"><i class=\"ti ti-map-pin\" style=\"color:#185FA5\"></i></div>":"")+
+            (o.notes?"<div title=\""+o.notes+"\"><i class=\"ti ti-note\" style=\"color:#27ae60\"></i></div>":"")+
+          "</td>"+
           (function(){
             var isOwner=!o.driver||o.driver===CU.name; // unassigned or mine
             var canComplete=can("eOrd")||isOwner; // manager/director always can
@@ -2637,6 +2661,7 @@ function rDel(q){
           })()
       }).join(""):"<tr><td colspan=\"10\"><div class=\"te\"><i class=\"ti ti-circle-check\"></i><p>All deliveries complete!</p></div></td></tr>")+
     "</tbody></table></div>";
+  if(prevFocus||DEL_Q)refocus("del-srch",DEL_Q);
 }
 
 function rStock(q,pg){
@@ -2649,7 +2674,7 @@ function rStock(q,pg){
   pgEl.innerHTML=
     "<div class=\"ph\"><h1>Stock Management</h1><p>"+D.stock.length+" products &middot; "+D.stock.filter(function(s){return s.qty<=s.min;}).length+" low stock</p></div>"+
     "<div class=\"toolbar\">"+
-      "<div class=\"srch\"><i class=\"ti ti-search\"></i><input type=\"text\" placeholder=\"Search product name or size...\" oninput=\"rStock(this.value,0)\" value=\""+q2+"\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
+      "<div class=\"srch\"><i class=\"ti ti-search\"></i><input id=\"stk-srch\" type=\"text\" placeholder=\"Search product name or size...\" oninput=\"rStock(this.value,0)\" value=\""+q2+"\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
       (can("aSt")?"<button class=\"btn btn-gold\" onclick=\"prepStAdd()\"><i class=\"ti ti-plus\"></i> Add product</button>":"")+
       (can("aSt")?"<button class=\"btn btn-navy\" onclick=\"prepRS()\"><i class=\"ti ti-refresh\"></i> Restock</button>":"")+
     "</div>"+
@@ -2669,6 +2694,7 @@ function rStock(q,pg){
       }).join(""):"<tr><td colspan=\"8\"><div class=\"te\"><i class=\"ti ti-package\"></i><p>"+(q2?"No results for \""+q2+"\"":"No products yet")+"</p></div></td></tr>")+
     "</tbody></table></div>"+
     pgBar(paged.page,paged.pages,paged.total,"rStock(undefined,");
+  if(q2)refocus("stk-srch",q2);
 }
 function prepStAdd(){
   el("s-edit-id").value="";
@@ -2750,15 +2776,15 @@ function rInvs(q,pg){
   pgEl.innerHTML=pendingBanner+
     "<div class=\"ph\"><h1>Invoices</h1><p>"+D.invoices.length+" total &middot; "+D.invoices.filter(function(i){return i.paid>=i.amount;}).length+" paid &middot; "+D.invoices.filter(function(i){return i.paid<i.amount&&i.due&&i.due<td;}).length+" overdue</p></div>"+
     "<div class=\"toolbar\">"+
-      "<div class=\"srch\"><i class=\"ti ti-search\"></i><input type=\"text\" placeholder=\"Search invoice #, customer, amount...\" oninput=\"rInvs(this.value,0)\" value=\""+q2+"\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
+      "<div class=\"srch\"><i class=\"ti ti-search\"></i><input id=\"inv-srch\" type=\"text\" placeholder=\"Search invoice #, customer, amount...\" oninput=\"rInvs(this.value,0)\" value=\""+q2+"\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
       "<select class=\"fsel\" onchange=\"filterInvs(this.value)\"><option value=\"\">All</option><option>Paid</option><option>Unpaid</option><option>Overdue</option></select>"+
       (can("aInv")?"<button class=\"btn btn-gold\" onclick=\"prepIv()\"><i class=\"ti ti-plus\"></i> New invoice</button>":"")+
     "</div>"+
     "<div class=\"tw\"><table><thead><tr><th>Inv#</th><th>Customer</th><th>Amount</th><th>Paid</th><th>Balance</th><th>Due</th><th>Last payment</th><th>Status</th><th></th></tr></thead>"+
     "<tbody id=\"itbody\">"+invRows(paged.items)+"</tbody></table></div>"+
     pgBar(paged.page,paged.pages,paged.total,"rInvs(undefined,");
-}
-function invRows(fil){
+  if(q2)refocus("inv-srch",q2);
+}function invRows(fil){
   var td=tday();if(!fil.length)return "<tr><td colspan=\"9\"><div class=\"te\"><i class=\"ti ti-receipt\"></i><p>No invoices found</p></div></td></tr>";
   return fil.map(function(i){
     var c=D.customers.find(function(x){return x.id===i.cId;});var bal=i.amount-i.paid;var ov=bal>0&&i.due&&i.due<td;
@@ -2913,7 +2939,7 @@ function rDebts(q,pg){
     "</div>"+
     "<div class=\"toolbar\">"+
     "<div class=\"srch\"><i class=\"ti ti-search\"></i>"+
-    "<input type=\"text\" placeholder=\"Search customer name, address, phone...\" value=\""+q2+"\" oninput=\"DEBT_Q=this.value;DEBT_PAGE=0;rDebts()\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\">"+
+    "<input id=\"debt-srch\" type=\"text\" placeholder=\"Search customer name, address, phone...\" value=\""+q2+"\" oninput=\"DEBT_Q=this.value;DEBT_PAGE=0;rDebts()\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\">"+
     "</div>"+
     "</div>"+
     "<div style=\"display:flex;gap:6px;margin:8px 0;align-items:center;flex-wrap:wrap\">"+
@@ -2936,6 +2962,7 @@ function rDebts(q,pg){
           "<td>"+(can("mPaid")?"<button class=\"btn btn-xs btn-gold\" onclick=\"openPay("+x.c.id+")\"><i class=\"ti ti-cash\"></i> Pay</button>":"")+"</td></tr>";
       }).join(""):"<tr><td colspan=\"8\"><div class=\"te\"><i class=\"ti ti-circle-check\"></i><p>"+(q2?"No debtors match your search":"No outstanding debts!")+"</p></div></td></tr>")+
     "</tbody></table></div>"+pgBar(debtPaged.page,debtPaged.pages,debtPaged.total,"rDebts(undefined,");
+  if(q2)refocus("debt-srch",q2);
 }
 
 function rCmps(q,pg){
@@ -2955,13 +2982,14 @@ function rCmps(q,pg){
       "<div class=\"stat sk\"><div class=\"sl\">Resolved</div><div class=\"sv\">"+D.complaints.filter(function(c){return c.status==="Resolved";}).length+"</div></div>"+
     "</div>"+
     "<div class=\"toolbar\">"+
-      "<div class=\"srch\"><i class=\"ti ti-search\"></i><input type=\"text\" placeholder=\"Search customer, type, details...\" oninput=\"rCmps(this.value,0)\" value=\""+q2+"\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
+      "<div class=\"srch\"><i class=\"ti ti-search\"></i><input id=\"cmp-srch\" type=\"text\" placeholder=\"Search customer, type, details...\" oninput=\"rCmps(this.value,0)\" value=\""+q2+"\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
       "<select class=\"fsel\" onchange=\"filterCmps(this.value)\"><option value=\"\">All</option><option>Open</option><option>In progress</option><option>Resolved</option></select>"+
       (can("aCmp")?"<button class=\"btn btn-gold\" onclick=\"prepCmp()\"><i class=\"ti ti-plus\"></i> Log complaint</button>":"")+
     "</div>"+
     "<div class=\"tw\"><table><thead><tr><th>#</th><th>Customer</th><th>Type</th><th>Details</th><th>Action taken</th><th>Date</th><th>Status</th><th></th></tr></thead>"+
     "<tbody id=\"cmpbody\">"+cmpRows(paged.items)+"</tbody></table></div>"+
     pgBar(paged.page,paged.pages,paged.total,"rCmps(undefined,");
+  if(q2)refocus("cmp-srch",q2);
 }
 function cmpRows(fil){
   var sm={"Open":"br","In progress":"ba","Resolved":"bg"};
