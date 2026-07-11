@@ -2837,17 +2837,25 @@ function rInvs(q,pg){
       "</div>";
     }
   }
-  pgEl.innerHTML=pendingBanner+
-    "<div class=\"ph\"><h1>Invoices</h1><p>"+D.invoices.length+" total &middot; "+D.invoices.filter(function(i){return i.paid>=i.amount;}).length+" paid &middot; "+D.invoices.filter(function(i){return i.paid<i.amount&&i.due&&i.due<td;}).length+" overdue</p></div>"+
-    "<div class=\"toolbar\">"+
-      "<div class=\"srch\"><i class=\"ti ti-search\"></i><input id=\"inv-srch\" type=\"text\" placeholder=\"Search invoice #, customer, amount...\" oninput=\"rInvs(this.value,0)\" value=\""+q2+"\" autocomplete=\"off\" autocorrect=\"off\" autocapitalize=\"off\" spellcheck=\"false\" inputmode=\"search\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
-      "<select class=\"fsel\" onchange=\"filterInvs(this.value)\"><option value=\"\">All</option><option>Paid</option><option>Unpaid</option><option>Overdue</option></select>"+
-      (can("aInv")?"<button class=\"btn btn-gold\" onclick=\"prepIv()\"><i class=\"ti ti-plus\"></i> New invoice</button>":"")+
-    "</div>"+
+  if(!el("inv-srch")){
+    pgEl.innerHTML=
+      "<div class=\"ph\"><h1>Invoices</h1><p id=\"inv-stats\"></p></div>"+
+      "<div id=\"inv-pending\"></div>"+
+      "<div class=\"toolbar\">"+
+        "<div class=\"srch\"><i class=\"ti ti-search\"></i><input id=\"inv-srch\" type=\"text\" placeholder=\"Search invoice #, customer, amount...\" oninput=\"rInvs(this.value,0)\" value=\""+q2+"\" autocomplete=\"off\" autocorrect=\"off\" autocapitalize=\"off\" spellcheck=\"false\" inputmode=\"search\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
+        "<select class=\"fsel\" onchange=\"filterInvs(this.value)\"><option value=\"\">All</option><option>Paid</option><option>Unpaid</option><option>Overdue</option></select>"+
+        (can("aInv")?"<button class=\"btn btn-gold\" onclick=\"prepIv()\"><i class=\"ti ti-plus\"></i> New invoice</button>":"")+
+      "</div>"+
+      "<div id=\"inv-results\"></div>";
+  }
+  var _is=el("inv-stats");
+  if(_is)_is.innerHTML=D.invoices.length+" total &middot; "+D.invoices.filter(function(i){return i.paid>=i.amount;}).length+" paid &middot; "+D.invoices.filter(function(i){return i.paid<i.amount&&i.due&&i.due<td;}).length+" overdue";
+  var _ip=el("inv-pending");if(_ip)_ip.innerHTML=pendingBanner;
+  var _ir=el("inv-results");
+  if(_ir)_ir.innerHTML=
     "<div class=\"tw\"><table><thead><tr><th>Inv#</th><th>Customer</th><th>Amount</th><th>Paid</th><th>Balance</th><th>Due</th><th>Last payment</th><th>Status</th><th></th></tr></thead>"+
     "<tbody id=\"itbody\">"+invRows(paged.items)+"</tbody></table></div>"+
     pgBar(paged.page,paged.pages,paged.total,"rInvs(undefined,");
-  var _ii=el("inv-srch");if(_ii&&document.activeElement!==_ii&&q2)_ii.focus();
 }function invRows(fil){
   var td=tday();if(!fil.length)return "<tr><td colspan=\"9\"><div class=\"te\"><i class=\"ti ti-receipt\"></i><p>No invoices found</p></div></td></tr>";
   return fil.map(function(i){
@@ -2992,34 +3000,46 @@ function rDebts(q,pg){
     var old=invs.length?invs.map(function(i){return i.due;}).sort()[0]:null;
     return{c:c,debt:debt,lastOrd:lastOrd,invCount:invs.length,ov:ov,oldest:old};
   }).filter(function(x){return x.debt>0;});
-  var total=debtors.reduce(function(a,x){return a+x.debt;},0);
   var q2=DEBT_Q||"";
   if(q2){var lq=q2.toLowerCase();debtors=debtors.filter(function(x){return x.c.name.toLowerCase().indexOf(lq)!==-1||cAddr(x.c).toLowerCase().indexOf(lq)!==-1||(can("vPhone")&&x.c.phone&&x.c.phone.indexOf(q2)!==-1);});}
+  var total=debtors.reduce(function(a,x){return a+x.debt;},0);
   if(DEBT_SORT==="name")debtors.sort(function(a,b){return a.c.name.localeCompare(b.c.name);});
   else if(DEBT_SORT==="overdue")debtors.sort(function(a,b){return b.ov-a.ov;});
   else debtors.sort(function(a,b){return b.debt-a.debt;});
   var debtPaged=paginate(debtors,DEBT_PAGE);
-  pg.innerHTML=
-    "<div class=\"ph\"><h1>Debt Tracker</h1><p>"+debtors.length+" customers with outstanding balances</p></div>"+
-    "<div class=\"stats\">"+
-      "<div class=\"stat sr\"><div class=\"sl\">Total outstanding</div><div class=\"sv\" style=\"color:#c0392b\">KSh "+total.toLocaleString()+"</div><div class=\"ss\">"+debtors.length+" customers</div></div>"+
-      "<div class=\"stat sa\"><div class=\"sl\">Overdue invoices</div><div class=\"sv\">"+D.invoices.filter(function(i){return i.paid<i.amount&&i.due<td;}).length+"</div></div>"+
-      "<div class=\"stat sn\"><div class=\"sl\">Largest debt</div><div class=\"sv\">"+(debtors.length?"KSh "+debtors[0].debt.toLocaleString():"KSh 0")+"</div><div class=\"ss\">"+(debtors.length?debtors[0].c.name:"")+"</div></div>"+
-    "</div>"+
-    "<div class=\"toolbar\">"+
-    "<div class=\"srch\"><i class=\"ti ti-search\"></i>"+
-    "<input id=\"debt-srch\" type=\"text\" autocomplete=\"off\" autocorrect=\"off\" autocapitalize=\"off\" spellcheck=\"false\" inputmode=\"search\" placeholder=\"Search customer name, address, phone...\" value=\""+q2+"\" oninput=\"DEBT_Q=this.value;DEBT_PAGE=0;rDebts()\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\">"+
-    "</div>"+
-    "</div>"+
+  if(!el("debt-srch")){
+    pg.innerHTML=
+      "<div class=\"ph\"><h1>Debt Tracker</h1><p id=\"debt-stats\"></p></div>"+
+      "<div class=\"stats\" id=\"debt-cards\"></div>"+
+      "<div class=\"toolbar\">"+
+        "<div class=\"srch\"><i class=\"ti ti-search\"></i>"+
+        "<input id=\"debt-srch\" type=\"text\" autocomplete=\"off\" autocorrect=\"off\" autocapitalize=\"off\" spellcheck=\"false\" inputmode=\"search\" placeholder=\"Search customer name, address, phone...\" value=\""+q2+"\" oninput=\"DEBT_Q=this.value;DEBT_PAGE=0;rDebts()\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\">"+
+        "</div>"+
+      "</div>"+
+      "<div id=\"debt-sort\"></div>"+
+      "<div id=\"debt-results\"></div>";
+  }
+  var _dstat=el("debt-stats");
+  if(_dstat)_dstat.innerHTML=debtors.length+" customers with outstanding balances"+(q2?" — filtered":"");
+  var _dcards=el("debt-cards");
+  if(_dcards)_dcards.innerHTML=
+    "<div class=\"stat sr\"><div class=\"sl\">Total outstanding</div><div class=\"sv\" style=\"color:#c0392b\">KSh "+total.toLocaleString()+"</div><div class=\"ss\">"+debtors.length+" customers</div></div>"+
+    "<div class=\"stat sa\"><div class=\"sl\">Overdue invoices</div><div class=\"sv\">"+D.invoices.filter(function(i){return i.paid<i.amount&&i.due<td;}).length+"</div></div>"+
+    "<div class=\"stat sn\"><div class=\"sl\">Largest debt</div><div class=\"sv\">"+(debtors.length?"KSh "+debtors[0].debt.toLocaleString():"KSh 0")+"</div><div class=\"ss\">"+(debtors.length?debtors[0].c.name:"")+"</div></div>";
+  var _dsort=el("debt-sort");
+  if(_dsort)_dsort.innerHTML=
     "<div style=\"display:flex;gap:6px;margin:8px 0;align-items:center;flex-wrap:wrap\">"+
     "<span style=\"font-size:11px;color:var(--tx2);font-weight:700\">Sort by:</span>"+
-    "<button class=\"btn btn-xs"+(DEBT_SORT==='amount'?' btn-navy':'')+"\" onclick=\"DEBT_SORT='amount';DEBT_PAGE=0;rDebts()\">Highest debt</button>"+
-    "<button class=\"btn btn-xs"+(DEBT_SORT==='overdue'?' btn-navy':'')+"\" onclick=\"DEBT_SORT='overdue';DEBT_PAGE=0;rDebts()\">Most overdue</button>"+
-    "<button class=\"btn btn-xs"+(DEBT_SORT==='name'?' btn-navy':'')+"\" onclick=\"DEBT_SORT='name';DEBT_PAGE=0;rDebts()\">A-Z name</button>"+
-    "</div>"+
+    "<button class=\"btn btn-xs"+(DEBT_SORT==="amount"?" btn-navy":"")+"\" onclick=\"DEBT_SORT='amount';DEBT_PAGE=0;rDebts()\">Highest debt</button>"+
+    "<button class=\"btn btn-xs"+(DEBT_SORT==="overdue"?" btn-navy":"")+"\" onclick=\"DEBT_SORT='overdue';DEBT_PAGE=0;rDebts()\">Most overdue</button>"+
+    "<button class=\"btn btn-xs"+(DEBT_SORT==="name"?" btn-navy":"")+"\" onclick=\"DEBT_SORT='name';DEBT_PAGE=0;rDebts()\">A-Z name</button>"+
+    "</div>";
+  var _dres=el("debt-results");
+  if(_dres)_dres.innerHTML=
     "<div class=\"tw\"><table><thead><tr><th>Customer</th><th>Contact &amp; address</th><th>Balance owed</th><th>Ageing</th><th>Invoices</th><th>Overdue</th><th>Oldest due</th><th>Last order</th><th></th></tr></thead>"+
     "<tbody>"+
-      (debtPaged.items.length?debtPaged.items.map(function(x){
+    (debtPaged.items.length?debtPaged.items.map(function(x){
+
         return "<tr class=\"dr\">"+
           "<td><div style=\"font-weight:800;font-size:13px\">"+(can("vPhone")?x.c.name:maskName(x.c.name))+"</div></td>"+
           "<td><div>"+(can("vPhone")?x.c.phone:maskPhone(x.c.phone))+"</div><div class=\"ca\">"+cAddr(x.c)+"</div></td>"+
@@ -3031,7 +3051,6 @@ function rDebts(q,pg){
           "<td>"+(can("mPaid")?"<button class=\"btn btn-xs btn-gold\" onclick=\"openPay("+x.c.id+")\"><i class=\"ti ti-cash\"></i> Pay</button>":"")+"</td></tr>";
       }).join(""):"<tr><td colspan=\"8\"><div class=\"te\"><i class=\"ti ti-circle-check\"></i><p>"+(q2?"No debtors match your search":"No outstanding debts!")+"</p></div></td></tr>")+
     "</tbody></table></div>"+pgBar(debtPaged.page,debtPaged.pages,debtPaged.total,"rDebts(undefined,");
-  var _di=el("debt-srch");if(_di&&document.activeElement!==_di&&q2)_di.focus();
 }
 
 function rCmps(q,pg){
@@ -3042,23 +3061,30 @@ function rCmps(q,pg){
   var fil=[].concat(D.complaints).reverse();
   if(q2){var lq=q2.toLowerCase();fil=fil.filter(function(c){var cu=D.customers.find(function(x){return x.id===c.cId;});return(cu&&cu.name.toLowerCase().indexOf(lq)!==-1)||c.type.toLowerCase().indexOf(lq)!==-1||(c.details&&c.details.toLowerCase().indexOf(lq)!==-1);});}
   var paged=paginate(fil,CMP_PAGE);
-  pgEl.innerHTML=
-    "<div class=\"ph\"><h1>Complaints</h1><p>"+D.complaints.length+" total &middot; "+D.complaints.filter(function(c){return c.status==="Open";}).length+" open</p></div>"+
-    "<div class=\"stats\" style=\"grid-template-columns:repeat(4,1fr)\">"+
-      "<div class=\"stat sn\"><div class=\"sl\">Total</div><div class=\"sv\">"+D.complaints.length+"</div></div>"+
-      "<div class=\"stat sr\"><div class=\"sl\">Open</div><div class=\"sv\" style=\"color:#c0392b\">"+D.complaints.filter(function(c){return c.status==="Open";}).length+"</div></div>"+
-      "<div class=\"stat sa\"><div class=\"sl\">In progress</div><div class=\"sv\">"+D.complaints.filter(function(c){return c.status==="In progress";}).length+"</div></div>"+
-      "<div class=\"stat sk\"><div class=\"sl\">Resolved</div><div class=\"sv\">"+D.complaints.filter(function(c){return c.status==="Resolved";}).length+"</div></div>"+
-    "</div>"+
-    "<div class=\"toolbar\">"+
-      "<div class=\"srch\"><i class=\"ti ti-search\"></i><input id=\"cmp-srch\" type=\"text\" placeholder=\"Search customer, type, details...\" oninput=\"rCmps(this.value,0)\" value=\""+q2+"\" autocomplete=\"off\" autocorrect=\"off\" autocapitalize=\"off\" spellcheck=\"false\" inputmode=\"search\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
-      "<select class=\"fsel\" onchange=\"filterCmps(this.value)\"><option value=\"\">All</option><option>Open</option><option>In progress</option><option>Resolved</option></select>"+
-      (can("aCmp")?"<button class=\"btn btn-gold\" onclick=\"prepCmp()\"><i class=\"ti ti-plus\"></i> Log complaint</button>":"")+
-    "</div>"+
+  if(!el("cmp-srch")){
+    pgEl.innerHTML=
+      "<div class=\"ph\"><h1>Complaints</h1><p id=\"cmp-stats\"></p></div>"+
+      "<div class=\"stats\" style=\"grid-template-columns:repeat(4,1fr)\" id=\"cmp-cards\"></div>"+
+      "<div class=\"toolbar\">"+
+        "<div class=\"srch\"><i class=\"ti ti-search\"></i><input id=\"cmp-srch\" type=\"text\" placeholder=\"Search customer, type, details...\" oninput=\"rCmps(this.value,0)\" value=\""+q2+"\" autocomplete=\"off\" autocorrect=\"off\" autocapitalize=\"off\" spellcheck=\"false\" inputmode=\"search\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
+        "<select class=\"fsel\" onchange=\"filterCmps(this.value)\"><option value=\"\">All</option><option>Open</option><option>In progress</option><option>Resolved</option></select>"+
+        (can("aCmp")?"<button class=\"btn btn-gold\" onclick=\"prepCmp()\"><i class=\"ti ti-plus\"></i> Log complaint</button>":"")+
+      "</div>"+
+      "<div id=\"cmp-results\"></div>";
+  }
+  var _cs=el("cmp-stats");
+  if(_cs)_cs.innerHTML=D.complaints.length+" total &middot; "+D.complaints.filter(function(c){return c.status==="Open";}).length+" open";
+  var _cc=el("cmp-cards");
+  if(_cc)_cc.innerHTML=
+    "<div class=\"stat sn\"><div class=\"sl\">Total</div><div class=\"sv\">"+D.complaints.length+"</div></div>"+
+    "<div class=\"stat sr\"><div class=\"sl\">Open</div><div class=\"sv\" style=\"color:#c0392b\">"+D.complaints.filter(function(c){return c.status==="Open";}).length+"</div></div>"+
+    "<div class=\"stat sa\"><div class=\"sl\">In progress</div><div class=\"sv\">"+D.complaints.filter(function(c){return c.status==="In progress";}).length+"</div></div>"+
+    "<div class=\"stat sk\"><div class=\"sl\">Resolved</div><div class=\"sv\">"+D.complaints.filter(function(c){return c.status==="Resolved";}).length+"</div></div>";
+  var _cr2=el("cmp-results");
+  if(_cr2)_cr2.innerHTML=
     "<div class=\"tw\"><table><thead><tr><th>#</th><th>Customer</th><th>Type</th><th>Details</th><th>Action taken</th><th>Date</th><th>Status</th><th></th></tr></thead>"+
     "<tbody id=\"cmpbody\">"+cmpRows(paged.items)+"</tbody></table></div>"+
     pgBar(paged.page,paged.pages,paged.total,"rCmps(undefined,");
-  var _ci=el("cmp-srch");if(_ci&&document.activeElement!==_ci&&q2)_ci.focus();
 }
 function cmpRows(fil){
   var sm={"Open":"br","In progress":"ba","Resolved":"bg"};
