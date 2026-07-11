@@ -263,7 +263,7 @@ function pgBar(page,pages,total,navFn){
   "</div>";
 }
 var CUST_PAGE=0,ORD_PAGE=0,INV_PAGE=0,CMP_PAGE=0,STK_PAGE=0,DEBT_PAGE=0;
-var CUST_Q="",ORD_Q="",INV_Q="",CMP_Q="",STK_Q="",DEL_Q="",DEBT_Q="",DEBT_SORT="amount";
+var CUST_Q="",ORD_Q="",INV_Q="",CMP_Q="",STK_Q="",DEL_Q="",DEBT_Q="",DEBT_SORT="amount",AUDIT_Q="",AUDIT_TYPE="";
 var CUST_SORT="recent",ORD_SORT="newest",CUST_TYPE="";
 function ia(v){return can("vInv")?"KSh "+Number(v).toLocaleString():"KSh "+String.fromCharCode(8226,8226,8226,8226);}
 function sb(s){var m={"Delivered":"bg","Pending":"ba","Out for delivery":"bp","Processing":"bb","Cancelled":"br"};var ic={"Delivered":"ti-circle-check","Pending":"ti-clock","Out for delivery":"ti-truck","Processing":"ti-loader","Cancelled":"ti-x"};return "<span class=\"badge "+(m[s]||"ba")+"\"><i class=\"ti "+(ic[s]||"ti-circle")+"\" style=\"font-size:10px;margin-right:2px\"></i>"+s+"</span>";}
@@ -301,6 +301,8 @@ function dirty(){
   scheduleCloudSync();
   autoSaveLocal();
 }
+var AUDIT_HOT_MAX=200; // entries kept live in main Firestore doc
+var AUDIT_ARCHIVE_THRESHOLD=180; // archive when hot log hits this
 function auditLog(action,details){
   if(!CU)return;
   if(!D.auditLog)D.auditLog=[];
@@ -308,11 +310,85 @@ function auditLog(action,details){
     ts:new Date().toISOString(),
     user:CU.name,
     role:CU.role,
+    uid:CU.id,
     action:action,
     details:details||""
   });
-  // Keep last 500 audit entries to stay within Firestore doc size
-  if(D.auditLog.length>500)D.auditLog=D.auditLog.slice(-500);
+  // Auto-archive: when hot log reaches threshold, flush oldest half to archive
+  if(D.auditLog.length>=AUDIT_HOT_MAX){
+    archiveAuditLogs();
+  }
+}
+function archiveAuditLogs(){
+  // Take the oldest entries, archive to Firestore, keep only the newest in hot log
+  if(!D.auditLog||D.auditLog.length<AUDIT_ARCHIVE_THRESHOLD)return;
+  var toArchive=D.auditLog.slice(0,AUDIT_ARCHIVE_THRESHOLD); // oldest half
+  D.auditLog=D.auditLog.slice(AUDIT_ARCHIVE_THRESHOLD);       // keep newest
+  if(!FB_READY||!FB_BACKUP_COL)return; // if offline, old entries simply drop
+  var archiveId="auditlog-"+new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
+  FB_BACKUP_COL.doc(archiveId).set({
+    type:"audit_archive",
+    archivedAt:new Date().toISOString(),
+    archivedBy:CU?CU.name:"system",
+    entries:toArchive,
+    count:toArchive.length
+  }).catch(function(){});
+  // Prune audit archives older than 90 days (free tier storage management)
+  pruneAuditArchives();
+}
+function pruneAuditArchives(){
+  if(!FB_BACKUP_COL)return;
+  var cutoff=new Date();
+  cutoff.setDate(cutoff.getDate()-90);
+  var cutoffId="auditlog-"+cutoff.toISOString().replace(/[:.]/g,"-").slice(0,19);
+  // Two-clause range query only (no composite index needed).
+  // JS-side filter discards any that are within 90 days.
+  FB_BACKUP_COL
+    .where(firebase.firestore.FieldPath.documentId(),">=","auditlog-")
+    .where(firebase.firestore.FieldPath.documentId(),"<","auditlog-z")
+    .limit(30)
+    .get().then(function(snap){
+      snap.forEach(function(d){
+        if(d.id<=cutoffId)d.ref.delete().catch(function(){});
+      });
+    }).catch(function(){});
+}
+function loadAuditArchives(cb){
+  // Load archived audit logs for display in the viewer
+  if(!FB_BACKUP_COL){if(cb)cb([]);return;}
+  FB_BACKUP_COL
+    .where(firebase.firestore.FieldPath.documentId(),">=","auditlog-")
+    .where(firebase.firestore.FieldPath.documentId(),"<","auditlog-z")
+    .orderBy(firebase.firestore.FieldPath.documentId(),"desc")
+    .limit(10)
+    .get().then(function(snap){
+      var all=[];
+      snap.forEach(function(d){
+        var data=d.data();
+        if(data&&data.entries)all=all.concat(data.entries);
+      });
+      // Sort newest first
+      all.sort(function(a,b){return b.ts>a.ts?1:-1;});
+      if(cb)cb(all);
+    }).catch(function(){if(cb)cb([]);});
+}
+function manualPurgeAuditLog(daysOld){
+  // Director-triggered: purge hot log entries older than N days
+  if(!can("exp")){toast("Director only","err");return;}
+  if(!D.auditLog||!D.auditLog.length){toast("Audit log is already empty");return;}
+  var cutoff=new Date();
+  cutoff.setDate(cutoff.getDate()-daysOld);
+  var cutoffStr=cutoff.toISOString();
+  var before=D.auditLog.length;
+  D.auditLog=D.auditLog.filter(function(e){return e.ts&&e.ts>cutoffStr;});
+  var removed=before-D.auditLog.length;
+  if(removed>0){
+    dirty();
+    toast("Purged "+removed+" log entries older than "+daysOld+" days");
+  }else{
+    toast("No entries older than "+daysOld+" days found");
+  }
+  rAuditLog();
 }
 function saved(){var e=el("sts");if(e){e.className="sts saved";e.innerHTML="<i class=\"ti ti-check\"></i> Saved "+new Date().toLocaleTimeString();}}
 
@@ -335,8 +411,13 @@ function processWriteQueue(){
   FB_WRITING=true;
   FB_WRITE_QUEUE=[];// collapse multiple pending writes into one
   FB_LAST_LOCAL_WRITE=Date.now();
+  // Strip audit log from live sync — reduces each write by ~40KB
+  // auditLog is archived separately; hot entries stay in localStorage
+  var DforSync={};
+  var keys=Object.keys(D);
+  for(var ki=0;ki<keys.length;ki++){if(keys[ki]!=="auditLog")DforSync[keys[ki]]=D[keys[ki]];}
   var payload={
-    D:D,USERS:USERS,nOId:nOId,nIId:nIId,nCId:nCId,
+    D:DforSync,USERS:USERS,nOId:nOId,nIId:nIId,nCId:nCId,
     setupDone:FB_SETUP_DONE,
     updatedAt:FB_LAST_LOCAL_WRITE
   };
@@ -389,13 +470,14 @@ function writeBackup(docId){
 }
 function pruneOldBackups(prefix,keepCount){
   if(!FB_BACKUP_COL)return;
+  // Bound reads to keepCount+5 — we only need to see slightly beyond the keep window
   FB_BACKUP_COL.where(firebase.firestore.FieldPath.documentId(),">=",prefix)
     .where(firebase.firestore.FieldPath.documentId(),"<",prefix.slice(0,-1)+String.fromCharCode(prefix.charCodeAt(prefix.length-1)+1))
     .orderBy(firebase.firestore.FieldPath.documentId(),"desc")
+    .limit(keepCount+5)
     .get().then(function(snap){
       var docs=[];
       snap.forEach(function(d){docs.push(d.id);});
-      // Delete anything beyond keepCount
       docs.slice(keepCount).forEach(function(id){
         FB_BACKUP_COL.doc(id).delete().catch(function(){});
       });
@@ -419,7 +501,7 @@ function runAutoBackup(){
   if(nowMs-FB_LAST_DAILY>24*60*60*1000){
     FB_LAST_DAILY=nowMs;
     writeBackup("daily-"+dateStr);
-    pruneOldBackups("daily-",30);
+    pruneOldBackups("daily-",14); // 14 daily backups = 2 weeks coverage
   }
 }
 function startAutoBackup(){
@@ -461,6 +543,14 @@ function restoreFromLatestBackup(onSuccess,onFail){
           FB_SETUP_DONE=true;
           syncIdCounters();
           syncPaymentStatuses();
+          // Merge hot audit log from localStorage (auditLog not in main doc)
+          var snap=autoSaveCheckLocal();
+          if(snap&&snap.D&&snap.D.auditLog&&snap.D.auditLog.length>0){
+            if(!D.auditLog)D.auditLog=[];
+            var existTs={};
+            D.auditLog.forEach(function(e){existTs[e.ts]=true;});
+            snap.D.auditLog.forEach(function(e){if(!existTs[e.ts])D.auditLog.push(e);});
+          }
           if(onSuccess)onSuccess(best);
         }else{tryNext();}
       }).catch(function(){tryNext();});
@@ -3025,6 +3115,103 @@ function rReports(){
     "</div>";
 }
 
+
+function rAuditLog(){
+  var pg=el("pg-excel");if(!pg||!can("exp"))return;
+  var logs=[].concat(D.auditLog||[]).reverse();
+  var q2=AUDIT_Q||"";
+  var tf=AUDIT_TYPE||"";
+  // Filter
+  if(q2){var lq=q2.toLowerCase();logs=logs.filter(function(e){return(e.user&&e.user.toLowerCase().indexOf(lq)!==-1)||(e.action&&e.action.toLowerCase().indexOf(lq)!==-1)||(e.details&&e.details.toLowerCase().indexOf(lq)!==-1)||(e.role&&e.role.toLowerCase().indexOf(lq)!==-1);});}
+  if(tf)logs=logs.filter(function(e){return e.action&&e.action.startsWith(tf);});
+  // Action type icons and colours
+  var typeMap={
+    "ORDER_PLACED":   {ic:"ti-clipboard-list",col:"#185FA5",bg:"#eaf0ff",label:"Order placed"},
+    "ORDER_UPDATED":  {ic:"ti-edit",col:"#7c3aed",bg:"#faf5ff",label:"Order edited"},
+    "DELIVERY_COMPLETE":{ic:"ti-truck",col:"#27ae60",bg:"#f0fdf4",label:"Delivery"},
+    "PAYMENT_RECORDED":{ic:"ti-cash",col:"#c8a951",bg:"#fffbf0",label:"Payment"},
+    "CASH_PENDING":   {ic:"ti-clock",col:"#f39c12",bg:"#fff8e1",label:"Cash pending"},
+    "CASH_ACKNOWLEDGED":{ic:"ti-circle-check",col:"#27ae60",bg:"#f0fdf4",label:"Cash acked"},
+    "COMPLAINT_LOGGED":{ic:"ti-message-report",col:"#e74c3c",bg:"#fff0f0",label:"Complaint"},
+    "COMPLAINT_UPDATED":{ic:"ti-message-report",col:"#e67e22",bg:"#fff8f0",label:"Complaint updated"},
+  };
+  var allTypes=Object.keys(typeMap);
+  var auditSection=el("audit-log-section");
+  if(!auditSection)return;
+  auditSection.innerHTML=
+    "<div class=\"toolbar\" style=\"flex-wrap:wrap;gap:8px\">"+
+      "<div class=\"srch\"><i class=\"ti ti-search\"></i>"+
+        "<input type=\"text\" placeholder=\"Search by user, action, details...\" value=\""+q2+"\" oninput=\"AUDIT_Q=this.value;rAuditLog()\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\">"+
+      "</div>"+
+      "<select style=\"padding:8px 12px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;font-family:inherit\" onchange=\"AUDIT_TYPE=this.value;rAuditLog()\">"+
+        "<option value=\"\">All actions</option>"+
+        allTypes.map(function(t){return "<option value=\""+t+"\"\>"+(typeMap[t].label)+"</option>";}).join("")+
+      "</select>"+
+    "</div>"+
+    "<div style=\"display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:12px\">"+
+    "<div style=\"font-size:12px;color:var(--tx2)\">"+
+      "<strong>"+(D.auditLog?D.auditLog.length:0)+"</strong> entries in hot log &middot; "+
+      "Auto-archives at "+AUDIT_HOT_MAX+" &middot; Archives kept 90 days"+
+    "</div>"+
+    "<div style=\"display:flex;gap:7px;flex-wrap:wrap\">"+
+      "<button class=\"btn btn-xs\" onclick=\"rAuditLogWithArchives()\" style=\"background:#7c3aed;color:#fff\" title=\"Load older archived entries from cloud\">"+
+        "<i class=\"ti ti-archive\"></i> Load archives</button>"+
+      "<button class=\"btn btn-xs\" onclick=\"if(confirm('Purge hot log entries older than 30 days? Archived entries are unaffected.'))manualPurgeAuditLog(30)\" style=\"background:#e67e22;color:#fff\">"+
+        "<i class=\"ti ti-trash\"></i> Purge &gt;30 days</button>"+
+      "<button class=\"btn btn-xs\" onclick=\"if(confirm('Purge ALL entries in hot log? Cannot be undone.'))manualPurgeAuditLog(0)\" style=\"background:#c0392b;color:#fff\">"+
+        "<i class=\"ti ti-trash\"></i> Purge all</button>"+
+    "</div>"+
+    "</div>"+
+    (logs.length?
+      "<div style=\"display:flex;flex-direction:column;gap:7px\">"+
+        logs.map(function(e){
+          var t=typeMap[e.action]||{ic:"ti-activity",col:"#666",bg:"#f5f5f5",label:e.action||"Event"};
+          var dt=e.ts?new Date(e.ts):null;
+          var dateStr=dt?dt.toLocaleDateString("en-GB",{day:"2-digit",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit"}):"—";
+          // Role badge colours
+          var rCol=e.role==="director"?"var(--nv)":e.role==="manager"?"#185FA5":e.role==="staff"?"#856404":"#27ae60";
+          return "<div style=\"display:flex;align-items:flex-start;gap:12px;background:#fff;border:1px solid var(--bd);border-radius:10px;padding:11px 13px;border-left:4px solid "+t.col+"\">"+
+            "<div style=\"width:34px;height:34px;border-radius:50%;background:"+t.bg+";display:flex;align-items:center;justify-content:center;flex-shrink:0\">"+
+              "<i class=\"ti "+t.ic+"\" style=\"color:"+t.col+";font-size:15px\"></i>"+
+            "</div>"+
+            "<div style=\"flex:1;min-width:0\">"+
+              "<div style=\"display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-bottom:3px\">"+
+                "<span style=\"font-weight:800;font-size:12px;color:"+t.col+"\">"+t.label+"</span>"+
+                "<span style=\"background:"+rCol+";color:#fff;font-size:10px;padding:2px 7px;border-radius:99px;font-weight:700\">"+(e.role||"unknown")+"</span>"+
+                "<span style=\"font-weight:700;font-size:12px\">"+(e.user||"System")+"</span>"+
+              "</div>"+
+              "<div style=\"font-size:12px;color:var(--tx);line-height:1.5\">"+e.details+"</div>"+
+            "</div>"+
+            "<div style=\"font-size:10px;color:var(--tx2);white-space:nowrap;flex-shrink:0\">"+dateStr+"</div>"+
+          "</div>";
+        }).join("")+
+      "</div>":
+      "<div class=\"te\"><i class=\"ti ti-activity\" style=\"font-size:28px;opacity:.4\"></i><p>"+(q2||tf?"No matching log entries":"No activity logged yet")+"</p></div>"
+    );
+}
+
+function rAuditLogWithArchives(){
+  var btn=event&&event.target;
+  if(btn){btn.innerHTML="<i class=\"ti ti-loader\"></i> Loading...";btn.disabled=true;}
+  loadAuditArchives(function(archived){
+    var hot=D.auditLog||[];
+    var combined=[].concat(hot).concat(archived);
+    // Deduplicate by ts
+    var seen={};
+    combined=combined.filter(function(e){if(!e.ts||seen[e.ts])return false;seen[e.ts]=true;return true;});
+    combined.sort(function(a,b){return b.ts>a.ts?1:-1;});
+    var auditSection=el("audit-log-section");
+    if(!auditSection){if(btn){btn.innerHTML="<i class=\"ti ti-archive\"></i> Load archives";btn.disabled=false;}return;}
+    // Show count
+    toast("Loaded "+combined.length+" entries ("+hot.length+" hot + "+archived.length+" archived)");
+    if(btn){btn.innerHTML="<i class=\"ti ti-check\"></i> "+combined.length+" loaded";btn.disabled=false;}
+    // Re-render with combined data
+    var PREV=D.auditLog;
+    D.auditLog=combined;
+    rAuditLog();
+    D.auditLog=PREV; // restore — archives stay in Firestore, not in hot log
+  });
+}
 function rExcel(){
   var pg=el("pg-excel");if(!pg)return;
   if(!can("exp")){
@@ -3093,7 +3280,33 @@ function rExcel(){
           "<div style=\"text-align:center;padding:20px;color:var(--tx2)\"><i class=\"ti ti-lock\" style=\"font-size:22px;display:block;margin-bottom:7px\"></i><span style=\"font-size:12px\">Director access required</span></div>")+
       "</div>"+
     "</div>"+
-    (can("rest")?
+    "<div class=\"card\" style=\"border:2px solid #1a1560;margin-bottom:0\">"+
+    "<div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-activity\" style=\"color:#1a1560\"></i>Activity Log &amp; Audit Trail</div>"+
+    "<span class=\"badge\" style=\"background:#1a1560;color:#fff\">"+((D.auditLog||[]).length)+" entries</span></div>"+
+    "<div style=\"display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap\">"+
+      "<div style=\"background:#f0fdf4;border:1px solid #27ae60;border-radius:8px;padding:10px 14px;flex:1;min-width:160px\">"+
+        "<div style=\"font-size:11px;color:#155724;font-weight:700;margin-bottom:3px\">HOT LOG (live)</div>"+
+        "<div style=\"font-size:20px;font-weight:900;color:#27ae60\">"+(D.auditLog?D.auditLog.length:0)+"</div>"+
+        "<div style=\"font-size:10px;color:#666\">Max "+AUDIT_HOT_MAX+" &middot; Stored in main doc</div>"+
+      "</div>"+
+      "<div style=\"background:#faf5ff;border:1px solid #7c3aed;border-radius:8px;padding:10px 14px;flex:1;min-width:160px\">"+
+        "<div style=\"font-size:11px;color:#5b21b6;font-weight:700;margin-bottom:3px\">ARCHIVES (cloud)</div>"+
+        "<div style=\"font-size:20px;font-weight:900;color:#7c3aed\">90 days</div>"+
+        "<div style=\"font-size:10px;color:#666\">Auto-archived &middot; Separate Firestore docs</div>"+
+      "</div>"+
+      "<div style=\"background:#fff8e1;border:1px solid #f39c12;border-radius:8px;padding:10px 14px;flex:1;min-width:160px\">"+
+        "<div style=\"font-size:11px;color:#856404;font-weight:700;margin-bottom:3px\">ENTRY SIZE</div>"+
+        "<div style=\"font-size:20px;font-weight:900;color:#f39c12\">~200B</div>"+
+        "<div style=\"font-size:10px;color:#666\">"+AUDIT_HOT_MAX+" entries ≈ 40KB of "+
+          "<span style=\"color:#27ae60;font-weight:700\">FREE</span> quota</div>"+
+      "</div>"+
+    "</div>"+
+    "<div style=\"font-size:12px;color:var(--tx2);line-height:1.8;margin-bottom:12px\">"+
+      "Complete record of who placed orders, recorded payments, logged complaints, and collected cash. Director-only view."+
+    "</div>"+
+    "<div id=\"audit-log-section\"></div>"+
+  "</div>"+
+  (can("rest")?
     "<div class=\"card\" style=\"border:2px solid #27ae60\">"+
       "<div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-mail\" style=\"color:#27ae60\"></i>Daily Email Backup</div>"+
         "<span class=\"badge "+(ejConfigured()?"bg":"br")+"\">"+(ejConfigured()?"✓ Active":"Not configured")+"</span></div>"+
@@ -3177,6 +3390,7 @@ function rExcel(){
         "<div style=\"padding:12px;background:#fff;border-radius:10px;border:1px solid var(--bd)\"><div style=\"font-weight:800;color:var(--nv);margin-bottom:7px\"><i class=\"ti ti-truck\"></i> Driver device</div><div style=\"color:var(--tx2);line-height:1.8\">&bull; Logs in as Driver role<br>&bull; Marks deliveries done<br>&bull; Logs complaints on route<br>&bull; Sends Excel to Director</div></div>"+
       "</div>"+
     "</div>";
+  setTimeout(rAuditLog,0);
 }
 
 function rUsers(){
