@@ -2313,8 +2313,30 @@ function openDlv(oid){
   el("dlv-amt").value="";el("dlv-notes").value="";
   var amtRow=el("dlv-amt")&&el("dlv-amt").closest(".fg");
   var payRow=el("dlv-pay")&&el("dlv-pay").closest(".fg");
-  if(amtRow)amtRow.style.display=can("mPaid")?"":"none";
-  if(payRow)payRow.style.display=can("mPaid")?"":"none";
+  // For mPaid roles: show full payment section
+  // For staff/driver: show simplified "cash collected" input — goes to pending approval
+  if(amtRow)amtRow.style.display=""; // always show amount — staff see it as "Cash collected"
+  if(payRow)payRow.style.display=can("mPaid")?"":"none"; // hide payment status for staff
+  // Update amount label for staff
+  var amtLabel=el("dlv-amt")&&el("dlv-amt").previousElementSibling||(el("dlv-amt")&&el("dlv-amt").parentElement&&el("dlv-amt").parentElement.querySelector("label"));
+  var amtContainer=el("dlv-amt")&&el("dlv-amt").closest(".fg");
+  if(amtContainer){
+    var lbl=amtContainer.querySelector("label");
+    if(lbl){
+      if(can("mPaid")){
+        lbl.innerHTML="Payment received (KSh)";
+        amtContainer.style.background="";
+        amtContainer.title="";
+      }else{
+        lbl.innerHTML="<i class=\"ti ti-clock\" style=\"color:#f39c12\"></i> Cash collected <span style=\"background:#fff8e1;color:#856404;font-size:10px;padding:2px 7px;border-radius:99px;margin-left:4px;font-weight:700\">Pending director approval</span>";
+        amtContainer.style.background="#fffbf0";
+        amtContainer.style.border="1.5px solid #f39c12";
+        amtContainer.style.borderRadius="8px";
+        amtContainer.style.padding="10px";
+        amtContainer.title="This amount will be sent to the director for acknowledgement. It will not reduce the debt until the director confirms receipt.";
+      }
+    }
+  }
   om("m-dlv");
 }
 function completeDlv(){
@@ -2391,6 +2413,7 @@ function completeDlv(){
       var dlvMeth=el("dlv-method")?el("dlv-method").value:"Cash";
       D.pendingPayments.push({id:uid(),ordId:o.id,cId:o.cId,amt:staffCash,method:dlvMeth,collectedBy:CU.name,collectedRole:CU.role,date:tday(),ack:false});
       auditLog("CASH_PENDING","KSh "+staffCash+" cash collected by "+CU.name+" ("+CU.role+") at delivery of Order #"+o.id+" — pending director acknowledgement");
+      toast("KSh "+staffCash.toLocaleString()+" cash recorded — awaiting director confirmation","warn");
     }
   }
   if(el("dlv-notes").value)o.notes=el("dlv-notes").value;
@@ -2581,7 +2604,28 @@ function rInvs(q,pg){
   var fil=[].concat(D.invoices).reverse();
   if(q2){var lq=q2.toLowerCase();fil=fil.filter(function(i){var c=D.customers.find(function(x){return x.id===i.cId;});return(c&&c.name.toLowerCase().indexOf(lq)!==-1)||String(i.id).indexOf(q2)!==-1||String(i.amount).indexOf(q2)!==-1;});}
   var paged=paginate(fil,INV_PAGE);
-  pgEl.innerHTML=
+  // Show pending cash payments requiring acknowledgement (director/manager only)
+  var pendingBanner="";
+  if(can("mPaid")&&D.pendingPayments&&D.pendingPayments.length){
+    var pendUnacked=D.pendingPayments.filter(function(p){return !p.ack;});
+    if(pendUnacked.length){
+      pendingBanner="<div style=\"background:#fff8e1;border:2px solid #f39c12;border-radius:12px;padding:14px 16px;margin-bottom:14px\">"+
+        "<div style=\"font-weight:800;font-size:13px;color:#856404;margin-bottom:10px\"><i class=\"ti ti-cash\" style=\"margin-right:6px\"></i>"+pendUnacked.length+" Cash Collection(s) Awaiting Acknowledgement</div>"+
+        pendUnacked.map(function(p){
+          var oc=D.customers.find(function(x){return x.id===p.cId;});
+          return "<div style=\"display:flex;align-items:center;justify-content:space-between;background:#fff;border-radius:8px;padding:10px 12px;margin-bottom:7px;border:1px solid #f39c12\">"+
+            "<div>"+
+              "<div style=\"font-weight:700;font-size:13px\">KSh "+p.amt.toLocaleString()+" &bull; "+(oc?oc.name:"Customer")+"</div>"+
+              "<div style=\"font-size:11px;color:var(--tx2)\">Collected by <strong>"+p.collectedBy+"</strong> ("+p.collectedRole+") on "+fmt(p.date)+" &bull; Method: "+p.method+"</div>"+
+              "<div style=\"font-size:11px;color:var(--tx2)\">Order #"+p.ordId+"</div>"+
+            "</div>"+
+            "<button class=\"btn btn-gold\" onclick=\"ackPendingPay("+p.id+")\" title=\"Confirm you received this cash\"><i class=\"ti ti-check\"></i> Acknowledge receipt</button>"+
+          "</div>";
+        }).join("")+
+      "</div>";
+    }
+  }
+  pgEl.innerHTML=pendingBanner+
     "<div class=\"ph\"><h1>Invoices</h1><p>"+D.invoices.length+" total &middot; "+D.invoices.filter(function(i){return i.paid>=i.amount;}).length+" paid &middot; "+D.invoices.filter(function(i){return i.paid<i.amount&&i.due&&i.due<td;}).length+" overdue</p></div>"+
     "<div class=\"toolbar\">"+
       "<div class=\"srch\"><i class=\"ti ti-search\"></i><input type=\"text\" placeholder=\"Search invoice #, customer, amount...\" oninput=\"rInvs(this.value,0)\" value=\""+q2+"\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
