@@ -2249,6 +2249,7 @@ function saveOrd(){
   }
 
   // Exact product order — normal flow
+  var st=D.stock.find(function(s){return s.name===pn;});
   if(st&&st.qty<=0){
     if(!confirm("⚠️ Stock Alert\n\n"+pn+" is OUT OF STOCK (0 units).\n\nThe order will be recorded but cannot be fulfilled until restocked.\n\nContinue placing this order?"))return;
   }else if(st&&st.qty<qty){
@@ -2263,7 +2264,7 @@ function saveOrd(){
   else{payStatus="Unpaid";}
   D.orders.push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:price,cost:costAtSale,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:"",prodConfirmed:true});
   // Always create invoice for exact orders — provides full financial trail
-  D.invoices.push({id:nIId++,cId:cId,amount:total,paid:amtPaid,due:(function(){var dd=new Date((el("od").value||tday())+"T00:00:00");dd.setDate(dd.getDate()+7);return dd.toISOString().split("T")[0];})(),notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
+  D.invoices.push({id:nIId++,cId:cId,amount:total,paid:amtPaid,due:(function(){var dd=new Date((el("od").value||tday())+"T12:00:00");dd.setDate(dd.getDate()+7);return dd.toISOString().split("T")[0];})(),notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
   auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty);
   cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+newOrdId+" placed");
 }
