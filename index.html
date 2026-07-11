@@ -412,11 +412,17 @@ function processWriteQueue(){
   FB_WRITING=true;
   FB_WRITE_QUEUE=[];// collapse multiple pending writes into one
   FB_LAST_LOCAL_WRITE=Date.now();
-  // Strip audit log from live sync — reduces each write by ~40KB
-  // auditLog is archived separately; hot entries stay in localStorage
+  // Include last 50 audit entries in Firestore for cross-device sync
+  // Full log (200 entries) stays in localStorage; Firestore gets recent 50 only
   var DforSync={};
   var keys=Object.keys(D);
-  for(var ki=0;ki<keys.length;ki++){if(keys[ki]!=="auditLog")DforSync[keys[ki]]=D[keys[ki]];}
+  for(var ki=0;ki<keys.length;ki++){
+    if(keys[ki]==="auditLog"){
+      DforSync.auditLog=(D.auditLog||[]).slice(-50); // last 50 for cross-device
+    }else{
+      DforSync[keys[ki]]=D[keys[ki]];
+    }
+  }
   var payload={
     D:DforSync,USERS:USERS,nOId:nOId,nIId:nIId,nCId:nCId,
     setupDone:FB_SETUP_DONE,
@@ -628,10 +634,22 @@ function startCloudListener(){
     if(!isOwnWrite||!weAreNewer){
       // Remote update from another device — merge their data in
       if(data.D){
+        // Preserve auditLog: it is stripped from Firestore writes and lives in localStorage
+        var _prevAuditLog=D.auditLog&&D.auditLog.length?D.auditLog:[];
         D=data.D;
         if(!D.routes)D.routes=[];
         if(!D.complaints)D.complaints=[];
         if(!D.offers)D.offers=[];
+        if(!D.pendingPayments)D.pendingPayments=[];
+        // Restore auditLog — merge remote (if any) with local
+        if(!D.auditLog||!D.auditLog.length){D.auditLog=_prevAuditLog;}
+        else{
+          // Merge: combine and deduplicate by ts
+          var _combined=_prevAuditLog.concat(D.auditLog);
+          var _seen={};
+          D.auditLog=_combined.filter(function(e){if(!e.ts||_seen[e.ts])return false;_seen[e.ts]=true;return true;});
+          D.auditLog.sort(function(a,b){return a.ts>b.ts?1:-1;});
+        }
       }
       if(data.USERS&&data.USERS.length)USERS=data.USERS;
       else USERS=[{id:1,name:"Director",role:"director",pin:"1234",ini:"DR",col:"#1a1560"}];
