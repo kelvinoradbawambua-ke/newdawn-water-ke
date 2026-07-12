@@ -2865,6 +2865,7 @@ function rInvs(q,pg){
     var c=D.customers.find(function(x){return x.id===i.cId;});var bal=i.amount-i.paid;var ov=bal>0&&i.due&&i.due<td;
     var st=bal<=0?"<span class=\"badge bg\"><i class=\"ti ti-check\"></i>Paid</span>":ov?"<span class=\"badge br\"><i class=\"ti ti-alert-circle\"></i>Overdue</span>":"<span class=\"badge ba\">Unpaid</span>";
     var lp=(i.payments||[]).slice().sort(function(a,b){return b.date>a.date?1:-1;})[0];
+    var iph=c?(can("vPhone")?c.phone:maskPhone(c.phone)):"";
     return "<tr class=\""+(ov&&bal>0?"dr":"")+"\">"+
       "<td style=\"font-weight:700\">#"+i.id+"</td>"+
       "<td><div style=\"font-weight:700\">"+(c?c.name:"&mdash;")+"</div><div class=\"ca\">"+(c?(can("vPhone")?c.phone:maskPhone(c.phone)):"")+"</div></td>"+
