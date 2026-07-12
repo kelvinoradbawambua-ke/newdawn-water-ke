@@ -710,9 +710,9 @@ function refreshCurrentPage(){
     orders:function(){rOrds(undefined,ORD_PAGE,ORD_SORT);},
     delivery:function(){DEL_Q="";rDel();},
     stock:function(){rStock(undefined,STK_PAGE);},
-    invoices:function(){rInvs(undefined,INV_PAGE);},
+    invoices:function(){INV_Q="";INV_PAGE=0;rInvs();},
     debts:function(){DEBT_Q="";DEBT_PAGE=0;rDebts();},
-    complaints:function(){rCmps(undefined,CMP_PAGE);},
+    complaints:function(){CMP_Q="";CMP_PAGE=0;rCmps();},
     offers:rOffers,
     reports:rReports,
     excel:function(){AUDIT_PAGE=0;AUDIT_Q="";AUDIT_TYPE="";rExcel();},
@@ -1388,7 +1388,7 @@ function nav(p,btn){
     if((b.getAttribute("onclick")||"").indexOf("'"+p+"'")!==-1)b.classList.add("act");
   });
   el("um").classList.remove("open");
-  var fns={dashboard:rDash,customers:function(){rCusts(undefined,CUST_PAGE);},orders:function(){ORD_STATUS_F="";ORD_DATE_F="";rOrds(undefined,ORD_PAGE);},delivery:function(){DEL_Q="";rDel();},stock:function(){rStock(undefined,STK_PAGE);},invoices:function(){rInvs(undefined,INV_PAGE);},debts:function(){DEBT_Q="";DEBT_PAGE=0;rDebts();},complaints:function(){rCmps(undefined,CMP_PAGE);},offers:rOffers,reports:rReports,excel:rExcel,users:rUsers};
+  var fns={dashboard:rDash,customers:function(){rCusts(undefined,CUST_PAGE);},orders:function(){ORD_STATUS_F="";ORD_DATE_F="";rOrds(undefined,ORD_PAGE);},delivery:function(){DEL_Q="";rDel();},stock:function(){rStock(undefined,STK_PAGE);},invoices:function(){INV_Q="";INV_PAGE=0;rInvs();},debts:function(){DEBT_Q="";DEBT_PAGE=0;rDebts();},complaints:function(){CMP_Q="";CMP_PAGE=0;rCmps();},offers:rOffers,reports:rReports,excel:rExcel,users:rUsers};
   if(fns[p])fns[p]();
 }
 
@@ -1828,8 +1828,6 @@ function rCusts(q,pg,sort,type){
       "</tbody>"+
     "</table></div>"+
     pgBar(paged.page,paged.pages,paged.total,"rCusts(undefined,");
-  var _inp=el("cust-srch");
-  if(_inp&&q2&&document.activeElement!==_inp)_inp.focus();
 }
 function rCustsF(t){rCusts(undefined,0,undefined,t);}
 
@@ -2008,8 +2006,6 @@ function rOrds(q,pg,sort){
     "<tbody id=\"otbody\">"+ordRows(paged.items)+"</tbody></table></div>"+
     pgBar(paged.page,paged.pages,paged.total,"rOrds(undefined,");
 
-  var _inp=el("ords-srch");
-  if(_inp&&document.activeElement!==_inp&&q2)_inp.focus();
 }
 function filterOrds(f){
   ORD_STATUS_F=f;ORD_DATE_F="";ORD_PAGE=0;
@@ -2717,7 +2713,6 @@ function rDel(q){
           })()
       }).join(""):"<tr><td colspan=\"10\"><div class=\"te\"><i class=\"ti ti-circle-check\"></i><p>All deliveries complete!</p></div></td></tr>")+
     "</tbody></table></div>";
-  var _di2=el("del-srch");if(_di2&&document.activeElement!==_di2&&DEL_Q)_di2.focus();
 }
 
 function rStock(q,pg){
@@ -2756,8 +2751,6 @@ function rStock(q,pg){
     "</tbody></table></div>"+
     pgBar(paged.page,paged.pages,paged.total,"rStock(undefined,");
 
-  var _inp=el("stk-srch");
-  if(_inp&&document.activeElement!==_inp&&q2)_inp.focus();
 }
 function prepStAdd(){
   el("s-edit-id").value="";
