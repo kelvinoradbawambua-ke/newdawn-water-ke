@@ -3080,7 +3080,9 @@ function cmpRows(fil){
   return fil.map(function(c){
     var cu=D.customers.find(function(x){return x.id===c.cId;});
     return "<tr><td>#"+c.id+"</td>"+
-      "<td><div style=\"font-weight:700\">"+(cu?cu.name:"&mdash;")+"</div><div class=\"ca\">"+(cu?[cu.court,cu.house?"No."+cu.house:""].filter(Boolean).join(" "):"")+"</div></td>"+
+      "<td>"+
+      (can("vPhone")?"<div style=\"font-weight:700\">"+(cu?cu.name:"&mdash;")+"</div><div class=\"ca\">"+(cu?(cu.phone||""):"")+"</div>":"<div style=\"font-weight:700\">"+(cu?[cu.estate,cu.court,cu.house?"No."+cu.house:""].filter(Boolean).join(", "):"&mdash;")+"</div>")+
+      "</td>"+
       "<td><span class=\"badge bgo\">"+c.type+"</span></td>"+
       "<td style=\"max-width:180px;white-space:normal;font-size:11px;line-height:1.4\">"+c.details+"</td>"+
       "<td style=\"max-width:140px;white-space:normal;font-size:11px;color:var(--tx2);line-height:1.4\">"+(c.action||"&mdash;")+"</td>"+
@@ -3150,7 +3152,10 @@ function cmpCustSelect(id,name){
 }
 function prepCmp(){
   // Reset customer search
-  var search=el("cmp-c-search");if(search)search.value="";
+  var search=el("cmp-c-search");if(search){
+    search.value="";
+    search.placeholder=can("vPhone")?"Type name, phone or address...":"Type court or house number...";
+  }
   var hidden=el("cmp-c");if(hidden)hidden.value="";
   var drop=el("cmp-c-drop");if(drop)drop.style.display="none";
   el("cmp-d").value=tday();
