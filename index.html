@@ -780,7 +780,7 @@ function skipCloud(){
 
 function makeLogo(sz){
   /* Enterprise sunrise emblem — mathematically fitted to avoid circle edge squeezing */
-  var id="nd"+sz;
+  var id="nd"+sz+"_"+Math.floor(Date.now()/1000%10000); // unique per call
   var R=sz*0.455;
   var cx=sz/2,cy=sz/2;
   var hy=cy+sz*0.06;   // horizon line — higher up = wider chord for DAWN
@@ -855,30 +855,7 @@ function makeLogoHTML(sz){
     '<div style="margin-top:3px;font-family:Georgia,serif;font-style:italic;font-size:'+fsTag+'px;color:rgba(200,169,81,0.52);letter-spacing:1px;text-align:center">Water is Life \xb7 Take water All the time</div>'+
     '</div>';
 }
-function makeLogoMini(){
-  /* 38px navbar icon — drop + horizon + DWN only, clean at tiny size */
-  return '<svg width="38" height="38" viewBox="0 0 180 180" xmlns="http://www.w3.org/2000/svg">'+
-    '<defs>'+
-    '<radialGradient id="mibg" cx="38%" cy="32%" r="68%"><stop offset="0%" stop-color="#312aa0"/><stop offset="100%" stop-color="#080620"/></radialGradient>'+
-    '<linearGradient id="misr" x1="0%" y1="100%" x2="0%" y2="0%"><stop offset="0%" stop-color="#c85000" stop-opacity="0"/><stop offset="100%" stop-color="#ffd060" stop-opacity="0.42"/></linearGradient>'+
-    '<linearGradient id="miwt" x1="15%" y1="0%" x2="85%" y2="100%"><stop offset="0%" stop-color="#c8eeff"/><stop offset="100%" stop-color="#1060b8"/></linearGradient>'+
-    '<clipPath id="micp"><circle cx="90" cy="90" r="82"/></clipPath>'+
-    '</defs>'+
-    '<circle cx="90" cy="90" r="82" fill="url(#mibg)"/>'+
-    '<circle cx="90" cy="90" r="82" fill="none" stroke="#c8a951" stroke-width="5"/>'+
-    '<g clip-path="url(#micp)">'+
-      '<line x1="90" y1="108" x2="90"  y2="8"  stroke="url(#misr)" stroke-width="2.5"/>'+
-      '<line x1="90" y1="108" x2="50"  y2="12" stroke="url(#misr)" stroke-width="1.8"/>'+
-      '<line x1="90" y1="108" x2="130" y2="12" stroke="url(#misr)" stroke-width="1.8"/>'+
-      '<line x1="90" y1="108" x2="22"  y2="34" stroke="url(#misr)" stroke-width="1.3"/>'+
-      '<line x1="90" y1="108" x2="158" y2="34" stroke="url(#misr)" stroke-width="1.3"/>'+
-    '</g>'+
-    '<path d="M90,30 C98,43 108,57 108,67 C108,81 100,90 90,90 C80,90 72,81 72,67 C72,57 82,43 90,30 Z" fill="url(#miwt)"/>'+
-    '<ellipse cx="83" cy="51" rx="6" ry="10" fill="rgba(255,255,255,0.3)" transform="rotate(-16,83,51)"/>'+
-    '<line x1="14" y1="108" x2="166" y2="108" stroke="#c8a951" stroke-width="2.5" clip-path="url(#micp)" opacity="0.9"/>'+
-    '<text x="90" y="148" text-anchor="middle" font-family="Arial Black,sans-serif" font-weight="900" font-size="36" fill="#ffffff" letter-spacing="1">DWN</text>'+
-    '</svg>';
-}
+function makeLogoMini(){return makeLogo(48);}
 
 function renderConnecting(){
   el("root").innerHTML="<div class=\"lscreen\"><div class=\"lbox\" style=\"text-align:center\">"+
@@ -1081,7 +1058,7 @@ function buildApp(){
   el("root").innerHTML=
     "<div class=\"topbar\">"+
       "<div class=\"tb-brand\">"+
-        "<div id=\"tbml\" style=\"width:38px;height:38px;flex-shrink:0\"></div>"+
+        "<div id=\"tbml\" style=\"width:48px;height:48px;flex-shrink:0\"></div>"+
         "<div><div class=\"tb-name\">NEW DAWN PURE WATER</div><div class=\"tb-sub\">Enterprise Management</div></div>"+
       "</div>"+
       "<div class=\"tnav\" id=\"tnav\" role=\"navigation\" aria-label=\"Main navigation\">"+
@@ -1120,7 +1097,7 @@ function buildApp(){
     "</div>"+
     "<div id=\"pages\">"+pages.map(function(n,i){return "<div class=\"pg"+(i===0?" act":"")+"\" id=\"pg-"+n.k+"\"></div>";}).join("")+"</div>"+
     "<div id=\"mods\"></div>";
-  el("tbml").innerHTML=makeLogoMini();
+  el("tbml").innerHTML=makeLogo(48);
   buildMods();
   nav(first,null);
   startAutoSaveLoop();
