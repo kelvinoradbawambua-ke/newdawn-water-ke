@@ -217,10 +217,10 @@ var FB_WRITE_QUEUE=[];
 var FB_WRITING=false;
 
 var R={
-  director:{label:"Director",c:"#1a1560",bg:"#e2d9f3",p:{dashboard:1,customers:1,orders:1,delivery:1,stock:1,invoices:1,debts:1,complaints:1,offers:1,reports:1,excel:1,users:1,vRev:1,vProfit:1,vCost:1,vInv:1,vDebt:1,aCust:1,eCust:1,dCust:1,aOrd:1,eOrd:1,dOrd:1,aSt:1,eSt:1,dSt:1,aOff:1,eOff:1,dOff:1,aInv:1,eInv:1,mPaid:1,ePrice:1,exp:1,rest:1,mUsers:1,aCmp:1,vPhone:1}},
-  manager:{label:"Manager",c:"#185FA5",bg:"#d1ecf1",p:{dashboard:1,customers:1,orders:1,delivery:1,stock:1,invoices:1,debts:1,complaints:1,offers:1,reports:1,excel:0,users:0,vRev:1,vProfit:0,vCost:0,vInv:1,vDebt:1,aCust:1,eCust:1,dCust:0,aOrd:1,eOrd:1,dOrd:0,aSt:1,eSt:1,dSt:0,aOff:1,eOff:1,dOff:0,aInv:1,eInv:1,mPaid:1,ePrice:0,exp:0,rest:0,mUsers:0,aCmp:1,vPhone:1}},
-  staff:{label:"Staff",c:"#856404",bg:"#fff3cd",p:{dashboard:1,customers:1,orders:1,delivery:1,stock:1,invoices:0,debts:0,complaints:1,offers:0,reports:0,excel:0,users:0,vRev:0,vProfit:0,vCost:0,vInv:0,vDebt:0,aCust:0,eCust:0,dCust:0,aOrd:1,eOrd:0,dOrd:0,aSt:0,eSt:0,dSt:0,aOff:0,eOff:0,dOff:0,aInv:0,eInv:0,mPaid:0,ePrice:0,exp:0,rest:0,mUsers:0,aCmp:1,vPhone:0}},
-  driver:{label:"Driver",c:"#534AB7",bg:"#ede9f8",p:{dashboard:0,customers:0,orders:0,delivery:1,stock:0,invoices:0,debts:0,complaints:1,offers:0,reports:0,excel:0,users:0,vRev:0,vProfit:0,vCost:0,vInv:0,vDebt:0,aCust:0,eCust:0,dCust:0,aOrd:0,eOrd:0,dOrd:0,aSt:0,eSt:0,dSt:0,aOff:0,eOff:0,dOff:0,aInv:0,eInv:0,mPaid:0,ePrice:0,exp:0,rest:0,mUsers:0,aCmp:1,vPhone:0}}
+  director:{label:"Director",c:"#1a1560",bg:"#e2d9f3",p:{dashboard:1,customers:1,orders:1,delivery:1,stock:1,invoices:1,debts:1,complaints:1,offers:1,reports:1,excel:1,users:1,vRev:1,vProfit:1,vCost:1,vInv:1,vDebt:1,aCust:1,eCust:1,dCust:1,aOrd:1,eOrd:1,dOrd:1,aSt:1,eSt:1,dSt:1,aOff:1,eOff:1,dOff:1,aInv:1,eInv:1,mPaid:1,ePrice:1,exp:1,rest:1,mUsers:1,aCmp:1,dCmp:1,mCmp:1,vPhone:1}},
+  manager:{label:"Manager",c:"#185FA5",bg:"#d1ecf1",p:{dashboard:1,customers:1,orders:1,delivery:1,stock:1,invoices:1,debts:1,complaints:1,offers:1,reports:1,excel:0,users:0,vRev:1,vProfit:0,vCost:0,vInv:1,vDebt:1,aCust:1,eCust:1,dCust:0,aOrd:1,eOrd:1,dOrd:0,aSt:1,eSt:1,dSt:0,aOff:1,eOff:1,dOff:0,aInv:1,eInv:1,mPaid:1,ePrice:0,exp:0,rest:0,mUsers:0,aCmp:1,dCmp:1,mCmp:1,vPhone:1}},
+  staff:{label:"Staff",c:"#856404",bg:"#fff3cd",p:{dashboard:1,customers:1,orders:1,delivery:1,stock:1,invoices:0,debts:0,complaints:1,offers:0,reports:0,excel:0,users:0,vRev:0,vProfit:0,vCost:0,vInv:0,vDebt:0,aCust:0,eCust:0,dCust:0,aOrd:1,eOrd:0,dOrd:0,aSt:0,eSt:0,dSt:0,aOff:0,eOff:0,dOff:0,aInv:0,eInv:0,mPaid:0,ePrice:0,exp:0,rest:0,mUsers:0,aCmp:1,dCmp:0,mCmp:0,vPhone:0}},
+  driver:{label:"Driver",c:"#534AB7",bg:"#ede9f8",p:{dashboard:0,customers:0,orders:0,delivery:1,stock:0,invoices:0,debts:0,complaints:1,offers:0,reports:0,excel:0,users:0,vRev:0,vProfit:0,vCost:0,vInv:0,vDebt:0,aCust:0,eCust:0,dCust:0,aOrd:0,eOrd:0,dOrd:0,aSt:0,eSt:0,dSt:0,aOff:0,eOff:0,dOff:0,aInv:0,eInv:0,mPaid:0,ePrice:0,exp:0,rest:0,mUsers:0,aCmp:1,dCmp:0,mCmp:0,vPhone:0}}
 };
 var USERS=[{id:1,name:"Director",role:"director",pin:"1234",ini:"DR",col:"#1a1560"}];
 var D={customers:[],stock:[],orders:[],offers:[],invoices:[],routes:[],complaints:[],pendingPayments:[],
@@ -1445,7 +1445,8 @@ function buildMods(){
         "<div class=\"fg\"><label class=\"flabel\">Payment status</label><select class=\"fi\" id=\"opay\"><option>Unpaid</option><option>Partial</option><option>Paid</option></select></div>"+
         "<div class=\"fg\"><label class=\"flabel\">Amount paid (KSh)</label><input class=\"fi\" type=\"number\" id=\"oamt\" value=\"0\"></div>"+
         "<div class=\"fg\"><label class=\"flabel\">Bottle condition before</label><select class=\"fi\" id=\"obtl\"><option>Good</option><option>Cracked</option><option>Damaged</option><option>Missing</option></select></div>"+
-        "<div class=\"fg fspan\"><label class=\"flabel\">Delivery notes</label><input class=\"fi\" id=\"odlvr\" placeholder=\"Address or instructions\"></div>"+
+        "<div class=\"fg fspan\"><label class=\"flabel\">Delivery instructions</label><input class=\"fi\" id=\"odlvr\" placeholder=\"Gate, landmark, call first...\"></div>"+
+        "<div class=\"fg fspan\"><label class=\"flabel\">Order notes <span style=\"font-size:10px;color:var(--gd)\">driver sees at delivery</span></label><input class=\"fi\" id=\"onotes\" placeholder=\"e.g. fragile, leave with guard...\"></div>"+
       "</div>"+
       "<div class=\"ftot\"><span>Order total</span><span id=\"otot\">KSh 0</span></div>"+
       "<input type=\"hidden\" id=\"o-edit-id\" value=\"\">"+
@@ -1568,12 +1569,18 @@ function buildMods(){
   var mCmp="<div class=\"ov\" id=\"m-cmp\"><div class=\"modal\">"+
     "<div class=\"mhd\"><div class=\"mttl\"><i class=\"ti ti-message-report\" style=\"color:#e74c3c;margin-right:7px\"></i>Log Complaint</div><button class=\"mcls\" onclick=\"cm('m-cmp')\"><i class=\"ti ti-x\"></i></button></div>"+
     "<div class=\"mbdy\"><div class=\"fg2\">"+
-      "<div class=\"fg\"><label class=\"flabel\">Customer</label><select class=\"fi\" id=\"cmp-c\"></select></div>"+
+      "<div class=\"fg\"><label class=\"flabel\">Customer</label>"+
+      "<div style=\"position:relative\">"+
+        "<input class=\"fi\" id=\"cmp-c-search\" autocomplete=\"off\" autocorrect=\"off\" autocapitalize=\"off\" spellcheck=\"false\" inputmode=\"search\" placeholder=\"Type name or address...\" oninput=\"cmpCustSearch(this.value)\" style=\"width:100%;padding-right:28px\">"+
+        "<div id=\"cmp-c-drop\" style=\"display:none;position:absolute;top:100%;left:0;right:0;background:#fff;border:1.5px solid var(--bd);border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.12);z-index:200;max-height:200px;overflow-y:auto;margin-top:2px\"></div>"+
+        "<input type=\"hidden\" id=\"cmp-c\" value=\"\">"+
+      "</div>"+
+    "</div>"+
       "<div class=\"fg\"><label class=\"flabel\">Date</label><input class=\"fi\" type=\"date\" id=\"cmp-d\"></div>"+
       "<div class=\"fg\"><label class=\"flabel\">Type</label><select class=\"fi\" id=\"cmp-t\"><option>Water quality</option><option>Delivery issue</option><option>Wrong quantity</option><option>Damaged bottle</option><option>Late delivery</option><option>Overcharged</option><option>Rude staff</option><option>Missing delivery</option><option>Other</option></select></div>"+
-      "<div class=\"fg\"><label class=\"flabel\">Status</label><select class=\"fi\" id=\"cmp-s\"><option>Open</option><option>In progress</option><option>Resolved</option></select></div>"+
+      "<div class=\"fg\" id=\"cmp-s-row\"><label class=\"flabel\">Status</label><select class=\"fi\" id=\"cmp-s\"><option>Open</option><option>In progress</option><option>Resolved</option></select></div>"+
       "<div class=\"fg fspan\"><label class=\"flabel\">Details *</label><textarea class=\"fi\" id=\"cmp-det\" rows=\"3\" style=\"resize:none\"></textarea></div>"+
-      "<div class=\"fg fspan\"><label class=\"flabel\">Action taken</label><textarea class=\"fi\" id=\"cmp-act\" rows=\"2\" style=\"resize:none\"></textarea></div>"+
+      "<div class=\"fg fspan\" id=\"cmp-act-row\"><label class=\"flabel\">Action taken</label><textarea class=\"fi\" id=\"cmp-act\" rows=\"2\" style=\"resize:none\"></textarea></div>"+
       "<input type=\"hidden\" id=\"cmp-id\" value=\"\">"+
     "</div></div>"+
     "<div class=\"mft\"><button class=\"btn\" onclick=\"cm('m-cmp')\">Cancel</button><button class=\"btn btn-gold\" onclick=\"saveCmp()\"><i class=\"ti ti-check\"></i> Log</button></div>"+
@@ -2184,7 +2191,7 @@ function prepO(){
     return "<option value=\""+d.name+"\">"+d.name+(warn?warn:"")+"</option>";
   }).join("");
   od.value=tday();
-  el("oq").value=1;el("oamt")&&(el("oamt").value=0);el("opay")&&(el("opay").value="Unpaid");el("obtl").value="Good";el("odlvr").value="";
+  el("oq").value=1;el("oamt")&&(el("oamt").value=0);el("opay")&&(el("opay").value="Unpaid");el("obtl").value="Good";el("odlvr").value="";if(el("onotes"))el("onotes").value="";
   // Hide payment and total fields from staff
   var payRow=el("opay")&&el("opay").closest?el("opay").closest(".fg"):null;
   var amtRow=el("oamt")&&el("oamt").closest?el("oamt").closest(".fg"):null;
@@ -2384,7 +2391,7 @@ function saveOrd(){
 
   if(isCat){
     // Category order: no stock deduction, no invoice yet, payment at delivery
-    D.orders.push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:0,cost:0,date:el("od").value,status:"Pending",paid:"Unpaid",amtPaid:0,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:"",prodConfirmed:false});
+    D.orders.push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:0,cost:0,date:el("od").value,status:"Pending",paid:"Unpaid",amtPaid:0,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?el("onotes").value:"",prodConfirmed:false});
     cm("m-o");rOrds(undefined,ORD_PAGE);dirty();
     toast("Order #"+newOrdId+" placed — driver confirms brand & collects payment at delivery");
     return;
@@ -2404,7 +2411,7 @@ function saveOrd(){
   if(amtPaid>=total){payStatus="Paid";}
   else if(amtPaid>0){payStatus="Partial";}
   else{payStatus="Unpaid";}
-  D.orders.push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:price,cost:costAtSale,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:"",prodConfirmed:true});
+  D.orders.push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:price,cost:costAtSale,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?el("onotes").value:"",prodConfirmed:true});
   // Always create invoice for exact orders — provides full financial trail
   D.invoices.push({id:nIId++,cId:cId,amount:total,paid:amtPaid,due:(function(){var dd=new Date((el("od").value||tday())+"T12:00:00");dd.setDate(dd.getDate()+7);return dd.toISOString().split("T")[0];})(),notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
   auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty);
@@ -3080,8 +3087,9 @@ function cmpRows(fil){
       "<td style=\"font-size:11px\">"+fmt(c.date)+"</td>"+
       "<td><span class=\"badge "+(sm[c.status]||"ba")+"\">"+c.status+"</span></td>"+
       "<td><div class=\"ac\">"+
-        (can("aCmp")?"<button class=\"btn btn-xs btn-navy\" onclick=\"editCmp("+c.id+")\" title=\"Edit complaint\"><i class=\"ti ti-edit\"></i></button>":"")+(c.status!=="Resolved"?"<button class=\"btn btn-xs btn-grn\" onclick=\"resolveCmp("+c.id+")\" title=\"Mark resolved\"><i class=\"ti ti-check\"></i></button>":"")+
-        "<button class=\"btn btn-xs btn-red\" onclick=\"delCmp("+c.id+")\" title=\"Delete complaint\"><i class=\"ti ti-trash\"></i></button>"+
+        (can("mCmp")?"<button class=\"btn btn-xs btn-navy\" onclick=\"editCmp("+c.id+")\" title=\"Edit complaint\"><i class=\"ti ti-edit\"></i></button>":"")+
+        (can("mCmp")&&c.status!=="Resolved"?"<button class=\"btn btn-xs btn-grn\" onclick=\"resolveCmp("+c.id+")\" title=\"Mark resolved\"><i class=\"ti ti-check\"></i></button>":"")+
+        (can("dCmp")?"<button class=\"btn btn-xs btn-red\" onclick=\"delCmp("+c.id+")\" title=\"Delete complaint\"><i class=\"ti ti-trash\"></i></button>":"")+
       "</div></td></tr>";
   }).join("");
 }
@@ -3091,9 +3099,61 @@ function filterCmps(f){
   var paged=paginate(fil,0);
   var tb=el("cmpbody");if(tb)tb.innerHTML=cmpRows(paged.items);
 }
-function prepCmp(){var s=el("cmp-c");if(s)s.innerHTML=D.customers.map(function(c){return "<option value=\""+c.id+"\">"+custName(c.id)+" - "+cAddr(c)+"</option>";}).join("");el("cmp-d").value=tday();om("m-cmp");}
+function cmpCustSearch(q){
+  var drop=el("cmp-c-drop");if(!drop)return;
+  var hidden=el("cmp-c");if(!hidden)return;
+  if(!q||q.length<1){drop.style.display="none";return;}
+  var lq=q.toLowerCase();
+  var matches=D.customers.filter(function(cu){
+    return cu.name.toLowerCase().indexOf(lq)!==-1||
+      (cu.court&&cu.court.toLowerCase().indexOf(lq)!==-1)||
+      (cu.estate&&cu.estate.toLowerCase().indexOf(lq)!==-1)||
+      (cu.house&&String(cu.house).indexOf(lq)!==-1)||
+      (cu.phone&&cu.phone.indexOf(q)!==-1);
+  }).slice(0,12);
+  if(!matches.length){drop.innerHTML="<div style=\"padding:10px 14px;font-size:12px;color:var(--tx2)\">No customers found</div>";drop.style.display="block";return;}
+  drop.innerHTML=matches.map(function(cu){
+    var addr=[cu.estate,cu.court,cu.house?"No."+cu.house:""].filter(Boolean).join(", ");
+    return "<div onmousedown=\"cmpCustSelect("+cu.id+",'"+cu.name.replace(/'/g,"\\'")+"')\""+
+      " style=\"padding:9px 14px;cursor:pointer;border-bottom:1px solid var(--bd);font-size:12px\""+
+      " onmouseover=\"this.style.background='var(--bg)'\" onmouseout=\"this.style.background=''\">" +
+      "<div style=\"font-weight:700\">"+cu.name+"</div>"+
+      "<div style=\"font-size:11px;color:var(--tx2)\">"+addr+"</div>"+
+      "</div>";
+  }).join("");
+  drop.style.display="block";
+}
+function cmpCustSelect(id,name){
+  var hidden=el("cmp-c");if(hidden)hidden.value=id;
+  var search=el("cmp-c-search");if(search)search.value=name;
+  var drop=el("cmp-c-drop");if(drop)drop.style.display="none";
+}
+function prepCmp(){
+  // Reset customer search
+  var search=el("cmp-c-search");if(search)search.value="";
+  var hidden=el("cmp-c");if(hidden)hidden.value="";
+  var drop=el("cmp-c-drop");if(drop)drop.style.display="none";
+  el("cmp-d").value=tday();
+  // Reset fields
+  var det=el("cmp-det");if(det)det.value="";
+  var act=el("cmp-act");if(act)act.value="";
+  var st=el("cmp-s");if(st)st.value="Open";
+  var cmpId=el("cmp-id");if(cmpId)cmpId.value="";
+  // Hide status/action for staff and driver — they can only log details
+  var sRow=el("cmp-s-row");var aRow=el("cmp-act-row");
+  if(sRow)sRow.style.display=can("mCmp")?"":"";
+  if(aRow)aRow.style.display=can("mCmp")?"":"";
+  // Make status/action read-only for staff when logging
+  var stEl=el("cmp-s");if(stEl){stEl.disabled=!can("mCmp");if(!can("mCmp"))stEl.value="Open";}
+  var actEl=el("cmp-act");if(actEl)actEl.disabled=!can("mCmp");
+  // Enable customer search for new complaints
+  if(search)search.disabled=false;
+  om("m-cmp");
+}
 function saveCmp(){
   if(!can("aCmp"))return;
+  var cmpCustId=parseInt(el("cmp-c").value);
+  if(!cmpCustId||isNaN(cmpCustId)){toast("Please select a customer","err");return;}
   var det=el("cmp-det").value.trim();if(!det){toast("Details required","err");return;}
   var editIdEl=el("cmp-id");var editId=editIdEl?editIdEl.value:"";
   if(editId){
@@ -3101,25 +3161,34 @@ function saveCmp(){
     if(ex){
       ex.cId=parseInt(el("cmp-c").value);ex.type=el("cmp-t").value;
       ex.details=det;ex.action=el("cmp-act").value;ex.status=el("cmp-s").value;
-      if(el("cmp-c"))el("cmp-c").disabled=false;
+      var cs2=el("cmp-c-search");if(cs2){cs2.disabled=false;cs2.value="";}
+      if(el("cmp-c"))el("cmp-c").value="";
       if(editIdEl)editIdEl.value="";
       cm("m-cmp");rCmps(undefined,CMP_PAGE);dirty();toast("Complaint updated");return;
     }
   }D.complaints.push({id:nCmpId++,cId:parseInt(el("cmp-c").value),type:el("cmp-t").value,details:det,action:el("cmp-act").value,status:el("cmp-s").value,date:el("cmp-d").value});el("cmp-det").value="";el("cmp-act").value="";auditLog("COMPLAINT_LOGGED","Complaint logged by "+CU.name+" ("+CU.role+"): "+el("cmp-t").value);
   cm("m-cmp");rCmps(undefined,CMP_PAGE);dirty();toast("Complaint logged");}
 function editCmp(id){
-  if(!can("aCmp"))return;
+  if(!can("mCmp")){toast("Only managers can edit complaints","err");return;}
   var cmp=D.complaints.find(function(x){return x.id===id;});if(!cmp)return;
   var ci=el("cmp-id");if(ci)ci.value=id;
-  var cc=el("cmp-c");if(cc){cc.value=cmp.cId;cc.disabled=true;}
+  // Set search input to show customer name, set hidden to cId
+  var cc=el("cmp-c");if(cc)cc.value=cmp.cId;
+  var cs=el("cmp-c-search");
+  var cu=D.customers.find(function(x){return x.id===cmp.cId;});
+  if(cs){cs.value=cu?cu.name:"Customer #"+cmp.cId;cs.disabled=true;}// lock customer in edit
+  var drop=el("cmp-c-drop");if(drop)drop.style.display="none";
+  // Show all fields for manager
+  var stEl=el("cmp-s");if(stEl)stEl.disabled=false;
+  var actEl=el("cmp-act");if(actEl)actEl.disabled=false;
   var cd=el("cmp-det");if(cd)cd.value=cmp.details||"";
   var ca=el("cmp-act");if(ca)ca.value=cmp.action||"";
   var cs=el("cmp-s");if(cs)cs.value=cmp.status||"Open";
   var ct=el("cmp-t");if(ct)ct.value=cmp.type||"Water quality";
   om("m-cmp");
 }
-function resolveCmp(id){if(!can("aCmp"))return;var c=D.complaints.find(function(x){return x.id===id;});if(c)c.status="Resolved";rCmps(undefined,CMP_PAGE);dirty();toast("Complaint resolved");}
-function delCmp(id){if(!can("aCmp"))return;if(!confirm("Delete complaint?"))return;D.complaints=D.complaints.filter(function(c){return c.id!==id;});rCmps(undefined,CMP_PAGE);dirty();}
+function resolveCmp(id){if(!can("mCmp")){toast("Only managers can resolve complaints","err");return;}var c=D.complaints.find(function(x){return x.id===id;});if(c)c.status="Resolved";rCmps(undefined,CMP_PAGE);dirty();toast("Complaint resolved");}
+function delCmp(id){if(!can("dCmp")){toast("Only managers can delete complaints","err");return;}if(!confirm("Delete complaint?"))return;D.complaints=D.complaints.filter(function(c){return c.id!==id;});rCmps(undefined,CMP_PAGE);dirty();}
 
 function rOffers(){
   var pg=el("pg-offers");if(!pg)return;
