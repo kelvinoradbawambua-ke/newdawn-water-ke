@@ -196,6 +196,7 @@ var fbAuth=null;
 var fbDb=null;
 var FB_DOC_REF=null;
 var FB_BACKUP_COL=null; // backup collection reference
+var FB_EVENTS_COL=null; // audit events subcollection — 1 doc per event
 var FB_READY=false;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
@@ -307,21 +308,23 @@ var AUDIT_HOT_MAX=200; // entries kept live in main Firestore doc
 var AUDIT_ARCHIVE_THRESHOLD=180; // archive when hot log hits this
 function auditLog(action,details){
   if(!CU)return;
-  if(!D.auditLog)D.auditLog=[];
-  // Auto-archive if at threshold
-  if(D.auditLog.length>=AUDIT_ARCHIVE_THRESHOLD)archiveAuditLogs();
-  D.auditLog.push({
+  var entry={
     ts:new Date().toISOString(),
     user:CU.name,
     role:CU.role,
     uid:CU.id,
     action:action,
     details:details||""
-  });
-  // Auto-archive: when hot log reaches threshold, flush oldest half to archive
-  if(D.auditLog.length>=AUDIT_HOT_MAX){
-    archiveAuditLogs();
+  };
+  // Write to Firestore subcollection — 1 doc per event, atomic, cross-device real-time
+  if(FB_EVENTS_COL&&FB_READY){
+    FB_EVENTS_COL.add(entry).catch(function(){});
   }
+  // Keep local cache for immediate display (stays in sync via onSnapshot listener)
+  if(!D.auditLog)D.auditLog=[];
+  D.auditLog.push(entry);
+  // Bound local cache to AUDIT_HOT_MAX — subcollection holds the full history
+  if(D.auditLog.length>AUDIT_HOT_MAX)D.auditLog=D.auditLog.slice(-AUDIT_HOT_MAX);
 }
 function archiveAuditLogs(){
   // Take the oldest entries, archive to Firestore, keep only the newest in hot log
@@ -341,20 +344,16 @@ function archiveAuditLogs(){
   pruneAuditArchives();
 }
 function pruneAuditArchives(){
-  if(!FB_BACKUP_COL)return;
+  // Prune newdawn_events older than 90 days
+  if(!FB_EVENTS_COL)return;
   var cutoff=new Date();
   cutoff.setDate(cutoff.getDate()-90);
-  var cutoffId="auditlog-"+cutoff.toISOString().replace(/[:.]/g,"-").slice(0,19);
-  // Two-clause range query only (no composite index needed).
-  // JS-side filter discards any that are within 90 days.
-  FB_BACKUP_COL
-    .where(firebase.firestore.FieldPath.documentId(),">=","auditlog-")
-    .where(firebase.firestore.FieldPath.documentId(),"<","auditlog-z")
+  var cutoffTs=cutoff.toISOString();
+  FB_EVENTS_COL
+    .where("ts","<",cutoffTs)
     .limit(30)
     .get().then(function(snap){
-      snap.forEach(function(d){
-        if(d.id<=cutoffId)d.ref.delete().catch(function(){});
-      });
+      snap.forEach(function(d){d.ref.delete().catch(function(){});});
     }).catch(function(){});
 }
 function loadAuditArchives(cb){
@@ -420,12 +419,10 @@ function processWriteQueue(){
   var keys=Object.keys(D);
   for(var ki=0;ki<keys.length;ki++){
     if(keys[ki]==="auditLog"){
-      // Send last 50 audit entries with every write for cross-device visibility
-      // Full log (up to 200) stays in localStorage; Firestore carries recent 50
-      DforSync.auditLog=(D.auditLog||[]).slice(-50);
-    }else{
-      DforSync[keys[ki]]=D[keys[ki]];
-    }
+      DforSync.auditLog=(D.auditLog||[]).slice(-50); // last 50 for cross-device
+      continue;
+    } // auditLog lives in subcollection — not in main doc
+    DforSync[keys[ki]]=D[keys[ki]];
   }
   // Doc size guard: trim delivered orders older than 6 months from sync payload
   // Data stays in D (in-memory + localStorage); only Firestore doc is trimmed
@@ -597,6 +594,25 @@ function restoreFromLatestBackup(onSuccess,onFail){
   }
   tryNext();
 }
+function startAuditListener(){
+  // Listen to last 200 audit events in real-time — cross-device, immutable
+  if(!FB_EVENTS_COL)return;
+  FB_EVENTS_COL
+    .orderBy("ts","desc")
+    .limit(200)
+    .onSnapshot(function(snap){
+      var events=[];
+      snap.forEach(function(d){events.push(d.data());});
+      // Sort ascending for display (newest last)
+      events.sort(function(a,b){return a.ts>b.ts?1:-1;});
+      D.auditLog=events;
+      // Refresh audit log view if visible
+      var pg=document.getElementById("pg-excel");
+      if(pg&&pg.classList.contains("act"))rAuditLog();
+    },function(err){
+      // If query fails (no index), fall back to local cache only
+    });
+}
 function startCloudListener(){
   if(!FB_DOC_REF)return;
   if(FB_UNSUB)FB_UNSUB();
@@ -667,26 +683,11 @@ function startCloudListener(){
     // Smart merge: never let Firestore reduce our customer count
     var remoteHasMore=(data.D&&(data.D.customers||[]).length>(D.customers||[]).length+2);
     var weHaveMore=(D.customers||[]).length>(data.D&&data.D.customers||[]).length+2;
-    // ── AUDIT LOG: always merge regardless of data conflict resolution ──
-    // Audit is additive — we always want entries from ALL devices
-    // This runs BEFORE the conditional so it never gets skipped
-    if(data.D&&data.D.auditLog&&data.D.auditLog.length){
-      if(!D.auditLog)D.auditLog=[];
-      var _seen0={};
-      D.auditLog.forEach(function(e){if(e.ts)_seen0[e.ts]=true;});
-      var _newEntries=data.D.auditLog.filter(function(e){return e.ts&&!_seen0[e.ts];});
-      if(_newEntries.length){
-        D.auditLog=D.auditLog.concat(_newEntries);
-        D.auditLog.sort(function(a,b){return a.ts>b.ts?1:-1;});
-        // Keep hot log bounded
-        if(D.auditLog.length>AUDIT_HOT_MAX)D.auditLog=D.auditLog.slice(-AUDIT_HOT_MAX);
-        autoSaveLocal(); // persist merged entries to localStorage immediately
-      }
-    }
+    // Audit log handled by dedicated subcollection listener (startAuditListener)
     if((!isOwnWrite||!weAreNewer)&&!weHaveMore){
       // Remote update from another device — merge their data in
       if(data.D){
-        // Save auditLog before overwrite (we already merged above)
+        // Preserve local audit cache across D= overwrite (subcollection listener repopulates)
         var _prevAuditLog=D.auditLog&&D.auditLog.length?D.auditLog:[];
         D=data.D;
         if(!D.routes)D.routes=[];
@@ -778,6 +779,7 @@ function initCloudConnection(cb){
   function tryAuth(){
     fbAuth.signInAnonymously().then(function(){
       startCloudListener();
+      startAuditListener();
       setTimeout(function(){clearTimeout(timeout);FB_READY=true;finish();},1500);
     }).catch(function(err){
       authRetries++;
@@ -1702,7 +1704,48 @@ function buildMods(){
     "</div>"+
     "<div class=\"mft\"><button class=\"btn\" onclick=\"cm('m-pin')\">Cancel</button><button class=\"btn btn-gold\" onclick=\"savePin()\"><i class=\"ti ti-check\"></i> Save PIN</button></div>"+
   "</div></div>";
-  el("mods").innerHTML=mC+mO+mOE+mDlv+mS+mRS+mOf+mIv+mPay+mCmp+mU+mSetup+mPin;
+    var mAssign="<div class=\"ov\" id=\"m-assign\"><div class=\"modal\" style=\"max-width:420px\">"+
+    "<div class=\"mhd\"><div class=\"mttl\"><i class=\"ti ti-arrows-exchange\" style=\"color:var(--gd);margin-right:7px\"></i>Assign Order</div>"+
+    "<button class=\"mcls\" onclick=\"cm('m-assign')\"><i class=\"ti ti-x\"></i></button></div>"+
+    "<div class=\"mbdy\">"+
+      "<div class=\"fg\"><label class=\"flabel\">Order</label><div id=\"assign-order-info\" style=\"font-weight:700;padding:8px 0;color:var(--tx)\"></div></div>"+
+      "<div class=\"fg\"><label class=\"flabel\">Assign to</label>"+
+        "<select class=\"fi\" id=\"assign-who\">"+
+          "<option value=\"\">— Unassigned —</option>"+
+        "</select></div>"+
+      "<div id=\"assign-workload\" style=\"font-size:11px;color:var(--tx2);margin-top:-6px;margin-bottom:10px\"></div>"+
+      "<div class=\"mft\">"+
+        "<button class=\"btn\" onclick=\"cm('m-assign')\">Cancel</button>"+
+        "<button class=\"btn btn-gold\" onclick=\"doAssignDriver()\"><i class=\"ti ti-check\"></i> Assign</button>"+
+      "</div>"+
+    "</div>"+
+  "</div></div>";
+  var mFollowUp="<div class=\"ov\" id=\"m-followup\"><div class=\"modal\" style=\"max-width:460px\">"+
+    "<div class=\"mhd\"><div class=\"mttl\"><i class=\"ti ti-phone-plus\" style=\"color:#0891b2;margin-right:7px\"></i>Log Follow-up</div>"+
+    "<button class=\"mcls\" onclick=\"cm('m-followup')\"><i class=\"ti ti-x\"></i></button></div>"+
+    "<div class=\"mbdy\">"+
+      "<div class=\"fg\"><label class=\"flabel\">Customer</label><div id=\"fu-cust-name\" style=\"font-weight:700;padding:8px 0\"></div></div>"+
+      "<div class=\"fg\"><label class=\"flabel\">Contact type</label>"+
+        "<select class=\"fi\" id=\"fu-type\">"+
+          "<option>Phone call</option><option>WhatsApp</option><option>In person</option><option>SMS</option><option>Other</option>"+
+        "</select></div>"+
+      "<div class=\"fg\"><label class=\"flabel\">Outcome</label>"+
+        "<select class=\"fi\" id=\"fu-outcome\">"+
+          "<option>Promised payment</option><option>Requested more time</option><option>Denied debt</option><option>No answer</option><option>Number unreachable</option><option>Agreed payment plan</option><option>Other</option>"+
+        "</select></div>"+
+      "<div class=\"fg\"><label class=\"flabel\">Notes <span style=\"font-size:10px;color:var(--tx2);font-weight:400\">(optional)</span></label>"+
+        "<textarea class=\"fi\" id=\"fu-notes\" rows=\"3\" placeholder=\"e.g. Promised KSh 2,000 by 20 July. Will pay at gate.\" style=\"resize:none\"></textarea></div>"+
+      "<div class=\"fg\"><label class=\"flabel\">Follow-up date <span style=\"font-size:10px;color:var(--tx2);font-weight:400\">(when to contact again)</span></label>"+
+        "<input type=\"date\" class=\"fi\" id=\"fu-next\"></div>"+
+      "<div class=\"fg\"><label class=\"flabel\">Previous follow-ups</label>"+
+        "<div id=\"fu-history\" style=\"max-height:120px;overflow-y:auto;font-size:11px;color:var(--tx2)\"></div></div>"+
+      "<div class=\"mft\">"+
+        "<button class=\"btn\" onclick=\"cm('m-followup')\">Cancel</button>"+
+        "<button class=\"btn btn-gold\" onclick=\"saveFollowUp()\"><i class=\"ti ti-check\"></i> Save</button>"+
+      "</div>"+
+    "</div>"+
+  "</div></div>";
+  el("mods").innerHTML=mC+mO+mOE+mDlv+mS+mRS+mOf+mIv+mPay+mCmp+mU+mSetup+mPin+mAssign+mFollowUp;
 }
 
 function rDash(){
@@ -1889,7 +1932,7 @@ function rCusts(q,pg,sort,type){
             "<td><span style=\"font-weight:800;color:"+(debt>0?"#c0392b":"#27ae60")+"\">"+(can("vDebt")?(debt>0?"KSh "+debt.toLocaleString():"Nil"):"&bull;&bull;&bull;&bull;")+"</span></td>"+
             "<td><div class=\"ac\">"+
               (can("mPaid")?"<button class=\"btn btn-xs btn-gold\" onclick=\"openPay("+c.id+")\" title=\"Record payment\"><i class=\"ti ti-cash\"></i></button>":"")+(can("vRev")?"<button class=\"btn btn-xs\" onclick=\"printStatement("+c.id+")\" title=\"Customer statement\" style=\"background:#7c3aed;color:#fff\"><i class=\"ti ti-file-text\"></i></button>":"")+
-              (can("aCmp")?"<button class=\"btn btn-xs\" onclick=\"addFollowUp("+c.id+")\" title=\"Log follow-up\" style=\"background:#0891b2;color:#fff\"><i class=\"ti ti-phone-plus\"></i></button>":"")+
+              (can("vRev")?"<button class=\"btn btn-xs\" onclick=\"addFollowUp("+c.id+")\" title=\"Log follow-up\" style=\"background:#0891b2;color:#fff\"><i class=\"ti ti-phone-plus\"></i></button>":"")+
               (can("eCust")?"<button class=\"btn btn-xs btn-navy\" onclick=\"editCust("+c.id+")\" title=\"Edit\"><i class=\"ti ti-edit\"></i></button>":"")+
               (can("dCust")?"<button class=\"btn btn-xs btn-red\" onclick=\"delC("+c.id+")\" title=\"Delete\"><i class=\"ti ti-trash\"></i></button>":"")+
             "</div></td>"+
@@ -1968,15 +2011,40 @@ function delC(id){
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   dirty();toast("Customer removed"+(paidInvs.length?" — "+paidInvs.length+" paid invoice(s) retained":""));
 }
+var _fuCid=0;
 function addFollowUp(cId){
+  if(!can("vRev")){toast("Director only","err");return;}
   var cu=D.customers.find(function(x){return x.id===cId;});if(!cu)return;
-  var note=prompt("Log follow-up for "+(can("vPhone")?cu.name:cAddr(cu))+":\n\n"+"(e.g. \"Called — promised payment by 20 Jul\" or \"No answer — try again\")\n\n"+"Previous notes: "+(cu.followups&&cu.followups.length?cu.followups[cu.followups.length-1].note:"None"));
-  if(!note||!note.trim())return;
+  _fuCid=cId;
+  var nm=el("fu-cust-name");
+  if(nm)nm.innerHTML=(can("vPhone")?cu.name:maskName(cu.name))+" &nbsp;<span style=\"color:var(--tx2);font-weight:400\">"+(can("vPhone")?cu.phone||"":"")+"</span>";
+  var nxt=el("fu-next");if(nxt)nxt.value="";
+  var notes=el("fu-notes");if(notes)notes.value="";
+  var ftype=el("fu-type");if(ftype)ftype.selectedIndex=0;
+  var fout=el("fu-outcome");if(fout)fout.selectedIndex=0;
+  var hist=el("fu-history");
+  if(hist){
+    var prev=(cu.followups||[]).slice().reverse().slice(0,5);
+    hist.innerHTML=prev.length?prev.map(function(f){
+      return "<div style=\"padding:5px 0;border-bottom:1px solid var(--bd)\">"+"<span style=\"font-weight:700\">"+(f.type||"Call")+"</span> &mdash; "+f.outcome+" &bull; <span style=\"color:var(--tx)\">"+(f.note||"")+"</span>"+"<div style=\"color:var(--tx2)\">"+(f.date||"")+" by "+(f.by||"")+(f.next?" · Next: "+f.next:"")+"</div></div>";
+    }).join(""):"<div style=\"color:var(--tx2)\">No previous follow-ups</div>";
+  }
+  om("m-followup");
+}
+function saveFollowUp(){
+  var cu=D.customers.find(function(x){return x.id===_fuCid;});if(!cu)return;
   if(!cu.followups)cu.followups=[];
-  cu.followups.push({date:tday(),by:CU.name,note:note.trim()});
-  auditLog("CUSTOMER_UPDATED","Follow-up logged for customer #"+cId+" by "+CU.name+": "+note.trim());
-  dirty();
-  toast("Follow-up logged for "+(can("vPhone")?cu.name:cAddr(cu)));
+  var entry={
+    date:tday(),by:CU.name,
+    type:el("fu-type")?el("fu-type").value:"Phone call",
+    outcome:el("fu-outcome")?el("fu-outcome").value:"Other",
+    note:el("fu-notes")?el("fu-notes").value.trim():"",
+    next:el("fu-next")?el("fu-next").value:""
+  };
+  cu.followups.push(entry);
+  auditLog("CUSTOMER_UPDATED","Follow-up: "+entry.type+" with "+(can("vPhone")?cu.name:"#"+cu.id)+" — "+entry.outcome);
+  dirty();cm("m-followup");
+  toast("Follow-up saved — "+entry.type+" · "+entry.outcome);
 }
 function openPay(cId){
   var c=D.customers.find(function(x){return x.id===cId;});if(!c)return;
@@ -2763,30 +2831,41 @@ function cancelO(id){
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   dirty();toast("Order #"+id+" cancelled"+(skipStockRestore?" — category order":" — stock restored"));
 }
+var _assignOid=0;
 function assignDriver(oid){
   if(!can("eOrd")){toast("Managers only","err");return;}
   var o=D.orders.find(function(x){return x.id===oid;});if(!o)return;
-  var drivers=USERS.filter(function(u){return u.role==="driver"||u.role==="staff";});// all staff can be assigned
-  if(!drivers.length){toast("No staff/drivers available","err");return;}
-  var opts=drivers.map(function(d){
-    var pending=D.orders.filter(function(x){return x.driver===d.name&&(x.status==="Pending"||x.status==="Processing"||x.status==="Out for delivery");}).length;
-    return d.name+(pending>0?" ("+pending+" pending)":"");
-  });
-  opts.unshift("Unassigned");
-  var cur=o.driver||"Unassigned";
-  var sel=prompt("Assign Order #"+oid+" to:\n\n"+opts.map(function(n,i){return(i+1)+". "+n;}).join("\n")+"\n\nCurrent: "+cur+"\n\nType number or name (blank to cancel):");
-  if(sel===null||sel.trim()==="")return;
-  var idx=parseInt(sel)-1;
-  var name=(!isNaN(idx)&&idx>=0&&idx<opts.length)?opts[idx]:sel.trim();
-  if(name==="Unassigned")name="";
-  var matched=name===""||drivers.find(function(d){return d.name===name;});
-  if(!matched){toast("Staff member not found","err");return;}
-  o.driver=name;
-  auditLog("ORDER_PLACED","Order #"+oid+" assigned to "+(name||"Unassigned")+" by "+CU.name);
-  dirty();
-  rDel();
-  toast("Order #"+oid+" "+(name?"assigned to "+name:"unassigned"));
+  _assignOid=oid;
+  var drivers=USERS.filter(function(u){return u.role==="driver"||u.role==="staff";});
+  var info=el("assign-order-info");
+  if(info)info.innerHTML="#"+oid+" &mdash; "+o.prod+" &times;"+o.qty+(o.driver?" <span style=\"color:var(--tx2)\">(currently: "+o.driver+")</span>":"");
+  var sel=el("assign-who");
+  if(sel){
+    sel.innerHTML="<option value=\"\">— Unassigned —</option>";
+    drivers.forEach(function(d){
+      var pend=D.orders.filter(function(x){return x.driver===d.name&&x.status!=="Delivered"&&x.status!=="Cancelled";}).length;
+      var opt=document.createElement("option");
+      opt.value=d.name;
+      opt.textContent=d.name+" ("+d.role+")"+(pend?" · "+pend+" pending":"· free");
+      if(d.name===o.driver)opt.selected=true;
+      sel.appendChild(opt);
+    });
+  }
+  var wl=el("assign-workload");
+  if(wl)wl.innerHTML=drivers.length+" staff available";
+  om("m-assign");
 }
+function doAssignDriver(){
+  var o=D.orders.find(function(x){return x.id===_assignOid;});if(!o)return;
+  var name=el("assign-who")?el("assign-who").value:"";
+  var prev=o.driver||"Unassigned";
+  o.driver=name;
+  auditLog("ORDER_PLACED","Order #"+_assignOid+" assigned to "+(name||"Unassigned")+" (was: "+prev+") by "+CU.name);
+  dirty();cm("m-assign");
+  rDel();rOrds();
+  toast(name?"Assigned to "+name:"Unassigned");
+}
+
 function rDel(q){
   if(q!==undefined)DEL_Q=q;
   var prevFocus=document.activeElement&&document.activeElement.id==="del-srch";
@@ -3178,7 +3257,7 @@ function rDebts(q,pg){
         return "<tr class=\"dr\">"+
           "<td><div style=\"font-weight:800;font-size:13px\">"+(can("vPhone")?x.c.name:maskName(x.c.name))+"</div>"+
             (x.c.followups&&x.c.followups.length?"<div style=\"font-size:10px;color:#0891b2;margin-top:2px\"><i class=\"ti ti-phone-check\" style=\"font-size:10px\"></i> "+x.c.followups[x.c.followups.length-1].date+": "+x.c.followups[x.c.followups.length-1].note.slice(0,50)+"</div>":"")+
-            (can("aCmp")?"<div style=\"margin-top:4px\"><button onclick=\"addFollowUp("+x.c.id+")\" class=\"btn btn-xs\" style=\"font-size:10px;padding:2px 6px;background:#0891b2;color:#fff;border:none\"><i class=\"ti ti-phone-plus\" style=\"font-size:10px\"></i> Follow up</button></div>":"")+
+            (can("vRev")?"<div style=\"margin-top:4px\"><button onclick=\"addFollowUp("+x.c.id+")\" class=\"btn btn-xs\" style=\"font-size:10px;padding:2px 6px;background:#0891b2;color:#fff;border:none\"><i class=\"ti ti-phone-plus\" style=\"font-size:10px\"></i> Follow up</button></div>":"")+
           "</td>"+
           "<td><div>"+(can("vPhone")?x.c.phone:maskPhone(x.c.phone))+"</div><div class=\"ca\">"+cAddr(x.c)+"</div></td>"+
           "<td><div style=\"font-size:18px;font-weight:900;color:#c0392b\">KSh "+x.debt.toLocaleString()+"</div></td>"+ageing(x.c.id)+
@@ -3490,7 +3569,8 @@ function rReports(){
     "<input type=\"date\" class=\"fi\" style=\"width:130px;padding:5px 8px\" value=\""+RPT_FROM+"\" onchange=\"RPT_FROM=this.value;rReports()\">"+
     "<span style=\"font-size:11px;color:var(--tx2)\">to</span>"+
     "<input type=\"date\" class=\"fi\" style=\"width:130px;padding:5px 8px\" value=\""+RPT_TO+"\" onchange=\"RPT_TO=this.value;rReports()\">"+
-    "<button class=\"btn btn-sm\" onclick=\"RPT_FROM='';RPT_TO='';rReports()\">All time</button>"+(can("exp")?"<button class=\\\"btn btn-sm\\\" onclick=\\\"exportReportXL()\\\" style=\\\"background:#27ae60;color:#fff;margin-left:6px\\\"><i class=\\\"ti ti-download\\\"></i> Excel</button>\"":"")
+    "<button class=\"btn btn-sm\" onclick=\"RPT_FROM='';RPT_TO='';rReports()\">All time</button>"+
+    (can("exp")?"<button class=\"btn btn-sm\" onclick=\"exportReportXL()\" style=\"background:#27ae60;color:#fff;margin-left:6px\"><i class=\"ti ti-download\"></i> Excel</button>":"")+
     "</div><p>Analytics &amp; performance overview</p></div>"+
     "<div class=\"stats\">"+
       "<div class=\"stat sg\"><div class=\"sl\">Total revenue</div><div class=\"sv\">"+ksh(rev)+"</div><div class=\"ss\">"+del.length+" orders</div></div>"+
@@ -4648,6 +4728,7 @@ window.addEventListener("load",function(){
       });
       FB_DOC_REF=fbDb.collection("newdawn").doc("main");
       FB_BACKUP_COL=fbDb.collection("newdawn_backups");
+      FB_EVENTS_COL=fbDb.collection("newdawn_events");
     }catch(e){
       var r=document.getElementById("root");
       if(r)r.innerHTML="<div class=\"lscreen\"><div class=\"lbox\" style=\"text-align:center\">"+
