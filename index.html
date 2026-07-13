@@ -402,7 +402,7 @@ function scheduleCloudSync(){
 function pushToCloud(){
   if(!FB_READY||!FB_DOC_REF)return;
   var isEmpty=(!D.customers||D.customers.length===0)&&(!D.orders||D.orders.length===0)&&(!D.stock||D.stock.length===0);
-  if(isEmpty&&FB_SETUP_DONE){console.warn("Skipping — empty data guard");return;}
+  if(isEmpty&&FB_SETUP_DONE)return; // empty data guard — silently skip
   // Queue the write — process one at a time to prevent race conditions
   FB_WRITE_QUEUE.push(Date.now());
   if(!FB_WRITING)processWriteQueue();
@@ -489,9 +489,9 @@ function writeBackup(docId){
     var payload=JSON.parse(JSON.stringify(getBackupPayload()));
     FB_BACKUP_COL.doc(docId).set(payload).then(function(){
     }).catch(function(e){
-      console.warn("Backup write failed: "+e.message);
+      /* backup write failed silently */
     });
-  }catch(e){console.warn("Backup error: "+e.message);}
+  }catch(e){/* backup error silently */}
 }
 function pruneOldBackups(prefix,keepCount){
   if(!FB_BACKUP_COL)return;
@@ -645,11 +645,14 @@ function startCloudListener(){
       return;
     }
     var data=doc.data();
-    var isOwnWrite=Date.now()-FB_LAST_LOCAL_WRITE<800;
+    var isOwnWrite=Date.now()-FB_LAST_LOCAL_WRITE<5000; // 5s window covers slow networks
     // Conflict detection: if server has newer data than our last write, always accept it
     var serverTime=data.updatedAt||0;
     var weAreNewer=FB_LAST_LOCAL_WRITE>serverTime+1000;
-    if(!isOwnWrite||!weAreNewer){
+    // Smart merge: never let Firestore reduce our customer count
+    var remoteHasMore=(data.D&&(data.D.customers||[]).length>(D.customers||[]).length+2);
+    var weHaveMore=(D.customers||[]).length>(data.D&&data.D.customers||[]).length+2;
+    if((!isOwnWrite||!weAreNewer)&&!weHaveMore){
       // Remote update from another device — merge their data in
       if(data.D){
         // Preserve auditLog: it is stripped from Firestore writes and lives in localStorage
@@ -1022,12 +1025,18 @@ function checkAutoSaveRecovery(){
       msg+="\n\nRestore this data now?";
       if(confirm(msg)){
         D=snap.D;
-        if(!D.routes)D.routes=[];if(!D.complaints)D.complaints=[];if(!D.offers)D.offers=[];if(!D.auditLog)D.auditLog=[];
+        if(!D.routes)D.routes=[];if(!D.complaints)D.complaints=[];if(!D.offers)D.offers=[];if(!D.auditLog)D.auditLog=[];if(!D.pendingPayments)D.pendingPayments=[];
         if(snap.USERS&&snap.USERS.length)USERS=snap.USERS;
         nOId=snap.nOId||nOId;nIId=snap.nIId||nIId;nCId=snap.nCId||nCId;
         FB_SETUP_DONE=snap.setupDone===true||FB_SETUP_DONE;
         syncIdCounters();syncPaymentStatuses();
-        toast("Auto-saved session restored — "+snapCusts+" customers loaded");
+        // CRITICAL: stamp write time BEFORE pushing so onSnapshot ignores this
+        // as a remote update (prevents Firestore overwriting our restored data)
+        FB_LAST_LOCAL_WRITE=Date.now();
+        // Push restored data to Firestore immediately — propagates to all devices
+        setTimeout(function(){pushToCloud();},500);
+        autoSaveLocal(); // persist restored state to localStorage too
+        toast("Session restored — "+snapCusts+" customers. Syncing to all devices...", "ok");
       }
     }
   }
@@ -4027,7 +4036,7 @@ function sendEmailBackup(manual){
   }).catch(function(err){
     var msg=err.text||err.message||JSON.stringify(err)||"unknown error";
     toast("Email failed: "+msg,"err");
-    console.error("EmailJS error — Service:"+EJ_SERVICE_ID+" Template:"+EJ_TEMPLATE_ID);
+    // EmailJS error — Service:"+EJ_SERVICE_ID+" Template:"+EJ_TEMPLATE_ID);
   });
 }
 function scheduleEmailBackup(){
@@ -4058,6 +4067,10 @@ function autoSaveLocal(){
   try{
     var snapshot={D:D,USERS:USERS,nOId:nOId,nIId:nIId,nCId:nCId,ts:new Date().toISOString(),setupDone:FB_SETUP_DONE};
     var json=JSON.stringify(snapshot);
+    // Save to user-keyed slot (prevents staff save overwriting director data)
+    var key=lsKey();
+    localStorage.setItem(key,json);
+    // Also save to shared slot for cross-user recovery
     localStorage.setItem("newdawn_autosave_shared",json);
     // Redundant copy in sessionStorage for same-session recovery
     try{sessionStorage.setItem("newdawn_session_backup",json);}catch(e2){}
@@ -4066,7 +4079,8 @@ function autoSaveLocal(){
 }
 function autoSaveCheckLocal(){
   try{
-    var raw=localStorage.getItem("newdawn_autosave_shared");
+    // Prefer user-keyed slot (most relevant to this user)
+    var raw=localStorage.getItem(lsKey())||localStorage.getItem("newdawn_autosave_shared");
     if(!raw){
       // Try sessionStorage as fallback
       try{raw=sessionStorage.getItem("newdawn_session_backup");}catch(e2){}
