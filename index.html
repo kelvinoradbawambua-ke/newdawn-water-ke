@@ -614,16 +614,17 @@ function startAuditListener(){
   if(!FB_EVENTS_COL)return;
   if(FB_AUDIT_UNSUB){try{FB_AUDIT_UNSUB();}catch(e){}FB_AUDIT_UNSUB=null;}
   FB_AUDIT_UNSUB=FB_EVENTS_COL
-    .orderBy("ts","asc")
+    .orderBy("ts","desc")
     .limit(200)
     .onSnapshot(function(snap){
       var events=[];
       snap.forEach(function(d){
         var data=d.data();
-        data._docId=d.id; // store doc id for delete operations
+        data._docId=d.id;
         events.push(data);
       });
-      // Already ascending from Firestore — newest is last (correct for display)
+      // desc from Firestore = newest first → reverse for display (oldest→newest)
+      events.sort(function(a,b){return a.ts>b.ts?1:-1;}); // asc for D.auditLog
       D.auditLog=events;
       // Refresh audit tab if currently visible
       var pg=document.getElementById("pg-excel");
