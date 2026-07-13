@@ -316,11 +316,9 @@ function auditLog(action,details){
     action:action,
     details:details||""
   };
-  // Write to Firestore subcollection — 1 doc per event, atomic, cross-device real-time
+  // Write to Firestore subcollection — queue if not yet ready
   if(FB_EVENTS_COL&&FB_READY){
     FB_EVENTS_COL.add(entry).catch(function(err){
-      // Entry already in local D.auditLog — not lost
-      // Track consecutive failures so director can be alerted
       if(!window._auditFailCount)window._auditFailCount=0;
       window._auditFailCount++;
       if(window._auditFailCount>=3&&CU&&CU.role==="director"){
@@ -328,6 +326,10 @@ function auditLog(action,details){
         window._auditFailCount=0;
       }
     });
+  }else if(FB_EVENTS_COL&&!FB_READY){
+    // Queue events fired before Firestore is ready — flush on connection
+    if(!window._auditQueue)window._auditQueue=[];
+    window._auditQueue.push(entry);
   }
   // Keep local cache for immediate display (stays in sync via onSnapshot listener)
   if(!D.auditLog)D.auditLog=[];
@@ -729,6 +731,11 @@ function startCloudListener(){
       syncPaymentStatuses();
     }
     FB_READY=true;
+    // Flush any audit events queued before Firestore was ready
+    if(window._auditQueue&&window._auditQueue.length&&FB_EVENTS_COL){
+      var q=window._auditQueue.splice(0);
+      q.forEach(function(e){FB_EVENTS_COL.add(e).catch(function(){});});
+    }
     var c=el("cloud-status");
     var custN=(D&&D.customers&&D.customers.length)||0;
     if(c)c.innerHTML="<span style=\"display:inline-block;width:7px;height:7px;background:#27ae60;border-radius:50%;margin-right:5px;animation:pulse 2s infinite\"></span>Live"+(custN>0?" &middot; "+custN+" customers":"");
@@ -2463,6 +2470,7 @@ function saveOrdEdit(){
   o.driver=el("oe-drv").value;
   if(o.status==="Delivered")o.bottle_after=el("oe-btl").value;else o.bottle_before=el("oe-btl").value;
   o.notes=el("oe-notes").value;
+  auditLog("ORDER_UPDATED","Order #"+oid+" updated by "+CU.name+" ("+CU.role+")");
   cm("m-oe");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+oid+" updated");
 }
 function calcO(){
@@ -2605,6 +2613,7 @@ function saveOrd(){
   if(isCat){
     // Category order: no stock deduction, no invoice yet, payment at delivery
     D.orders.push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:0,cost:0,date:el("od").value,status:"Pending",paid:"Unpaid",amtPaid:0,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?el("onotes").value:"",prodConfirmed:false});
+    auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty+" (category/TBC)");
     cm("m-o");rOrds(undefined,ORD_PAGE);dirty();
     toast("Order #"+newOrdId+" placed — driver confirms brand & collects payment at delivery");
     return;
