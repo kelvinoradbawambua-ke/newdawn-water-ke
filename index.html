@@ -171,6 +171,7 @@ td{padding:9px 12px;vertical-align:middle}
 .pn{color:#c0392b;font-size:12px;display:flex;align-items:center;gap:5px;margin-bottom:5px;font-weight:600}
 .hdiv{height:1px;background:var(--bd);margin:10px 0}
 .ac{display:flex;gap:4px;align-items:center;flex-wrap:wrap}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 .install-bar{display:none;position:fixed;bottom:0;left:0;right:0;background:var(--nv);border-top:3px solid var(--gd);padding:12px 16px;z-index:500;align-items:center;justify-content:space-between;gap:12px}
 .install-bar.show{display:flex}
 </style>
@@ -458,7 +459,7 @@ function processWriteQueue(){
     var e=el("sts");if(e){e.className="sts saved";e.innerHTML="<i class=\"ti ti-cloud-check\"></i> Synced "+new Date().toLocaleTimeString();}
     var cs=el("cloud-status");
     var custN=(D&&D.customers&&D.customers.length)||0;
-    if(cs)cs.innerHTML="<i class=\"ti ti-cloud-check\"></i> Online &middot; Live"+(custN>0?" &middot; "+custN+" customers":"");
+    if(cs)cs.innerHTML="<span style=\"display:inline-block;width:7px;height:7px;background:#27ae60;border-radius:50%;margin-right:5px;animation:pulse 2s infinite\"></span>Live"+(custN>0?" &middot; "+custN+" customers":"");
     // Process any writes that came in while we were writing
     if(FB_WRITE_QUEUE.length)processWriteQueue();
   }).catch(function(err){
@@ -666,28 +667,37 @@ function startCloudListener(){
     // Smart merge: never let Firestore reduce our customer count
     var remoteHasMore=(data.D&&(data.D.customers||[]).length>(D.customers||[]).length+2);
     var weHaveMore=(D.customers||[]).length>(data.D&&data.D.customers||[]).length+2;
+    // ── AUDIT LOG: always merge regardless of data conflict resolution ──
+    // Audit is additive — we always want entries from ALL devices
+    // This runs BEFORE the conditional so it never gets skipped
+    if(data.D&&data.D.auditLog&&data.D.auditLog.length){
+      if(!D.auditLog)D.auditLog=[];
+      var _seen0={};
+      D.auditLog.forEach(function(e){if(e.ts)_seen0[e.ts]=true;});
+      var _newEntries=data.D.auditLog.filter(function(e){return e.ts&&!_seen0[e.ts];});
+      if(_newEntries.length){
+        D.auditLog=D.auditLog.concat(_newEntries);
+        D.auditLog.sort(function(a,b){return a.ts>b.ts?1:-1;});
+        // Keep hot log bounded
+        if(D.auditLog.length>AUDIT_HOT_MAX)D.auditLog=D.auditLog.slice(-AUDIT_HOT_MAX);
+        autoSaveLocal(); // persist merged entries to localStorage immediately
+      }
+    }
     if((!isOwnWrite||!weAreNewer)&&!weHaveMore){
       // Remote update from another device — merge their data in
       if(data.D){
-        // Preserve auditLog: it is stripped from Firestore writes and lives in localStorage
+        // Save auditLog before overwrite (we already merged above)
         var _prevAuditLog=D.auditLog&&D.auditLog.length?D.auditLog:[];
         D=data.D;
         if(!D.routes)D.routes=[];
         if(!D.complaints)D.complaints=[];
         if(!D.offers)D.offers=[];
         if(!D.pendingPayments)D.pendingPayments=[];
-        // Carry backup stamp across sync so all devices share knowledge
+        // Carry backup stamp across sync
         if(data.D._lastDailyBackup)D._lastDailyBackup=data.D._lastDailyBackup;
         else if(data._lastDailyBackup)D._lastDailyBackup=data._lastDailyBackup;
-        // Restore auditLog — merge remote (if any) with local
-        if(!D.auditLog||!D.auditLog.length){D.auditLog=_prevAuditLog;}
-        else{
-          // Merge: combine and deduplicate by ts
-          var _combined=_prevAuditLog.concat(D.auditLog);
-          var _seen={};
-          D.auditLog=_combined.filter(function(e){if(!e.ts||_seen[e.ts])return false;_seen[e.ts]=true;return true;});
-          D.auditLog.sort(function(a,b){return a.ts>b.ts?1:-1;});
-        }
+        // Restore the already-merged auditLog
+        D.auditLog=_prevAuditLog;
       }
       if(data.USERS&&data.USERS.length)USERS=data.USERS;
       else USERS=[{id:1,name:"Director",role:"director",pin:"1234",ini:"DR",col:"#1a1560"}];
@@ -698,7 +708,7 @@ function startCloudListener(){
     FB_READY=true;
     var c=el("cloud-status");
     var custN=(D&&D.customers&&D.customers.length)||0;
-    if(c)c.innerHTML="<i class=\"ti ti-cloud-check\"></i> Online &middot; Live"+(custN>0?" &middot; "+custN+" customers":"");
+    if(c)c.innerHTML="<span style=\"display:inline-block;width:7px;height:7px;background:#27ae60;border-radius:50%;margin-right:5px;animation:pulse 2s infinite\"></span>Live"+(custN>0?" &middot; "+custN+" customers":"");
     // Security check: if current user was deleted, force logout immediately
     if(CU){
       var stillExists=USERS.find(function(u){return u.id===CU.id;});
@@ -998,6 +1008,8 @@ function pk(k){
         s.lockedUntil=now+PIN_LOCKOUT*1000;
         setPinState(s);
         el("perr").textContent="Too many wrong attempts. Locked for "+PIN_LOCKOUT+"s.";
+        // Log lockout to audit so director sees it
+        if(SU)auditLog("SECURITY_VIOLATION","PIN lockout: "+SU.name+" ("+SU.role+") exceeded "+PIN_MAX+" attempts — locked "+PIN_LOCKOUT+"s");
         // Start countdown display
         var countdown=setInterval(function(){
           var r=pinLockRemaining();
@@ -1174,6 +1186,10 @@ document.addEventListener("keydown",function(e){
     return;
   }
   if(inInput)return; // don't fire shortcuts when typing
+  // Navigation shortcuts
+  var navKeys={"1":function(){nav("dashboard",null);},"2":function(){if(can("customers"))nav("customers",null);},"3":function(){if(can("orders"))nav("orders",null);},"4":function(){if(can("delivery"))nav("delivery",null);},"5":function(){if(can("stock"))nav("stock",null);},"6":function(){if(can("invoices"))nav("invoices",null);},"7":function(){if(can("debts"))nav("debts",null);},"8":function(){if(can("complaints"))nav("complaints",null);},"9":function(){if(can("reports"))nav("reports",null);},"0":function(){if(can("excel"))nav("excel",null);}};
+  if(navKeys[e.key]&&!e.ctrlKey&&!e.metaKey&&!e.altKey){e.preventDefault();navKeys[e.key]();return;}
+  if(e.key==="?"||e.key==="/"){e.preventDefault();toast("Keys: 1-0=tabs N=new order C=new customer F=find customer Esc=close","ok");return;}
   if(e.key==="n"&&can("aOrd")){e.preventDefault();prepO();} // N = new order
   if(e.key==="c"&&can("aCust")){e.preventDefault();prepCustAdd();} // C = new customer
   if(e.key==="f"){e.preventDefault();nav("customers",null);setTimeout(function(){var s=document.querySelector(".srch input");if(s)s.focus();},200);} // F = find customer
@@ -1504,7 +1520,7 @@ function buildMods(){
         "</div>"+
         "<div class=\"fg\"><label class=\"flabel\">Quantity</label><input class=\"fi\" type=\"number\" id=\"oq\" value=\"1\" min=\"1\" oninput=\"calcO()\"></div>"+
         "<div class=\"fg\"><label class=\"flabel\">Delivery date</label><input class=\"fi\" type=\"date\" id=\"od\"></div>"+
-        "<div class=\"fg\"><label class=\"flabel\">Driver</label><select class=\"fi\" id=\"odrv\"></select></div>"+
+        "<div class=\"fg\"><label class=\"flabel\">Assign to <span style=\"font-size:10px;color:var(--tx2);font-weight:400\">(optional)</span></label><select class=\"fi\" id=\"odrv\"></select></div>"+
         "<div class=\"fg\"><label class=\"flabel\">Payment status</label><select class=\"fi\" id=\"opay\"><option>Unpaid</option><option>Partial</option><option>Paid</option></select></div>"+
         "<div class=\"fg\"><label class=\"flabel\">Amount paid (KSh)</label><input class=\"fi\" type=\"number\" id=\"oamt\" value=\"0\"></div>"+
         "<div class=\"fg\"><label class=\"flabel\">Bottle condition before</label><select class=\"fi\" id=\"obtl\"><option>Good</option><option>Cracked</option><option>Damaged</option><option>Missing</option></select></div>"+
@@ -1873,6 +1889,7 @@ function rCusts(q,pg,sort,type){
             "<td><span style=\"font-weight:800;color:"+(debt>0?"#c0392b":"#27ae60")+"\">"+(can("vDebt")?(debt>0?"KSh "+debt.toLocaleString():"Nil"):"&bull;&bull;&bull;&bull;")+"</span></td>"+
             "<td><div class=\"ac\">"+
               (can("mPaid")?"<button class=\"btn btn-xs btn-gold\" onclick=\"openPay("+c.id+")\" title=\"Record payment\"><i class=\"ti ti-cash\"></i></button>":"")+(can("vRev")?"<button class=\"btn btn-xs\" onclick=\"printStatement("+c.id+")\" title=\"Customer statement\" style=\"background:#7c3aed;color:#fff\"><i class=\"ti ti-file-text\"></i></button>":"")+
+              (can("aCmp")?"<button class=\"btn btn-xs\" onclick=\"addFollowUp("+c.id+")\" title=\"Log follow-up\" style=\"background:#0891b2;color:#fff\"><i class=\"ti ti-phone-plus\"></i></button>":"")+
               (can("eCust")?"<button class=\"btn btn-xs btn-navy\" onclick=\"editCust("+c.id+")\" title=\"Edit\"><i class=\"ti ti-edit\"></i></button>":"")+
               (can("dCust")?"<button class=\"btn btn-xs btn-red\" onclick=\"delC("+c.id+")\" title=\"Delete\"><i class=\"ti ti-trash\"></i></button>":"")+
             "</div></td>"+
@@ -1950,6 +1967,16 @@ function delC(id){
   rCusts(undefined,CUST_PAGE);
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   dirty();toast("Customer removed"+(paidInvs.length?" — "+paidInvs.length+" paid invoice(s) retained":""));
+}
+function addFollowUp(cId){
+  var cu=D.customers.find(function(x){return x.id===cId;});if(!cu)return;
+  var note=prompt("Log follow-up for "+(can("vPhone")?cu.name:cAddr(cu))+":\n\n"+"(e.g. \"Called — promised payment by 20 Jul\" or \"No answer — try again\")\n\n"+"Previous notes: "+(cu.followups&&cu.followups.length?cu.followups[cu.followups.length-1].note:"None"));
+  if(!note||!note.trim())return;
+  if(!cu.followups)cu.followups=[];
+  cu.followups.push({date:tday(),by:CU.name,note:note.trim()});
+  auditLog("CUSTOMER_UPDATED","Follow-up logged for customer #"+cId+" by "+CU.name+": "+note.trim());
+  dirty();
+  toast("Follow-up logged for "+(can("vPhone")?cu.name:cAddr(cu)));
 }
 function openPay(cId){
   var c=D.customers.find(function(x){return x.id===cId;});if(!c)return;
@@ -2064,7 +2091,7 @@ function rOrds(q,pg,sort){
     "</div>";
   // Partial render: only update results — input preserved
   var _r=el("ords-results");
-  if(_r)_r.innerHTML="<div class=\"tw\"><table><thead><tr><th>#</th><th>Customer</th><th>Product</th><th>Qty</th>"+(can("vRev")?"<th>Total</th>":"")+"<th>Payment</th><th>Bottle</th><th>Date</th><th>Driver</th><th>Status</th><th></th></tr></thead>"+
+  if(_r)_r.innerHTML="<div class=\"tw\"><table><thead><tr><th>#</th><th>Customer</th><th>Product</th><th>Qty</th>"+(can("vRev")?"<th>Total</th>":"")+"<th>Payment</th><th>Bottle</th><th>Date</th><th>Assigned</th><th>Status</th><th></th></tr></thead>"+
     "<tbody id=\"otbody\">"+ordRows(paged.items)+"</tbody></table></div>"+
     pgBar(paged.page,paged.pages,paged.total,"rOrds(undefined,");
 
@@ -2197,9 +2224,11 @@ function opSearch(q){
       var inStock=s.qty>0;
       var stockTxt=can("eSt")?" &middot; "+(inStock?"<span style=\"color:#27ae60\">"+s.qty+" in stock</span>":"<span style=\"color:#dc3545\">Out of stock</span>"):"";
       var priceTxt=can("vRev")?" &nbsp;<span style=\"color:var(--gd);font-weight:800\">KSh "+s.price+"</span>":"";
+      var _ofr=D.offers.find(function(o){return o.active&&o.prod===s.name&&o.end>=tday()&&o.start<=tday();});
+      var offerBadge=_ofr?"<span style=\"background:var(--gd);color:var(--nv);padding:1px 6px;border-radius:3px;font-size:10px;font-weight:800;margin-left:5px\">"+_ofr.disc+"% OFF</span>":"";
       html+="<div onmousedown=\"opSelect('"+s.name.replace(/'/g,"\\'")+"',"+s.price+",event)\" "+
         "style=\"padding:9px 14px;cursor:pointer;border-bottom:1px solid var(--bd);font-size:12px;"+(inStock?"":"opacity:.7")+"\">"+
-        "<div style=\"font-weight:700\">"+s.name+priceTxt+"</div>"+
+        "<div style=\"font-weight:700\">"+s.name+priceTxt+offerBadge+"</div>"+
         "<div style=\"font-size:11px;color:var(--tx2)\">"+sz+stockTxt+"</div>"+
       "</div>";
     });
@@ -2261,7 +2290,8 @@ function prepO(){
   if(el("op"))el("op").value="";el("op")&&el("op").setAttribute("data-p","0");
   if(el("op-sel"))el("op-sel").innerHTML="";
   if(el("op-drop"))el("op-drop").style.display="none";
-  var drvs=USERS.filter(function(u){return u.role==="driver"||u.role==="staff";});
+  var // All staff and drivers can be assigned to an order
+  drvs=USERS.filter(function(u){return u.role==="driver"||u.role==="staff";});
   odrv.innerHTML="<option value=\"\">Unassigned</option>"+drvs.map(function(d){
     var pending=D.orders.filter(function(o){
       return o.driver===d.name&&(o.status==="Pending"||o.status==="Processing"||o.status==="Out for delivery");
@@ -2374,6 +2404,17 @@ function saveOrd(){
     var opEl=el("op");pn=opEl?opEl.value:"";
     if(!pn){toast("Please select a product","err");if(el("op-search"))el("op-search").focus();return;}
     price=parseInt((opEl?opEl.getAttribute("data-p"):0)||0);
+    // Auto-apply active offer discount if product+qty matches
+    if(price>0&&!isCat){
+      var _of=D.offers.find(function(o){
+        return o.active&&o.prod===pn&&o.end>=tday()&&o.start<=tday()&&qty>=(o.minqty||1);
+      });
+      if(_of){
+        var _origPrice=price;
+        price=Math.round(price*(1-_of.disc/100));
+        toast(_of.disc+"% offer applied — "+pn+": KSh "+_origPrice+" → KSh "+price+"/unit","ok");
+      }
+    }
     if(price<=0&&!isCat){if(!confirm("⚠️ Price Warning\n\nThis product has no sale price set (KSh 0).\n\nContinue with a zero-value order?"))return;}
   }
 
@@ -2722,6 +2763,30 @@ function cancelO(id){
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   dirty();toast("Order #"+id+" cancelled"+(skipStockRestore?" — category order":" — stock restored"));
 }
+function assignDriver(oid){
+  if(!can("eOrd")){toast("Managers only","err");return;}
+  var o=D.orders.find(function(x){return x.id===oid;});if(!o)return;
+  var drivers=USERS.filter(function(u){return u.role==="driver"||u.role==="staff";});// all staff can be assigned
+  if(!drivers.length){toast("No staff/drivers available","err");return;}
+  var opts=drivers.map(function(d){
+    var pending=D.orders.filter(function(x){return x.driver===d.name&&(x.status==="Pending"||x.status==="Processing"||x.status==="Out for delivery");}).length;
+    return d.name+(pending>0?" ("+pending+" pending)":"");
+  });
+  opts.unshift("Unassigned");
+  var cur=o.driver||"Unassigned";
+  var sel=prompt("Assign Order #"+oid+" to:\n\n"+opts.map(function(n,i){return(i+1)+". "+n;}).join("\n")+"\n\nCurrent: "+cur+"\n\nType number or name (blank to cancel):");
+  if(sel===null||sel.trim()==="")return;
+  var idx=parseInt(sel)-1;
+  var name=(!isNaN(idx)&&idx>=0&&idx<opts.length)?opts[idx]:sel.trim();
+  if(name==="Unassigned")name="";
+  var matched=name===""||drivers.find(function(d){return d.name===name;});
+  if(!matched){toast("Staff member not found","err");return;}
+  o.driver=name;
+  auditLog("ORDER_PLACED","Order #"+oid+" assigned to "+(name||"Unassigned")+" by "+CU.name);
+  dirty();
+  rDel();
+  toast("Order #"+oid+" "+(name?"assigned to "+name:"unassigned"));
+}
 function rDel(q){
   if(q!==undefined)DEL_Q=q;
   var prevFocus=document.activeElement&&document.activeElement.id==="del-srch";
@@ -2753,7 +2818,7 @@ function rDel(q){
   var _dr=el("del-results");
   if(_dr)_dr.innerHTML=
     "<div class=\"tw\"><table>"+
-    "<thead><tr><th>#</th><th>Customer</th><th>Full address</th><th>Product</th><th>Qty</th><th>Bottle before</th><th>Driver</th><th>Payment</th><th>Status</th><th style=\"width:30px\" title=\"Notes/Instructions\">&#128196;</th><th></th></tr></thead>"+
+    "<thead><tr><th>#</th><th>Customer</th><th>Full address</th><th>Product</th><th>Qty</th><th>Bottle before</th><th>Assigned</th><th>Payment</th><th>Status</th><th style=\"width:30px\" title=\"Notes/Instructions\">&#128196;</th><th></th></tr></thead>"+
     "<tbody>"+
       (pendFil.length?pendFil.map(function(o){
         var c=D.customers.find(function(x){return x.id===o.cId;});
@@ -2778,10 +2843,13 @@ function rDel(q){
             var isOwner=!o.driver||o.driver===CU.name; // unassigned or mine
             var canComplete=can("eOrd")||isOwner; // manager/director always can
             if(canComplete){
-              return "<td><button class=\"btn btn-xs btn-grn\" onclick=\"openDlv("+o.id+")\" title=\"Complete delivery\"><i class=\"ti ti-check\"></i> Done</button></td></tr>";
+              return "<td style=\"display:flex;gap:4px\"><button class=\"btn btn-xs btn-grn\" onclick=\"openDlv("+o.id+")\" title=\"Complete delivery\"><i class=\"ti ti-check\"></i> Done</button>"+
+              (can("eOrd")?"<button class=\"btn btn-xs\" onclick=\"assignDriver("+o.id+")\" title=\"Assign driver\" style=\"font-size:10px;padding:3px 7px\"><i class=\"ti ti-user-plus\" style=\"font-size:10px\"></i></button>":"")+
+              "</td></tr>";
             }else{
               return "<td><div title=\"Assigned to "+o.driver+" — only they can complete this delivery\" style=\"display:inline-flex;align-items:center;gap:5px;background:#f5f5f5;border:1.5px solid #ddd;border-radius:7px;padding:5px 10px;font-size:11px;color:#999;cursor:not-allowed\">"+
-                "<i class=\"ti ti-lock\" style=\"font-size:11px\"></i> "+o.driver.split(" ")[0]+" - assigned</div></td></tr>";
+                "<i class=\"ti ti-lock\" style=\"font-size:11px\"></i> "+o.driver.split(" ")[0]+"</div>"+(can("eOrd")?"<button class=\"btn btn-xs\" onclick=\"assignDriver("+o.id+")\" style=\"padding:3px 6px\" title=\"Re-assign\"><i class=\"ti ti-arrows-exchange\" style=\"font-size:10px\"></i></button>":"")+
+              "</td></tr>";
             }
           })()
       }).join(""):"<tr><td colspan=\"10\"><div class=\"te\"><i class=\"ti ti-circle-check\"></i><p>All deliveries complete!</p></div></td></tr>")+
@@ -3108,7 +3176,10 @@ function rDebts(q,pg){
     (debtPaged.items.length?debtPaged.items.map(function(x){
 
         return "<tr class=\"dr\">"+
-          "<td><div style=\"font-weight:800;font-size:13px\">"+(can("vPhone")?x.c.name:maskName(x.c.name))+"</div></td>"+
+          "<td><div style=\"font-weight:800;font-size:13px\">"+(can("vPhone")?x.c.name:maskName(x.c.name))+"</div>"+
+            (x.c.followups&&x.c.followups.length?"<div style=\"font-size:10px;color:#0891b2;margin-top:2px\"><i class=\"ti ti-phone-check\" style=\"font-size:10px\"></i> "+x.c.followups[x.c.followups.length-1].date+": "+x.c.followups[x.c.followups.length-1].note.slice(0,50)+"</div>":"")+
+            (can("aCmp")?"<div style=\"margin-top:4px\"><button onclick=\"addFollowUp("+x.c.id+")\" class=\"btn btn-xs\" style=\"font-size:10px;padding:2px 6px;background:#0891b2;color:#fff;border:none\"><i class=\"ti ti-phone-plus\" style=\"font-size:10px\"></i> Follow up</button></div>":"")+
+          "</td>"+
           "<td><div>"+(can("vPhone")?x.c.phone:maskPhone(x.c.phone))+"</div><div class=\"ca\">"+cAddr(x.c)+"</div></td>"+
           "<td><div style=\"font-size:18px;font-weight:900;color:#c0392b\">KSh "+x.debt.toLocaleString()+"</div></td>"+ageing(x.c.id)+
           "<td>"+x.invCount+"</td>"+
@@ -3294,11 +3365,30 @@ function editCmp(id){
 function resolveCmp(id){if(!can("mCmp")){toast("Only managers can resolve complaints","err");return;}var c=D.complaints.find(function(x){return x.id===id;});if(c)c.status="Resolved";rCmps(undefined,CMP_PAGE);dirty();toast("Complaint resolved");}
 function delCmp(id){if(!can("dCmp")){toast("Only managers can delete complaints","err");return;}if(!confirm("Delete complaint?"))return;D.complaints=D.complaints.filter(function(c){return c.id!==id;});rCmps(undefined,CMP_PAGE);dirty();}
 
+function addRoute(){
+  if(!can("eOrd")){toast("Managers only","err");return;}
+  var name=prompt("Route name (e.g. Nyayo Estate Morning Run):");
+  if(!name||!name.trim())return;
+  var estates=prompt("Areas covered (comma-separated):\ne.g. Nyayo Estate, Court 290, Court 531");
+  if(!D.routes)D.routes=[];
+  D.routes.push({id:uid(),name:name.trim(),estates:(estates||"").split(",").map(function(e){return e.trim();}).filter(Boolean),created:tday()});
+  dirty();rOffers();toast("Route added");
+}
+function delRoute(id){
+  if(!can("eOrd"))return;
+  if(!confirm("Remove this route?"))return;
+  D.routes=(D.routes||[]).filter(function(r){return r.id!==id;});
+  dirty();rOffers();
+}
 function rOffers(){
   var pg=el("pg-offers");if(!pg)return;
   pg.innerHTML=
     "<div class=\"ph\"><h1>Promotions &amp; Offers</h1><p>"+D.offers.filter(function(o){return o.active;}).length+" active</p></div>"+
     "<div class=\"toolbar\">"+(can("aOff")?"<button class=\"btn btn-gold\" onclick=\"prepOf()\"><i class=\"ti ti-plus\"></i> New promotion</button>":"")+"</div>"+
+    "<div style=\"margin-bottom:14px;padding:12px;background:var(--bg);border-radius:10px;border:1px solid var(--bd)\">"+
+    "<div style=\"display:flex;align-items:center;justify-content:space-between;margin-bottom:8px\"><strong><i class=\"ti ti-route\" style=\"color:var(--gd)\"></i> Delivery Routes ("+D.routes.length+")</strong>"+(can("eOrd")?"<button class=\"btn btn-sm\" onclick=\"addRoute()\"><i class=\"ti ti-plus\"></i> Add</button>":"")+"</div>"+
+    (D.routes&&D.routes.length?D.routes.map(function(r){return "<span style=\"display:inline-flex;align-items:center;gap:5px;background:#fff;border:1px solid var(--bd);border-radius:6px;padding:4px 10px;margin:3px;font-size:11px\">"+(r.name)+"<span style=\"color:var(--tx2)\"> "+((r.estates||[]).slice(0,2).join(", "))+"</span>"+(can("eOrd")?"<i class=\"ti ti-x\" style=\"cursor:pointer;color:#c0392b\" onclick=\"delRoute("+r.id+")\"></i>":"")+"</span>";}).join(""):"<span style=\"font-size:11px;color:var(--tx2)\">No routes — add delivery zones.</span>")+
+    "</div>"+
     "<div style=\"display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:13px\">"+
       (D.offers.length?D.offers.map(function(o){
         return "<div style=\"background:"+(o.active?"var(--nv)":"#fff")+";border:"+(o.active?"2px solid var(--gd)":"1px solid var(--bd)")+";border-radius:14px;padding:18px;box-shadow:var(--sh)\">"+
@@ -3360,6 +3450,27 @@ function editOf(id){
 function delOf(id){if(!can("dOff"))return;if(!confirm("Delete?"))return;D.offers=D.offers.filter(function(o){return o.id!==id;});rOffers();dirty();}
 
 var RPT_FROM="";var RPT_TO="";
+function exportReportXL(){
+  if(!can("exp")){toast("Director only","err");return;}
+  var from=RPT_FROM||"";var to2=RPT_TO||tday();
+  var delivered=D.orders.filter(function(o){
+    var dd=o.deliveredAt||o.date;if(o.status!=="Delivered")return false;
+    if(from&&dd<from)return false;if(to2&&dd>to2)return false;return true;
+  });
+  var byProd={};delivered.forEach(function(o){
+    if(!byProd[o.prod])byProd[o.prod]={Product:o.prod,Units:0,Revenue:0};
+    byProd[o.prod].Units+=o.qty;byProd[o.prod].Revenue+=o.qty*o.price;});
+  var byCust={};delivered.forEach(function(o){
+    var cu=D.customers.find(function(x){return x.id===o.cId;});var n=cu?cu.name:"Unknown";
+    if(!byCust[n])byCust[n]={Customer:n,Orders:0,Revenue:0};
+    byCust[n].Orders++;byCust[n].Revenue+=o.qty*o.price;});
+  var wb=XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(Object.values(byProd)),"By Product");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(Object.values(byCust).sort(function(a,b){return b.Revenue-a.Revenue;})),"By Customer");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(delivered.map(function(o){var cu=D.customers.find(function(x){return x.id===o.cId;});return{Date:o.deliveredAt||o.date,Order:o.id,Customer:cu?cu.name:"",Product:o.prod,Qty:o.qty,Price:o.price,Revenue:o.qty*o.price,Driver:o.driver||"",Payment:o.paid};})),"Orders Detail");
+  XLSX.writeFile(wb,"NewDawn_Report_"+new Date().toISOString().slice(0,10)+".xlsx");
+  toast("Report exported — "+delivered.length+" deliveries");
+}
 function rReports(){
   var pg=el("pg-reports");if(!pg)return;
   var del=D.orders.filter(function(o){if(o.status!=="Delivered")return false;var dDate=o.deliveredAt||o.date; // use actual delivery date for reporting
@@ -3379,7 +3490,7 @@ function rReports(){
     "<input type=\"date\" class=\"fi\" style=\"width:130px;padding:5px 8px\" value=\""+RPT_FROM+"\" onchange=\"RPT_FROM=this.value;rReports()\">"+
     "<span style=\"font-size:11px;color:var(--tx2)\">to</span>"+
     "<input type=\"date\" class=\"fi\" style=\"width:130px;padding:5px 8px\" value=\""+RPT_TO+"\" onchange=\"RPT_TO=this.value;rReports()\">"+
-    "<button class=\"btn btn-sm\" onclick=\"RPT_FROM='';RPT_TO='';rReports()\">All time</button>"+
+    "<button class=\"btn btn-sm\" onclick=\"RPT_FROM='';RPT_TO='';rReports()\">All time</button>"+(can("exp")?"<button class=\\\"btn btn-sm\\\" onclick=\\\"exportReportXL()\\\" style=\\\"background:#27ae60;color:#fff;margin-left:6px\\\"><i class=\\\"ti ti-download\\\"></i> Excel</button>\"":"")
     "</div><p>Analytics &amp; performance overview</p></div>"+
     "<div class=\"stats\">"+
       "<div class=\"stat sg\"><div class=\"sl\">Total revenue</div><div class=\"sv\">"+ksh(rev)+"</div><div class=\"ss\">"+del.length+" orders</div></div>"+
