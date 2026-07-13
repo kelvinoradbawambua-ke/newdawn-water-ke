@@ -615,44 +615,60 @@ function restoreFromLatestBackup(onSuccess,onFail){
   tryNext();
 }
 var FB_AUDIT_UNSUB=null;
+function _mergeAuditEvents(remote){
+  // Core merge — used by both listener and one-time load
+  // NEVER replaces D.auditLog — only adds new entries
+  if(!remote||!remote.length)return;
+  if(!D.auditLog)D.auditLog=[];
+  var existing={};
+  D.auditLog.forEach(function(e){if(e.ts)existing[e.ts]=true;});
+  var added=0;
+  remote.forEach(function(e){
+    if(e.ts&&!existing[e.ts]){D.auditLog.push(e);existing[e.ts]=true;added++;}
+  });
+  if(added>0){
+    D.auditLog.sort(function(a,b){return a.ts<b.ts?-1:a.ts>b.ts?1:0;});
+    if(D.auditLog.length>AUDIT_HOT_MAX)D.auditLog=D.auditLog.slice(-AUDIT_HOT_MAX);
+    var pg=document.getElementById("pg-excel");
+    if(pg&&pg.classList.contains("act"))rAuditLog();
+  }
+}
 function startAuditListener(){
-  // DEFINITIVE ARCHITECTURE: One-time load on login
-  // No live listener = no D.auditLog overwrite race
-  // auditLog() appends locally in real-time
-  // Cross-device history loaded once at login via .get()
   if(!FB_EVENTS_COL)return;
-  // Load last 200 events ordered by ts descending — no index needed for get()
-  // We use try-catch: if orderBy fails, fall back to unordered get
-  var loadEvents=function(query){
-    query.get().then(function(snap){
+  // Tear down previous listener
+  if(FB_AUDIT_UNSUB){try{FB_AUDIT_UNSUB();}catch(e){}FB_AUDIT_UNSUB=null;}
+  // 30-day rolling window — new events always have ts > cutoff
+  var cutoff=new Date();
+  cutoff.setDate(cutoff.getDate()-30);
+  var cutoffTs=cutoff.toISOString();
+  // Real-time listener: MERGE incoming, never replace
+  // orderBy("ts","asc") on newdawn_events — Firestore auto-creates
+  // single-field ascending index for every collection automatically
+  FB_AUDIT_UNSUB=FB_EVENTS_COL
+    .orderBy("ts","asc")
+    .startAfter(cutoffTs)
+    .onSnapshot(function(snap){
       var remote=[];
       snap.forEach(function(d){remote.push(d.data());});
-      remote.sort(function(a,b){return a.ts>b.ts?1:-1;});
-      // MERGE into D.auditLog — never replace
-      if(!D.auditLog)D.auditLog=[];
-      var existing={};
-      D.auditLog.forEach(function(e){if(e.ts)existing[e.ts]=true;});
-      var added=0;
-      remote.forEach(function(e){
-        if(e.ts&&!existing[e.ts]){D.auditLog.push(e);existing[e.ts]=true;added++;}
-      });
-      if(added>0){
-        D.auditLog.sort(function(a,b){return a.ts>b.ts?1:-1;});
-        D.auditLog=D.auditLog.slice(-AUDIT_HOT_MAX);
-        var pg=document.getElementById("pg-excel");
-        if(pg&&pg.classList.contains("act"))rAuditLog();
-      }
-      var statusEl=document.getElementById("audit-sync-status");
-      if(statusEl)statusEl.innerHTML=
-        "<span style=\"display:inline-block;width:7px;height:7px;background:#27ae60;border-radius:50%;margin-right:4px;animation:pulse 2s infinite\"></span>Live";
-    }).catch(function(){});
-  };
-  // Try with orderBy first (works if index exists), fall back without
-  try{
-    loadEvents(FB_EVENTS_COL.orderBy("ts","desc").limit(200));
-  }catch(e){
-    loadEvents(FB_EVENTS_COL.limit(200));
-  }
+      _mergeAuditEvents(remote);
+      // Update live indicator
+      var s=document.getElementById("audit-sync-status");
+      if(s)s.innerHTML="<span style=\"display:inline-block;width:7px;height:7px;"+
+        "background:#27ae60;border-radius:50%;margin-right:4px;animation:pulse 2s infinite\"></span>Live";
+    },function(err){
+      // Index not yet ready — do a one-time get() without orderBy as fallback
+      // This ensures director sees events even before index builds
+      FB_EVENTS_COL.limit(200).get().then(function(snap){
+        var remote=[];
+        snap.forEach(function(d){remote.push(d.data());});
+        _mergeAuditEvents(remote);
+      }).catch(function(){});
+      // Retry live listener in 2 minutes — index builds in background
+      var s=document.getElementById("audit-sync-status");
+      if(s)s.innerHTML="<span style=\"color:#f39c12\">"+
+        "<i class=\"ti ti-refresh\"></i> Syncing...</span>";
+      setTimeout(startAuditListener,120000);
+    });
 }
 function startCloudListener(){
   if(!FB_DOC_REF)return;
