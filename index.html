@@ -321,12 +321,9 @@ function auditLog(action,details){
   // Write to Firestore subcollection — queue if not yet ready
   if(FB_EVENTS_COL&&FB_READY){
     FB_EVENTS_COL.add(entry).catch(function(err){
-      if(!window._auditFailCount)window._auditFailCount=0;
-      window._auditFailCount++;
-      if(window._auditFailCount>=3){
-        if(CU&&CU.role==="director")toast("⚠️ Audit log sync issue — events recorded locally only","warn");
-        window._auditFailCount=0;
-      }
+      // Show actual error to director for diagnosis
+      var msg=err&&err.message?err.message:(err&&err.code?err.code:"unknown");
+      if(CU&&CU.role==="director")toast("Audit write failed: "+msg,"err");
     });
   }else if(FB_EVENTS_COL&&!FB_READY){
     // Queue events fired before Firestore is ready — flush on connection
@@ -441,7 +438,11 @@ function processWriteQueue(){
   var DforSync={};
   var keys=Object.keys(D);
   for(var ki=0;ki<keys.length;ki++){
-    if(keys[ki]==="auditLog")continue; // subcollection handles cross-device sync in subcollection — not in main doc
+    if(keys[ki]==="auditLog"){
+      // Last 20 audit entries in main doc — guaranteed cross-device fallback
+      DforSync.auditLog=(D.auditLog||[]).slice(-20);
+      continue;
+    }
     DforSync[keys[ki]]=D[keys[ki]];
   }
   // Doc size guard: trim delivered orders older than 6 months from sync payload
@@ -651,22 +652,27 @@ function startAuditListener(){
       var remote=[];
       snap.forEach(function(d){remote.push(d.data());});
       _mergeAuditEvents(remote);
-      // Update live indicator
+      // If listener returned empty but we expect data, also do unordered get as safety
+      if(remote.length===0&&(!D.auditLog||D.auditLog.length===0)){
+        FB_EVENTS_COL.limit(200).get().then(function(s2){
+          var r2=[];s2.forEach(function(d){r2.push(d.data());});_mergeAuditEvents(r2);
+        }).catch(function(){});
+      }
       var s=document.getElementById("audit-sync-status");
       if(s)s.innerHTML="<span style=\"display:inline-block;width:7px;height:7px;"+
         "background:#27ae60;border-radius:50%;margin-right:4px;animation:pulse 2s infinite\"></span>Live";
     },function(err){
-      // Index not yet ready — do a one-time get() without orderBy as fallback
-      // This ensures director sees events even before index builds
+      var errMsg=err&&err.message?err.message:(err&&err.code?err.code:"unknown");
+      var s=document.getElementById("audit-sync-status");
+      if(s)s.innerHTML="<span style=\"color:#e74c3c\">Audit error: "+errMsg+"</span>";
+      // Fallback: get without orderBy
       FB_EVENTS_COL.limit(200).get().then(function(snap){
         var remote=[];
         snap.forEach(function(d){remote.push(d.data());});
         _mergeAuditEvents(remote);
-      }).catch(function(){});
-      // Retry live listener in 2 minutes — index builds in background
-      var s=document.getElementById("audit-sync-status");
-      if(s)s.innerHTML="<span style=\"color:#f39c12\">"+
-        "<i class=\"ti ti-refresh\"></i> Syncing...</span>";
+      }).catch(function(e2){
+        if(s)s.innerHTML="<span style=\"color:#e74c3c\">Audit read failed: "+(e2&&e2.code?e2.code:"")+"</span>";
+      });
       setTimeout(startAuditListener,120000);
     });
 }
@@ -754,7 +760,11 @@ function startCloudListener(){
         // Carry backup stamp across sync
         if(data.D._lastDailyBackup)D._lastDailyBackup=data.D._lastDailyBackup;
         else if(data._lastDailyBackup)D._lastDailyBackup=data._lastDailyBackup;
-        // Restore the already-merged auditLog
+        // Merge audit from main doc (belt-and-suspenders cross-device sync)
+        if(data.D&&data.D.auditLog&&data.D.auditLog.length){
+          _mergeAuditEvents(data.D.auditLog);
+        }
+        // Restore merged auditLog after D= overwrite
         D.auditLog=_prevAuditLog;
       }
       if(data.USERS&&data.USERS.length)USERS=data.USERS;
@@ -808,7 +818,7 @@ function refreshCurrentPage(){
     complaints:function(){CMP_Q="";CMP_PAGE=0;rCmps();},
     offers:rOffers,
     reports:rReports,
-    excel:function(){AUDIT_PAGE=0;AUDIT_Q="";AUDIT_TYPE="";rExcel();},
+    excel:function(){AUDIT_PAGE=0;AUDIT_Q="";AUDIT_TYPE="";rExcel();startAuditListener();},
     users:rUsers
   };
   if(fns[pid])fns[pid]();
@@ -849,9 +859,11 @@ function initCloudConnection(cb){
         // Retry auth after delay - handles temporary API key restriction issues
         setTimeout(tryAuth, 2000*authRetries);
       }else{
-        // Auth failed after retries - continue in offline mode
+        // Auth failed — likely firestore.googleapis.com blocked by network/firewall
         clearTimeout(timeout);
         FB_READY=false;
+        var cs=document.getElementById("cloud-status");
+        if(cs)cs.innerHTML="<span style=\"color:#e74c3c\">⚠ Offline — check network</span>";
         var snap=autoSaveCheckLocal();
         if(snap&&snap.D){
           D=snap.D;
@@ -986,10 +998,11 @@ function renderLogin(){
       "<div style=\"margin-top:4px;font-size:9px;color:#aaa\">v"+APP_VERSION+"</div>"+
     "</div>"+
     "</div></div>";
-  el("ll").innerHTML=makeLogoHTML(180);
+  var _ll=el("ll");if(_ll)_ll.innerHTML=makeLogoHTML(180);
   renderUG();
 }
 function renderUG(){
+  if(!el("usg"))return; // login screen not active — ignore
   var isDefault=USERS.length===1&&USERS[0].name==="Director"&&!FB_READY;
   el("usg").innerHTML=USERS.map(function(u){
     var rl=R[u.role]||{label:u.role};
@@ -3797,7 +3810,7 @@ function rAuditLog(pg){
   var resEl=el("audit-results");if(!resEl)return;
   if(!pageLogs.length){
     resEl.innerHTML="<div class=\"te\"><i class=\"ti ti-activity\" style=\"font-size:28px;opacity:.4\"></i>"+
-      "<p>"+(q2||tf?"No matching entries":"No activity logged yet")+"</p>"+
+      "<p>"+(q2||tf?"No matching entries":(FB_READY?"No activity logged yet — try refreshing":"Loading audit log..."))+"</p>"+
       (q2||tf?"<span><a href=\"#\" onclick=\"AUDIT_Q='';AUDIT_TYPE='';AUDIT_PAGE=0;rAuditLog();return false\" style=\"color:var(--gd)\">Clear filters</a></span>":"")+"</div>";
     return;
   }
