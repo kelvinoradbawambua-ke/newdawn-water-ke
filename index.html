@@ -1830,15 +1830,21 @@ function rCusts(q,pg,sort,type){
     "</div>"+
     "<div style=\"display:flex;gap:6px;flex-wrap:wrap;padding:0 2px 12px;align-items:center\">"+
       "<span style=\"font-size:11px;color:var(--tx2);font-weight:600\">Sort by:</span>"+
+    "<div id=\"cust-sort\"></div>"+
+        "<div id=\"cust-results\"></div>";
+  }
+  // Always rebuild sort buttons so active state reflects current sort
+  var _cs=el("cust-sort");
+  if(_cs)_cs.innerHTML=
+    "<div style=\"display:flex;gap:6px;flex-wrap:wrap;padding:0 2px 12px;align-items:center\">"+
+      "<span style=\"font-size:11px;color:var(--tx2);font-weight:600\">Sort by:</span>"+
       sortBtn("recent","Recent")+" "+
       sortBtn("name","Name A–Z")+" "+
       sortBtn("debt","Highest Debt")+" "+
       sortBtn("nodebts","Clear First")+" "+
       sortBtn("orders","Most Orders")+" "+
       (can("vRev")?sortBtn("revenue","Top Revenue")+" ":"")+
-    "</div>"+
-        "<div id=\"cust-results\"></div>";
-  }
+    "</div>";
   // Always update results (partial render — input stays alive)
   var _cr=el("cust-results");
   if(_cr)_cr.innerHTML="<div class=\"tw\"><table id=\"ctbl\">"+
@@ -1997,7 +2003,12 @@ function rOrds(q,pg,sort){
     if(!q2)return true;
     var lq=q2.toLowerCase();
     var c=D.customers.find(function(x){return x.id===o.cId;});
-    return(c&&(c.name.toLowerCase().indexOf(lq)!==-1||cAddr(c).toLowerCase().indexOf(lq)!==-1))||
+    // vPhone gate: staff search by address/order#/product only — not customer name
+    var custMatch=c&&(
+      (can("vPhone")&&c.name.toLowerCase().indexOf(lq)!==-1)||
+      cAddr(c).toLowerCase().indexOf(lq)!==-1
+    );
+    return custMatch||
       String(o.id).indexOf(q2)!==-1||o.prod.toLowerCase().indexOf(lq)!==-1||
       (o.driver&&o.driver.toLowerCase().indexOf(lq)!==-1);
   });
@@ -2020,7 +2031,7 @@ function rOrds(q,pg,sort){
     pgEl.innerHTML=
     "<div class=\"ph\"><h1>Orders</h1><p>"+D.orders.length+" total &middot; "+D.orders.filter(function(o){return o.status==="Pending"||o.status==="Processing";}).length+" active</p></div>"+
     "<div class=\"toolbar\">"+
-      "<div class=\"srch\"><i class=\"ti ti-search\"></i><input id=\"ords-srch\" type=\"text\" autocomplete=\"off\" autocorrect=\"off\" autocapitalize=\"off\" spellcheck=\"false\" inputmode=\"search\" placeholder=\"Search by #, customer, product, driver, address...\" oninput=\"rOrds(this.value,0)\" value=\""+q2+"\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
+      "<div class=\"srch\"><i class=\"ti ti-search\"></i><input id=\"ords-srch\" type=\"text\" autocomplete=\"off\" autocorrect=\"off\" autocapitalize=\"off\" spellcheck=\"false\" inputmode=\"search\" placeholder=\"Search by order #, product, address, driver...\" oninput=\"rOrds(this.value,0)\" value=\""+q2+"\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
       "<select class=\"fsel\" onchange=\"filterOrds(this.value)\">"+
         "<option value=\"\" "+(sf===""?"selected":"")+">All statuses</option>"+
         "<option value=\"Pending\" "+(sf==="Pending"?"selected":"")+">Pending</option>"+
@@ -2031,18 +2042,22 @@ function rOrds(q,pg,sort){
       "</select>"+
       (can("aOrd")?"<button class=\"btn btn-gold\" onclick=\"prepO()\"><i class=\"ti ti-plus\"></i> New order</button>":"")+
     "</div>"+
+    "<div id=\"ords-sort\"></div>"+
+    "<div id=\"ords-results\"></div>";
+  }
+  // Always rebuild sort buttons so active state reflects current sort
+  var _os=el("ords-sort");
+  if(_os)_os.innerHTML=
     "<div style=\"display:flex;gap:6px;flex-wrap:wrap;padding:0 2px 12px\">"+
       "<span style=\"font-size:11px;color:var(--tx2);font-weight:600\">Sort:</span>"+
       sBtn("newest","Newest")+" "+sBtn("oldest","Oldest")+" "+
-      sBtn("unpaid","Unpaid first")+" "+sBtn("partial","Partial first")+" "+
+      (can("mPaid")?sBtn("unpaid","Unpaid first")+" "+sBtn("partial","Partial first")+" ":"")+
       (can("vRev")?sBtn("highval","Highest value")+" ":"")+
       sBtn("customer","Customer A–Z")+
-    "</div>"+
-    "<div id=\"ords-results\"></div>";
-  }
+    "</div>";
   // Partial render: only update results — input preserved
   var _r=el("ords-results");
-  if(_r)_r.innerHTML="<div class=\"tw\"><table><thead><tr><th>#</th><th>Customer</th><th>Product</th><th>Qty</th><th>Total</th><th>Payment</th><th>Bottle</th><th>Date</th><th>Driver</th><th>Status</th><th></th></tr></thead>"+
+  if(_r)_r.innerHTML="<div class=\"tw\"><table><thead><tr><th>#</th><th>Customer</th><th>Product</th><th>Qty</th>"+(can("vRev")?"<th>Total</th>":"")+"<th>Payment</th><th>Bottle</th><th>Date</th><th>Driver</th><th>Status</th><th></th></tr></thead>"+
     "<tbody id=\"otbody\">"+ordRows(paged.items)+"</tbody></table></div>"+
     pgBar(paged.page,paged.pages,paged.total,"rOrds(undefined,");
 
@@ -2052,21 +2067,22 @@ function filterOrds(f){
   rOrds(undefined,0);
 }
 function ordRows(fil){
-  if(!fil.length)return "<tr><td colspan=\"11\"><div class=\"te\"><i class=\"ti ti-clipboard-list\"></i><p>No orders found</p></div></td></tr>";
+  if(!fil.length)return "<tr><td colspan=\""+(can("vRev")?"11":"10")+"\"><div class=\"te\"><i class=\"ti ti-clipboard-list\"></i><p>No orders found</p></div></td></tr>";
   return fil.map(function(o){
     var c=D.customers.find(function(x){return x.id===o.cId;});
     return "<tr><td style=\"font-weight:700\">#"+o.id+"</td>"+
       "<td><div style=\"font-weight:700\">"+(c?(can("vPhone")?c.name:maskName(c.name)):"&mdash;")+"</div><div class=\"ca\">"+(c?[c.court,c.house?"No."+c.house:""].filter(Boolean).join(" "):"")+"</div></td>"+
       "<td>"+o.prod+(o.prodConfirmed===false?" <span style=\"background:#fff3cd;color:#856404;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:700\">TBC</span>":"")+"</td><td style=\"font-weight:700\">"+o.qty+"</td>"+
-      "<td>"+kshS(o.qty*o.price)+"</td>"+
+      "<td>"+(can("vRev")?kshS(o.qty*o.price):"<span style=\"color:var(--tx2);font-size:11px\">—</span>")+"</td>"+
       "<td>"+(can("mPaid")?pb(o.paid):"<span style=\"color:var(--tx2);font-size:11px\">&mdash;</span>")+"</td>"+
       "<td>"+btl(o.bottle_after||o.bottle_before)+"</td>"+
       "<td style=\"font-size:11px\">"+fmt(o.date)+"</td>"+
       "<td style=\"font-size:11px\">"+(o.driver||"&mdash;")+(o.completedBy&&o.completedBy!==o.driver?'<span style=\"font-size:9px;color:#27ae60\" title=\"Completed by this person\"> ✓'+o.completedBy+"</span>":"")+"</td>"+
       "<td>"+sb(o.status)+"</td>"+
       "<td><div class=\"ac\">"+
-        (o.status!=="Delivered"&&o.status!=="Cancelled"?"<button class=\"btn btn-xs btn-grn\" onclick=\"openDlv("+o.id+")\" title=\"Complete delivery\"><i class=\"ti ti-check\"></i></button>":"")+
-        (can("eOrd")&&o.status!=="Delivered"&&o.status!=="Cancelled"?"<button class=\"btn btn-xs btn-navy\" onclick=\"editOrd("+o.id+")\" title=\"Edit\"><i class=\"ti ti-edit\"></i></button>":"")+
+        // Complete button: managers/directors can complete any order from here
+        // Staff/drivers: use the Delivery board (shows only their assigned orders)
+        (can("eOrd")&&o.status!=="Delivered"&&o.status!=="Cancelled"?"<button class=\"btn btn-xs btn-grn\" onclick=\"openDlv("+o.id+")\" title=\"Complete delivery\"><i class=\"ti ti-check\"></i></button>":"")+        (can("eOrd")&&o.status!=="Delivered"&&o.status!=="Cancelled"?"<button class=\"btn btn-xs btn-navy\" onclick=\"editOrd("+o.id+")\" title=\"Edit\"><i class=\"ti ti-edit\"></i></button>":"")+
         (can("eOrd")&&(o.status==="Pending"||o.status==="Processing")?"<button class=\"btn btn-xs\" onclick=\"cancelO("+o.id+")\" title=\"Cancel order\" style=\"background:#f39c12;color:#fff\"><i class=\"ti ti-x\"></i></button>":"")+
         (can("dOrd")?"<button class=\"btn btn-xs btn-red\" onclick=\"delO("+o.id+")\" title=\"Delete order\"><i class=\"ti ti-trash\"></i></button>":"")+
       "</div></td></tr>";
