@@ -530,6 +530,8 @@ function runAutoBackup(){
   }
 }
 function startAutoBackup(){
+  // Backups only meaningful for director (has full data access)
+  if(!CU||CU.role!=="director")return;
   // Run immediately after login, then every 10 minutes check if backup needed
   setTimeout(runAutoBackup,10000);
   if(FB_BACKUP_TIMER)clearInterval(FB_BACKUP_TIMER);
@@ -1008,6 +1010,11 @@ function checkAutoSaveRecovery(){
     });
     D.auditLog.sort(function(a,b){return a.ts>b.ts?1:-1;});
   }
+  // Non-director/manager roles: skip localStorage restore — trust Firestore
+  if(!CU||( CU.role!=="director"&&CU.role!=="manager")){
+    buildApp();
+    return;
+  }
   var snap=autoSaveCheckLocal();
   var hasCurrentData=D.customers.length||D.orders.length||D.invoices.length;
   if(snap&&snap.D){
@@ -1016,27 +1023,49 @@ function checkAutoSaveRecovery(){
     var snapOrds=(snap.D.orders||[]).length;
     var currCusts=D.customers?D.customers.length:0;
     var currOrds=D.orders?D.orders.length:0;
-    // Offer restore if: no current data, OR snapshot has significantly more records
     var snapIsBetter=!hasCurrentData||(snapCusts>currCusts+5)||(snapOrds>currOrds+10);
+    // Check if local snapshot is more recent than Firestore
+    var snapTs=snap.ts?new Date(snap.ts).getTime():0;
+    var snapIsNewer=snapTs>0&&snapTs>Date.now()-30*60*1000; // within 30 min
     if(snapHasData&&snapIsBetter){
-      var snapTime=snap.ts?new Date(snap.ts).toLocaleString():"earlier session";
-      var msg="Found an auto-saved session from "+snapTime+" on this device with "+snapCusts+" customers and "+snapOrds+" orders.";
-      if(hasCurrentData)msg+="\n\nCloud has "+currCusts+" customers. The local save has more data.";
-      msg+="\n\nRestore this data now?";
-      if(confirm(msg)){
+      // Director fast-path: if local is clearly better and very recent, auto-restore
+      if(snapIsNewer&&snapCusts>currCusts+5){
         D=snap.D;
-        if(!D.routes)D.routes=[];if(!D.complaints)D.complaints=[];if(!D.offers)D.offers=[];if(!D.auditLog)D.auditLog=[];if(!D.pendingPayments)D.pendingPayments=[];
+        if(!D.routes)D.routes=[];
+        if(!D.complaints)D.complaints=[];
+        if(!D.offers)D.offers=[];
+        if(!D.auditLog)D.auditLog=[];
+        if(!D.pendingPayments)D.pendingPayments=[];
         if(snap.USERS&&snap.USERS.length)USERS=snap.USERS;
         nOId=snap.nOId||nOId;nIId=snap.nIId||nIId;nCId=snap.nCId||nCId;
         FB_SETUP_DONE=snap.setupDone===true||FB_SETUP_DONE;
         syncIdCounters();syncPaymentStatuses();
-        // CRITICAL: stamp write time BEFORE pushing so onSnapshot ignores this
-        // as a remote update (prevents Firestore overwriting our restored data)
         FB_LAST_LOCAL_WRITE=Date.now();
-        // Push restored data to Firestore immediately — propagates to all devices
         setTimeout(function(){pushToCloud();},500);
-        autoSaveLocal(); // persist restored state to localStorage too
-        toast("Session restored — "+snapCusts+" customers. Syncing to all devices...", "ok");
+        autoSaveLocal();
+        toast("Local session auto-restored — "+snapCusts+" customers. Syncing...","ok");
+      }else{
+        // Ask director to confirm (older local data or smaller difference)
+        var snapTime=snap.ts?new Date(snap.ts).toLocaleString():"earlier session";
+        var msg="Found an auto-saved session from "+snapTime+" on this device with "+snapCusts+" customers and "+snapOrds+" orders.";
+        if(hasCurrentData)msg+="\n\nCloud has "+currCusts+" customers. The local save has more data.";
+        msg+="\n\nRestore this data now?";
+        if(confirm(msg)){
+          D=snap.D;
+          if(!D.routes)D.routes=[];
+          if(!D.complaints)D.complaints=[];
+          if(!D.offers)D.offers=[];
+          if(!D.auditLog)D.auditLog=[];
+          if(!D.pendingPayments)D.pendingPayments=[];
+          if(snap.USERS&&snap.USERS.length)USERS=snap.USERS;
+          nOId=snap.nOId||nOId;nIId=snap.nIId||nIId;nCId=snap.nCId||nCId;
+          FB_SETUP_DONE=snap.setupDone===true||FB_SETUP_DONE;
+          syncIdCounters();syncPaymentStatuses();
+          FB_LAST_LOCAL_WRITE=Date.now();
+          setTimeout(function(){pushToCloud();},500);
+          autoSaveLocal();
+          toast("Session restored — "+snapCusts+" customers. Syncing to all devices...","ok");
+        }
       }
     }
   }
@@ -3922,6 +3951,7 @@ function printStatement(cId){
   w.document.close();
 }
 function showBackupHistory(){
+  if(!can("rest")){toast("Only directors can view backup history","err");return;}
   var el2=el("backup-history");if(!el2||!FB_BACKUP_COL)return;
   el2.innerHTML="<div style=\"font-size:12px;color:var(--tx2)\">Loading backup history...</div>";
   FB_BACKUP_COL.orderBy(firebase.firestore.FieldPath.documentId(),"desc").limit(10).get().then(function(snap){
@@ -3944,6 +3974,7 @@ function showBackupHistory(){
   });
 }
 function restoreSpecificBackup(docId){
+  if(!can("rest")){toast("Only directors can restore backups","err");return;}
   if(!FB_BACKUP_COL)return;
   if(!confirm("Restore from backup '"+docId+"'?\n\nThis will REPLACE your current data with this backup. Current data will be overwritten.\n\nMake sure you want to do this."))return;
   FB_BACKUP_COL.doc(docId).get().then(function(doc){
@@ -4040,6 +4071,7 @@ function sendEmailBackup(manual){
   });
 }
 function scheduleEmailBackup(){
+  if(!CU||CU.role!=="director")return; // email backup director only
   if(EJ_TIMER)clearInterval(EJ_TIMER);
   if(!ejConfigured())return;
   EJ_TIMER=setInterval(function(){
