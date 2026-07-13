@@ -307,6 +307,8 @@ var AUDIT_ARCHIVE_THRESHOLD=180; // archive when hot log hits this
 function auditLog(action,details){
   if(!CU)return;
   if(!D.auditLog)D.auditLog=[];
+  // Auto-archive if at threshold
+  if(D.auditLog.length>=AUDIT_ARCHIVE_THRESHOLD)archiveAuditLogs();
   D.auditLog.push({
     ts:new Date().toISOString(),
     user:CU.name,
@@ -416,8 +418,13 @@ function processWriteQueue(){
   var DforSync={};
   var keys=Object.keys(D);
   for(var ki=0;ki<keys.length;ki++){
-    if(keys[ki]==="auditLog"){continue;} // auditLog stays in localStorage only
-    DforSync[keys[ki]]=D[keys[ki]];
+    if(keys[ki]==="auditLog"){
+      // Send last 50 audit entries with every write for cross-device visibility
+      // Full log (up to 200) stays in localStorage; Firestore carries recent 50
+      DforSync.auditLog=(D.auditLog||[]).slice(-50);
+    }else{
+      DforSync[keys[ki]]=D[keys[ki]];
+    }
   }
   // Doc size guard: trim delivered orders older than 6 months from sync payload
   // Data stays in D (in-memory + localStorage); only Firestore doc is trimmed
@@ -3481,13 +3488,14 @@ function rAuditLog(pg){
     var mm=String(d.getMinutes()).padStart(2,"0");
     return dd+" "+mo+" "+d.getFullYear()+" "+hh+":"+mm;
   }
-  var cats={Orders:0,Delivery:0,Payment:0,People:0,Stock:0,Security:0};
+  var cats={Orders:0,Delivery:0,Payment:0,Complaints:0,People:0,Stock:0,Security:0};
   allLogs.forEach(function(e){
     if(!e.action)return;
     if(e.action.indexOf("ORDER")===0)cats.Orders++;
     else if(e.action.indexOf("DELIVERY")===0)cats.Delivery++;
     else if(e.action.indexOf("PAYMENT")===0||e.action.indexOf("CASH")===0)cats.Payment++;
-    else if(e.action.indexOf("USER")===0||e.action==="PIN_CHANGED"||e.action.indexOf("CUSTOMER")===0)cats.People++;
+    else if(e.action.indexOf("COMPLAINT")===0)cats.Complaints++;
+    else if(e.action.indexOf("USER")===0||e.action==="PIN_CHANGED"||e.action.indexOf("CUSTOMER")===0||e.action==="DATA_EXPORTED")cats.People++;
     else if(e.action.indexOf("STOCK")===0)cats.Stock++;
     else if(e.action.indexOf("SECURITY")===0||e.action.indexOf("UNAUTHORISED")===0)cats.Security++;
   });
