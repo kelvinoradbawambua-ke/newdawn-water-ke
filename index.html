@@ -1234,6 +1234,8 @@ function buildApp(){
   startAutoBackup();
   setTimeout(checkBackupReminder,3000);
   setTimeout(updateBackupBadge,4000); // update badge after cloud data loads
+  // Restart audit listener after login — ensures live connection with auth established
+  setTimeout(startAuditListener,1000);
   if(!FB_SETUP_DONE&&CU&&CU.role==="director"){
     setTimeout(showSetupWizard,600);
   }
