@@ -318,7 +318,16 @@ function auditLog(action,details){
   };
   // Write to Firestore subcollection — 1 doc per event, atomic, cross-device real-time
   if(FB_EVENTS_COL&&FB_READY){
-    FB_EVENTS_COL.add(entry).catch(function(){});
+    FB_EVENTS_COL.add(entry).catch(function(err){
+      // Entry already in local D.auditLog — not lost
+      // Track consecutive failures so director can be alerted
+      if(!window._auditFailCount)window._auditFailCount=0;
+      window._auditFailCount++;
+      if(window._auditFailCount>=3&&CU&&CU.role==="director"){
+        toast("⚠️ Audit log sync issue — events recorded locally only","warn");
+        window._auditFailCount=0;
+      }
+    });
   }
   // Keep local cache for immediate display (stays in sync via onSnapshot listener)
   if(!D.auditLog)D.auditLog=[];
@@ -327,11 +336,10 @@ function auditLog(action,details){
   if(D.auditLog.length>AUDIT_HOT_MAX)D.auditLog=D.auditLog.slice(-AUDIT_HOT_MAX);
 }
 function archiveAuditLogs(){
-  // Take the oldest entries, archive to Firestore, keep only the newest in hot log
   if(!D.auditLog||D.auditLog.length<AUDIT_ARCHIVE_THRESHOLD)return;
-  var toArchive=D.auditLog.slice(0,AUDIT_ARCHIVE_THRESHOLD); // oldest half
-  D.auditLog=D.auditLog.slice(AUDIT_ARCHIVE_THRESHOLD);       // keep newest
-  if(!FB_READY||!FB_BACKUP_COL)return; // if offline, old entries simply drop
+  // Only archive when online — never drop entries without confirming write
+  if(!FB_READY||!FB_BACKUP_COL)return;
+  var toArchive=D.auditLog.slice(0,AUDIT_ARCHIVE_THRESHOLD);
   var archiveId="auditlog-"+new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
   FB_BACKUP_COL.doc(archiveId).set({
     type:"audit_archive",
@@ -343,16 +351,22 @@ function archiveAuditLogs(){
   // Prune audit archives older than 90 days (free tier storage management)
   pruneAuditArchives();
 }
+var _lastAuditPrune=0;
 function pruneAuditArchives(){
-  // Prune newdawn_events older than 90 days
-  if(!FB_EVENTS_COL)return;
+  // Only prune once per hour per session — prevents excess reads
+  var now=Date.now();
+  if(now-_lastAuditPrune<3600000)return;
+  _lastAuditPrune=now;
+  if(!FB_EVENTS_COL||!FB_READY)return;
   var cutoff=new Date();
   cutoff.setDate(cutoff.getDate()-90);
   var cutoffTs=cutoff.toISOString();
   FB_EVENTS_COL
+    .orderBy("ts","asc")
     .where("ts","<",cutoffTs)
     .limit(30)
     .get().then(function(snap){
+      if(snap.empty)return;
       snap.forEach(function(d){d.ref.delete().catch(function(){});});
     }).catch(function(){});
 }
@@ -418,10 +432,7 @@ function processWriteQueue(){
   var DforSync={};
   var keys=Object.keys(D);
   for(var ki=0;ki<keys.length;ki++){
-    if(keys[ki]==="auditLog"){
-      DforSync.auditLog=(D.auditLog||[]).slice(-50); // last 50 for cross-device
-      continue;
-    } // auditLog lives in subcollection — not in main doc
+    if(keys[ki]==="auditLog")continue; // subcollection handles cross-device sync in subcollection — not in main doc
     DforSync[keys[ki]]=D[keys[ki]];
   }
   // Doc size guard: trim delivered orders older than 6 months from sync payload
@@ -594,23 +605,34 @@ function restoreFromLatestBackup(onSuccess,onFail){
   }
   tryNext();
 }
+var FB_AUDIT_UNSUB=null;
 function startAuditListener(){
-  // Listen to last 200 audit events in real-time — cross-device, immutable
+  // Real-time audit listener — no orderBy (avoids composite index requirement)
+  // Firestore auto-indexes every field ascending — ts ascending needs NO manual index
   if(!FB_EVENTS_COL)return;
-  FB_EVENTS_COL
-    .orderBy("ts","desc")
+  if(FB_AUDIT_UNSUB){try{FB_AUDIT_UNSUB();}catch(e){}FB_AUDIT_UNSUB=null;}
+  FB_AUDIT_UNSUB=FB_EVENTS_COL
+    .orderBy("ts","asc")
     .limit(200)
     .onSnapshot(function(snap){
       var events=[];
-      snap.forEach(function(d){events.push(d.data());});
-      // Sort ascending for display (newest last)
-      events.sort(function(a,b){return a.ts>b.ts?1:-1;});
+      snap.forEach(function(d){
+        var data=d.data();
+        data._docId=d.id; // store doc id for delete operations
+        events.push(data);
+      });
+      // Already ascending from Firestore — newest is last (correct for display)
       D.auditLog=events;
-      // Refresh audit log view if visible
+      // Refresh audit tab if currently visible
       var pg=document.getElementById("pg-excel");
       if(pg&&pg.classList.contains("act"))rAuditLog();
+      // Update audit stats badge if present
+      var badge=document.getElementById("audit-count-badge");
+      if(badge)badge.textContent=events.length;
     },function(err){
-      // If query fails (no index), fall back to local cache only
+      // Error visible to director — does not break app
+      var statusEl=document.getElementById("audit-sync-status");
+      if(statusEl)statusEl.innerHTML="<span style=\"color:#e74c3c\">Audit sync error — viewing local cache</span>";
     });
 }
 function startCloudListener(){
@@ -1428,11 +1450,12 @@ function wizFinish(){
 }
 function logout(){
   stopAutoSaveLoop();
-  // Trigger a final backup snapshot on logout so the daily backup is always current
   if(CU&&CU.role==="director"&&FB_READY){
     try{runAutoBackup();}catch(e){}
   }
-  if(FB_UNSUB){FB_UNSUB();FB_UNSUB=null;}
+  if(FB_UNSUB){try{FB_UNSUB();}catch(e){}FB_UNSUB=null;}
+  if(FB_AUDIT_UNSUB){try{FB_AUDIT_UNSUB();}catch(e){}FB_AUDIT_UNSUB=null;}
+  D.auditLog=[];
   FB_READY=false;CU=null;SU=null;PE="";
   renderLogin();
 }
