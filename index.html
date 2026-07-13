@@ -1856,7 +1856,9 @@ function rCusts(q,pg,sort,type){
     if(type2&&c.ctype!==type2)return false;
     if(!q2)return true;
     var lq=q2.toLowerCase();
-    var searchFields=[c.name,c.court,c.house,c.estate];if(can("vPhone"))searchFields.push(c.phone,c.phone2);
+    // vPhone gate: staff search by address only — not name or phone
+    var searchFields=can("vPhone")?[c.name,c.court,c.house,c.estate]:[c.court,c.house,c.estate];
+    if(can("vPhone"))searchFields.push(c.phone,c.phone2);
     return searchFields.some(function(v){return v&&String(v).toLowerCase().indexOf(lq)!==-1;});
   });
   // Sort
@@ -2875,7 +2877,7 @@ function rDel(q){
   var todayDel=D.orders.filter(function(o){return o.status==="Delivered"&&(o.deliveredAt===tday()||(!o.deliveredAt&&o.date===tday()));}).length;
   var totalDel=D.orders.filter(function(o){return o.status==="Delivered";}).length;
   var q2=DEL_Q||"";
-  var pendFil=q2?pend.filter(function(o){var cu=D.customers.find(function(x){return x.id===o.cId;});var lq=q2.toLowerCase();return(cu&&(cu.name.toLowerCase().indexOf(lq)!==-1||cAddr(cu).toLowerCase().indexOf(lq)!==-1))||String(o.id).indexOf(DEL_Q)!==-1||o.prod.toLowerCase().indexOf(lq)!==-1||(o.driver&&o.driver.toLowerCase().indexOf(lq)!==-1);}):pend;
+  var pendFil=q2?pend.filter(function(o){var cu=D.customers.find(function(x){return x.id===o.cId;});var lq=q2.toLowerCase();return(cu&&((can("vPhone")&&cu.name.toLowerCase().indexOf(lq)!==-1)||cAddr(cu).toLowerCase().indexOf(lq)!==-1))||String(o.id).indexOf(DEL_Q)!==-1||o.prod.toLowerCase().indexOf(lq)!==-1||(o.driver&&o.driver.toLowerCase().indexOf(lq)!==-1);}):pend;
   // Partial render: build shell once, only update results on search
   if(!el("del-srch")){
     pg.innerHTML=
@@ -3027,7 +3029,7 @@ function rInvs(q,pg){
   var pgEl=el("pg-invoices");if(!pgEl)return;
   var td=tday();
   var fil=[].concat(D.invoices).reverse();
-  if(q2){var lq=q2.toLowerCase();fil=fil.filter(function(i){var c=D.customers.find(function(x){return x.id===i.cId;});return(c&&c.name.toLowerCase().indexOf(lq)!==-1)||String(i.id).indexOf(q2)!==-1||String(i.amount).indexOf(q2)!==-1;});}
+  if(q2){var lq=q2.toLowerCase();fil=fil.filter(function(i){var c=D.customers.find(function(x){return x.id===i.cId;});return(c&&(can("vPhone")&&c.name.toLowerCase().indexOf(lq)!==-1))||String(i.id).indexOf(q2)!==-1||String(i.amount).indexOf(q2)!==-1;});}
   var paged=paginate(fil,INV_PAGE);
   // Show pending cash payments requiring acknowledgement (director/manager only)
   var pendingBanner="";
@@ -3215,7 +3217,7 @@ function rDebts(q,pg){
     return{c:c,debt:debt,lastOrd:lastOrd,invCount:invs.length,ov:ov,oldest:old};
   }).filter(function(x){return x.debt>0;});
   var q2=DEBT_Q||"";
-  if(q2){var lq=q2.toLowerCase();debtors=debtors.filter(function(x){return x.c.name.toLowerCase().indexOf(lq)!==-1||cAddr(x.c).toLowerCase().indexOf(lq)!==-1||(can("vPhone")&&x.c.phone&&x.c.phone.indexOf(q2)!==-1);});}
+  if(q2){var lq=q2.toLowerCase();debtors=debtors.filter(function(x){return (can("vPhone")&&x.c.name.toLowerCase().indexOf(lq)!==-1)||cAddr(x.c).toLowerCase().indexOf(lq)!==-1||(can("vPhone")&&x.c.phone&&x.c.phone.indexOf(q2)!==-1);});}
   var total=debtors.reduce(function(a,x){return a+x.debt;},0);
   if(DEBT_SORT==="name")debtors.sort(function(a,b){return a.c.name.localeCompare(b.c.name);});
   else if(DEBT_SORT==="overdue")debtors.sort(function(a,b){return b.ov-a.ov;});
@@ -3239,7 +3241,7 @@ function rDebts(q,pg){
   if(_dcards)_dcards.innerHTML=
     "<div class=\"stat sr\"><div class=\"sl\">Total outstanding</div><div class=\"sv\" style=\"color:#c0392b\">KSh "+total.toLocaleString()+"</div><div class=\"ss\">"+debtors.length+" customers</div></div>"+
     "<div class=\"stat sa\"><div class=\"sl\">Overdue invoices</div><div class=\"sv\">"+D.invoices.filter(function(i){return i.paid<i.amount&&i.due<td;}).length+"</div></div>"+
-    "<div class=\"stat sn\"><div class=\"sl\">Largest debt</div><div class=\"sv\">"+(debtors.length?"KSh "+debtors[0].debt.toLocaleString():"KSh 0")+"</div><div class=\"ss\">"+(debtors.length?debtors[0].c.name:"")+"</div></div>";
+    "<div class=\"stat sn\"><div class=\"sl\">Largest debt</div><div class=\"sv\">"+(debtors.length?"KSh "+debtors[0].debt.toLocaleString():"KSh 0")+"</div><div class=\"ss\">"+(debtors.length?(can("vPhone")?debtors[0].c.name:maskName(debtors[0].c.name)):"")+"</div></div>";
   var _dsort=el("debt-sort");
   if(_dsort)_dsort.innerHTML=
     "<div style=\"display:flex;gap:6px;margin:8px 0;align-items:center;flex-wrap:wrap\">"+
