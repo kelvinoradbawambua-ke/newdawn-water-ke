@@ -750,8 +750,14 @@ function startCloudListener(){
     if((!isOwnWrite||!weAreNewer)&&!weHaveMore){
       // Remote update from another device — merge their data in
       if(data.D){
-        // Preserve local audit cache across D= overwrite (subcollection listener repopulates)
-        var _prevAuditLog=D.auditLog&&D.auditLog.length?D.auditLog:[];
+        // Save current audit log before D= overwrites it
+        var _prevAuditLog=D.auditLog&&D.auditLog.length?D.auditLog.slice():[];
+        // Merge any audit entries from main doc into saved log BEFORE overwrite
+        if(data.D&&data.D.auditLog&&data.D.auditLog.length){
+          var _ex={};_prevAuditLog.forEach(function(e){if(e.ts)_ex[e.ts]=true;});
+          data.D.auditLog.forEach(function(e){if(e.ts&&!_ex[e.ts]){_prevAuditLog.push(e);_ex[e.ts]=true;}});
+          _prevAuditLog.sort(function(a,b){return a.ts<b.ts?-1:a.ts>b.ts?1:0;});
+        }
         D=data.D;
         if(!D.routes)D.routes=[];
         if(!D.complaints)D.complaints=[];
@@ -760,11 +766,7 @@ function startCloudListener(){
         // Carry backup stamp across sync
         if(data.D._lastDailyBackup)D._lastDailyBackup=data.D._lastDailyBackup;
         else if(data._lastDailyBackup)D._lastDailyBackup=data._lastDailyBackup;
-        // Merge audit from main doc (belt-and-suspenders cross-device sync)
-        if(data.D&&data.D.auditLog&&data.D.auditLog.length){
-          _mergeAuditEvents(data.D.auditLog);
-        }
-        // Restore merged auditLog after D= overwrite
+        // Restore the merged audit log
         D.auditLog=_prevAuditLog;
       }
       if(data.USERS&&data.USERS.length)USERS=data.USERS;
