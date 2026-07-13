@@ -609,13 +609,13 @@ function restoreFromLatestBackup(onSuccess,onFail){
 }
 var FB_AUDIT_UNSUB=null;
 function startAuditListener(){
-  // Real-time audit listener — no orderBy (avoids composite index requirement)
-  // Firestore auto-indexes every field ascending — ts ascending needs NO manual index
+  // No orderBy — avoids ALL index requirements on subcollections
+  // Firestore .add() generates time-sortable document IDs naturally
+  // We sort client-side by ts after fetch — zero index configuration needed
   if(!FB_EVENTS_COL)return;
   if(FB_AUDIT_UNSUB){try{FB_AUDIT_UNSUB();}catch(e){}FB_AUDIT_UNSUB=null;}
   FB_AUDIT_UNSUB=FB_EVENTS_COL
-    .orderBy("ts","desc")
-    .limit(200)
+    .limit(500)
     .onSnapshot(function(snap){
       var events=[];
       snap.forEach(function(d){
@@ -623,19 +623,20 @@ function startAuditListener(){
         data._docId=d.id;
         events.push(data);
       });
-      // desc from Firestore = newest first → reverse for display (oldest→newest)
-      events.sort(function(a,b){return a.ts>b.ts?1:-1;}); // asc for D.auditLog
+      // Sort ascending by ts client-side — reliable, no index required
+      events.sort(function(a,b){
+        if(a.ts<b.ts)return -1;
+        if(a.ts>b.ts)return 1;
+        return 0;
+      });
+      // Keep only last 200 after sort (newest 200)
+      if(events.length>200)events=events.slice(-200);
       D.auditLog=events;
-      // Refresh audit tab if currently visible
       var pg=document.getElementById("pg-excel");
       if(pg&&pg.classList.contains("act"))rAuditLog();
-      // Update audit stats badge if present
-      var badge=document.getElementById("audit-count-badge");
-      if(badge)badge.textContent=events.length;
     },function(err){
-      // Error visible to director — does not break app
       var statusEl=document.getElementById("audit-sync-status");
-      if(statusEl)statusEl.innerHTML="<span style=\"color:#e74c3c\">Audit sync error — viewing local cache</span>";
+      if(statusEl)statusEl.innerHTML="<span style=\"color:#e74c3c\"><i class=\"ti ti-wifi-off\"></i> Audit sync error</span>";
     });
 }
 function startCloudListener(){
