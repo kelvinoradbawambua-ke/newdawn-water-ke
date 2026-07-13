@@ -488,6 +488,11 @@ function writeBackup(docId){
   try{
     var payload=JSON.parse(JSON.stringify(getBackupPayload()));
     FB_BACKUP_COL.doc(docId).set(payload).then(function(){
+      // Stamp completion in main doc so all devices know a backup happened
+      if(docId.indexOf("daily-")===0&&FB_DOC_REF){
+        D._lastDailyBackup=tday();
+        FB_DOC_REF.set({_lastDailyBackup:tday()},{merge:true}).catch(function(){});
+      }
     }).catch(function(e){
       /* backup write failed silently */
     });
@@ -664,6 +669,9 @@ function startCloudListener(){
         if(!D.complaints)D.complaints=[];
         if(!D.offers)D.offers=[];
         if(!D.pendingPayments)D.pendingPayments=[];
+        // Carry backup stamp across sync so all devices share knowledge
+        if(data.D._lastDailyBackup)D._lastDailyBackup=data.D._lastDailyBackup;
+        else if(data._lastDailyBackup)D._lastDailyBackup=data._lastDailyBackup;
         // Restore auditLog — merge remote (if any) with local
         if(!D.auditLog||!D.auditLog.length){D.auditLog=_prevAuditLog;}
         else{
@@ -1142,6 +1150,7 @@ function buildApp(){
   scheduleEmailBackup();
   startAutoBackup();
   setTimeout(checkBackupReminder,3000);
+  setTimeout(updateBackupBadge,4000); // update badge after cloud data loads
   if(!FB_SETUP_DONE&&CU&&CU.role==="director"){
     setTimeout(showSetupWizard,600);
   }
@@ -1392,7 +1401,16 @@ function wizFinish(){
     setTimeout(wizFinish,3000);
   });
 }
-function logout(){stopAutoSaveLoop();if(FB_UNSUB){FB_UNSUB();FB_UNSUB=null;}FB_READY=false;CU=null;SU=null;PE="";renderLogin();}
+function logout(){
+  stopAutoSaveLoop();
+  // Trigger a final backup snapshot on logout so the daily backup is always current
+  if(CU&&CU.role==="director"&&FB_READY){
+    try{runAutoBackup();}catch(e){}
+  }
+  if(FB_UNSUB){FB_UNSUB();FB_UNSUB=null;}
+  FB_READY=false;CU=null;SU=null;PE="";
+  renderLogin();
+}
 function nav(p,btn){
   if(!can(p))return;
   document.querySelectorAll(".pg").forEach(function(x){x.classList.remove("act");});
@@ -3426,6 +3444,7 @@ function rAuditLog(pg){
     "STOCK_RESTOCKED":  {ic:"ti-package-import",col:"#27ae60",bg:"#f0fdf4",label:"Restocked"},
     "UNAUTHORISED_DLV_ATTEMPT":{ic:"ti-shield-x",col:"#e74c3c",bg:"#fff0f0",label:"Unauthorised attempt"},
     "SECURITY_VIOLATION":{ic:"ti-shield-exclamation",col:"#c0392b",bg:"#fff0f0",label:"Security block"},
+    "DATA_EXPORTED":    {ic:"ti-download",col:"#27ae60",bg:"#f0fdf4",label:"Data exported"},
   };
   var allTypes=Object.keys(typeMap);
   var allLogs=[].concat(D.auditLog||[]).reverse();
@@ -3582,7 +3601,8 @@ function rExcel(){
     "</div>"+
     "<div class=\"card\" style=\"border:2px solid #7c3aed;background:linear-gradient(135deg,#faf5ff,#fff)\">"+
       "<div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-database-backup\" style=\"color:#7c3aed\"></i>Automatic Cloud Backups</div>"+
-        "<span class=\"badge\" style=\"background:#7c3aed;color:#fff\">Always ON</span></div>"+
+        "<span class=\"badge\" style=\"background:#7c3aed;color:#fff\">Always ON</span>"+
+        "<span id=\"backup-status-badge\" style=\"display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:99px;font-size:11px;font-weight:700;margin-left:6px;cursor:default\">Checking...</span></div>"+
       "<div style=\"font-size:12px;color:var(--tx2);line-height:1.8;margin-bottom:12px\">"+
         "Your data is automatically backed up to a <strong>separate Firestore collection</strong> independent of the main data. "+
         "If the main database is ever wiped or corrupted, the system auto-restores from the most recent backup on next load.<br><br>"+
@@ -3859,8 +3879,9 @@ function saveXL(){
   XLSX.writeFile(wb,"NewDawn_Backup_"+ts+".xlsx");
   localStorage.setItem("nd_last_backup",tday());
   saved();var l=el("lsl");if(l)l.innerHTML="Saved at "+new Date().toLocaleTimeString();
-  auditLog("USER_DELETED","Team member removed by "+CU.name+" ("+CU.role+")");
-toast("Backup saved — keep this file safe!");
+  auditLog("DATA_EXPORTED","Excel backup downloaded by "+CU.name+" ("+CU.role+")");
+  updateBackupBadge();
+  toast("Backup saved — keep this file safe!");
 }
 function printInvoice(invId){
   var i=D.invoices.find(function(x){return x.id===invId;});if(!i)return;
@@ -3995,15 +4016,51 @@ function restoreSpecificBackup(docId){
 }
 function checkBackupReminder(){
   if(!CU||CU.role!=="director"||!can("exp"))return;
-  var last=localStorage.getItem("nd_last_backup")||"";
-  var today=tday();
-  if(last===today)return; // already backed up today
-  var daysSince=last?Math.floor((new Date(today)-new Date(last))/(1000*60*60*24)):999;
-  var msg=daysSince>=1?"⚠️ No backup taken "+(daysSince===999?"yet":(daysSince===1?"since yesterday":"in "+daysSince+" days"))+".\n\nYour data only exists in the cloud. If something goes wrong you could lose everything.\n\nDownload a backup now?":"";
-  if(msg){
+  // Never nag on mobile — cloud backups run automatically; Excel download is meaningless on phone
+  var isMobile=window.innerWidth<768||navigator.maxTouchPoints>0;
+  // Check cloud backup stamp (cross-device truth) first
+  var cloudBackupToday=D._lastDailyBackup&&D._lastDailyBackup===tday();
+  // Check manual Excel download (laptop only)
+  var localBackupToday=localStorage.getItem("nd_last_backup")===tday();
+  // Update the badge in the Data tab (always, silent)
+  updateBackupBadge();
+  // No dialog if: mobile, OR cloud backed up today, OR manual backup today
+  if(isMobile||cloudBackupToday||localBackupToday)return;
+  // Only interrupt with a dialog if genuinely no backup in 3+ days
+  var lastCloud=D._lastDailyBackup||"";
+  var lastManual=localStorage.getItem("nd_last_backup")||"";
+  var lastAny=lastCloud>lastManual?lastCloud:lastManual;
+  var daysSince=lastAny?Math.floor((new Date(tday())-new Date(lastAny))/(1000*60*60*24)):999;
+  if(daysSince>=3){
     setTimeout(function(){
+      var msg="⚠️ No backup in "+(daysSince===999?"a while":daysSince+" days")+".";
+      msg+="\n\nCloud backups run automatically, but downloading a local copy is extra protection.";
+      msg+="\n\nDownload a backup now?";
       if(confirm(msg)){saveXL();}
-    },2000);
+    },3000);
+  }
+}
+function updateBackupBadge(){
+  // Update backup status badge in Data tab without interrupting the user
+  var badge=el("backup-status-badge");
+  if(!badge)return;
+  var cloudBackupToday=D._lastDailyBackup&&D._lastDailyBackup===tday();
+  var manualToday=localStorage.getItem("nd_last_backup")===tday();
+  var lastCloud=D._lastDailyBackup||"";
+  var lastManual=localStorage.getItem("nd_last_backup")||"";
+  var lastAny=lastCloud>lastManual?lastCloud:lastManual;
+  var daysSince=lastAny?Math.floor((new Date(tday())-new Date(lastAny))/(1000*60*60*24)):999;
+  if(cloudBackupToday||manualToday){
+    badge.innerHTML="<i class=\"ti ti-shield-check\"></i> Backed up today";
+    badge.style.background="#27ae60";badge.style.color="#fff";
+  }else if(daysSince<=2){
+    badge.innerHTML="<i class=\"ti ti-shield\"></i> Last backup: "+lastAny;
+    badge.style.background="#f39c12";badge.style.color="#fff";
+  }else{
+    badge.innerHTML="<i class=\"ti ti-shield-off\"></i> No recent backup — click to download";
+    badge.style.background="#e74c3c";badge.style.color="#fff";
+    badge.setAttribute("onclick","saveXL()");
+    badge.style.cursor="pointer";
   }
 }
 
