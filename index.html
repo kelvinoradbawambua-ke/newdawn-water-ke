@@ -307,12 +307,14 @@ function dirty(){
 var AUDIT_HOT_MAX=200; // entries kept live in main Firestore doc
 var AUDIT_ARCHIVE_THRESHOLD=180; // archive when hot log hits this
 function auditLog(action,details){
-  if(!CU)return;
+  // Use CU (logged-in user) or SU (selected but not yet verified) for pre-login events
+  var actor=CU||SU;
+  if(!actor)return;
   var entry={
     ts:new Date().toISOString(),
-    user:CU.name,
-    role:CU.role,
-    uid:CU.id,
+    user:actor.name,
+    role:actor.role,
+    uid:actor.id,
     action:action,
     details:details||""
   };
@@ -321,8 +323,8 @@ function auditLog(action,details){
     FB_EVENTS_COL.add(entry).catch(function(err){
       if(!window._auditFailCount)window._auditFailCount=0;
       window._auditFailCount++;
-      if(window._auditFailCount>=3&&CU&&CU.role==="director"){
-        toast("⚠️ Audit log sync issue — events recorded locally only","warn");
+      if(window._auditFailCount>=3){
+        if(CU&&CU.role==="director")toast("⚠️ Audit log sync issue — events recorded locally only","warn");
         window._auditFailCount=0;
       }
     });
@@ -331,11 +333,15 @@ function auditLog(action,details){
     if(!window._auditQueue)window._auditQueue=[];
     window._auditQueue.push(entry);
   }
-  // Keep local cache for immediate display (stays in sync via onSnapshot listener)
+  // Keep local cache for immediate display
   if(!D.auditLog)D.auditLog=[];
   D.auditLog.push(entry);
-  // Bound local cache to AUDIT_HOT_MAX — subcollection holds the full history
   if(D.auditLog.length>AUDIT_HOT_MAX)D.auditLog=D.auditLog.slice(-AUDIT_HOT_MAX);
+  // Refresh audit view immediately if visible — don't wait for Firestore roundtrip
+  try{
+    var _ap=document.getElementById("pg-excel");
+    if(_ap&&_ap.classList.contains("act"))rAuditLog();
+  }catch(e){}
 }
 function archiveAuditLogs(){
   if(!D.auditLog||D.auditLog.length<AUDIT_ARCHIVE_THRESHOLD)return;
