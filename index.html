@@ -275,6 +275,7 @@ function custDebt(id){
   return D.invoices.filter(function(i){
     if(i.cId!==id)return false;
     if(i.paid>=i.amount)return false; // fully paid, no debt
+    if(i.voided)return false; // voided/written-off — excluded from debt
     // Check if linked to a cancelled or deleted order
     if(i.notes&&i.notes.indexOf("#")!==-1){
       var match=i.notes.match(/#(\d+)/);
@@ -1250,8 +1251,10 @@ function buildApp(){
   startAutoBackup();
   setTimeout(checkBackupReminder,3000);
   setTimeout(updateBackupBadge,4000); // update badge after cloud data loads
+  setTimeout(updateStockBadge,2000); // low stock badge on nav
   // Restart audit listener after login — ensures live connection with auth established
   setTimeout(startAuditListener,1000);
+  setTimeout(runIntegrityCheck,3500);
   if(!FB_SETUP_DONE&&CU&&CU.role==="director"){
     setTimeout(showSetupWizard,600);
   }
@@ -2052,6 +2055,17 @@ function saveCust(){
       return;
     }
   }
+  // Duplicate detection: same house+court combination
+  var house2=el("chouse").value.trim();var court2=el("ccourt").value.trim();
+  if(house2&&court2){
+    var dupAddr=D.customers.find(function(x){
+      return String(x.house).trim()===house2&&String(x.court).trim()===court2;
+    });
+    if(dupAddr){
+      if(!confirm("⚠️ Possible duplicate\n\nA customer at Court "+court2+", No."+house2+" already exists:\n"
+        +(can("vPhone")?dupAddr.name:maskName(dupAddr.name))+"\n\nContinue adding a new customer?"))return;
+    }
+  }
   D.customers.push({id:uid(),name:n,phone:ph,phone2:el("cph2").value,idno:el("cid").value,estate:el("cestate").value,court:el("ccourt").value,house:el("chouse").value,htype:el("chtype").value,road:el("croad").value,zone:el("czone").value,ctype:el("ctype").value,credit:parseFloat(el("ccl").value)||0,notes:el("cnotes").value,created:tday()});
   ["cn","cph","cph2","cid","cestate","ccourt","chouse","croad","czone","cnotes"].forEach(function(id){el(id).value="";});el("ccl").value="0";
   cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer added");
@@ -2135,6 +2149,88 @@ function openPay(cId){
   el("pay-cid").value=cId;
   el("pay-info").innerHTML="<div style=\"font-weight:800;font-size:14px;margin-bottom:4px\">"+(can("vPhone")?c.name:maskName(c.name))+"</div><div style=\"color:var(--tx2);font-size:12px\">"+cAddr(c)+"</div><div style=\"margin-top:7px;font-size:13px;color:#c0392b;font-weight:700\">Outstanding: KSh "+debt.toLocaleString()+"</div>";
   el("pay-date").value=tday();el("pay-amt").value="";el("pay-ref").value="";om("m-pay");
+}
+function showPayments(invId){
+  if(!can("rest")){toast("Director only","err");return;}
+  var inv=D.invoices.find(function(x){return x.id===invId;});
+  if(!inv){toast("Invoice not found","err");return;}
+  var pays=inv.payments||[];
+  var html="<div style=\"padding:16px 20px\">"
+    +"<div style=\"font-size:14px;font-weight:800;margin-bottom:12px;color:var(--nv)\">Invoice #"+invId+" — Payments</div>";
+  if(!pays.length){
+    html+="<div style=\"color:var(--tx2);padding:20px 0;text-align:center\">No payments recorded</div>";
+  }else{
+    html+=pays.map(function(p,idx){
+      return "<div style=\"display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--bd)\">"
+        +"<div><div style=\"font-weight:700\">KSh "+p.amt.toLocaleString()+"</div>"
+        +"<div style=\"font-size:11px;color:var(--tx2)\">"+p.method+" &middot; "+p.date+(p.ref?" &middot; "+p.ref:"")+"</div></div>"
+        +"<button class=\"btn btn-xs btn-red\" onclick=\"reversePayment("+invId+","+idx+");cm('m-generic');\" title=\"Reverse this payment\">"
+        +"<i class=\"ti ti-rotate-clockwise\"></i> Reverse</button></div>";
+    }).join("");
+  }
+  html+="<div style=\"margin-top:14px;display:flex;justify-content:space-between;align-items:center\">"
+    +"<div style=\"font-size:12px;color:var(--tx2)\">Total paid: <strong>KSh "+inv.paid.toLocaleString()+"</strong></div>"
+    +"<button class=\"btn\" onclick=\"cm('m-generic')\">Close</button></div></div>";
+  var gm=el("m-generic");var gb=el("m-generic-body");
+  if(gb)gb.innerHTML=html;
+  if(gm)om("m-generic");
+}
+function reversePayment(invId,payIdx){
+  if(!can("rest")){toast("Director only","err");return;}
+  var inv=D.invoices.find(function(x){return x.id===invId;});
+  if(!inv){toast("Invoice not found","err");return;}
+  var pays=inv.payments||[];
+  if(payIdx<0||payIdx>=pays.length){toast("Payment not found","err");return;}
+  var pay=pays[payIdx];
+  var msg="Reverse payment of KSh "+pay.amt.toLocaleString()+" ("+pay.method+", "+pay.date+")?\n\n"
+    +"This will reduce the invoice paid amount by KSh "+pay.amt.toLocaleString()+"\n"
+    +"and is recorded in the audit log.";
+  if(!confirm(msg))return;
+  // Remove the payment entry
+  pays.splice(payIdx,1);
+  // Recalculate paid total from remaining payments — source of truth
+  inv.paid=pays.reduce(function(s,p){return s+(p.amt||0);},0);
+  inv.payments=pays;
+  // Sync linked order payment status
+  var ordMatch=inv.notes&&inv.notes.match(/#(\d+)/);
+  if(ordMatch){
+    var o=D.orders.find(function(x){return String(x.id)===ordMatch[1];});
+    if(o){
+      if(inv.paid>=inv.amount){o.paid="Paid";}else if(inv.paid>0){o.paid="Partial";}else{o.paid="Unpaid";}
+      o.amtPaid=inv.paid;
+    }
+  }
+  auditLog("PAYMENT_RECORDED","REVERSAL: KSh "+pay.amt+" removed from Invoice #"+invId+" by "+CU.name+". Method: "+pay.method+". New paid total: KSh "+inv.paid);
+  dirty();
+  if(el("pg-invoices")&&el("pg-invoices").classList.contains("act"))rInvs(undefined,INV_PAGE);
+  if(el("pg-orders")&&el("pg-orders").classList.contains("act"))rOrds(undefined,ORD_PAGE);
+  if(el("pg-debts")&&el("pg-debts").classList.contains("act"))rDebts();
+  toast("Payment reversed — Invoice #"+invId+" updated","ok");
+}
+function voidInvoice(invId){
+  if(!can("rest")){toast("Director only","err");return;}
+  var inv=D.invoices.find(function(x){return x.id===invId;});
+  if(!inv){toast("Invoice not found","err");return;}
+  if(inv.voided){toast("Already voided","err");return;}
+  var bal=inv.amount-inv.paid;
+  var reason=prompt("Void Invoice #"+invId+" (KSh "+bal.toLocaleString()+" outstanding)?\n\n"
+    +"Enter reason (e.g. Bad debt, Duplicate, Error):");
+  if(!reason||!reason.trim())return;
+  inv.voided=true;
+  inv.voidedBy=CU.name;
+  inv.voidedAt=tday();
+  inv.voidReason=reason.trim();
+  // Sync linked order — mark as voided so it no longer shows as debt
+  var ordMatch=inv.notes&&inv.notes.match(/#(\d+)/);
+  if(ordMatch){
+    var o=D.orders.find(function(x){return String(x.id)===ordMatch[1];});
+    if(o&&o.status!=="Delivered")o.paid="Voided";
+  }
+  auditLog("PAYMENT_RECORDED","VOID: Invoice #"+invId+" voided by "+CU.name+". Reason: "+reason.trim()+". Amount written off: KSh "+bal);
+  dirty();
+  if(el("pg-invoices")&&el("pg-invoices").classList.contains("act"))rInvs(undefined,INV_PAGE);
+  if(el("pg-debts")&&el("pg-debts").classList.contains("act"))rDebts();
+  toast("Invoice #"+invId+" voided — removed from debt","ok");
 }
 function recPay(){
   if(!can("mPaid")){toast("No permission to record payments","err");return;}
@@ -2677,7 +2773,12 @@ function saveOrd(){
   }else if(st&&st.qty<qty){
     if(!confirm("⚠️ Stock Alert\n\n"+pn+" has only "+st.qty+" unit(s) in stock but you are ordering "+qty+".\n\nThe order will be recorded. Please restock soon.\n\nContinue?"))return;
   }
-  if(st)st.qty=Math.max(0,st.qty-qty);
+  if(st){
+    st.qty=Math.max(0,st.qty-qty);
+    if(!st.history)st.history=[];
+    st.history.push({ts:tday(),type:"sale",qty:-qty,by:CU.name,ordId:newOrdId,bal:st.qty});
+    if(st.history.length>50)st.history=st.history.slice(-50);
+  }
   var total=price*qty;
   var amtPaid=can("mPaid")?(parseFloat(el("oamt").value)||0):0;
   var payStatus=can("mPaid")?el("opay").value:"Unpaid";
@@ -2800,6 +2901,9 @@ function completeDlv(){
         if(!confirm("⚠️ Only "+st.qty+" in stock but delivering "+o.qty+".\n\nStock will go to 0. Continue?"))return;
       }
       st.qty=Math.max(0,st.qty-o.qty);
+      if(!st.history)st.history=[];
+      st.history.push({ts:tday(),type:"sale",qty:-o.qty,by:CU.name,ordId:o.id,bal:st.qty});
+      if(st.history.length>50)st.history=st.history.slice(-50);
     }
     var stCost=D.stock.find(function(s){return s.name===confirmedProd;});
     // Update order with confirmed product
@@ -2903,7 +3007,12 @@ function cancelO(id){
   // Restore stock
   var skipStockRestore=(o.prodConfirmed===false);
   var st=D.stock.find(function(s){return s.name===o.prod;});
-  if(st&&!skipStockRestore)st.qty+=o.qty;
+  if(st&&!skipStockRestore){
+    st.qty+=o.qty;
+    if(!st.history)st.history=[];
+    st.history.push({ts:tday(),type:"restore",qty:+o.qty,by:CU.name,ordId:id,bal:st.qty});
+    if(st.history.length>50)st.history=st.history.slice(-50);
+  }
   // Update order status
   o.status="Cancelled";
   o.paid=hasPaid?"Partial":"Cancelled";
@@ -3026,6 +3135,53 @@ function rDel(q){
     "</tbody></table></div>";
 }
 
+function showStockHistory(sid){
+  var s=D.stock.find(function(x){return x.id===sid;});if(!s)return;
+  var hist=(s.history||[]).slice().reverse(); // newest first
+  var html="<div style=\"padding:16px 20px\">"
+    +"<div style=\"font-size:14px;font-weight:800;margin-bottom:12px;color:var(--nv)\">"
+    +s.name+" — Stock Movement History</div>";
+  if(!hist.length){
+    html+="<div style=\"color:var(--tx2);padding:20px 0;text-align:center\">No movement history yet</div>";
+  }else{
+    html+="<table style=\"width:100%;border-collapse:collapse;font-size:12px\">"
+      +"<thead><tr style=\"background:var(--nv)\"><th style=\"padding:7px 10px;color:#fff;text-align:left\">Date</th>"
+      +"<th style=\"padding:7px 10px;color:#fff;text-align:left\">Type</th>"
+      +"<th style=\"padding:7px 10px;color:#fff;text-align:right\">Change</th>"
+      +"<th style=\"padding:7px 10px;color:#fff;text-align:right\">Balance</th>"
+      +"<th style=\"padding:7px 10px;color:#fff;text-align:left\">By</th></tr></thead><tbody>";
+    html+=hist.map(function(h){
+      var typeCol=h.type==="restock"?"#27ae60":h.type==="restore"?"#3498db":"#e74c3c";
+      var typeLabel=h.type==="restock"?"Restock":h.type==="restore"?"Restore (cancel)":"Sale";
+      var qtyStr=(h.qty>0?"+":"")+h.qty;
+      return "<tr style=\"border-bottom:1px solid var(--bd)\">"
+        +"<td style=\"padding:7px 10px\">"+h.ts+"</td>"
+        +"<td style=\"padding:7px 10px\"><span style=\"color:"+typeCol+";font-weight:700\">"+typeLabel+"</span></td>"
+        +"<td style=\"padding:7px 10px;text-align:right;font-weight:700;color:"+typeCol+"\">" +qtyStr+"</td>"
+        +"<td style=\"padding:7px 10px;text-align:right\">"+h.bal+"</td>"
+        +"<td style=\"padding:7px 10px;color:var(--tx2)\">"+h.by+"</td></tr>";
+    }).join("");
+    html+="</tbody></table>";
+  }
+  html+="<div style=\"margin-top:14px;text-align:right\"><button class=\"btn\" onclick=\"cm('m-generic')\">Close</button></div></div>";
+  var gb=el("m-generic-body");if(gb)gb.innerHTML=html;
+  om("m-generic");
+}
+function updateStockBadge(){
+  var low=D.stock.filter(function(s){return s.qty<=s.min;}).length;
+  var btn=document.getElementById("nav-stock-btn");
+  if(!btn)return;
+  // Remove existing badge
+  var oldBadge=btn.querySelector(".nb");
+  if(oldBadge)oldBadge.parentNode.removeChild(oldBadge);
+  if(low>0){
+    var badge=document.createElement("span");
+    badge.className="nb";
+    badge.textContent=low;
+    badge.title=low+" product(s) at or below minimum stock";
+    btn.appendChild(badge);
+  }
+}
 function rStock(q,pg){
   if(q!==undefined)STK_Q=q;
   if(pg!==undefined)STK_PAGE=pg;
@@ -3057,7 +3213,8 @@ function rStock(q,pg){
           "<td><div style=\"font-weight:800;color:"+(low?"#c0392b":"var(--tx)")+"\">"+s.qty+"</div><div class=\"prog\" style=\"width:56px;margin-top:3px\"><div class=\"progb\" style=\"width:"+pct+"%;background:"+col+"\"></div></div></td>"+
           "<td>"+s.min+"</td>"+
           "<td>"+(low?"<span class=\"badge br\"><i class=\"ti ti-alert-triangle\"></i> Low</span>":"<span class=\"badge bg\"><i class=\"ti ti-check\"></i> OK</span>")+"</td>"+
-          "<td><div class=\"ac\">"+(can("eSt")?"<button class=\"btn btn-xs btn-navy\" onclick=\"editSt("+s.id+")\" title=\"Edit product\"><i class=\"ti ti-edit\"></i></button>":"")+(can("dSt")?"<button class=\"btn btn-xs btn-red\" onclick=\"delS("+s.id+")\" title=\"Delete product\"><i class=\"ti ti-trash\"></i></button>":"")+"</div></td></tr>";
+          "<td><div class=\"ac\">"+(can("eSt")?"<button class=\"btn btn-xs btn-navy\" onclick=\"editSt("+s.id+")\" title=\"Edit product\"><i class=\"ti ti-edit\"></i></button>":"")+(can("vRev")?"<button class=\"btn btn-xs\" onclick=\"showStockHistory("+s.id+")\" title=\"Movement history\" style=\"background:#e8f4fd;color:#0c5460\"><i class=\"ti ti-history\"></i></button>":"")+
+          (can("dSt")?"<button class=\"btn btn-xs btn-red\" onclick=\"delS("+s.id+")\" title=\"Delete product\"><i class=\"ti ti-trash\"></i></button>":"")+"</div></td></tr>";
       }).join(""):"<tr><td colspan=\"8\"><div class=\"te\"><i class=\"ti ti-package\"></i><p>"+(q2?"No results for \""+q2+"\"":"No products yet")+"</p></div></td></tr>")+
     "</tbody></table></div>"+
     pgBar(paged.page,paged.pages,paged.total,"rStock(undefined,");
@@ -3099,7 +3256,9 @@ function editSt(id){
   om("m-s");
 }
 function prepRS(){var rp=el("rp");if(rp)rp.innerHTML=D.stock.map(function(x){return "<option value=\""+x.id+"\">"+x.name+" ("+x.qty+" in stock)</option>";}).join("");om("m-rs");}
-function doRS(){if(!can("aSt")){toast("Permission denied","err");return;}var id=parseInt(el("rp").value);var q=parseInt(el("rq").value)||0;if(q<=0){toast("Enter quantity to add","err");return;}var p=D.stock.find(function(s){return s.id===id;});if(p){p.qty+=q;auditLog("STOCK_RESTOCKED","+"+q+" units of "+p.name+" by "+CU.name+" ("+CU.role+"). Now: "+p.qty);toast(p.name+" restocked +"+q+" — now "+p.qty+" in stock");}el("rq").value="";cm("m-rs");rStock(undefined,STK_PAGE);if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();dirty();}
+function doRS(){if(!can("aSt")){toast("Permission denied","err");return;}var id=parseInt(el("rp").value);var q=parseInt(el("rq").value)||0;if(q<=0){toast("Enter quantity to add","err");return;}var p=D.stock.find(function(s){return s.id===id;});if(p){p.qty+=q;
+  if(!p.history)p.history=[];p.history.push({ts:tday(),type:"restock",qty:q,by:CU.name,bal:p.qty});if(p.history.length>50)p.history=p.history.slice(-50);
+  auditLog("STOCK_RESTOCKED","+"+q+" units of "+p.name+" by "+CU.name+" ("+CU.role+"). Now: "+p.qty);toast(p.name+" restocked +"+q+" — now "+p.qty+" in stock");}el("rq").value="";cm("m-rs");rStock(undefined,STK_PAGE);if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();updateStockBadge();dirty();}
 function delS(id){
   if(!can("dSt"))return;
   var s=D.stock.find(function(x){return x.id===id;});if(!s)return;
@@ -3176,7 +3335,9 @@ function rInvs(q,pg){
       "<td style=\"font-size:11px\">"+(lp?"<div>"+fmt(lp.date)+"</div><div class=\"ca\">KSh "+lp.amt.toLocaleString()+" &middot; "+lp.method+"</div>":"-")+"</td>"+
       "<td>"+st+"</td>"+
       "<td><div class=\"ac\">"+
-        (can("eInv")&&(!i.payments||!i.payments.length)?"<button class=\"btn btn-xs btn-navy\" onclick=\"editInv("+i.id+")\" title=\"Edit\"><i class=\"ti ti-edit\"></i></button>":"")+
+        (can("eInv")&&(!i.payments||!i.payments.length||can("rest"))?"<button class=\"btn btn-xs btn-navy\" onclick=\"editInv("+i.id+")\" title=\"Edit\"><i class=\"ti ti-edit\"></i></button>":"")+
+        (can("rest")&&i.payments&&i.payments.length?"<button class=\"btn btn-xs\" onclick=\"showPayments("+i.id+")\" title=\"View &amp; reverse payments\" style=\"background:#fff8e1;color:#856404;border-color:#f0d070\"><i class=\"ti ti-history\"></i></button>":"")+
+        (can("rest")&&!i.voided&&bal>0?"<button class=\"btn btn-xs btn-red\" onclick=\"voidInvoice("+i.id+")\" title=\"Void invoice\"><i class=\"ti ti-ban\"></i></button>":"")+
         (can("mPaid")&&bal>0?"<button class=\"btn btn-xs btn-grn\" onclick=\"payI("+i.id+")\" title=\"Mark paid\"><i class=\"ti ti-check\"></i></button>":"")+
         (can("mPaid")&&bal>0?"<button class=\"btn btn-xs btn-gold\" onclick=\"openPayInv("+i.id+")\" title=\"Partial payment\"><i class=\"ti ti-cash\"></i></button>":"")+
       "<button class=\"btn btn-xs\" onclick=\"printInvoice("+i.id+")\" style=\"background:#7c3aed;color:#fff\" title=\"Print\"><i class=\"ti ti-printer\"></i></button>"+
@@ -3204,7 +3365,10 @@ function prepIv(){
 function editInv(id){
   if(!can("eInv"))return;
   var i=D.invoices.find(function(x){return x.id===id;});if(!i)return;
-  if(i.payments&&i.payments.length){toast("Cannot edit - payments already recorded against this invoice","err");return;}
+  // Directors can edit even with payments — generates audit trail
+  if(i.payments&&i.payments.length&&!can("rest")){
+    toast("Cannot edit — payments recorded. Only a Director can override.","err");return;
+  }
   var s=el("ivc");if(s)s.innerHTML=D.customers.map(function(c){return "<option value=\""+c.id+"\""+(c.id===i.cId?" selected":"")+">"+c.name+"</option>";}).join("");
   el("iv-edit-id").value=i.id;
   el("iva").value=i.amount;el("ivp").value=i.paid;el("ivd").value=i.due;el("ivn").value=i.notes||"";
@@ -3223,7 +3387,12 @@ function saveInv(){
   if(editId){
     var i=D.invoices.find(function(x){return String(x.id)===String(editId);});
     if(i){
-      if(i.payments&&i.payments.length){toast("Cannot edit - payments already recorded","err");return;}
+      if(i.payments&&i.payments.length){
+        if(!can("rest")){toast("Cannot edit — payments recorded. Director only.","err");return;}
+        // Director override — log correction with full audit trail
+        auditLog("PAYMENT_RECORDED","CORRECTION: Invoice #"+editId+" amount corrected by "
+          +CU.name+" from KSh "+i.amount+" to KSh "+a+". Previous paid: KSh "+i.paid);
+      }
       i.cId=cId;i.amount=a;i.paid=p;i.due=el("ivd").value;i.notes=el("ivn").value;
       if(p>0)i.payments=[{date:tday(),amt:p,method:"Cash",ref:"Opening (edited)"}];
       cm("m-iv");rInvs(undefined,INV_PAGE);dirty();toast("Invoice updated");
@@ -4631,6 +4800,37 @@ function restoreXL(input){
     toast("File read error","err");
   };
   reader.readAsArrayBuffer(file);input.value="";
+}
+function runIntegrityCheck(){
+  if(!CU||CU.role!=="director"||!FB_READY)return;
+  var issues=[];
+  // Check 1: negative stock
+  D.stock.forEach(function(s){
+    if(s.qty<0){s.qty=0;issues.push("Stock: "+s.name+" had negative qty — reset to 0");}
+  });
+  // Check 2: orders referencing missing customers
+  var custIds=D.customers.reduce(function(m,c){m[c.id]=true;return m;},{});
+  D.orders.forEach(function(o){
+    if(!custIds[o.cId])issues.push("Order #"+o.id+" references missing customer ID "+o.cId);
+  });
+  // Check 3: orphaned invoices (no matching order, amount unpaid)
+  D.invoices.forEach(function(inv){
+    if(inv.paid>=inv.amount||inv.voided)return; // paid or voided — ignore
+    var ordMatch=inv.notes&&inv.notes.match(/#(\d+)/);
+    if(ordMatch){
+      var o=D.orders.find(function(x){return String(x.id)===ordMatch[1];});
+      if(!o)issues.push("Invoice #"+inv.id+" references deleted order #"+ordMatch[1]+" — KSh "+(inv.amount-inv.paid)+" outstanding");
+    }
+  });
+  // Check 4: ID counter sync
+  syncIdCounters();
+  // Check 5: payment status sync
+  syncPaymentStatuses();
+  if(issues.length>0){
+    // Fix silently, log to audit
+    if(D.stock.some(function(s){return s.qty===0&&issues.some(function(i){return i.indexOf(s.name)>-1});}))dirty();
+    auditLog("CUSTOMER_UPDATED","Data integrity check: "+issues.length+" issue(s) found — "+issues.slice(0,3).join("; "));
+  }
 }
 function syncIdCounters(){
   var maxO=D.orders.reduce(function(m,o){return Math.max(m,Number(o.id)||0);},1000);
