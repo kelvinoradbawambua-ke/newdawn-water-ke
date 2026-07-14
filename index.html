@@ -1829,7 +1829,10 @@ function buildMods(){
       "</div>"+
     "</div>"+
   "</div></div>";
-  el("mods").innerHTML=mC+mO+mOE+mDlv+mS+mRS+mOf+mIv+mPay+mCmp+mU+mSetup+mPin+mAssign+mFollowUp;
+  var mGeneric='<div class="ov" id="m-generic"><div class="modal" style="max-width:560px">'
+    +'<div id="m-generic-body"></div>'
+    +'</div></div>';
+  el("mods").innerHTML=mC+mO+mOE+mDlv+mS+mRS+mOf+mIv+mPay+mCmp+mU+mSetup+mPin+mAssign+mFollowUp+mGeneric;
 }
 
 function rDash(){
