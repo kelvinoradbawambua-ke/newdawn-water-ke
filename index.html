@@ -3372,7 +3372,20 @@ function editInv(id){
   var s=el("ivc");if(s)s.innerHTML=D.customers.map(function(c){return "<option value=\""+c.id+"\""+(c.id===i.cId?" selected":"")+">"+c.name+"</option>";}).join("");
   el("iv-edit-id").value=i.id;
   el("iva").value=i.amount;el("ivp").value=i.paid;el("ivd").value=i.due;el("ivn").value=i.notes||"";
-  el("m-iv-title").innerHTML="<i class=\"ti ti-edit\" style=\"color:var(--gd);margin-right:7px\"></i>Edit Invoice #"+i.id;
+  // If invoice has payments, make paid field read-only — it's recalculated from payments
+  var ivpEl=el("ivp");
+  if(ivpEl){
+    if(i.payments&&i.payments.length){
+      ivpEl.readOnly=true;
+      ivpEl.style.background="#f5f5f5";ivpEl.style.color="var(--tx2)";
+      ivpEl.title="Paid amount is calculated from payment records. Use Reverse Payment to adjust.";
+    }else{
+      ivpEl.readOnly=false;
+      ivpEl.style.background="";ivpEl.style.color="";
+      ivpEl.title="";
+    }
+  }
+  el("m-iv-title").innerHTML="<i class=\"ti ti-edit\" style=\"color:var(--gd);margin-right:7px\"></i>Edit Invoice #"+i.id+    (i.payments&&i.payments.length?" <span style=\"font-size:10px;color:var(--tx2);font-weight:400\">(paid amount locked — use Reverse to adjust)</span>":"");
   el("m-iv-save").innerHTML="<i class=\"ti ti-check\"></i> Update";
   om("m-iv");
 }
@@ -3393,9 +3406,21 @@ function saveInv(){
         auditLog("PAYMENT_RECORDED","CORRECTION: Invoice #"+editId+" amount corrected by "
           +CU.name+" from KSh "+i.amount+" to KSh "+a+". Previous paid: KSh "+i.paid);
       }
-      i.cId=cId;i.amount=a;i.paid=p;i.due=el("ivd").value;i.notes=el("ivn").value;
-      if(p>0)i.payments=[{date:tday(),amt:p,method:"Cash",ref:"Opening (edited)"}];
-      cm("m-iv");rInvs(undefined,INV_PAGE);dirty();toast("Invoice updated");
+      // Update safe fields always
+      i.cId=cId;i.amount=a;i.due=el("ivd").value;i.notes=el("ivn").value;
+      // Only touch paid/payments if no real payments exist yet
+      if(!i.payments||!i.payments.length){
+        i.paid=p;
+        if(p>0)i.payments=[{date:tday(),amt:p,method:"Cash",ref:"Opening balance"}];
+      }
+      // If payments exist, recalculate paid from them — never overwrite
+      if(i.payments&&i.payments.length){
+        i.paid=i.payments.reduce(function(s,py){return s+(py.amt||0);},0);
+      }
+      // Sync linked order
+      var ordMatch=i.notes&&i.notes.match(/#(\d+)/);
+      if(ordMatch){var o=D.orders.find(function(x){return String(x.id)===ordMatch[1];});if(o){if(i.paid>=i.amount){o.paid="Paid";}else if(i.paid>0){o.paid="Partial";}else{o.paid="Unpaid";}o.amtPaid=i.paid;}}
+      cm("m-iv");rInvs(undefined,INV_PAGE);dirty();toast("Invoice #"+editId+" updated");
       return;
     }
   }
@@ -3429,19 +3454,26 @@ function ackPendingPay(id){
 }
 function payI(id){
   if(!can("mPaid")){toast("No permission to record payments","err");return;}
-  var i=D.invoices.find(function(x){return x.id===id;});
-  if(i){
-    if(!i.payments)i.payments=[];
-    i.payments.push({date:tday(),amt:i.amount-i.paid,method:"Cash",ref:"Full payment"});
-    i.paid=i.amount;
-    // Sync linked order payment status
-    var ordId=i.notes&&i.notes.match(/#(\d+)/);
-    if(ordId){var o=D.orders.find(function(x){return String(x.id)===ordId[1];});if(o){o.paid="Paid";o.amtPaid=i.amount;}}
-  }
+  var i=D.invoices.find(function(x){return x.id===id;});if(!i)return;
+  var cu=D.customers.find(function(x){return x.id===i.cId;});
+  var bal=i.amount-i.paid;
+  if(bal<=0){toast("Invoice already fully paid","err");return;}
+  // Confirmation required — this is an irreversible financial record
+  var custName=cu?(can("vPhone")?cu.name:maskName(cu.name)):"Customer";
+  if(!confirm("Mark Invoice #"+id+" as fully paid?\n\n"
+    +custName+"\nAmount: KSh "+bal.toLocaleString()+"\nMethod: Cash\n\n"
+    +"This will record KSh "+bal.toLocaleString()+" as received. Continue?"))return;
+  if(!i.payments)i.payments=[];
+  i.payments.push({date:tday(),amt:bal,method:"Cash",ref:"Full payment — marked paid"});
+  i.paid=i.amount;
+  // Sync linked order payment status
+  var ordId=i.notes&&i.notes.match(/#(\d+)/);
+  if(ordId){var o=D.orders.find(function(x){return String(x.id)===ordId[1];});if(o){o.paid="Paid";o.amtPaid=i.amount;}}
+  auditLog("PAYMENT_RECORDED","Invoice #"+id+" marked fully paid by "+CU.name+" ("+CU.role+"). KSh "+bal+" cash recorded.");
   rInvs(undefined,INV_PAGE);
   if(el("pg-orders")&&el("pg-orders").classList.contains("act"))rOrds(undefined,ORD_PAGE);
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
-  dirty();toast("Invoice marked paid");
+  dirty();toast("Invoice #"+id+" marked paid — KSh "+bal.toLocaleString()+" recorded");
 }
 function openPayInv(id){var i=D.invoices.find(function(x){return x.id===id;});if(!i)return;var c=D.customers.find(function(x){return x.id===i.cId;});el("pay-cid").value=i.cId;el("pay-info").innerHTML="<strong>"+(c?(can("vPhone")?c.name:maskName(c.name)):"?")+"</strong> &mdash; Invoice #"+id+"<br><span style=\"color:#c0392b;font-weight:700\">Balance: KSh "+(i.amount-i.paid).toLocaleString()+"</span>";el("pay-date").value=tday();el("pay-amt").value="";om("m-pay");}
 
