@@ -272,7 +272,9 @@ function sb(s){var m={"Delivered":"bg","Pending":"ba","Out for delivery":"bp","P
 function pb(p){if(p==="Cancelled")return "<span class=\"badge\" style=\"background:#f0f0f0;color:#999;border:1px solid #ddd\"><i class=\"ti ti-x\" style=\"font-size:10px;margin-right:2px\"></i>Cancelled</span>";var ic=p==="Paid"?"ti-check":p==="Partial"?"ti-clock":"ti-alert-circle";return "<span class=\"badge "+(p==="Paid"?"bg":p==="Partial"?"ba":"br")+"\"><i class=\"ti "+ic+"\" style=\"font-size:10px;margin-right:2px\"></i>"+p+"</span>";}
 function btl(v){if(!v||v==="Good")return "<span class=\"badge bg\">Good</span>";if(v==="Damaged")return "<span class=\"badge br\">Damaged</span>";if(v==="Cracked")return "<span class=\"badge ba\">Cracked</span>";return "<span class=\"badge bgr\">"+v+"</span>";}
 function custDebt(id){
-  return D.invoices.filter(function(i){
+  var cu=D.customers.find(function(x){return x.id===id;});
+  var credit=(cu&&cu.credit>0)?cu.credit:0;
+  var gross=D.invoices.filter(function(i){
     if(i.cId!==id)return false;
     if(i.paid>=i.amount)return false; // fully paid, no debt
     if(i.voided)return false; // voided/written-off — excluded from debt
@@ -287,6 +289,7 @@ function custDebt(id){
     }
     return true;
   }).reduce(function(a,i){return a+(i.amount-i.paid);},0);
+  return Math.max(0,gross-credit); // net debt after credit
 }
 function custName(id){var c=D.customers.find(function(x){return x.id===id;});if(!c)return"—";return can("vPhone")?c.name:maskName(c.name);}
 function cAddr(c){if(!c)return "";return [c.estate,c.court,c.house?"No."+c.house:""].filter(Boolean).join(", ");}
@@ -1722,11 +1725,13 @@ function buildMods(){
       "<input type=\"hidden\" id=\"pay-inv-id\" value=\"\">"+
       "<div id=\"pay-info\" style=\"background:var(--bg);border-radius:8px;padding:12px 14px;margin-bottom:14px;font-size:12px;border-left:4px solid #e74c3c\"></div>"+
       "<div class=\"fg2\">"+
-        "<div class=\"fg\"><label class=\"flabel\">Amount received (KSh) *</label><input class=\"fi\" type=\"number\" id=\"pay-amt\"></div>"+
+        "<div class=\"fg\"><label class=\"flabel\">Amount received (KSh) *</label>"
+    +"<input class=\"fi\" type=\"number\" id=\"pay-amt\" placeholder=\"Enter amount...\" oninput=\"payCalc()\" min=\"0\" step=\"any\"></div>"+
         "<div class=\"fg\"><label class=\"flabel\">Payment date</label><input class=\"fi\" type=\"date\" id=\"pay-date\"></div>"+
         "<div class=\"fg\"><label class=\"flabel\">Method</label><select class=\"fi\" id=\"pay-method\"><option>Cash</option><option>M-Pesa</option><option>Bank transfer</option><option>Cheque</option></select></div>"+
         "<div class=\"fg\"><label class=\"flabel\">Reference / M-Pesa code</label><input class=\"fi\" id=\"pay-ref\"></div>"+
       "</div>"+
+      "<div id=\"pay-calc\" style=\"display:none;background:var(--bg);border-radius:8px;padding:10px 13px;margin-bottom:10px;font-size:12px;border-left:3px solid #27ae60\"></div>"+
       "<input type=\"hidden\" id=\"pay-cid\">"+
     "</div>"+
     "<div class=\"mft\"><button class=\"btn\" onclick=\"cm('m-pay')\">Cancel</button><button class=\"btn btn-gold\" onclick=\"recPay()\"><i class=\"ti ti-check\"></i> Record</button></div>"+
@@ -2155,6 +2160,11 @@ function openPay(cId){
   el("pay-cid").value=cId;
   el("pay-info").innerHTML="<div style=\"font-weight:800;font-size:14px;margin-bottom:4px\">"+(can("vPhone")?c.name:maskName(c.name))+"</div><div style=\"color:var(--tx2);font-size:12px\">"+cAddr(c)+"</div><div style=\"margin-top:7px;font-size:13px;color:#c0392b;font-weight:700\">Outstanding: KSh "+debt.toLocaleString()+"</div>";
   el("pay-date").value=tday();el("pay-amt").value="";el("pay-ref").value="";om("m-pay");
+  var pi=el("pay-inv-id");if(pi)pi.value="";
+  var pm2=el("pay-method");if(pm2)pm2.value="Cash";
+  var pc2=el("pay-calc");if(pc2)pc2.style.display="none";
+  om("m-pay");
+  setTimeout(function(){var pa=el("pay-amt");if(pa)pa.focus();},300);
 }
 function showPayments(invId){
   if(!can("rest")){toast("Director only","err");return;}
@@ -2304,28 +2314,88 @@ function recPay(){
   var cId=parseInt(el("pay-cid").value),amt=parseFloat(el("pay-amt").value)||0;
   if(!cId||isNaN(cId)){toast("Invalid customer","err");return;}
   if(!amt){toast("Enter amount","err");return;}
-  var totalDebt=D.invoices.filter(function(i){return i.cId===cId&&i.paid<i.amount;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
-  if(amt>totalDebt&&totalDebt>0){if(!confirm("Amount KSh "+amt.toLocaleString()+" exceeds total balance of KSh "+totalDebt.toLocaleString()+". Continue?"))return;amt=totalDebt;}
-  var rem=amt;
-  D.invoices.filter(function(i){return i.cId===cId&&i.paid<i.amount;}).sort(function(a,b){return a.date>b.date?1:-1;}).forEach(function(inv){
-    if(rem<=0)return;
-    var tap=Math.min(rem,inv.amount-inv.paid);
-    inv.paid+=tap;rem-=tap;
+  var invId=el("pay-inv-id")&&el("pay-inv-id").value?parseInt(el("pay-inv-id").value):0;
+  var payDate=el("pay-date")&&el("pay-date").value?el("pay-date").value:tday();
+  var method=el("pay-method")?el("pay-method").value:"Cash";
+  var ref=el("pay-ref")?el("pay-ref").value:"";
+  // ── INVOICE-SPECIFIC PAYMENT ──────────────────────────────────────────
+  if(invId){
+    var inv=D.invoices.find(function(x){return x.id===invId;});if(!inv){toast("Invoice not found","err");return;}
+    var bal=inv.amount-inv.paid;
+    var credit=0;
+    if(amt>bal){
+      credit=amt-bal; // overpayment — goes to customer credit
+      amt=bal;        // invoice gets exactly what it needs
+    }
     if(!inv.payments)inv.payments=[];
-    inv.payments.push({date:el("pay-date")&&el("pay-date").value?el("pay-date").value:tday(),amt:tap,method:el("pay-method")?el("pay-method").value:"Cash",ref:el("pay-ref")?el("pay-ref").value:""});
-    // Sync payment status back to the linked order
-    var ordId=inv.notes&&inv.notes.match(/#(\d+)/);
-    if(ordId){
-      var o=D.orders.find(function(x){return String(x.id)===ordId[1];});
+    inv.payments.push({date:payDate,amt:amt,method:method,ref:ref});
+    inv.paid=inv.payments.reduce(function(s,p){return s+(p.amt||0);},0);
+    // Store overpayment as customer credit balance
+    if(credit>0){
+      var cu=D.customers.find(function(x){return x.id===cId;});
+      if(cu){
+        cu.credit=(cu.credit||0)+credit;
+        if(!cu.creditLog)cu.creditLog=[];
+        cu.creditLog.push({date:payDate,amt:credit,type:"overpayment",invId:invId,method:method,ref:ref,by:CU.name});
+        toast("KSh "+credit.toLocaleString()+" overpayment stored as credit for "+(can("vPhone")?cu.name:maskName(cu.name)),"ok");
+      }
+    }
+    // Sync linked order
+    var ordMatch=inv.notes&&inv.notes.match(/#(\d+)/);
+    if(ordMatch){
+      var o=D.orders.find(function(x){return String(x.id)===ordMatch[1];});
       if(o){
-        if(inv.paid>=inv.amount){o.paid="Paid";}
-        else if(inv.paid>0){o.paid="Partial";}
-        else{o.paid="Unpaid";}
+        if(inv.paid>=inv.amount){o.paid="Paid";}else if(inv.paid>0){o.paid="Partial";}else{o.paid="Unpaid";}
         o.amtPaid=inv.paid;
       }
     }
-  });
-  auditLog("PAYMENT_RECORDED","KSh "+amt.toLocaleString()+" recorded by "+CU.name+" ("+CU.role+") for customer ID "+cId);
+    auditLog("PAYMENT_RECORDED","KSh "+amt.toLocaleString()+" on Invoice #"+invId+" by "+CU.name+" ("+CU.role+"). Method: "+method+(ref?" Ref: "+ref:"")+(credit>0?" | KSh "+credit.toLocaleString()+" overpayment added to credit":"")+". Balance: KSh "+(inv.amount-inv.paid).toLocaleString());
+  }else{
+  // ── CUSTOMER-LEVEL PAYMENT — distribute oldest-first ─────────────────
+    var cu2=D.customers.find(function(x){return x.id===cId;});
+    var existingCredit=(cu2&&cu2.credit>0)?cu2.credit:0;
+    var totalDebt=D.invoices.filter(function(i){return i.cId===cId&&i.paid<i.amount&&!i.voided;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
+    // Apply any existing credit balance first
+    if(existingCredit>0&&totalDebt>0){
+      var useCredit=Math.min(existingCredit,totalDebt);
+      cu2.credit-=useCredit;
+      if(!cu2.creditLog)cu2.creditLog=[];
+      cu2.creditLog.push({date:payDate,amt:-useCredit,type:"applied",by:CU.name});
+      amt+=useCredit; // add credit to the payment being allocated
+      toast("KSh "+useCredit.toLocaleString()+" credit applied from balance","ok");
+    }
+    var credit2=0;
+    if(amt>totalDebt&&totalDebt>0){
+      credit2=amt-totalDebt;
+      if(cu2){
+        cu2.credit=(cu2.credit||0)+credit2;
+        if(!cu2.creditLog)cu2.creditLog=[];
+        cu2.creditLog.push({date:payDate,amt:credit2,type:"overpayment",method:method,ref:ref,by:CU.name});
+        toast("KSh "+credit2.toLocaleString()+" overpayment stored as credit","ok");
+      }
+      amt=totalDebt;
+    }
+    var rem=amt;
+    D.invoices.filter(function(i){return i.cId===cId&&i.paid<i.amount&&!i.voided;})
+      .sort(function(a,b){return a.date>b.date?1:-1;})
+      .forEach(function(inv){
+        if(rem<=0)return;
+        var tap=Math.min(rem,inv.amount-inv.paid);
+        if(!inv.payments)inv.payments=[];
+        inv.payments.push({date:payDate,amt:tap,method:method,ref:ref});
+        inv.paid=inv.payments.reduce(function(s,p){return s+(p.amt||0);},0);
+        rem-=tap;
+        var ordId=inv.notes&&inv.notes.match(/#(\d+)/);
+        if(ordId){
+          var o2=D.orders.find(function(x){return String(x.id)===ordId[1];});
+          if(o2){
+            if(inv.paid>=inv.amount){o2.paid="Paid";}else if(inv.paid>0){o2.paid="Partial";}else{o2.paid="Unpaid";}
+            o2.amtPaid=inv.paid;
+          }
+        }
+      });
+    auditLog("PAYMENT_RECORDED","KSh "+amt.toLocaleString()+" by "+CU.name+" ("+CU.role+") for customer #"+cId+". Method: "+method+(ref?" Ref: "+ref:"")+". Distributed oldest-first.");
+  }
   cm("m-pay");
   // Refresh all affected pages
   rCusts(undefined,CUST_PAGE);
@@ -3528,6 +3598,49 @@ function payI(id){
   if(bal<=0){toast("Invoice already fully paid","err");return;}
   openPayInv(id); // opens standard payment modal pre-filled
 }
+function payCalc(){
+  var amt=parseFloat(el("pay-amt").value)||0;
+  var pc=el("pay-calc");if(!pc)return;
+  if(amt<=0){pc.style.display="none";return;}
+  // Determine context: invoice-specific or customer-level
+  var invId=el("pay-inv-id")&&el("pay-inv-id").value?parseInt(el("pay-inv-id").value):0;
+  var cId=parseInt(el("pay-cid").value)||0;
+  pc.style.display="block";
+  if(invId){
+    // Invoice-specific: show balance for this invoice only
+    var inv=D.invoices.find(function(x){return x.id===invId;});
+    if(!inv){pc.style.display="none";return;}
+    var bal=inv.amount-inv.paid;
+    var after=Math.max(0,bal-amt);
+    var over=amt>bal;
+    pc.innerHTML=
+      "<div style=\"display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap\">"
+      +"<div><span style=\"color:var(--tx2)\">Invoice balance: </span>"
+      +"<strong>KSh "+bal.toLocaleString()+"</strong></div>"
+      +"<div style=\"color:"+(over?"#e67e22":"#27ae60")+";font-weight:700\">"
+      +(over?"⚠ Over by KSh "+(amt-bal).toLocaleString():"After payment: KSh "+after.toLocaleString())
+      +(after===0&&!over?" <span style=\"background:#27ae60;color:#fff;padding:1px 7px;border-radius:99px;font-size:10px;margin-left:4px\">CLEARS</span>":"")
+      +"</div></div>";
+    pc.style.borderColor=over?"#e67e22":"#27ae60";
+  }else{
+    var cu3=D.customers.find(function(x){return x.id===cId;});
+    var existCr=(cu3&&cu3.credit>0)?cu3.credit:0;
+    var debt=D.invoices.filter(function(i){return i.cId===cId&&i.paid<i.amount&&!i.voided;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
+    var effectiveAmt=amt+existCr; // credit applied first
+    var after2=Math.max(0,debt-effectiveAmt);
+    var over2=effectiveAmt>debt;
+    pc.innerHTML=
+      "<div style=\"display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap\">"
+      +(existCr>0?"<div style=\"color:#3498db;font-size:11px;width:100%\"><i class=\"ti ti-gift\"></i> KSh "+existCr.toLocaleString()+" credit will be applied first</div>":"")
+      +"<div><span style=\"color:var(--tx2)\">Total outstanding: </span>"
+      +"<strong>KSh "+debt.toLocaleString()+"</strong></div>"
+      +"<div style=\"color:"+(over2?"#e67e22":"#27ae60")+";font-weight:700\">"
+      +(over2?"⚠ KSh "+(effectiveAmt-debt).toLocaleString()+" will become credit":"After payment: KSh "+after2.toLocaleString())
+      +(after2===0&&!over2?" <span style=\"background:#27ae60;color:#fff;padding:1px 7px;border-radius:99px;font-size:10px;margin-left:4px\">CLEARS ALL</span>":"")
+      +"</div></div>";
+    pc.style.borderColor=over2?"#e67e22":"#27ae60";
+  }
+}
 function openPayInv(id){
   var i=D.invoices.find(function(x){return x.id===id;});if(!i)return;
   var c=D.customers.find(function(x){return x.id===i.cId;});
@@ -3537,21 +3650,23 @@ function openPayInv(id){
   var pi=el("pay-inv-id");if(pi)pi.value=id;
   el("pay-info").innerHTML=
     "<div style=\"font-weight:800;font-size:13px\">"+(c?(can("vPhone")?c.name:maskName(c.name)):"?")+"</div>"
-    +"<div style=\"font-size:11px;color:var(--tx2);margin-top:2px\">"
-    +(c?cAddr(c):"")
-    +"</div>"
-    +"<div style=\"margin-top:8px;display:flex;gap:16px;font-size:12px\">"
+    +"<div style=\"font-size:11px;color:var(--tx2);margin-top:2px\">"+(c?cAddr(c):"")+"</div>"
+    +"<div style=\"margin-top:8px;display:flex;gap:16px;font-size:12px;flex-wrap:wrap\">"
     +"<span>Invoice <strong>#"+id+"</strong></span>"
     +"<span>Total: <strong>KSh "+i.amount.toLocaleString()+"</strong></span>"
     +"<span style=\"color:#c0392b\">Balance: <strong>KSh "+bal.toLocaleString()+"</strong></span>"
+    +(c&&c.credit>0?"<span style=\"color:#3498db\"><i class=\"ti ti-gift\"></i> Credit: <strong>KSh "+c.credit.toLocaleString()+"</strong></span>":"")
     +"</div>";
   el("pay-date").value=tday();
-  // Pre-fill with full balance so one click is ready
-  var pa=el("pay-amt");if(pa)pa.value=bal;
+  // Leave amount blank — director enters what was actually received
+  var pa=el("pay-amt");if(pa){pa.value="";}
   var pr=el("pay-ref");if(pr)pr.value="";
   // Set method to Cash by default
   var pm=el("pay-method");if(pm)pm.value="Cash";
+  var pc=el("pay-calc");if(pc)pc.style.display="none";
   om("m-pay");
+  // Focus amount field for quick entry
+  setTimeout(function(){var pa=el("pay-amt");if(pa)pa.focus();},300);
 }
 
 function ageing(cId){
@@ -3624,7 +3739,9 @@ function rDebts(q,pg){
     (debtPaged.items.length?debtPaged.items.map(function(x){
 
         return "<tr class=\"dr\">"+
-          "<td><div style=\"font-weight:800;font-size:13px\">"+(can("vPhone")?x.c.name:maskName(x.c.name))+"</div>"+
+          "<td><div style=\"font-weight:800;font-size:13px\">"+(can("vPhone")?x.c.name:maskName(x.c.name))
+            +(x.c.credit>0?" <span class=\"badge bb\" style=\"font-size:9px\" title=\"Credit balance\"><i class=\"ti ti-gift\"></i> KSh "+x.c.credit.toLocaleString()+" credit</span>":"")
+            +"</div>"+
             (x.c.followups&&x.c.followups.length?"<div style=\"font-size:10px;color:#0891b2;margin-top:2px\"><i class=\"ti ti-phone-check\" style=\"font-size:10px\"></i> "+x.c.followups[x.c.followups.length-1].date+": "+x.c.followups[x.c.followups.length-1].note.slice(0,50)+"</div>":"")+
             (can("vRev")?"<div style=\"margin-top:4px\"><button onclick=\"addFollowUp("+x.c.id+")\" class=\"btn btn-xs\" style=\"font-size:10px;padding:2px 6px;background:#0891b2;color:#fff;border:none\"><i class=\"ti ti-phone-plus\" style=\"font-size:10px\"></i> Follow up</button></div>":"")+
           "</td>"+
