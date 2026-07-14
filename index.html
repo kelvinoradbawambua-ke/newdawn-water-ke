@@ -1829,9 +1829,11 @@ function buildMods(){
       "</div>"+
     "</div>"+
   "</div></div>";
-  var mGeneric='<div class="ov" id="m-generic"><div class="modal" style="max-width:560px">'
-    +'<div id="m-generic-body"></div>'
-    +'</div></div>';
+  var mGeneric="<div class=\"ov\" id=\"m-generic\"><div class=\"modal\" style=\"max-width:560px\">"
+    +"<div class=\"mhd\"><div class=\"mttl\" id=\"m-generic-title\"></div>"
+    +"<button class=\"mcls\" onclick=\"cm('m-generic')\"><i class=\"ti ti-x\"></i></button></div>"
+    +"<div id=\"m-generic-body\"></div>"
+    +"</div></div>";
   el("mods").innerHTML=mC+mO+mOE+mDlv+mS+mRS+mOf+mIv+mPay+mCmp+mU+mSetup+mPin+mAssign+mFollowUp+mGeneric;
 }
 
@@ -2155,28 +2157,65 @@ function openPay(cId){
 }
 function showPayments(invId){
   if(!can("rest")){toast("Director only","err");return;}
-  var inv=D.invoices.find(function(x){return x.id===invId;});
-  if(!inv){toast("Invoice not found","err");return;}
+  var inv=D.invoices.find(function(x){return x.id===invId;});if(!inv){toast("Invoice not found","err");return;}
+  var cu=D.customers.find(function(x){return x.id===inv.cId;});
   var pays=inv.payments||[];
-  var html="<div style=\"padding:16px 20px\">"
-    +"<div style=\"font-size:14px;font-weight:800;margin-bottom:12px;color:var(--nv)\">Invoice #"+invId+" — Payments</div>";
+  // Set modal title
+  var tt=el("m-generic-title");
+  if(tt)tt.innerHTML="<i class=\"ti ti-history\" style=\"color:var(--gd);margin-right:8px\"></i>Invoice #"+invId+" — Payment History";
+  // Build body
+  var html="<div class=\"mbdy\">";
+  // Customer + invoice summary
+  html+="<div class=\"notif ni\" style=\"margin-bottom:12px\">"
+    +"<i class=\"ti ti-receipt\"></i>"
+    +"<div><strong>"+(cu?(can("vPhone")?cu.name:maskName(cu.name)):"Customer")+"</strong>"
+    +" &nbsp;&middot;&nbsp; Invoice #"+invId
+    +"<div style=\"font-size:11px;margin-top:2px\">Amount: KSh "+inv.amount.toLocaleString()+" &nbsp;&middot;&nbsp; Paid: KSh "+inv.paid.toLocaleString()+" &nbsp;&middot;&nbsp; Balance: <strong style=\"color:"+(inv.paid<inv.amount?"#c0392b":"#27ae60")+"\">KSh "+(inv.amount-inv.paid).toLocaleString()+"</strong></div>"
+    +"</div></div>";
   if(!pays.length){
-    html+="<div style=\"color:var(--tx2);padding:20px 0;text-align:center\">No payments recorded</div>";
+    html+="<div class=\"te\"><i class=\"ti ti-cash-off\"></i><p>No payments recorded</p><span>Use the cash or partial payment buttons to record payments</span></div>";
   }else{
+    html+="<div style=\"border:1px solid var(--bd);border-radius:var(--r2);overflow:hidden;\">";
     html+=pays.map(function(p,idx){
-      return "<div style=\"display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--bd)\">"
-        +"<div><div style=\"font-weight:700\">KSh "+p.amt.toLocaleString()+"</div>"
-        +"<div style=\"font-size:11px;color:var(--tx2)\">"+p.method+" &middot; "+p.date+(p.ref?" &middot; "+p.ref:"")+"</div></div>"
-        +"<button class=\"btn btn-xs btn-red\" onclick=\"reversePayment("+invId+","+idx+");cm('m-generic');\" title=\"Reverse this payment\">"
-        +"<i class=\"ti ti-rotate-clockwise\"></i> Reverse</button></div>";
+      return "<div style=\"display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid var(--bd);background:#fff\">"
+        +"<div style=\"display:flex;align-items:center;gap:12px\">"
+        +"<div style=\"width:38px;height:38px;border-radius:50%;background:#e8f8f2;display:flex;align-items:center;justify-content:center;flex-shrink:0\">"
+        +"<i class=\"ti ti-cash\" style=\"color:#27ae60;font-size:16px\"></i></div>"
+        +"<div><div style=\"font-weight:800;font-size:13px\">KSh "+p.amt.toLocaleString()+"</div>"
+        +"<div style=\"font-size:11px;color:var(--tx2);margin-top:2px\">"
+        +p.method+" &nbsp;&middot;&nbsp; "+p.date+(p.ref?" &nbsp;&middot;&nbsp; "+p.ref:"")+"</div></div></div>"
+        +"<button class=\"btn btn-xs btn-red\" onclick=\"showPayments._confirm("+invId+","+idx+")\" style=\"min-width:80px;justify-content:center\">"
+        +"<i class=\"ti ti-arrow-back-up\"></i> Reverse</button></div>";
     }).join("");
+    html+="</div>";
   }
-  html+="<div style=\"margin-top:14px;display:flex;justify-content:space-between;align-items:center\">"
-    +"<div style=\"font-size:12px;color:var(--tx2)\">Total paid: <strong>KSh "+inv.paid.toLocaleString()+"</strong></div>"
-    +"<button class=\"btn\" onclick=\"cm('m-generic')\">Close</button></div></div>";
-  var gm=el("m-generic");var gb=el("m-generic-body");
-  if(gb)gb.innerHTML=html;
-  if(gm)om("m-generic");
+  html+="</div>";
+  var gb=el("m-generic-body");if(gb)gb.innerHTML=html;
+  om("m-generic");
+}
+// Reversal confirmation — shown inside the existing modal, no nested confirm()
+showPayments._confirm=function(invId,idx){
+  var inv=D.invoices.find(function(x){return x.id===invId;});if(!inv)return;
+  var pay=(inv.payments||[])[idx];if(!pay)return;
+  var cu=D.customers.find(function(x){return x.id===inv.cId;});
+  var custName=cu?(can("vPhone")?cu.name:maskName(cu.name)):"Customer";
+  var gb=el("m-generic-body");if(!gb)return;
+  gb.innerHTML="<div class=\"mbdy\">"
+    +"<div class=\"notif nw\" style=\"margin-bottom:16px\">"
+    +"<i class=\"ti ti-alert-triangle\"></i>"
+    +"<div><strong>Reverse this payment?</strong>"
+    +"<div style=\"margin-top:4px;font-size:12px\">"
+    +"<div>Customer: "+custName+"</div>"
+    +"<div>Amount: <strong>KSh "+pay.amt.toLocaleString()+"</strong></div>"
+    +"<div>Method: "+pay.method+" &nbsp;&middot;&nbsp; Date: "+pay.date+"</div>"
+    +(pay.ref?"<div>Reference: "+pay.ref+"</div>":"")
+    +"<div style=\"margin-top:6px;color:#c0392b\">This will reduce the paid total on Invoice #"+invId+" by KSh "+pay.amt.toLocaleString()+".</div>"
+    +"</div></div></div>"
+    +"<div class=\"mft\">"
+    +"<button class=\"btn\" onclick=\"showPayments("+invId+")\" >Cancel</button>"
+    +"<button class=\"btn btn-red\" onclick=\"reversePayment("+invId+","+idx+");showPayments("+invId+")\" >"
+    +"<i class=\"ti ti-arrow-back-up\"></i> Confirm Reversal</button>"
+    +"</div></div>";
 }
 function reversePayment(invId,payIdx){
   if(!can("rest")){toast("Director only","err");return;}
@@ -2185,10 +2224,6 @@ function reversePayment(invId,payIdx){
   var pays=inv.payments||[];
   if(payIdx<0||payIdx>=pays.length){toast("Payment not found","err");return;}
   var pay=pays[payIdx];
-  var msg="Reverse payment of KSh "+pay.amt.toLocaleString()+" ("+pay.method+", "+pay.date+")?\n\n"
-    +"This will reduce the invoice paid amount by KSh "+pay.amt.toLocaleString()+"\n"
-    +"and is recorded in the audit log.";
-  if(!confirm(msg))return;
   // Remove the payment entry
   pays.splice(payIdx,1);
   // Recalculate paid total from remaining payments — source of truth
@@ -2212,28 +2247,56 @@ function reversePayment(invId,payIdx){
 }
 function voidInvoice(invId){
   if(!can("rest")){toast("Director only","err");return;}
-  var inv=D.invoices.find(function(x){return x.id===invId;});
-  if(!inv){toast("Invoice not found","err");return;}
+  var inv=D.invoices.find(function(x){return x.id===invId;});if(!inv){toast("Invoice not found","err");return;}
   if(inv.voided){toast("Already voided","err");return;}
+  var cu=D.customers.find(function(x){return x.id===inv.cId;});
   var bal=inv.amount-inv.paid;
-  var reason=prompt("Void Invoice #"+invId+" (KSh "+bal.toLocaleString()+" outstanding)?\n\n"
-    +"Enter reason (e.g. Bad debt, Duplicate, Error):");
-  if(!reason||!reason.trim())return;
-  inv.voided=true;
-  inv.voidedBy=CU.name;
-  inv.voidedAt=tday();
-  inv.voidReason=reason.trim();
-  // Sync linked order — mark as voided so it no longer shows as debt
+  var tt=el("m-generic-title");
+  if(tt)tt.innerHTML="<i class=\"ti ti-ban\" style=\"color:#e74c3c;margin-right:8px\"></i>Void Invoice #"+invId;
+  var gb=el("m-generic-body");if(!gb)return;
+  gb.innerHTML="<div class=\"mbdy\">"
+    +"<div class=\"notif nr\" style=\"margin-bottom:16px\">"
+    +"<i class=\"ti ti-alert-circle\"></i>"
+    +"<div><strong>This action removes KSh "+bal.toLocaleString()+" from outstanding debt.</strong>"
+    +"<div style=\"margin-top:3px;font-size:12px\">"
+    +"Customer: "+(cu?(can("vPhone")?cu.name:maskName(cu.name)):"?")
+    +" &nbsp;&middot;&nbsp; Invoice #"+invId
+    +"<br>The invoice stays in records but is excluded from all debt calculations.</div>"
+    +"</div></div>"
+    +"<div class=\"fg\" style=\"margin-bottom:0\">"
+    +"<label class=\"flabel\">Reason <span style=\"color:#c0392b\">*</span></label>"
+    +"<select class=\"fi\" id=\"void-reason-sel\" onchange=\"var o=el('void-reason-other');if(o)o.style.display=this.value==='Other'?'block':'none'\">"
+    +"<option value=\"\">— Select reason —</option>"
+    +"<option>Bad debt — customer unable to pay</option>"
+    +"<option>Duplicate invoice</option>"
+    +"<option>Data entry error</option>"
+    +"<option>Goodwill write-off</option>"
+    +"<option>Other</option>"
+    +"</select>"
+    +"<input type=\"text\" class=\"fi\" id=\"void-reason-other\" placeholder=\"Specify reason...\" style=\"display:none;margin-top:6px\">"
+    +"</div>"
+    +"<div class=\"mft\">"
+    +"<button class=\"btn\" onclick=\"cm('m-generic')\">Cancel</button>"
+    +"<button class=\"btn btn-red\" onclick=\"voidInvoice._confirm("+invId+")\" >"
+    +"<i class=\"ti ti-ban\"></i> Void Invoice</button>"
+    +"</div></div>";
+  om("m-generic");
+}
+voidInvoice._confirm=function(invId){
+  var sel=el("void-reason-sel");var other=el("void-reason-other");
+  var reason=(sel&&sel.value?sel.value:"");
+  if(reason==="Other")reason=(other&&other.value.trim())||"";
+  if(!reason){toast("Please select a reason","err");return;}
+  var inv=D.invoices.find(function(x){return x.id===invId;});if(!inv)return;
+  var bal=inv.amount-inv.paid;
+  inv.voided=true;inv.voidedBy=CU.name;inv.voidedAt=tday();inv.voidReason=reason;
   var ordMatch=inv.notes&&inv.notes.match(/#(\d+)/);
-  if(ordMatch){
-    var o=D.orders.find(function(x){return String(x.id)===ordMatch[1];});
-    if(o&&o.status!=="Delivered")o.paid="Voided";
-  }
-  auditLog("PAYMENT_RECORDED","VOID: Invoice #"+invId+" voided by "+CU.name+". Reason: "+reason.trim()+". Amount written off: KSh "+bal);
-  dirty();
+  if(ordMatch){var o=D.orders.find(function(x){return String(x.id)===ordMatch[1];});if(o&&o.status!=="Delivered")o.paid="Voided";}
+  auditLog("PAYMENT_RECORDED","VOID: Invoice #"+invId+" voided by "+CU.name+". Reason: "+reason+". Amount written off: KSh "+bal);
+  dirty();cm("m-generic");
   if(el("pg-invoices")&&el("pg-invoices").classList.contains("act"))rInvs(undefined,INV_PAGE);
   if(el("pg-debts")&&el("pg-debts").classList.contains("act"))rDebts();
-  toast("Invoice #"+invId+" voided — removed from debt","ok");
+  toast("Invoice #"+invId+" voided — KSh "+bal.toLocaleString()+" written off","ok");
 }
 function recPay(){
   if(!can("mPaid")){toast("No permission to record payments","err");return;}
@@ -3166,8 +3229,10 @@ function showStockHistory(sid){
     }).join("");
     html+="</tbody></table>";
   }
-  html+="<div style=\"margin-top:14px;text-align:right\"><button class=\"btn\" onclick=\"cm('m-generic')\">Close</button></div></div>";
-  var gb=el("m-generic-body");if(gb)gb.innerHTML=html;
+  html+="</div>";
+  var tt=el("m-generic-title");
+  if(tt)tt.innerHTML="<i class=\"ti ti-history\" style=\"color:var(--gd);margin-right:8px\"></i>"+s.name+" — Stock Movement";
+  var gb=el("m-generic-body");if(gb)gb.innerHTML="<div class=\"mbdy\">"+html+"</div>";
   om("m-generic");
 }
 function updateStockBadge(){
@@ -3329,14 +3394,14 @@ function rInvs(q,pg){
     var st=bal<=0?"<span class=\"badge bg\"><i class=\"ti ti-check\"></i>Paid</span>":ov?"<span class=\"badge br\"><i class=\"ti ti-alert-circle\"></i>Overdue</span>":"<span class=\"badge ba\">Unpaid</span>";
     var lp=(i.payments||[]).slice().sort(function(a,b){return b.date>a.date?1:-1;})[0];
     var iph=c?(can("vPhone")?c.phone:maskPhone(c.phone)):"";
-    return "<tr class=\""+(ov&&bal>0?"dr":"")+"\">"+
+    return "<tr class=\""+(i.voided?"dr":ov&&bal>0?"dr":"")+"\">"+
       "<td style=\"font-weight:700\">#"+i.id+"</td>"+
       "<td><div style=\"font-weight:700\">"+(c?c.name:"&mdash;")+"</div><div class=\"ca\">"+(c?(can("vPhone")?c.phone:maskPhone(c.phone)):"")+"</div></td>"+
       "<td>"+ia(i.amount)+"</td><td>"+ia(i.paid)+"</td>"+
       "<td style=\"font-weight:800;color:"+(bal>0?"#c0392b":"#27ae60")+"\">"+ia(bal)+"</td>"+
       "<td style=\"font-size:11px\">"+fmt(i.due)+"</td>"+
       "<td style=\"font-size:11px\">"+(lp?"<div>"+fmt(lp.date)+"</div><div class=\"ca\">KSh "+lp.amt.toLocaleString()+" &middot; "+lp.method+"</div>":"-")+"</td>"+
-      "<td>"+st+"</td>"+
+      "<td>"+(i.voided?"<span class=\"badge bgr\"><i class=\"ti ti-ban\"></i> Voided</span>":st)+"</td>"+
       "<td><div class=\"ac\">"+
         (can("eInv")&&(!i.payments||!i.payments.length||can("rest"))?"<button class=\"btn btn-xs btn-navy\" onclick=\"editInv("+i.id+")\" title=\"Edit\"><i class=\"ti ti-edit\"></i></button>":"")+
         (can("rest")&&i.payments&&i.payments.length?"<button class=\"btn btn-xs\" onclick=\"showPayments("+i.id+")\" title=\"View &amp; reverse payments\" style=\"background:#fff8e1;color:#856404;border-color:#f0d070\"><i class=\"ti ti-history\"></i></button>":"")+
