@@ -1719,6 +1719,7 @@ function buildMods(){
   var mPay="<div class=\"ov\" id=\"m-pay\"><div class=\"modal\">"+
     "<div class=\"mhd\"><div class=\"mttl\"><i class=\"ti ti-cash\" style=\"color:#27ae60;margin-right:7px\"></i>Record Payment</div><button class=\"mcls\" onclick=\"cm('m-pay')\"><i class=\"ti ti-x\"></i></button></div>"+
     "<div class=\"mbdy\">"+
+      "<input type=\"hidden\" id=\"pay-inv-id\" value=\"\">"+
       "<div id=\"pay-info\" style=\"background:var(--bg);border-radius:8px;padding:12px 14px;margin-bottom:14px;font-size:12px;border-left:4px solid #e74c3c\"></div>"+
       "<div class=\"fg2\">"+
         "<div class=\"fg\"><label class=\"flabel\">Amount received (KSh) *</label><input class=\"fi\" type=\"number\" id=\"pay-amt\"></div>"+
@@ -3406,8 +3407,7 @@ function rInvs(q,pg){
         (can("eInv")&&(!i.payments||!i.payments.length||can("rest"))?"<button class=\"btn btn-xs btn-navy\" onclick=\"editInv("+i.id+")\" title=\"Edit\"><i class=\"ti ti-edit\"></i></button>":"")+
         (can("rest")&&i.payments&&i.payments.length?"<button class=\"btn btn-xs\" onclick=\"showPayments("+i.id+")\" title=\"View &amp; reverse payments\" style=\"background:#fff8e1;color:#856404;border-color:#f0d070\"><i class=\"ti ti-history\"></i></button>":"")+
         (can("rest")&&!i.voided&&bal>0?"<button class=\"btn btn-xs btn-red\" onclick=\"voidInvoice("+i.id+")\" title=\"Void invoice\"><i class=\"ti ti-ban\"></i></button>":"")+
-        (can("mPaid")&&bal>0?"<button class=\"btn btn-xs btn-grn\" onclick=\"payI("+i.id+")\" title=\"Mark paid\"><i class=\"ti ti-check\"></i></button>":"")+
-        (can("mPaid")&&bal>0?"<button class=\"btn btn-xs btn-gold\" onclick=\"openPayInv("+i.id+")\" title=\"Partial payment\"><i class=\"ti ti-cash\"></i></button>":"")+
+        (can("mPaid")&&bal>0?"<button class=\"btn btn-xs btn-grn\" onclick=\"openPayInv("+i.id+")\" title=\"Record payment\"><i class=\"ti ti-cash\"></i> Pay</button>":"")+
       "<button class=\"btn btn-xs\" onclick=\"printInvoice("+i.id+")\" style=\"background:#7c3aed;color:#fff\" title=\"Print\"><i class=\"ti ti-printer\"></i></button>"+
     "</div></td></tr>";
   }).join("");
@@ -3520,30 +3520,39 @@ function ackPendingPay(id){
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   if(el("pg-customers")&&el("pg-customers").classList.contains("act"))rCusts(undefined,CUST_PAGE);
 }
+// payI: open payment modal pre-filled for full balance
 function payI(id){
-  if(!can("mPaid")){toast("No permission to record payments","err");return;}
+  if(!can("mPaid")){toast("No permission","err");return;}
   var i=D.invoices.find(function(x){return x.id===id;});if(!i)return;
-  var cu=D.customers.find(function(x){return x.id===i.cId;});
   var bal=i.amount-i.paid;
   if(bal<=0){toast("Invoice already fully paid","err");return;}
-  // Confirmation required — this is an irreversible financial record
-  var custName=cu?(can("vPhone")?cu.name:maskName(cu.name)):"Customer";
-  if(!confirm("Mark Invoice #"+id+" as fully paid?\n\n"
-    +custName+"\nAmount: KSh "+bal.toLocaleString()+"\nMethod: Cash\n\n"
-    +"This will record KSh "+bal.toLocaleString()+" as received. Continue?"))return;
-  if(!i.payments)i.payments=[];
-  i.payments.push({date:tday(),amt:bal,method:"Cash",ref:"Full payment — marked paid"});
-  i.paid=i.amount;
-  // Sync linked order payment status
-  var ordId=i.notes&&i.notes.match(/#(\d+)/);
-  if(ordId){var o=D.orders.find(function(x){return String(x.id)===ordId[1];});if(o){o.paid="Paid";o.amtPaid=i.amount;}}
-  auditLog("PAYMENT_RECORDED","Invoice #"+id+" marked fully paid by "+CU.name+" ("+CU.role+"). KSh "+bal+" cash recorded.");
-  rInvs(undefined,INV_PAGE);
-  if(el("pg-orders")&&el("pg-orders").classList.contains("act"))rOrds(undefined,ORD_PAGE);
-  if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
-  dirty();toast("Invoice #"+id+" marked paid — KSh "+bal.toLocaleString()+" recorded");
+  openPayInv(id); // opens standard payment modal pre-filled
 }
-function openPayInv(id){var i=D.invoices.find(function(x){return x.id===id;});if(!i)return;var c=D.customers.find(function(x){return x.id===i.cId;});el("pay-cid").value=i.cId;el("pay-info").innerHTML="<strong>"+(c?(can("vPhone")?c.name:maskName(c.name)):"?")+"</strong> &mdash; Invoice #"+id+"<br><span style=\"color:#c0392b;font-weight:700\">Balance: KSh "+(i.amount-i.paid).toLocaleString()+"</span>";el("pay-date").value=tday();el("pay-amt").value="";om("m-pay");}
+function openPayInv(id){
+  var i=D.invoices.find(function(x){return x.id===id;});if(!i)return;
+  var c=D.customers.find(function(x){return x.id===i.cId;});
+  var bal=i.amount-i.paid;
+  el("pay-cid").value=i.cId;
+  // Store invoice id so recPay can sync it
+  var pi=el("pay-inv-id");if(pi)pi.value=id;
+  el("pay-info").innerHTML=
+    "<div style=\"font-weight:800;font-size:13px\">"+(c?(can("vPhone")?c.name:maskName(c.name)):"?")+"</div>"
+    +"<div style=\"font-size:11px;color:var(--tx2);margin-top:2px\">"
+    +(c?cAddr(c):"")
+    +"</div>"
+    +"<div style=\"margin-top:8px;display:flex;gap:16px;font-size:12px\">"
+    +"<span>Invoice <strong>#"+id+"</strong></span>"
+    +"<span>Total: <strong>KSh "+i.amount.toLocaleString()+"</strong></span>"
+    +"<span style=\"color:#c0392b\">Balance: <strong>KSh "+bal.toLocaleString()+"</strong></span>"
+    +"</div>";
+  el("pay-date").value=tday();
+  // Pre-fill with full balance so one click is ready
+  var pa=el("pay-amt");if(pa)pa.value=bal;
+  var pr=el("pay-ref");if(pr)pr.value="";
+  // Set method to Cash by default
+  var pm=el("pay-method");if(pm)pm.value="Cash";
+  om("m-pay");
+}
 
 function ageing(cId){
   var td=tday();
