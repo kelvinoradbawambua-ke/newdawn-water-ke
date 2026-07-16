@@ -1623,7 +1623,7 @@ function buildMods(){
       "<div class=\"slbl\" style=\"margin-top:14px\">Account</div>"+
       "<div class=\"fg2\">"+
         "<div class=\"fg\"><label class=\"flabel\">Customer type</label><select class=\"fi\" id=\"ctype\"><option>Residential</option><option>Commercial</option><option>Institution</option><option>Distributor</option></select></div>"+
-        "<div class=\"fg\"><label class=\"flabel\">Credit limit (KSh)</label><input class=\"fi\" type=\"number\" id=\"ccl\" value=\"0\"></div>"+
+        "<div class=\"fg\"><label class=\"flabel\">Credit limit (KSh) <span style=\"font-weight:400;font-size:10px;color:var(--tx2)\">— max allowed debt</span></label><input class=\"fi\" type=\"number\" id=\"ccl\" value=\"0\"></div>"+
         "<div class=\"fg fspan\"><label class=\"flabel\">Notes</label><input class=\"fi\" id=\"cnotes\"></div>"+
       "</div>"+
       "<input type=\"hidden\" id=\"c-edit-id\" value=\"\">"+
@@ -2110,7 +2110,7 @@ function rCustsF(t){rCusts(undefined,0,undefined,t);}
 function prepCustAdd(){
   el("c-edit-id").value="";
   ["cn","cph","cph2","cid","cestate","ccourt","chouse","croad","czone","cnotes"].forEach(function(id){el(id).value="";});
-  el("ccl").value="0";el("chtype").value="House";el("ctype").value="Residential";
+  el("ccl").value="0";el("chtype").value="House";el("ctype").value="Residential"; // ccl = creditLimit
   el("m-c-title").innerHTML="<i class=\"ti ti-user-plus\" style=\"color:var(--gd);margin-right:7px\"></i>Add Customer";
   el("m-c-save").innerHTML="<i class=\"ti ti-check\"></i> Save";
   om("m-c");
@@ -2126,7 +2126,7 @@ function saveCust(){
       c.name=n;c.phone=ph;c.phone2=el("cph2").value;c.idno=el("cid").value;
       c.estate=el("cestate").value;c.court=el("ccourt").value;c.house=el("chouse").value;
       c.htype=el("chtype").value;c.road=el("croad").value;c.zone=el("czone").value;
-      c.ctype=el("ctype").value;c.credit=parseFloat(el("ccl").value)||0;c.notes=el("cnotes").value;
+      c.ctype=el("ctype").value;c.creditLimit=parseFloat(el("ccl").value)||0;c.notes=el("cnotes").value;
       auditLog("CUSTOMER_UPDATED","Customer updated by "+CU.name+" ("+CU.role+"): "+n);
       cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer updated");
       return;
@@ -2143,7 +2143,7 @@ function saveCust(){
         +(can("vPhone")?dupAddr.name:maskName(dupAddr.name))+"\n\nContinue adding a new customer?"))return;
     }
   }
-  D.customers.push({id:uid(),name:n,phone:ph,phone2:el("cph2").value,idno:el("cid").value,estate:el("cestate").value,court:el("ccourt").value,house:el("chouse").value,htype:el("chtype").value,road:el("croad").value,zone:el("czone").value,ctype:el("ctype").value,credit:parseFloat(el("ccl").value)||0,notes:el("cnotes").value,created:tday()});
+  D.customers.push({id:uid(),name:n,phone:ph,phone2:el("cph2").value,idno:el("cid").value,estate:el("cestate").value,court:el("ccourt").value,house:el("chouse").value,htype:el("chtype").value,road:el("croad").value,zone:el("czone").value,ctype:el("ctype").value,creditLimit:parseFloat(el("ccl").value)||0,notes:el("cnotes").value,created:tday()});
   ["cn","cph","cph2","cid","cestate","ccourt","chouse","croad","czone","cnotes"].forEach(function(id){el(id).value="";});el("ccl").value="0";
   cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer added");
 }
@@ -2156,7 +2156,7 @@ function editCust(id){
   el("cid").value=c.idno||"";el("cestate").value=c.estate||"";el("ccourt").value=c.court||"";
   el("chouse").value=c.house||"";el("chtype").value=c.htype||"House";el("croad").value=c.road||"";
   el("czone").value=c.zone||"";el("ctype").value=c.ctype||"Residential";
-  el("ccl").value=c.credit||0;el("cnotes").value=c.notes||"";
+  el("ccl").value=c.creditLimit||0;el("cnotes").value=c.notes||"";
   el("m-c-title").innerHTML="<i class=\"ti ti-user-edit\" style=\"color:var(--gd);margin-right:7px\"></i>Edit Customer";
   el("m-c-save").innerHTML="<i class=\"ti ti-check\"></i> Update";
   om("m-c");
@@ -2931,7 +2931,7 @@ function saveOrd(){
   if(!editId){
     var existingDebt=custDebt(cId);
     var cust=D.customers.find(function(x){return x.id===cId;});
-    var creditLimit=cust?cust.credit||0:0;
+    var creditLimit=cust?(cust.creditLimit||0):0; // creditLimit is separate from credit balance
     var orderTotal=price*qty;
     var projectedDebt=existingDebt+orderTotal;
     if(existingDebt>0){
@@ -5240,6 +5240,19 @@ function restoreXL(input){
 function runIntegrityCheck(){
   if(!CU||CU.role!=="director"||!FB_READY)return;
   var issues=[];
+  // Fix: migrate old c.credit (used as creditLimit) to c.creditLimit
+  // If c.credit > 0 but creditLog is empty or missing, it was set via the form
+  // (old behaviour before the split) — move it to creditLimit and zero credit
+  var migrated=0;
+  D.customers.forEach(function(cu){
+    if((cu.credit>0)&&(!cu.creditLog||!cu.creditLog.length)){
+      // No payment history means this was set via the form as creditLimit
+      if(!cu.creditLimit||cu.creditLimit===0){cu.creditLimit=cu.credit;}
+      cu.credit=0;
+      migrated++;
+    }
+  });
+  if(migrated>0){issues.push("Migrated "+migrated+" customer(s): moved form-set credit to creditLimit field");dirty();}
   // Check 1: negative stock
   D.stock.forEach(function(s){
     if(s.qty<0){s.qty=0;issues.push("Stock: "+s.name+" had negative qty — reset to 0");}
