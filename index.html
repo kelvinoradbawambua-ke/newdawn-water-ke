@@ -3439,8 +3439,15 @@ function rDel(q){
   var _dlvWkS=_dlvWkStart.toISOString().slice(0,10);
   var _dlvMo=_dlvNow.getFullYear()+"-"+String(_dlvNow.getMonth()+1).padStart(2,"0");
   var todayDel=D.orders.filter(function(o){return o.status==="Delivered"&&(o.deliveredAt===_dlvTd||(!o.deliveredAt&&o.date===_dlvTd));}).length;
-  var weekDel=D.orders.filter(function(o){if(o.status!=="Delivered")return false;var dd=o.deliveredAt||o.date;return dd&&dd>=_dlvWkS&&dd<=_dlvTd;}).length;
-  var monthDel=D.orders.filter(function(o){if(o.status!=="Delivered")return false;var dd=o.deliveredAt||o.date;return dd&&dd.startsWith(_dlvMo);}).length;
+  // Use deliveredAt (set by completeDlv) for accuracy; fall back to o.date
+  var weekDel=D.orders.filter(function(o){
+    if(o.status!=="Delivered")return false;
+    var dd=o.deliveredAt||o.date;return dd&&dd>=_dlvWkS&&dd<=_dlvTd;
+  }).length;
+  var monthDel=D.orders.filter(function(o){
+    if(o.status!=="Delivered")return false;
+    var dd=o.deliveredAt||o.date;return dd&&dd.startsWith(_dlvMo);
+  }).length;
   var totalDel=D.orders.filter(function(o){return o.status==="Delivered";}).length;
   var q2=DEL_Q||"";
   var pendFil=q2?pend.filter(function(o){var cu=D.customers.find(function(x){return x.id===o.cId;});var lq=q2.toLowerCase();return(cu&&((can("vPhone")&&cu.name.toLowerCase().indexOf(lq)!==-1)||cAddr(cu).toLowerCase().indexOf(lq)!==-1))||String(o.id).indexOf(DEL_Q)!==-1||o.prod.toLowerCase().indexOf(lq)!==-1||(o.driver&&o.driver.toLowerCase().indexOf(lq)!==-1);}):pend;
@@ -3939,21 +3946,22 @@ function rDebts(q,pg){
   var debtors=D.customers.map(function(c){
     // Period-scoped debt: find orders in this period and their unpaid invoices
     var allInvs=D.invoices.filter(function(i){return i.cId===c.id&&i.paid<i.amount&&!i.voided;});
-    var periodInvs=allInvs.filter(function(i){
-      // Filter by the ORDER date linked to this invoice (when the debt was created)
+    var periodInvs=(DEBT_PERIOD==="all")?allInvs:allInvs.filter(function(i){
+      // Use the linked order's date — the actual date the debt was created
+      var ordDate="";
       var ordMatch=i.notes&&i.notes.match(/#(\d+)/);
-      var ordDate=i.date||td; // invoice date as fallback
       if(ordMatch){
-        var o=D.orders.find(function(x){return String(x.id)===ordMatch[1];});
-        if(o)ordDate=o.date||ordDate;
+        var _o=D.orders.find(function(x){return String(x.id)===ordMatch[1];});
+        if(_o)ordDate=_o.date||"";
       }
+      if(!ordDate)return false; // no linked order = exclude from period views
       if(DEBT_PERIOD==="today") return ordDate===td;
       if(DEBT_PERIOD==="week")  return ordDate>=_dwkS&&ordDate<=td;
       if(DEBT_PERIOD==="month") return ordDate.startsWith(_dmo);
-      return true; // all
+      return true;
     });
     var debt=periodInvs.reduce(function(a,i){return a+(i.amount-i.paid);},0);
-    // Apply credit balance only on "all" period
+    // Net of credit on "all" view only
     if(DEBT_PERIOD==="all"){var cr=c.credit||0;debt=Math.max(0,debt-cr);}
     var lastOrd=[].concat(D.orders).filter(function(o){return o.cId===c.id;}).sort(function(a,b){return b.date>a.date?1:-1;})[0];
     var ov=periodInvs.filter(function(i){return i.due&&i.due<td;}).length;
@@ -3982,14 +3990,7 @@ function rDebts(q,pg){
   if(!el("debt-srch")){
     pg.innerHTML=
       "<div class=\"ph\"><h1>Debt Tracker</h1><p id=\"debt-stats\"></p></div>"
-    +"<div style=\"display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:6px\">"
-    +"<span style=\"font-size:11px;color:var(--tx2);font-weight:600\"><i class=\"ti ti-calendar\" style=\"margin-right:4px\"></i>Period</span>"
-    +"<div style=\"display:flex;gap:3px\">"
-    +["today","week","month","all"].map(function(p){
-      var lbl=p==="today"?"Today":p==="week"?"This week":p==="month"?"This month":"All time";
-      return "<button class=\"btn btn-xs\" onclick=\"DEBT_PERIOD='"+p+"';rDebts(undefined,0)\" style=\""+(DEBT_PERIOD===p?"background:var(--nv);color:#fff;border-color:var(--nv);\"":"background:#fff;\">")+lbl+"</button>";
-    }).join("")
-    +"</div></div>"+
+    +"<div id=\"debt-period-bar\"></div>"+
       "<div class=\"stats\" id=\"debt-cards\"></div>"+
       "<div class=\"toolbar\">"+
         "<div class=\"srch\"><i class=\"ti ti-search\"></i>"+
@@ -3999,6 +4000,19 @@ function rDebts(q,pg){
       "<div id=\"debt-sort\"></div>"+
       "<div id=\"debt-results\"></div>";
   }
+  // Period pills — always re-rendered so active state is correct
+  var _dpb=el("debt-period-bar");
+  if(_dpb)_dpb.innerHTML=
+    "<div style=\"display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:6px\">"+
+    "<span style=\"font-size:11px;color:var(--tx2);font-weight:600\"><i class=\"ti ti-calendar\" style=\"margin-right:4px\"></i>Debt period</span>"+
+    "<div style=\"display:flex;gap:4px;flex-wrap:wrap\">"+
+    ["today","week","month","all"].map(function(p){
+      var lbl=p==="today"?"Today":p==="week"?"This week":p==="month"?"This month":"All time";
+      return "<button onclick=\"DEBT_PERIOD='"+p+"';rDebts(undefined,0)\" style=\"padding:4px 12px;border-radius:99px;border:1.5px solid "
+        +(DEBT_PERIOD===p?"var(--nv);background:var(--nv);color:#fff":"var(--bd);background:#fff;color:var(--tx2)")
+        +";font-size:11px;font-weight:700;cursor:pointer;font-family:inherit\">"+lbl+"</button>";
+    }).join("")
+    +"</div></div>";
   var _dstat=el("debt-stats");
   var _creditMode=q2==="__credit__";
   var _dPeriodLabel=DEBT_PERIOD==="today"?"today":DEBT_PERIOD==="week"?"this week":DEBT_PERIOD==="month"?"this month":"all time";
@@ -4041,7 +4055,7 @@ function rDebts(q,pg){
           "<td style=\"font-weight:700;color:"+(x.oldest&&x.oldest<td?"#c0392b":"var(--tx)")+"\">"+fmt(x.oldest)+"</td>"+
           "<td style=\"font-size:11px\">"+(x.lastOrd?fmt(x.lastOrd.date):"&mdash;")+"</td>"+
           "<td>"+(can("mPaid")?"<button class=\"btn btn-xs btn-gold\" onclick=\"openPay("+x.c.id+")\"><i class=\"ti ti-cash\"></i> Pay</button>":"")+"</td></tr>";
-      }).join(""):"<tr><td colspan=\"8\"><div class=\"te\"><i class=\"ti ti-circle-check\"></i><p>"+(q2?"No debtors match your search":"No outstanding debts!")+"</p></div></td></tr>")+
+      }).join(""):"<tr><td colspan=\"8\"><div class=\"te\"><i class=\"ti ti-circle-check\"></i><p>"+(q2?"No debtors match your search":"No outstanding debts"+(DEBT_PERIOD!=="all"?" in "+_dPeriodLabel:"!")+" ")+"</p></div></td></tr>")+
     "</tbody></table></div>"+pgBar(debtPaged.page,debtPaged.pages,debtPaged.total,"rDebts(undefined,");
 }
 
