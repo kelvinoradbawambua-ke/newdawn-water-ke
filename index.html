@@ -442,6 +442,7 @@ function processWriteQueue(){
   var DforSync={};
   var keys=Object.keys(D);
   for(var ki=0;ki<keys.length;ki++){
+    if(keys[ki]==="_ts")continue; // internal timestamp — not persisted
     if(keys[ki]==="auditLog"){
       // Last 20 audit entries in main doc — guaranteed cross-device fallback
       DforSync.auditLog=(D.auditLog||[]).slice(-20);
@@ -744,42 +745,104 @@ function startCloudListener(){
       return;
     }
     var data=doc.data();
-    var isOwnWrite=Date.now()-FB_LAST_LOCAL_WRITE<5000; // 5s window covers slow networks
-    // Conflict detection: if server has newer data than our last write, always accept it
+    if(!data.D)return; // empty doc — skip
+    var isOwnWrite=Date.now()-FB_LAST_LOCAL_WRITE<5000;
     var serverTime=data.updatedAt||0;
     var weAreNewer=FB_LAST_LOCAL_WRITE>serverTime+1000;
-    // Smart merge: never let Firestore reduce our customer count
-    var remoteHasMore=(data.D&&(data.D.customers||[]).length>(D.customers||[]).length+2);
-    var weHaveMore=(D.customers||[]).length>(data.D&&data.D.customers||[]).length+2;
-    // Audit log handled by dedicated subcollection listener (startAuditListener)
-    if((!isOwnWrite||!weAreNewer)&&!weHaveMore){
-      // Remote update from another device — merge their data in
-      if(data.D){
-        // Save current audit log before D= overwrites it
-        var _prevAuditLog=D.auditLog&&D.auditLog.length?D.auditLog.slice():[];
-        // Merge any audit entries from main doc into saved log BEFORE overwrite
-        if(data.D&&data.D.auditLog&&data.D.auditLog.length){
-          var _ex={};_prevAuditLog.forEach(function(e){if(e.ts)_ex[e.ts]=true;});
-          data.D.auditLog.forEach(function(e){if(e.ts&&!_ex[e.ts]){_prevAuditLog.push(e);_ex[e.ts]=true;}});
-          _prevAuditLog.sort(function(a,b){return a.ts<b.ts?-1:a.ts>b.ts?1:0;});
-        }
-        D=data.D;
-        if(!D.routes)D.routes=[];
-        if(!D.complaints)D.complaints=[];
-        if(!D.offers)D.offers=[];
-        if(!D.pendingPayments)D.pendingPayments=[];
-        // Carry backup stamp across sync
-        if(data.D._lastDailyBackup)D._lastDailyBackup=data.D._lastDailyBackup;
-        else if(data._lastDailyBackup)D._lastDailyBackup=data._lastDailyBackup;
-        // Restore the merged audit log
-        D.auditLog=_prevAuditLog;
-      }
-      if(data.USERS&&data.USERS.length)USERS=data.USERS;
-      else USERS=[{id:1,name:"Director",role:"director",pin:"1234",ini:"DR",col:"#1a1560"}];
-      FB_SETUP_DONE=data.setupDone===true;
-      syncIdCounters();
-      syncPaymentStatuses();
+
+    // ── FIELD-LEVEL SMART MERGE ─────────────────────────────────────────
+    // Orders, invoices, stock, payments: ALWAYS accept remote
+    //   (staff completes delivery → director must see it immediately)
+    // Customers: never reduce — protect against data loss
+    // Audit log: always merge, never replace
+
+    // 1. Preserve current audit log across merge
+    var _prevAuditLog=D.auditLog&&D.auditLog.length?D.auditLog.slice():[];
+    if(data.D.auditLog&&data.D.auditLog.length){
+      var _ex={};_prevAuditLog.forEach(function(e){if(e.ts)_ex[e.ts]=true;});
+      data.D.auditLog.forEach(function(e){if(e.ts&&!_ex[e.ts]){_prevAuditLog.push(e);_ex[e.ts]=true;}});
+      _prevAuditLog.sort(function(a,b){return a.ts<b.ts?-1:a.ts>b.ts?1:0;});
     }
+
+    // 2. Always merge operational data from remote (orders, invoices, stock)
+    //    These change on staff devices — director must see them
+    if(!isOwnWrite||!weAreNewer){
+      // Orders: take remote (staff delivery updates MUST flow to director)
+      if(data.D.orders&&data.D.orders.length){
+        // Merge: local orders that are newer (being edited) win
+        // Remote orders that are Delivered win (can't un-deliver)
+        var localOrdMap={};
+        (D.orders||[]).forEach(function(o){localOrdMap[o.id]=o;});
+        data.D.orders.forEach(function(ro){
+          var lo=localOrdMap[ro.id];
+          if(!lo){D.orders.push(ro);} // new order from remote
+          else if(ro.status==="Delivered"&&lo.status!=="Delivered"){
+            // Remote shows delivered — always accept (staff completed it)
+            Object.assign(lo,ro);
+          } else if(lo.status==="Delivered"&&ro.status!=="Delivered"){
+            // Local already delivered — keep local (don't regress)
+          } else if(!isOwnWrite){
+            // Neutral: take remote for other status changes
+            Object.assign(lo,ro);
+          }
+        });
+        // Remove orders deleted remotely — but protect orders placed in last 60s
+        var remoteOrdIds={};
+        data.D.orders.forEach(function(o){remoteOrdIds[o.id]=true;});
+        var sixtyAgo=Date.now()-60000;
+        D.orders=D.orders.filter(function(o){
+          return remoteOrdIds[o.id]||(o._ts&&o._ts>sixtyAgo); // keep recent local orders
+        });
+      }
+      // Invoices: take remote (payments recorded on any device)
+      if(data.D.invoices)D.invoices=data.D.invoices;
+      // Stock: take remote (restocks on any device)
+      if(data.D.stock)D.stock=data.D.stock;
+      // Pending payments: merge (staff collections from multiple devices)
+      if(data.D.pendingPayments){
+        var localPP={};
+        (D.pendingPayments||[]).forEach(function(p){if(p.id)localPP[p.id]=true;});
+        (data.D.pendingPayments||[]).forEach(function(p){
+          if(p.id&&!localPP[p.id])(D.pendingPayments=D.pendingPayments||[]).push(p);
+        });
+      }
+      // Routes, offers, complaints: take remote
+      if(data.D.routes)D.routes=data.D.routes;
+      if(data.D.offers)D.offers=data.D.offers;
+      if(data.D.complaints)D.complaints=data.D.complaints;
+    }
+
+    // 3. Customers: only take remote if they have MORE (prevent reduction)
+    var remoteCustomers=data.D.customers||[];
+    var localCustomers=D.customers||[];
+    if(remoteCustomers.length>=localCustomers.length){
+      // Remote has same or more customers — safe to take
+      D.customers=remoteCustomers;
+    } else if(!isOwnWrite&&remoteCustomers.length>0){
+      // Remote has fewer but it's not our write — merge (add missing local)
+      var remCustIds={};
+      remoteCustomers.forEach(function(cu){remCustIds[cu.id]=true;});
+      var onlyLocal=localCustomers.filter(function(cu){return !remCustIds[cu.id];});
+      D.customers=remoteCustomers.concat(onlyLocal);
+    }
+    // Always ensure required arrays exist
+    if(!D.routes)D.routes=[];
+    if(!D.complaints)D.complaints=[];
+    if(!D.offers)D.offers=[];
+    if(!D.pendingPayments)D.pendingPayments=[];
+
+    // 4. Restore merged audit log
+    D.auditLog=_prevAuditLog;
+
+    // 5. Users and setup
+    if(data.USERS&&data.USERS.length)USERS=data.USERS;
+    else USERS=[{id:1,name:"Director",role:"director",pin:"1234",ini:"DR",col:"#1a1560"}];
+    FB_SETUP_DONE=data.setupDone===true;
+    // Carry backup stamp
+    if(data.D._lastDailyBackup)D._lastDailyBackup=data.D._lastDailyBackup;
+    else if(data._lastDailyBackup)D._lastDailyBackup=data._lastDailyBackup;
+    syncIdCounters();
+    syncPaymentStatuses();
     FB_READY=true;
     // Flush any audit events queued before Firestore was ready
     if(window._auditQueue&&window._auditQueue.length&&FB_EVENTS_COL){
@@ -2896,7 +2959,7 @@ function saveOrd(){
 
   if(isCat){
     // Category order: no stock deduction, no invoice yet, payment at delivery
-    D.orders.push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:0,cost:0,date:el("od").value,status:"Pending",paid:"Unpaid",amtPaid:0,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?el("onotes").value:"",prodConfirmed:false});
+    D.orders.push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:0,cost:0,date:el("od").value,status:"Pending",paid:"Unpaid",amtPaid:0,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?el("onotes").value:"",prodConfirmed:false,_ts:Date.now()});
     auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty+" (category/TBC)");
     cm("m-o");rOrds(undefined,ORD_PAGE);dirty();
     toast("Order #"+newOrdId+" placed — driver confirms brand & collects payment at delivery");
@@ -2922,7 +2985,7 @@ function saveOrd(){
   if(amtPaid>=total){payStatus="Paid";}
   else if(amtPaid>0){payStatus="Partial";}
   else{payStatus="Unpaid";}
-  D.orders.push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:price,cost:costAtSale,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?el("onotes").value:"",prodConfirmed:true});
+  D.orders.push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:price,cost:costAtSale,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?el("onotes").value:"",_ts:Date.now(),prodConfirmed:true});
   // Always create invoice for exact orders — provides full financial trail
   D.invoices.push({id:nIId++,cId:cId,amount:total,paid:amtPaid,due:(function(){var dd=new Date((el("od").value||tday())+"T12:00:00");dd.setDate(dd.getDate()+7);return dd.toISOString().split("T")[0];})(),notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
   auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty);
@@ -3067,10 +3130,23 @@ function completeDlv(){
       D.invoices.push(inv);
     }
     if(amt>0&&inv){
-      inv.paid=Math.min(inv.amount,inv.paid+amt);
       if(!inv.payments)inv.payments=[];
       var dlvMethod=el("dlv-method")?el("dlv-method").value:"Cash";
-      inv.payments.push({date:tday(),amt:amt,method:dlvMethod,ref:"Delivery #"+oid});
+      var dlvAmt=Math.min(amt,inv.amount-inv.paid); // never overpay invoice
+      if(dlvAmt>0){
+        inv.payments.push({date:tday(),amt:dlvAmt,method:dlvMethod,ref:"Delivery #"+oid});
+        inv.paid=inv.payments.reduce(function(s,p){return s+(p.amt||0);},0); // source of truth
+        // Overpayment → customer credit
+        var dlvOver=amt-dlvAmt;
+        if(dlvOver>0){
+          var dlvCu=D.customers.find(function(x){return x.id===o.cId;});
+          if(dlvCu){
+            dlvCu.credit=(dlvCu.credit||0)+dlvOver;
+            if(!dlvCu.creditLog)dlvCu.creditLog=[];
+            dlvCu.creditLog.push({date:tday(),amt:dlvOver,type:"overpayment",ordId:oid,method:dlvMethod,by:CU.name});
+          }
+        }
+      }
     }
     if(inv){
       if(inv.paid>=inv.amount){o.paid="Paid";o.amtPaid=inv.paid;}
