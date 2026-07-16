@@ -1709,8 +1709,11 @@ function buildMods(){
       "<div id=\"dlv-info\" style=\"background:var(--bg);border-radius:8px;padding:11px 13px;margin-bottom:14px;font-size:12px;border-left:4px solid var(--gd)\"></div>"+
       "<div id=\"dlv-prod-row\" style=\"display:none;background:#fff8e1;border-radius:8px;padding:12px 14px;margin-bottom:14px;border-left:4px solid #f0c040\">"+
         "<div style=\"font-size:12px;font-weight:700;color:#856404;margin-bottom:8px\"><i class=\"ti ti-package\"></i> Confirm exact product loaded</div>"+
-        "<select class=\"fi\" id=\"dlv-prod-select\" style=\"margin-bottom:6px\"><option value=\"\">-- Select exact brand --</option></select>"+
-        "<div style=\"font-size:11px;color:#856404\">Select the exact brand you are delivering. This updates the order and sets the price.</div>"+
+        "<select class=\"fi\" id=\"dlv-prod-select\" style=\"margin-bottom:6px\" onchange=\"var o=el('dlv-other-wrap');if(o)o.style.display=this.value==='__other__'?'block':'none'\"><option value=\"\">-- Select exact brand --</option></select>"+
+        "<div id=\"dlv-other-wrap\" style=\"display:none;margin-bottom:6px\">"
+          +"<input class=\"fi\" id=\"dlv-other-prod\" placeholder=\"Type exact product name e.g. Aquamist 20ltr\" style=\"margin-top:4px\">"
+        +"</div>"+
+        "<div style=\"font-size:11px;color:#856404\">Select the exact brand you are delivering.</div>"+
       "</div>"+
       "<div class=\"fg2\">"+
         "<div class=\"fg\"><label class=\"flabel\">Bottle condition after</label><select class=\"fi\" id=\"dlv-btl\"><option>Good</option><option>Cracked</option><option>Damaged</option><option>Missing</option></select></div>"+
@@ -3063,6 +3066,9 @@ function openDlv(oid){
       }
     }
   }
+  // Reset other product input
+  var ow=el("dlv-other-wrap");if(ow)ow.style.display="none";
+  var oi=el("dlv-other-prod");if(oi)oi.value="";
   om("m-dlv");
 }
 function completeDlv(){
@@ -3087,9 +3093,10 @@ function completeDlv(){
     var selVal=sel?sel.value:"";
     if(!selVal){toast("Please select the exact brand being delivered","err");return;}
     if(selVal==="__other__"){
-      var customProd=prompt("Enter the exact product name:");
-      if(!customProd||!customProd.trim()){toast("Product name required","err");return;}
-      selVal=customProd.trim()+"|0";
+      var otherInput=el("dlv-other-prod");
+      var customProd=otherInput?otherInput.value.trim():"";
+      if(!customProd){toast("Please type the exact product name","err");return;}
+      selVal=customProd+"|0";
     }
     var parts=selVal.split("|");
     var confirmedProd=parts[0];
@@ -3176,6 +3183,7 @@ function completeDlv(){
   auditLog("DELIVERY_COMPLETE","Order #"+o.id+" completed by "+CU.name+" ("+CU.role+")"+assignedStr+". Product: "+o.prod+", Qty: "+o.qty+". Cash collected: "+(el("dlv-amt")&&el("dlv-amt").value>0?"KSh "+el("dlv-amt").value:"none"));
   cm("m-dlv");rOrds(undefined,ORD_PAGE);rDel();
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
+  updateStockBadge();
   dirty();
   toast(isCat?"Delivery completed — "+o.prod+" confirmed!":"Delivery completed!");
 }
@@ -4010,12 +4018,28 @@ function delCmp(id){if(!can("dCmp")){toast("Only managers can delete complaints"
 
 function addRoute(){
   if(!can("eOrd")){toast("Managers only","err");return;}
-  var name=prompt("Route name (e.g. Nyayo Estate Morning Run):");
-  if(!name||!name.trim())return;
-  var estates=prompt("Areas covered (comma-separated):\ne.g. Nyayo Estate, Court 290, Court 531");
+  var tt=el("m-generic-title");
+  if(tt)tt.innerHTML="<i class=\"ti ti-route\" style=\"color:var(--gd);margin-right:8px\"></i>Add Delivery Route";
+  var gb=el("m-generic-body");if(!gb)return;
+  gb.innerHTML="<div class=\"mbdy\">"
+    +"<div class=\"fg\" style=\"margin-bottom:10px\"><label class=\"flabel\">Route name *</label>"
+    +"<input class=\"fi\" id=\"route-name-inp\" placeholder=\"e.g. Nyayo Estate Morning Run\"></div>"
+    +"<div class=\"fg\" style=\"margin-bottom:0\"><label class=\"flabel\">Areas covered <span style=\"font-weight:400;color:var(--tx2)\">(comma-separated)</span></label>"
+    +"<textarea class=\"fi\" id=\"route-areas-inp\" rows=\"3\" placeholder=\"e.g. Nyayo Estate, Court 290, Court 531\" style=\"resize:none\"></textarea></div>"
+    +"<div class=\"mft\">"
+    +"<button class=\"btn\" onclick=\"cm('m-generic')\">Cancel</button>"
+    +"<button class=\"btn btn-gold\" onclick=\"addRoute._save()\"><i class=\"ti ti-check\"></i> Add Route</button>"
+    +"</div></div>";
+  om("m-generic");
+  setTimeout(function(){var n=el("route-name-inp");if(n)n.focus();},300);
+}
+addRoute._save=function(){
+  var name=el("route-name-inp")?el("route-name-inp").value.trim():"";
+  if(!name){toast("Route name required","err");return;}
+  var estates=el("route-areas-inp")?el("route-areas-inp").value:"";
   if(!D.routes)D.routes=[];
-  D.routes.push({id:uid(),name:name.trim(),estates:(estates||"").split(",").map(function(e){return e.trim();}).filter(Boolean),created:tday()});
-  dirty();rOffers();toast("Route added");
+  D.routes.push({id:uid(),name:name,estates:(estates||"").split(",").map(function(e){return e.trim();}).filter(Boolean),created:tday()});
+  dirty();cm("m-generic");rOffers();toast("Route \""+name+"\" added");
 }
 function delRoute(id){
   if(!can("eOrd"))return;
@@ -4111,6 +4135,14 @@ function exportReportXL(){
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(Object.values(byProd)),"By Product");
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(Object.values(byCust).sort(function(a,b){return b.Revenue-a.Revenue;})),"By Customer");
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(delivered.map(function(o){var cu=D.customers.find(function(x){return x.id===o.cId;});return{Date:o.deliveredAt||o.date,Order:o.id,Customer:cu?cu.name:"",Product:o.prod,Qty:o.qty,Price:o.price,Revenue:o.qty*o.price,Driver:o.driver||"",Payment:o.paid};})),"Orders Detail");
+  // Driver performance sheet
+  var drvMap2={};delivered.forEach(function(o){var d=o.completedBy||o.driver||"Unassigned";if(!drvMap2[d])drvMap2[d]={Driver:d,Deliveries:0,Units:0,Revenue:0};drvMap2[d].Deliveries++;drvMap2[d].Units+=o.qty;drvMap2[d].Revenue+=o.qty*o.price;});
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(Object.values(drvMap2).sort(function(a,b){return b.Deliveries-a.Deliveries;})),"Driver Performance");
+  // Audit log sheet (last 100 events)
+  if(D.auditLog&&D.auditLog.length){
+    var auditRows=(D.auditLog||[]).slice(-100).reverse().map(function(e){return{Timestamp:e.ts,User:e.user,Role:e.role,Action:e.action,Details:e.details||""};});
+    XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(auditRows),"Audit Log");
+  }
   XLSX.writeFile(wb,"NewDawn_Report_"+new Date().toISOString().slice(0,10)+".xlsx");
   toast("Report exported — "+delivered.length+" deliveries");
 }
@@ -4121,7 +4153,26 @@ function rReports(){
   var rev=del.reduce(function(a,o){return a+o.qty*o.price;},0);
   var cost=del.reduce(function(a,o){return a+o.qty*(o.cost||0);},0);
   var totD=D.customers.reduce(function(a,c){return a+custDebt(c.id);},0);
+  var totCredit=D.customers.reduce(function(a,cu){return a+(cu.credit||0);},0);
   var btlIss=D.orders.filter(function(o){return o.bottle_after&&o.bottle_after!=="Good";}).length;
+  // Driver performance
+  var drvMap={};del.forEach(function(o){
+    var d=o.completedBy||o.driver||"Unassigned";
+    if(!drvMap[d])drvMap[d]={name:d,deliveries:0,qty:0};
+    drvMap[d].deliveries++;drvMap[d].qty+=o.qty;
+  });
+  var drvPerf=Object.values(drvMap).sort(function(a,b){return b.deliveries-a.deliveries;});
+  // Payment aging
+  var today=tday();
+  var aging={d7:0,d14:0,d30:0,d60:0,d60p:0};
+  D.invoices.filter(function(i){return i.paid<i.amount&&!i.voided;}).forEach(function(inv){
+    var days=inv.due?Math.floor((new Date(today)-new Date(inv.due))/(86400000)):0;
+    if(days<=7)aging.d7+=(inv.amount-inv.paid);
+    else if(days<=14)aging.d14+=(inv.amount-inv.paid);
+    else if(days<=30)aging.d30+=(inv.amount-inv.paid);
+    else if(days<=60)aging.d60+=(inv.amount-inv.paid);
+    else aging.d60p+=(inv.amount-inv.paid);
+  });
   var cRevMap={};del.forEach(function(o){if(!cRevMap[o.cId])cRevMap[o.cId]={rev:0,ords:0};cRevMap[o.cId].rev+=o.qty*o.price;cRevMap[o.cId].ords++;});
   var cRevs=D.customers.map(function(c){var cm=cRevMap[c.id]||{rev:0,ords:0};return{c:c,rev:cm.rev,ords:cm.ords,debt:custDebt(c.id)};}).sort(function(a,b){return b.rev-a.rev;});
   var pRevs={};del.forEach(function(o){if(!pRevs[o.prod])pRevs[o.prod]={qty:0,rev:0};pRevs[o.prod].qty+=o.qty;pRevs[o.prod].rev+=o.qty*o.price;});
@@ -4139,7 +4190,7 @@ function rReports(){
     "<div class=\"stats\">"+
       "<div class=\"stat sg\"><div class=\"sl\">Total revenue</div><div class=\"sv\">"+ksh(rev)+"</div><div class=\"ss\">"+del.length+" orders</div></div>"+
       "<div class=\"stat sn\"><div class=\"sl\">Gross profit</div><div class=\"sv\">"+(can("vProfit")?"KSh "+(rev-cost).toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>")+"</div><div class=\"ss\">"+(can("vProfit")&&rev>0?Math.round((rev-cost)/rev*100)+"% margin":"&mdash;&mdash;")+"</div></div>"+
-      "<div class=\"stat sr\"><div class=\"sl\">Total debt</div><div class=\"sv\">"+(can("vDebt")?"KSh "+totD.toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>")+"</div></div>"+
+      "<div class=\"stat sr\"><div class=\"sl\">Total debt</div><div class=\"sv\">"+(can("vDebt")?"KSh "+totD.toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>")+"</div>"+(totCredit>0&&can("vDebt")?"<div class=\"ss\" style=\"color:#3498db\">KSh "+totCredit.toLocaleString()+" credit held</div>":"<div class=\"ss\">net of credits</div>")+"</div>"+
       "<div class=\"stat sa\"><div class=\"sl\">Bottle issues</div><div class=\"sv\">"+btlIss+"</div><div class=\"ss\">damaged/cracked/missing</div></div>"+
       "<div class=\"stat sb\"><div class=\"sl\">Open complaints</div><div class=\"sv\">"+D.complaints.filter(function(c){return c.status!=="Resolved";}).length+"</div></div>"+
     "</div>"+
@@ -4166,6 +4217,24 @@ function rReports(){
           return "<tr><td>"+z+"</td><td>"+cu+"</td><td>"+or+"</td></tr>";
         }).join(""):"<tr><td colspan=\"3\" style=\"text-align:center;padding:18px;color:var(--tx2)\">No area data yet</td></tr>")+
         "</tbody></table></div>"+
+      "</div>"+
+      "<div class=\"card\"><div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-steering-wheel\"></i>Driver performance</div></div>"+
+        (can("vRev")?
+          "<div class=\"tw\"><table><thead><tr><th>Driver</th><th>Deliveries</th><th>Units</th></tr></thead><tbody>"+
+          (drvPerf.length?drvPerf.map(function(d){
+            return "<tr><td style=\"font-weight:700\">"+d.name+"</td><td>"+d.deliveries+"</td><td>"+d.qty+"</td></tr>";
+          }).join(""):"<tr><td colspan=\"3\" style=\"text-align:center;padding:18px;color:var(--tx2)\">No deliveries in period</td></tr>")+
+          "</tbody></table></div>":'<div class="te" style="padding:20px"><i class="ti ti-eye-off"></i><p>Hidden for your role</p></div>')+
+      "</div>"+
+      "<div class=\"card\"><div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-clock-exclamation\"></i>Payment aging</div></div>"+
+        (can("vDebt")?
+          "<div class=\"tw\"><table><thead><tr><th>Overdue by</th><th>Amount</th><th>Risk</th></tr></thead><tbody>"+
+          "<tr><td>0-7 days</td><td>KSh "+aging.d7.toLocaleString()+"</td><td><span class=\"badge bg\">Low</span></td></tr>"+
+          "<tr><td>8-14 days</td><td>KSh "+aging.d14.toLocaleString()+"</td><td><span class=\"badge ba\">Watch</span></td></tr>"+
+          "<tr><td>15-30 days</td><td>KSh "+aging.d30.toLocaleString()+"</td><td><span class=\"badge ba\">Medium</span></td></tr>"+
+          "<tr><td>31-60 days</td><td>KSh "+aging.d60.toLocaleString()+"</td><td><span class=\"badge br\">High</span></td></tr>"+
+          "<tr style=\"font-weight:700\"><td>60+ days</td><td style=\"color:#c0392b\">KSh "+aging.d60p.toLocaleString()+"</td><td><span class=\"badge br\">Critical</span></td></tr>"+
+          "</tbody></table></div>":'<div class="te" style="padding:20px"><i class="ti ti-eye-off"></i><p>Hidden for your role</p></div>')+
       "</div>"+
       "<div class=\"card\"><div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-droplet\"></i>Bottle condition</div></div>"+
         "<div class=\"tw\"><table><thead><tr><th>Condition</th><th>Count</th><th>%</th></tr></thead><tbody>"+
