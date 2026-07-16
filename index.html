@@ -265,8 +265,8 @@ function pgBar(page,pages,total,navFn){
   "</div>";
 }
 var CUST_PAGE=0,ORD_PAGE=0,INV_PAGE=0,CMP_PAGE=0,STK_PAGE=0,DEBT_PAGE=0;
-var DASH_PERIOD="today"; // today|month|quarter|all — default: today
-var CUST_Q="",ORD_Q="",INV_Q="",CMP_Q="",STK_Q="",DEL_Q="",DEBT_Q="",DEBT_SORT="amount",AUDIT_Q="",AUDIT_TYPE="",AUDIT_PAGE=0;
+var DASH_PERIOD="today"; // today|week|month|quarter|all — default: today
+var CUST_Q="",ORD_Q="",INV_Q="",CMP_Q="",STK_Q="",DEL_Q="",DEBT_Q="",DEBT_SORT="amount",DEBT_PERIOD="all",AUDIT_Q="",AUDIT_TYPE="",AUDIT_PAGE=0;
 var CUST_SORT="recent",ORD_SORT="newest",CUST_TYPE="";
 function ia(v){return can("vInv")?"KSh "+Number(v).toLocaleString():"KSh "+String.fromCharCode(8226,8226,8226,8226);}
 function sb(s){var m={"Delivered":"bg","Pending":"ba","Out for delivery":"bp","Processing":"bb","Cancelled":"br"};var ic={"Delivered":"ti-circle-check","Pending":"ti-clock","Out for delivery":"ti-truck","Processing":"ti-loader","Cancelled":"ti-x"};return "<span class=\"badge "+(m[s]||"ba")+"\"><i class=\"ti "+(ic[s]||"ti-circle")+"\" style=\"font-size:10px;margin-right:2px\"></i>"+s+"</span>";}
@@ -1920,20 +1920,37 @@ function rDash(){
   var td=now.toISOString().slice(0,10);
   var qStart=Math.floor(mo/3)*3; // quarter start month (0-based)
   var qEnd=qStart+2; // quarter end month (0-based)
+  // ── Week bounds ───────────────────────────────────────────────────
+  var dow=now.getDay(); // 0=Sun
+  var weekStart=new Date(now); weekStart.setDate(now.getDate()-(dow===0?6:dow-1)); // Mon
+  var weekEnd=new Date(weekStart); weekEnd.setDate(weekStart.getDate()+6); // Sun
+  var wkS=weekStart.toISOString().slice(0,10);
+  var wkE=weekEnd.toISOString().slice(0,10);
   var periodDel=del.filter(function(o){
     var dd=(o.deliveredAt||o.date)||"";
     if(!dd)return DASH_PERIOD==="all";
-    if(DASH_PERIOD==="today") return dd===td;
-    if(DASH_PERIOD==="month") return dd.startsWith(yr+"-"+String(mo+1).padStart(2,"0"));
+    if(DASH_PERIOD==="today")   return dd===td;
+    if(DASH_PERIOD==="week")    return dd>=wkS && dd<=wkE;
+    if(DASH_PERIOD==="month")   return dd.startsWith(yr+"-"+String(mo+1).padStart(2,"0"));
     if(DASH_PERIOD==="quarter"){
-      var oMo=parseInt(dd.slice(5,7))-1; // month 0-based
-      return dd.startsWith(String(yr)) && oMo>=qStart && oMo<=qEnd;
+      var oMo=parseInt(dd.slice(5,7))-1;
+      return dd.startsWith(String(yr))&&oMo>=qStart&&oMo<=qEnd;
     }
     return true; // all
   });
   var periodLabel=DASH_PERIOD==="today"?"Today":
+    DASH_PERIOD==="week"?"This week ("+wkS.slice(5)+" – "+wkE.slice(5)+")":
     DASH_PERIOD==="month"?["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][mo]+" "+yr:
     DASH_PERIOD==="quarter"?"Q"+(Math.floor(mo/3)+1)+" "+yr:"All time";
+  // ── Week daily breakdown (for weekly chart) ───────────────────────
+  var wkDays=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+  var wkRevs=wkDays.map(function(_,i){
+    var d=new Date(weekStart);d.setDate(weekStart.getDate()+i);
+    var ds=d.toISOString().slice(0,10);
+    return del.filter(function(o){var dd=o.deliveredAt||o.date;return dd===ds;}).reduce(function(a,o){return a+o.qty*o.price;},0);
+  });
+  var wkMax=Math.max.apply(null,wkRevs.concat([1]));
+  var todayDow=dow===0?6:dow-1; // 0=Mon…6=Sun
   var rev=periodDel.reduce(function(a,o){return a+o.qty*o.price;},0);
   var cost=periodDel.reduce(function(a,o){return a+o.qty*(o.cost||0);},0);
   var pend=D.orders.filter(function(o){return o.status==="Pending"||o.status==="Processing";}).length;
@@ -1984,8 +2001,8 @@ function rDash(){
     "<div style=\"display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px\">"
     +"<div style=\"font-size:12px;color:var(--tx2);font-weight:600\"><i class=\"ti ti-calendar\" style=\"margin-right:5px\"></i>Financial period</div>"
     +"<div style=\"display:flex;gap:4px;flex-wrap:wrap\">"
-    +["today","month","quarter","all"].map(function(p){
-      var lbl=p==="today"?"Today":p==="month"?"This month":p==="quarter"?"This quarter":"All time";
+    +["today","week","month","quarter","all"].map(function(p){
+      var lbl=p==="today"?"Today":p==="week"?"This week":p==="month"?"This month":p==="quarter"?"This quarter":"All time";
       var active=DASH_PERIOD===p;
       return "<button onclick=\"DASH_PERIOD='"+p+"';rDash()\" class=\"btn btn-sm\" style=\""
         +(active?"background:var(--nv);color:#fff;border-color:var(--nv);\"":"background:#fff;\">")
@@ -2004,12 +2021,30 @@ function rDash(){
       +"<div class=\"sv\">"+(can("vProfit")?"KSh "+(rev-cost).toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>")+"</div><div class=\"ss\">"+(can("vProfit")&&rev>0?Math.round((rev-cost)/rev*100)+"% margin &rarr;":(periodDel.length===0?"No deliveries yet":"No cost data"))+"</div></div>"+
       "<div class=\"stat sb\" style=\"cursor:pointer\" onclick=\"nav('customers',null)\" title=\"View all customers\"><div class=\"sic\" style=\"background:#eaf0ff;color:#185FA5\"><i class=\"ti ti-users\"></i></div><div class=\"sl\">Customers</div><div class=\"sv\">"+D.customers.length+"</div><div class=\"ss\">"+D.customers.filter(function(c){return c.ctype==="Distributor";}).length+" distributors &rarr;</div></div>"+
       "<div class=\"stat sa\" style=\"cursor:pointer\" onclick=\"nav('orders',null);setTimeout(function(){filterOrds('Pending');},100)\" title=\"View pending orders\"><div class=\"sic\" style=\"background:#fff8e1;color:#f39c12\"><i class=\"ti ti-clipboard-list\"></i></div><div class=\"sl\">Active orders</div><div class=\"sv\">"+pend+"</div><div class=\"ss\">pending / processing &rarr;</div></div>"+
-      "<div class=\"stat sr\" style=\"cursor:pointer\" onclick=\"nav('debts',null)\" title=\"View debts\"><div class=\"sic\" style=\"background:#fff0f0;color:#c0392b\"><i class=\"ti ti-alert-circle\"></i></div><div class=\"sl\">Total debts</div><div class=\"sv\">"+(can("vDebt")?"KSh "+totD.toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>")+"</div><div class=\"ss\">"+(can("vDebt")?debts.length+" customers &rarr;":"&mdash;&mdash;")+"</div></div>"+
+      "<div class=\"stat sr\" style=\"cursor:pointer\" onclick=\"nav('debts',null)\" title=\"View debts\"><div class=\"sic\" style=\"background:#fff0f0;color:#c0392b\"><i class=\"ti ti-alert-circle\"></i></div><div class=\"sl\">Outstanding debt</div><div class=\"sv\">"+(can("vDebt")?"KSh "+totD.toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>")+"</div><div class=\"ss\">"+(can("vDebt")?debts.length+" customers &rarr;":"&mdash;&mdash;")+"</div></div>"+
       "<div class=\"stat sk\" style=\"cursor:pointer\" onclick=\"nav('stock',null)\" title=\"View stock levels\"><div class=\"sic\" style=\"background:#fff8e1;color:#e67e22\"><i class=\"ti ti-package\"></i></div><div class=\"sl\">Stock alerts</div><div class=\"sv\">"+low+"</div><div class=\"ss\">below minimum &rarr;</div></div>"+
     "</div>"+
     "<div class=\"g2\">"+
       "<div>"+
-        "<div class=\"card\"><div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-chart-bar\"></i>Monthly revenue "+yr+"</div></div>"+
+        "<div class=\"card\" style=\"margin-bottom:10px\">"
+        +"<div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-chart-bar-off\"></i>This week &mdash; daily revenue</div></div>"
+        +(can("vRev")?
+          "<div style=\"display:flex;align-items:flex-end;gap:4px;height:72px;margin-top:8px\">"
+          +wkDays.map(function(d,i){
+            var isToday=i===todayDow;
+            var hasData=wkRevs[i]>0;
+            var isFuture=i>todayDow;
+            var barH=isFuture?4:Math.round(wkRevs[i]/wkMax*60+4);
+            return "<div style=\"flex:1;display:flex;flex-direction:column;align-items:center;\">"
+              +"<div style=\"font-size:9px;color:var(--tx2);margin-bottom:3px;font-weight:"+(hasData?"700":"400")+";\">" +(hasData?"KSh "+Math.round(wkRevs[i]/1000)+"k":"")+"</div>"
+              +"<div style=\"width:100%;border-radius:4px 4px 0 0;background:"+(isToday?"var(--gd)":isFuture?"var(--bd)":"var(--nv2)")+";opacity:"+(isFuture?0.3:1)+";height:"+barH+"px\"></div>"
+              +"<div style=\"font-size:10px;color:"+(isToday?"var(--gd)":"var(--tx2)")+";margin-top:3px;font-weight:"+(isToday?"800":"400")+";\">"+d+"</div>"
+              +"</div>";
+          }).join("")
+          +"</div>":
+          "<div style=\"padding:20px;text-align:center;color:var(--tx2)\"><i class=\"ti ti-eye-off\"></i></div>")
+        +"</div>"
+        +"<div class=\"card\"><div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-chart-bar\"></i>Monthly revenue "+yr+"</div></div>"+
           (can("vRev")?
             "<div style=\"display:flex;align-items:flex-end;gap:5px;height:88px;margin-top:8px\">"+
             mns.map(function(m,i){var mKey=yr+"-"+String(i+1).padStart(2,"0");var hasData=mRevs[i]>0;return "<div style=\"flex:1;display:flex;flex-direction:column;align-items:center;"+(hasData?"cursor:pointer;\"onclick=\"RPT_FROM='"+mKey+"-01';RPT_TO='"+mKey+"-31';nav('reports',null)\" title=\"View "+m+" "+yr+" in reports\"":"\"")+"\"><div style=\"width:100%;border-radius:4px 4px 0 0;background:"+(i===mo?"var(--gd)":"var(--nv2)")+";opacity:"+(hasData?1:0.2)+";height:"+Math.round(mRevs[i]/mMax*76+4)+"px;transition:opacity .15s\"onmouseover=\"if(this.style.opacity)this.style.opacity=0.8\" onmouseout=\"this.style.opacity='"+(hasData?1:0.2)+"'\"></div><div style=\"font-size:9px;color:var(--tx2);margin-top:3px\">"+m+"</div></div>";}).join("")+
@@ -3390,7 +3425,15 @@ function rDel(q){
   var pg=el("pg-delivery");if(!pg)return;
   var allPend=D.orders.filter(function(o){return o.status==="Pending"||o.status==="Processing"||o.status==="Out for delivery";});
   var pend=CU&&CU.role==="driver"?allPend.filter(function(o){return o.driver===CU.name;}):allPend;
-  var todayDel=D.orders.filter(function(o){return o.status==="Delivered"&&(o.deliveredAt===tday()||(!o.deliveredAt&&o.date===tday()));}).length;
+  var _dlvNow=new Date();
+  var _dlvTd=tday();
+  var _dlvDow=_dlvNow.getDay();
+  var _dlvWkStart=new Date(_dlvNow);_dlvWkStart.setDate(_dlvNow.getDate()-(_dlvDow===0?6:_dlvDow-1));
+  var _dlvWkS=_dlvWkStart.toISOString().slice(0,10);
+  var _dlvMo=_dlvNow.getFullYear()+"-"+String(_dlvNow.getMonth()+1).padStart(2,"0");
+  var todayDel=D.orders.filter(function(o){return o.status==="Delivered"&&(o.deliveredAt===_dlvTd||(!o.deliveredAt&&o.date===_dlvTd));}).length;
+  var weekDel=D.orders.filter(function(o){if(o.status!=="Delivered")return false;var dd=o.deliveredAt||o.date;return dd&&dd>=_dlvWkS&&dd<=_dlvTd;}).length;
+  var monthDel=D.orders.filter(function(o){if(o.status!=="Delivered")return false;var dd=o.deliveredAt||o.date;return dd&&dd.startsWith(_dlvMo);}).length;
   var totalDel=D.orders.filter(function(o){return o.status==="Delivered";}).length;
   var q2=DEL_Q||"";
   var pendFil=q2?pend.filter(function(o){var cu=D.customers.find(function(x){return x.id===o.cId;});var lq=q2.toLowerCase();return(cu&&((can("vPhone")&&cu.name.toLowerCase().indexOf(lq)!==-1)||cAddr(cu).toLowerCase().indexOf(lq)!==-1))||String(o.id).indexOf(DEL_Q)!==-1||o.prod.toLowerCase().indexOf(lq)!==-1||(o.driver&&o.driver.toLowerCase().indexOf(lq)!==-1);}):pend;
@@ -3398,7 +3441,7 @@ function rDel(q){
   if(!el("del-srch")){
     pg.innerHTML=
       "<div class=\"ph\"><h1>Delivery Board</h1><p id=\"del-sub\"></p></div>"+
-      "<div class=\"stats\" style=\"grid-template-columns:repeat(4,1fr)\" id=\"del-stats\"></div>"+
+      "<div class=\"stats\" style=\"grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px\" id=\"del-stats\"></div>"+
       "<div class=\"toolbar\" style=\"margin-bottom:10px\"><div class=\"srch\">"+
       "<i class=\"ti ti-search\"></i>"+
       "<input id=\"del-srch\" type=\"text\" autocomplete=\"off\" autocorrect=\"off\" autocapitalize=\"off\" spellcheck=\"false\" inputmode=\"search\" placeholder=\"Search by order #, customer, product, driver...\" value=\""+q2+"\" oninput=\"rDel(this.value)\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div></div>"+
@@ -3410,6 +3453,8 @@ function rDel(q){
   if(_dc)_dc.innerHTML=
     "<div class=\"stat sa\" style=\"cursor:pointer\" onclick=\"nav('orders',null);setTimeout(function(){filterOrds('Pending');},80)\"><div class=\"sl\">Pending</div><div class=\"sv\">"+pend.length+"</div><div class=\"ss\">view all &rarr;</div></div>"+
     "<div class=\"stat sk\" style=\"cursor:pointer\" onclick=\"nav('orders',null);setTimeout(function(){ORD_STATUS_F='Delivered';ORD_DATE_F=tday();rOrds(undefined,0);},80)\"><div class=\"sl\">Delivered today</div><div class=\"sv\">"+todayDel+"</div><div class=\"ss\">view &rarr;</div></div>"+
+    "<div class=\"stat sn\"><div class=\"sl\">This week</div><div class=\"sv\">"+weekDel+"</div><div class=\"ss\">delivered</div></div>"+
+    "<div class=\"stat sb\"><div class=\"sl\">This month</div><div class=\"sv\">"+monthDel+"</div><div class=\"ss\">delivered</div></div>"+
     "<div class=\"stat sn\" style=\"cursor:pointer\" onclick=\"nav('orders',null);setTimeout(function(){filterOrds('Delivered');},80)\"><div class=\"sl\">Total delivered</div><div class=\"sv\">"+totalDel+"</div><div class=\"ss\">view all &rarr;</div></div>"+
     "<div class=\"stat sb\"><div class=\"sl\">Routes</div><div class=\"sv\">"+D.routes.length+"</div></div>";
   var _dr=el("del-results");
@@ -3508,6 +3553,13 @@ function rStock(q,pg){
   var q2=STK_Q||"";
   var pgEl=el("pg-stock");if(!pgEl)return;
   var fil=D.stock.filter(function(s){if(!q2)return true;var lq=q2.toLowerCase();return s.name.toLowerCase().indexOf(lq)!==-1||(s.size&&s.size.toLowerCase().indexOf(lq)!==-1);});
+  // Sort: low stock first (critical → warning → ok), then alphabetical within each tier
+  fil=fil.slice().sort(function(a,b){
+    var aLow=a.qty<=a.min?0:a.qty<=a.min*1.5?1:2;
+    var bLow=b.qty<=b.min?0:b.qty<=b.min*1.5?1:2;
+    if(aLow!==bLow)return aLow-bLow;
+    return a.name.localeCompare(b.name);
+  });
   var paged=paginate(fil,STK_PAGE);
   if(!el("stk-srch")){
     pgEl.innerHTML=
@@ -3871,10 +3923,23 @@ function rDebts(q,pg){
   var pg=el("pg-debts");if(!pg)return;
   if(!can("vDebt")){pg.innerHTML="<div style=\"padding:60px;text-align:center\"><i class=\"ti ti-lock\" style=\"font-size:38px;color:var(--bd);display:block;margin-bottom:12px\"></i><p style=\"font-size:14px;font-weight:700;color:var(--tx2)\">Access restricted</p></div>";return;}
   var td=tday();
+  // Period bounds for debt tracker
+  var _dnow=new Date();
+  var _ddow=_dnow.getDay();
+  var _dwkStart=new Date(_dnow);_dwkStart.setDate(_dnow.getDate()-(_ddow===0?6:_ddow-1));
+  var _dwkS=_dwkStart.toISOString().slice(0,10);
+  var _dmo=_dnow.getFullYear()+"-"+String(_dnow.getMonth()+1).padStart(2,"0");
   var debtors=D.customers.map(function(c){
     var debt=custDebt(c.id);
     var lastOrd=[].concat(D.orders).filter(function(o){return o.cId===c.id;}).sort(function(a,b){return b.date>a.date?1:-1;})[0];
-    var invs=D.invoices.filter(function(i){return i.cId===c.id&&i.paid<i.amount;});
+    var invs=D.invoices.filter(function(i){
+      if(i.cId!==c.id||i.paid>=i.amount||i.voided)return false;
+      // Period filter on due date or invoice date
+      if(DEBT_PERIOD==="today"){var dd=i.due||i.date;return dd===td;}
+      if(DEBT_PERIOD==="week"){var dd=i.due||i.date;return dd&&dd>=_dwkS&&dd<=td;}
+      if(DEBT_PERIOD==="month"){var dd=i.due||i.date;return dd&&dd.startsWith(_dmo);}
+      return i.paid<i.amount; // all
+    });
     var ov=invs.filter(function(i){return i.due&&i.due<td;}).length;
     var old=invs.length?invs.map(function(i){return i.due;}).sort()[0]:null;
     return{c:c,debt:debt,lastOrd:lastOrd,invCount:invs.length,ov:ov,oldest:old};
@@ -3900,7 +3965,15 @@ function rDebts(q,pg){
   var debtPaged=paginate(debtors,DEBT_PAGE);
   if(!el("debt-srch")){
     pg.innerHTML=
-      "<div class=\"ph\"><h1>Debt Tracker</h1><p id=\"debt-stats\"></p></div>"+
+      "<div class=\"ph\"><h1>Debt Tracker</h1><p id=\"debt-stats\"></p></div>"
+    +"<div style=\"display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:6px\">"
+    +"<span style=\"font-size:11px;color:var(--tx2);font-weight:600\"><i class=\"ti ti-calendar\" style=\"margin-right:4px\"></i>Period</span>"
+    +"<div style=\"display:flex;gap:3px\">"
+    +["today","week","month","all"].map(function(p){
+      var lbl=p==="today"?"Today":p==="week"?"This week":p==="month"?"This month":"All time";
+      return "<button class=\"btn btn-xs\" onclick=\"DEBT_PERIOD='"+p+"';rDebts(undefined,0)\" style=\""+(DEBT_PERIOD===p?"background:var(--nv);color:#fff;border-color:var(--nv);\"":"background:#fff;\">")+lbl+"</button>";
+    }).join("")
+    +"</div></div>"+
       "<div class=\"stats\" id=\"debt-cards\"></div>"+
       "<div class=\"toolbar\">"+
         "<div class=\"srch\"><i class=\"ti ti-search\"></i>"+
