@@ -3781,9 +3781,21 @@ function rDebts(q,pg){
     var ov=invs.filter(function(i){return i.due&&i.due<td;}).length;
     var old=invs.length?invs.map(function(i){return i.due;}).sort()[0]:null;
     return{c:c,debt:debt,lastOrd:lastOrd,invCount:invs.length,ov:ov,oldest:old};
-  }).filter(function(x){return x.debt>0;});
+  });
   var q2=DEBT_Q||"";
+  // Credit filter mode: show all customers with a credit balance
+  if(q2==="__credit__"){
+    debtors=D.customers
+      .filter(function(cu){return cu.credit>0;})
+      .map(function(cu){
+        var lastOrd=[].concat(D.orders).filter(function(o){return o.cId===cu.id;}).sort(function(a,b){return b.date>a.date?1:-1;})[0];
+        return {c:cu,debt:custDebt(cu.id),credit:cu.credit||0,lastOrd:lastOrd,ov:0,oldest:null};
+      })
+      .sort(function(a,b){return b.credit-a.credit;});
+  }else{
+  debtors=debtors.filter(function(x){return x.debt>0;});
   if(q2){var lq=q2.toLowerCase();debtors=debtors.filter(function(x){return (can("vPhone")&&x.c.name.toLowerCase().indexOf(lq)!==-1)||cAddr(x.c).toLowerCase().indexOf(lq)!==-1||(can("vPhone")&&x.c.phone&&x.c.phone.indexOf(q2)!==-1);});}
+  }
   var total=debtors.reduce(function(a,x){return a+x.debt;},0);
   if(DEBT_SORT==="name")debtors.sort(function(a,b){return a.c.name.localeCompare(b.c.name);});
   else if(DEBT_SORT==="overdue")debtors.sort(function(a,b){return b.ov-a.ov;});
@@ -3802,7 +3814,8 @@ function rDebts(q,pg){
       "<div id=\"debt-results\"></div>";
   }
   var _dstat=el("debt-stats");
-  if(_dstat)_dstat.innerHTML=debtors.length+" customers with outstanding balances"+(q2?" — filtered":"");
+  var _creditMode=q2==="__credit__";
+  if(_dstat)_dstat.innerHTML=(_creditMode?"<span style=\"color:#3498db;font-weight:700\"><i class=\"ti ti-gift\"></i> Customers with credit balance — "+debtors.length+"</span> <button class=\"btn btn-xs\" onclick=\"rDebts('',0)\" style=\"margin-left:8px\">Show all</button>":debtors.length+" customers with outstanding balances"+(q2?" — filtered":""));
   var _dcards=el("debt-cards");
   if(_dcards)_dcards.innerHTML=
     "<div class=\"stat sr\"><div class=\"sl\">Total outstanding</div><div class=\"sv\" style=\"color:#c0392b\">KSh "+total.toLocaleString()+"</div><div class=\"ss\">"+debtors.length+" customers</div></div>"+
@@ -4190,7 +4203,7 @@ function rReports(){
     "<div class=\"stats\">"+
       "<div class=\"stat sg\"><div class=\"sl\">Total revenue</div><div class=\"sv\">"+ksh(rev)+"</div><div class=\"ss\">"+del.length+" orders</div></div>"+
       "<div class=\"stat sn\"><div class=\"sl\">Gross profit</div><div class=\"sv\">"+(can("vProfit")?"KSh "+(rev-cost).toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>")+"</div><div class=\"ss\">"+(can("vProfit")&&rev>0?Math.round((rev-cost)/rev*100)+"% margin":"&mdash;&mdash;")+"</div></div>"+
-      "<div class=\"stat sr\"><div class=\"sl\">Total debt</div><div class=\"sv\">"+(can("vDebt")?"KSh "+totD.toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>")+"</div>"+(totCredit>0&&can("vDebt")?"<div class=\"ss\" style=\"color:#3498db\">KSh "+totCredit.toLocaleString()+" credit held</div>":"<div class=\"ss\">net of credits</div>")+"</div>"+
+      "<div class=\"stat sr\"><div class=\"sl\">Total debt</div><div class=\"sv\">"+(can("vDebt")?"KSh "+totD.toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>")+"</div>"+(totCredit>0&&can("vDebt")?"<div class=\"ss\" style=\"color:#3498db;cursor:pointer\" onclick=\"nav('debts');setTimeout(function(){rDebts('__credit__',0);},200)\" title=\"See customers with credit\"><i class=\"ti ti-gift\"></i> KSh "+totCredit.toLocaleString()+" credit held &rarr;</div>":"<div class=\"ss\">net of credits</div>")+"</div>"+
       "<div class=\"stat sa\"><div class=\"sl\">Bottle issues</div><div class=\"sv\">"+btlIss+"</div><div class=\"ss\">damaged/cracked/missing</div></div>"+
       "<div class=\"stat sb\"><div class=\"sl\">Open complaints</div><div class=\"sv\">"+D.complaints.filter(function(c){return c.status!=="Resolved";}).length+"</div></div>"+
     "</div>"+
