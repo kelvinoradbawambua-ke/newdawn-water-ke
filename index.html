@@ -2232,6 +2232,58 @@ function openPay(cId){
   om("m-pay");
   setTimeout(function(){var pa=el("pay-amt");if(pa)pa.focus();},300);
 }
+function showCreditLog(cId){
+  if(!can("vRev")){toast("Manager+ only","err");return;}
+  var cu=D.customers.find(function(x){return x.id===cId;});
+  if(!cu)return;
+  var log=(cu.creditLog||[]).slice().reverse(); // newest first
+  var tt=el("m-generic-title");
+  if(tt)tt.innerHTML="<i class=\"ti ti-gift\" style=\"color:#3498db;margin-right:8px\"></i>"
+    +(can("vPhone")?cu.name:maskName(cu.name))+" — Credit History";
+  var html="<div class=\"mbdy\">";
+  // Summary banner
+  var bal=cu.credit||0;
+  html+="<div class=\"notif "+(bal>0?"ni":"nw")+"\" style=\"margin-bottom:14px\">"
+    +"<i class=\"ti ti-gift\"></i>"
+    +"<div><strong>Current credit balance: KSh "+bal.toLocaleString()+"</strong>"
+    +(bal>0?"<div style=\"font-size:11px;margin-top:2px\">Available to apply on next payment</div>":"<div style=\"font-size:11px;margin-top:2px\">All credit has been used</div>")
+    +"</div></div>";
+  if(!log.length){
+    html+="<div class=\"te\"><i class=\"ti ti-history\"></i><p>No credit history</p></div>";
+  }else{
+    html+="<div style=\"border:1px solid var(--bd);border-radius:var(--r2);overflow:hidden\">";
+    html+=log.map(function(e,idx){
+      var isCredit=e.amt>0;
+      var typeLabel=e.type==="overpayment"?"Overpayment":e.type==="applied"?"Applied to payment":"Adjustment";
+      var typeIcon=isCredit?"ti-plus":"ti-minus";
+      var typeCol=isCredit?"#27ae60":"#e67e22";
+      var source=e.invId?"Invoice #"+e.invId:e.ordId?"Order #"+e.ordId:"";
+      return "<div style=\"display:flex;align-items:flex-start;gap:12px;padding:13px 14px;border-bottom:1px solid var(--bd);background:#fff\">"
+        +"<div style=\"width:34px;height:34px;border-radius:50%;background:"+(isCredit?"#e8f8f2":"#fff8e1")+";display:flex;align-items:center;justify-content:center;flex-shrink:0\">"
+        +"<i class=\"ti "+typeIcon+"\" style=\"color:"+typeCol+";font-size:14px\"></i></div>"
+        +"<div style=\"flex:1;min-width:0\">"
+        +"<div style=\"display:flex;justify-content:space-between;align-items:flex-start;gap:8px\">"
+        +"<div><div style=\"font-weight:800;font-size:13px;color:"+typeCol+"\">"
+        +(isCredit?"+":"")+e.amt.toLocaleString()+" KSh"
+        +"</div>"
+        +"<div style=\"font-weight:700;font-size:12px;margin-top:2px\">"+typeLabel+"</div>"
+        +(e.note?"<div style=\"font-size:11px;color:var(--tx2);margin-top:2px\">"+e.note+"</div>":"")
+        +(source?"<div style=\"font-size:11px;color:var(--tx2)\"><i class=\"ti ti-link\"></i> "+source+"</div>":"")
+        +(e.method?"<div style=\"font-size:11px;color:var(--tx2)\"><i class=\"ti ti-cash\"></i> "+e.method+(e.ref?" · "+e.ref:"")+"</div>":"")
+        +"</div>"
+        +"<div style=\"text-align:right;flex-shrink:0\">"
+        +"<div style=\"font-size:11px;color:var(--tx2)\">"+e.date+"</div>"
+        +"<div style=\"font-size:11px;font-weight:700;margin-top:3px\">"+e.by+"</div>"
+        +"<div style=\"font-size:10px;color:var(--tx2)\">"+( e.role||"")+"</div>"
+        +"</div></div>"
+        +"</div></div>";
+    }).join("");
+    html+="</div>";
+  }
+  html+="</div>";
+  var gb=el("m-generic-body");if(gb)gb.innerHTML=html;
+  om("m-generic");
+}
 function showPayments(invId){
   if(!can("rest")){toast("Director only","err");return;}
   var inv=D.invoices.find(function(x){return x.id===invId;});if(!inv){toast("Invoice not found","err");return;}
@@ -2402,7 +2454,7 @@ function recPay(){
       if(cu){
         cu.credit=(cu.credit||0)+credit;
         if(!cu.creditLog)cu.creditLog=[];
-        cu.creditLog.push({date:payDate,amt:credit,type:"overpayment",invId:invId,method:method,ref:ref,by:CU.name});
+        cu.creditLog.push({date:payDate,amt:credit,type:"overpayment",invId:invId,method:method,ref:ref,by:CU.name,role:CU.role,note:"Overpayment on Invoice #"+invId});
         toast("KSh "+credit.toLocaleString()+" overpayment stored as credit for "+(can("vPhone")?cu.name:maskName(cu.name)),"ok");
       }
     }
@@ -2426,7 +2478,7 @@ function recPay(){
       var useCredit=Math.min(existingCredit,totalDebt);
       cu2.credit-=useCredit;
       if(!cu2.creditLog)cu2.creditLog=[];
-      cu2.creditLog.push({date:payDate,amt:-useCredit,type:"applied",by:CU.name});
+      cu2.creditLog.push({date:payDate,amt:-useCredit,type:"applied",by:CU.name,role:CU.role,method:method,note:"Credit applied to payment"});
       amt+=useCredit; // add credit to the payment being allocated
       toast("KSh "+useCredit.toLocaleString()+" credit applied from balance","ok");
     }
@@ -2436,7 +2488,7 @@ function recPay(){
       if(cu2){
         cu2.credit=(cu2.credit||0)+credit2;
         if(!cu2.creditLog)cu2.creditLog=[];
-        cu2.creditLog.push({date:payDate,amt:credit2,type:"overpayment",method:method,ref:ref,by:CU.name});
+        cu2.creditLog.push({date:payDate,amt:credit2,type:"overpayment",method:method,ref:ref,by:CU.name,role:CU.role,note:"Overpayment on customer account"});
         toast("KSh "+credit2.toLocaleString()+" overpayment stored as credit","ok");
       }
       amt=totalDebt;
@@ -3150,7 +3202,7 @@ function completeDlv(){
           if(dlvCu){
             dlvCu.credit=(dlvCu.credit||0)+dlvOver;
             if(!dlvCu.creditLog)dlvCu.creditLog=[];
-            dlvCu.creditLog.push({date:tday(),amt:dlvOver,type:"overpayment",ordId:oid,method:dlvMethod,by:CU.name});
+            dlvCu.creditLog.push({date:tday(),amt:dlvOver,type:"overpayment",ordId:oid,method:dlvMethod,by:CU.name,role:CU.role,note:"Overpayment at delivery of Order #"+oid});
           }
         }
       }
@@ -3739,7 +3791,7 @@ function openPayInv(id){
     +"<span>Invoice <strong>#"+id+"</strong></span>"
     +"<span>Total: <strong>KSh "+i.amount.toLocaleString()+"</strong></span>"
     +"<span style=\"color:#c0392b\">Balance: <strong>KSh "+bal.toLocaleString()+"</strong></span>"
-    +(c&&c.credit>0?"<span style=\"color:#3498db\"><i class=\"ti ti-gift\"></i> Credit: <strong>KSh "+c.credit.toLocaleString()+"</strong></span>":"")
+    +(c&&c.credit>0?"<span style=\"color:#3498db;cursor:pointer\" onclick=\"showCreditLog("+id+");event.stopPropagation()\" title=\"View credit history\"><i class=\"ti ti-gift\"></i> Credit: <strong>KSh "+c.credit.toLocaleString()+"</strong> &rarr;</span>":"")
     +"</div>";
   el("pay-date").value=tday();
   // Leave amount blank — director enters what was actually received
@@ -3837,7 +3889,7 @@ function rDebts(q,pg){
 
         return "<tr class=\"dr\">"+
           "<td><div style=\"font-weight:800;font-size:13px\">"+(can("vPhone")?x.c.name:maskName(x.c.name))
-            +(x.c.credit>0?" <span class=\"badge bb\" style=\"font-size:9px\" title=\"Credit balance\"><i class=\"ti ti-gift\"></i> KSh "+x.c.credit.toLocaleString()+" credit</span>":"")
+            +(x.c.credit>0?" <span class=\"badge bb\" style=\"font-size:9px;cursor:pointer\" onclick=\"showCreditLog("+x.c.id+")\" title=\"View credit history\"><i class=\"ti ti-gift\"></i> KSh "+x.c.credit.toLocaleString()+" credit &rarr;</span>":"")
             +"</div>"+
             (x.c.followups&&x.c.followups.length?"<div style=\"font-size:10px;color:#0891b2;margin-top:2px\"><i class=\"ti ti-phone-check\" style=\"font-size:10px\"></i> "+x.c.followups[x.c.followups.length-1].date+": "+x.c.followups[x.c.followups.length-1].note.slice(0,50)+"</div>":"")+
             (can("vRev")?"<div style=\"margin-top:4px\"><button onclick=\"addFollowUp("+x.c.id+")\" class=\"btn btn-xs\" style=\"font-size:10px;padding:2px 6px;background:#0891b2;color:#fff;border:none\"><i class=\"ti ti-phone-plus\" style=\"font-size:10px\"></i> Follow up</button></div>":"")+
