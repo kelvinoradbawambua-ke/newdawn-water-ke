@@ -3033,6 +3033,7 @@ function saveOrd(){
     if(!st.history)st.history=[];
     st.history.push({ts:tday(),type:"sale",qty:-qty,by:CU.name,ordId:newOrdId,bal:st.qty});
     if(st.history.length>50)st.history=st.history.slice(-50);
+    updateStockBadge();
   }
   var total=price*qty;
   var amtPaid=can("mPaid")?(parseFloat(el("oamt").value)||0):0;
@@ -3250,7 +3251,13 @@ function delO(id){
   // Restore stock — skip for category orders (prodConfirmed===false means no stock was deducted)
   var st=D.stock.find(function(s){return s.name===o.prod;});
   var wasStockDeducted=(o.prodConfirmed!==false);
-  if(st&&o.status!=="Delivered"&&o.status!=="Cancelled"&&wasStockDeducted)st.qty+=o.qty;
+  if(st&&o.status!=="Delivered"&&o.status!=="Cancelled"&&wasStockDeducted){
+    st.qty+=o.qty;
+    if(!st.history)st.history=[];
+    st.history.push({ts:tday(),type:"restore",qty:+o.qty,by:CU.name,ordId:oid,bal:st.qty});
+    if(st.history.length>50)st.history=st.history.slice(-50);
+    updateStockBadge();
+  }
   // Remove order
   D.orders=D.orders.filter(function(x){return x.id!==id;});
   // Remove unpaid invoices only — keep paid ones for records
@@ -3285,6 +3292,7 @@ function cancelO(id){
     if(!st.history)st.history=[];
     st.history.push({ts:tday(),type:"restore",qty:+o.qty,by:CU.name,ordId:id,bal:st.qty});
     if(st.history.length>50)st.history=st.history.slice(-50);
+    updateStockBadge();
   }
   // Update order status
   o.status="Cancelled";
