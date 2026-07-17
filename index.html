@@ -2353,7 +2353,7 @@ function openPay(cId){
   setTimeout(function(){var pa=el("pay-amt");if(pa)pa.focus();},300);
 }
 function showCycleHistory(cId){
-  if(!can("eCust")&&CU.role!=="director"){toast("Director/Manager only","err");return;}
+  if(!can("eCust")){toast("Manager+ required","err");return;}
   var cu=D.customers.find(function(x){return x.id===cId;});if(!cu)return;
   var tt=el("m-generic-title");
   if(tt)tt.innerHTML="<i class=\"ti ti-refresh\" style=\"color:var(--nv);margin-right:8px\"></i>"
@@ -3851,8 +3851,8 @@ function saveSt(){
       s.isWater=el("sw")&&el("sw").checked?true:false;
       auditLog("STOCK_UPDATED","Product saved by "+CU.name+" ("+CU.role+"): "+n+(s.isWater?" [water cycle product]":""));
       cm("m-s");rStock();dirty();
-      // Re-run water cycle sync so isWater change takes effect immediately
-      setTimeout(function(){runIntegrityCheck();},500);
+      // Re-sync water cycles after isWater change (targeted, no race with dirty)
+      if(s.isWater)setTimeout(syncWaterCycles,1500);
       toast(n+" updated"+(s.isWater?" — water cycle tracking enabled":""));
       return;
     }
@@ -4565,7 +4565,7 @@ function editOf(id){
   el("m-of-save").innerHTML="<i class=\"ti ti-check\"></i> Update";
   om("m-of");
 }
-function delOf(id){if(!can("dOff"))return;if(!confirm("Delete?"))return;D.offers=D.offers.filter(function(o){return o.id!==id;});rOffers();dirty();}
+function delOf(id){if(!can("dOff"))return;D.offers=D.offers.filter(function(o){return o.id!==id;});rOffers();dirty();}
 
 var RPT_FROM="";var RPT_TO="";
 function exportReportXL(){
@@ -5689,6 +5689,41 @@ function restoreXL(input){
     toast("File read error","err");
   };
   reader.readAsArrayBuffer(file);input.value="";
+}
+function syncWaterCycles(){
+  // Lightweight water-only resync — no credit migration, no stock fixes
+  // Safe to call after stock edit without racing the main dirty() write
+  if(!CU||CU.role!=="director"||!FB_READY)return;
+  var changed=0;
+  D.customers.forEach(function(cu){
+    var waterOrds=D.orders.filter(function(o){
+      return o.cId===cu.id&&o.status==="Delivered"&&is20ltr(o.prod);
+    }).sort(function(a,b){
+      var da=a.deliveredAt||a.date||"";var db=b.deliveredAt||b.date||"";
+      return da>db?1:da<db?-1:0;
+    });
+    var totalBottles=waterOrds.reduce(function(s,o){return s+(o.qty||1);},0);
+    var correct=totalBottles%8;
+    if(cu.waterCycle!==correct){
+      cu.waterCycle=correct;
+      // Rebuild history
+      var newH=[];var cum=0;var cyc=0;
+      for(var oi=0;oi<waterOrds.length;oi++){
+        var ord=waterOrds[oi];var prev=cum;
+        cum+=(ord.qty||1);
+        if(prev<4&&cum>=4&&cum<8)newH.push({ts:ord.deliveredAt||ord.date||tday(),bottles:cum,event:"milestone_4",ordId:ord.id,qty:ord.qty,by:"System (sync)"});
+        while(cum>=8){cyc++;newH.push({ts:ord.deliveredAt||ord.date||tday(),bottles:8,event:"cycle_complete",cycleNum:cyc,ordId:ord.id,qty:ord.qty,by:"System (sync)"});cum-=8;}
+      }
+      var manual=(cu.cycleHistory||[]).filter(function(h){return h.by&&h.by!=="System (bootstrap)"&&h.by!=="System (sync)";});
+      cu.cycleHistory=newH.concat(manual);
+      changed++;
+    }
+  });
+  if(changed>0){
+    dirty();
+    toast("Water cycles updated for "+changed+" customer(s)","ok");
+    if(el("pg-customers")&&el("pg-customers").classList.contains("act"))rCusts();
+  }
 }
 function runIntegrityCheck(){
   if(!CU||CU.role!=="director"||!FB_READY)return;
