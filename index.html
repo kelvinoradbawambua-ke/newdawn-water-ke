@@ -1996,6 +1996,7 @@ function rDash(){
   }
   D.complaints.filter(function(c){return c.status==="Open";}).slice(0,2).forEach(function(c){var cu=D.customers.find(function(x){return x.id===c.cId;});alerts.push({t:"nw",i:"ti-message-report",m:"Complaint: <strong>"+(cu?(can("vPhone")?cu.name:maskName(cu.name)):"?")+"</strong> &mdash; "+c.type,dest:"complaints"});});
   D.orders.filter(function(o){return o.status==="Pending";}).slice(0,3).forEach(function(o){alerts.push({t:"ni",i:"ti-truck",m:"Pending: <strong>#"+o.id+"</strong> &mdash; "+custName(o.cId)+": "+o.qty+"&times; "+o.prod,dest:"orders"});});
+  var _urgency={nr:0,nw:1,ni:2,nok:3};alerts.sort(function(a,b){return(_urgency[a.t]||2)-(_urgency[b.t]||2);});
   pg.innerHTML=
     "<div class=\"ph\"><h1>Dashboard</h1><p>Welcome back, "+CU.name+" &middot; "+new Date().toLocaleDateString("en-GB",{weekday:"long",day:"numeric",month:"long",year:"numeric"})+"</p></div>"+
     "<div style=\"display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px\">"
@@ -2027,9 +2028,7 @@ function rDash(){
     "<div class=\"g2\">"+
       "<div>"+
         "<div class=\"card\" style=\"margin-bottom:10px\">"
-        +"<div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-calendar-week\"></i>This week &mdash; daily revenue</div>"
-        +(can("vRev")?"<div style=\"font-size:11px;color:var(--tx2)\">KSh "+wkRevs.reduce(function(a,v){return a+v;},0).toLocaleString()+" total</div>":"")
-        +"</div>"
+        +"<div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-calendar-week\"></i>This week &mdash; daily revenue</div></div>"
         +(can("vRev")?
           "<div style=\"display:flex;align-items:flex-end;gap:6px;height:90px;margin:12px 0 4px\">"
           +wkDays.map(function(d,i){
@@ -2073,10 +2072,7 @@ return "<div class=\"notif "+a.t+"\" style=\""+style+"\"><i class=\"ti "+a.i+"\"
             "<div class=\"notif nok\"><i class=\"ti ti-circle-check\"></i><span>All clear &mdash; no alerts</span></div>")+
         "</div>"+
         "<div class=\"card\" style=\"padding-bottom:0\">"+
-        "<div class=\"ct\">"+
-        "<div class=\"ctl\"><i class=\"ti ti-package\"></i>Stock levels</div>"+
-        (D.stock.length>10?"<button class=\"btn btn-xs\" onclick=\"nav('stock',null)\" style=\"font-size:11px\"><i class=\"ti ti-arrow-right\"></i> All</button>":"")+
-        "</div>"+
+        "<div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-package\"></i>Stock levels</div></div>"+
         (function(){
           if(!D.stock.length)
             return "<div class=\"te\" style=\"padding:18px\"><i class=\"ti ti-package\"></i><p>No products</p></div>";
@@ -4387,7 +4383,7 @@ function exportReportXL(){
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(Object.values(byCust).sort(function(a,b){return b.Revenue-a.Revenue;})),"By Customer");
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(delivered.map(function(o){var cu=D.customers.find(function(x){return x.id===o.cId;});return{Date:o.deliveredAt||o.date,Order:o.id,Customer:cu?cu.name:"",Product:o.prod,Qty:o.qty,Price:o.price,Revenue:o.qty*o.price,Driver:o.driver||"",Payment:o.paid};})),"Orders Detail");
   // Driver performance sheet
-  var drvMap2={};delivered.forEach(function(o){var d=o.completedBy||o.driver||"Unassigned";if(!drvMap2[d])drvMap2[d]={Driver:d,Deliveries:0,Units:0,Revenue:0};drvMap2[d].Deliveries++;drvMap2[d].Units+=o.qty;drvMap2[d].Revenue+=o.qty*o.price;});
+  var drvMap2={};delivered.forEach(function(o){var d=o.completedBy||o.driver||"Unassigned";var asgn=o.driver||"Unassigned";if(!drvMap2[d])drvMap2[d]={"Completed By":d,"Assigned Driver":asgn===d?"(same)":asgn,Deliveries:0,Units:0,Revenue:0};drvMap2[d].Deliveries++;drvMap2[d].Units+=o.qty;drvMap2[d].Revenue+=o.qty*o.price;});
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(Object.values(drvMap2).sort(function(a,b){return b.Deliveries-a.Deliveries;})),"Driver Performance");
   // Audit log sheet (last 100 events)
   if(D.auditLog&&D.auditLog.length){
@@ -4399,24 +4395,53 @@ function exportReportXL(){
 }
 function rReports(){
   var pg=el("pg-reports");if(!pg)return;
-  var del=D.orders.filter(function(o){if(o.status!=="Delivered")return false;var dDate=o.deliveredAt||o.date; // use actual delivery date for reporting
-  if(RPT_FROM&&dDate<RPT_FROM)return false;if(RPT_TO&&dDate>RPT_TO)return false;return true;});
+  var del=D.orders.filter(function(o){
+    if(o.status!=="Delivered")return false;
+    if(RPT_FROM||RPT_TO){
+      // Date range selected: use deliveredAt for accuracy
+      // Orders without deliveredAt cannot be placed in a period reliably
+      var dDate=o.deliveredAt||o.date;
+      if(!dDate)return false;
+      if(RPT_FROM&&dDate<RPT_FROM)return false;
+      if(RPT_TO&&dDate>RPT_TO)return false;
+    }
+    return true;
+  });
   var rev=del.reduce(function(a,o){return a+o.qty*o.price;},0);
   var cost=del.reduce(function(a,o){return a+o.qty*(o.cost||0);},0);
   var totD=D.customers.reduce(function(a,c){return a+custDebt(c.id);},0);
   var totCredit=D.customers.reduce(function(a,cu){return a+(cu.credit||0);},0);
   var btlIss=D.orders.filter(function(o){return o.bottle_after&&o.bottle_after!=="Good";}).length;
   // Driver performance
-  var drvMap={};del.forEach(function(o){
-    var d=o.completedBy||o.driver||"Unassigned";
-    if(!drvMap[d])drvMap[d]={name:d,deliveries:0,qty:0};
-    drvMap[d].deliveries++;drvMap[d].qty+=o.qty;
+  // Driver performance: group by who COMPLETED the delivery (completedBy)
+  // Fall back to assigned driver if completedBy not set (legacy orders)
+  var drvMap={};
+  del.forEach(function(o){
+    var completed=o.completedBy||o.driver||"Unassigned";
+    var assigned=o.driver||"Unassigned";
+    if(!drvMap[completed])drvMap[completed]={name:completed,assigned:assigned===completed?"":assigned,deliveries:0,qty:0,rev:0};
+    drvMap[completed].deliveries++;
+    drvMap[completed].qty+=o.qty;
+    drvMap[completed].rev+=o.qty*o.price;
   });
   var drvPerf=Object.values(drvMap).sort(function(a,b){return b.deliveries-a.deliveries;});
   // Payment aging
   var today=tday();
   var aging={d7:0,d14:0,d30:0,d60:0,d60p:0};
-  D.invoices.filter(function(i){return i.paid<i.amount&&!i.voided;}).forEach(function(inv){
+  // Aging respects the selected date period
+  D.invoices.filter(function(i){
+    if(i.paid>=i.amount||i.voided)return false;
+    if(!RPT_FROM&&!RPT_TO)return true;
+    var ordMatch=i.notes&&i.notes.match(/#(\d+)/);
+    if(ordMatch){
+      var _ao=D.orders.find(function(x){return String(x.id)===ordMatch[1];});
+      if(_ao&&_ao.date){
+        if(RPT_FROM&&_ao.date<RPT_FROM)return false;
+        if(RPT_TO&&_ao.date>RPT_TO)return false;
+      }
+    }
+    return true;
+  }).forEach(function(inv){
     var days=inv.due?Math.floor((new Date(today)-new Date(inv.due))/(86400000)):0;
     if(days<=7)aging.d7+=(inv.amount-inv.paid);
     else if(days<=14)aging.d14+=(inv.amount-inv.paid);
@@ -4428,9 +4453,32 @@ function rReports(){
   var cRevs=D.customers.map(function(c){var cm=cRevMap[c.id]||{rev:0,ords:0};return{c:c,rev:cm.rev,ords:cm.ords,debt:custDebt(c.id)};}).sort(function(a,b){return b.rev-a.rev;});
   var pRevs={};del.forEach(function(o){if(!pRevs[o.prod])pRevs[o.prod]={qty:0,rev:0};pRevs[o.prod].qty+=o.qty;pRevs[o.prod].rev+=o.qty*o.price;});
   var zones=[].concat([],D.customers.map(function(c){return c.estate||c.zone||"";})).filter(function(z,i,a){return z&&a.indexOf(z)===i;});
+  var _rptLabel="";if(RPT_FROM&&RPT_TO)_rptLabel=RPT_FROM+" to "+RPT_TO;else if(RPT_FROM)_rptLabel="From "+RPT_FROM;else if(RPT_TO)_rptLabel="Up to "+RPT_TO;
   pg.innerHTML=
     "<div class=\"ph\"><h1>Business Reports</h1>"+
-    "<div style=\"display:flex;gap:8px;align-items:center;margin:8px 0;flex-wrap:wrap\">"+
+    "<div style=\"display:flex;flex-wrap:wrap;gap:5px;margin:8px 0 4px\">"+
+    (function(){
+      var n2=new Date(),y2=n2.getFullYear(),m2=n2.getMonth(),t2=tday();
+      var mS=y2+"-"+String(m2+1).padStart(2,"0")+"-01";
+      var lmD=new Date(y2,m2-1,1);
+      var lmS=lmD.getFullYear()+"-"+String(lmD.getMonth()+1).padStart(2,"0")+"-01";
+      var lmE=new Date(y2,m2,0).toISOString().slice(0,10);
+      var qS=y2+"-"+String(Math.floor(m2/3)*3+1).padStart(2,"0")+"-01";
+      var yS=y2+"-01-01";
+      var ps="padding:4px 10px;border-radius:99px;border:1.5px solid ";
+      var af="font-size:11px;font-weight:700;cursor:pointer;font-family:inherit";
+      function _p(lbl,f,t){
+        var a=RPT_FROM===f&&RPT_TO===t;
+        return "<button onclick=\"RPT_FROM='"+f+"';RPT_TO='"+t+"';rReports()\""+
+          " style=\""+ps+(a?"var(--nv);background:var(--nv);color:#fff":"var(--bd);background:#fff;color:var(--tx2)")+";"+af+"\">"+lbl+"</button>";
+      }
+      var _aa=!RPT_FROM&&!RPT_TO;
+      var _as=ps+(_aa?"var(--nv);background:var(--nv);color:#fff":"var(--bd);background:#fff;color:var(--tx2)")+";"+af;
+      var _ab='<button onclick="RPT_FROM=\'\';RPT_TO=\'\';rReports()" style="'+_as+'">All time</button>';
+      return _p("This month",mS,t2)+_p("Last month",lmS,lmE)+_p("This quarter",qS,t2)+_p("This year",yS,t2)+_ab;
+    })()+
+    "</div>"+
+    "<div style=\"display:flex;gap:8px;align-items:center;margin:4px 0 8px;flex-wrap:wrap\">"+
     "<span style=\"font-size:12px;font-weight:700;color:var(--nv)\">Period:</span>"+
     "<input type=\"date\" class=\"fi\" style=\"width:130px;padding:5px 8px\" value=\""+RPT_FROM+"\" onchange=\"RPT_FROM=this.value;rReports()\">"+
     "<span style=\"font-size:11px;color:var(--tx2)\">to</span>"+
@@ -4447,6 +4495,8 @@ function rReports(){
     "</div>"+
     "<div class=\"g2\">"+
       "<div class=\"card\"><div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-trophy\"></i>Top customers</div></div>"+
+      (_rptLabel?"<p style=\"font-size:10px;color:var(--tx2);margin:-8px 0 8px;padding:0 2px\">"+_rptLabel+"</p>":"")+
+
         (can("vRev")?
           "<div class=\"tw\"><table><thead><tr><th>Customer</th><th>Orders</th><th>Revenue</th><th>Debt</th></tr></thead><tbody>"+
           cRevs.slice(0,8).map(function(x){return "<tr><td><div style=\"font-weight:700\">"+(can("vPhone")?x.c.name:maskName(x.c.name))+"</div><div class=\"ca\">"+(x.c.court||x.c.estate||"")+"</div></td><td>"+x.ords+"</td><td>KSh "+x.rev.toLocaleString()+"</td><td style=\"font-weight:700;color:"+(x.debt>0?"#c0392b":"#27ae60")+"\">"+(x.debt>0?"KSh "+x.debt.toLocaleString():"Clear")+"</td></tr>";}).join("")+
@@ -4454,30 +4504,43 @@ function rReports(){
           "<div class=\"te\" style=\"padding:20px\"><i class=\"ti ti-eye-off\"></i><p>Hidden for your role</p></div>")+
       "</div>"+
       "<div class=\"card\"><div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-package\"></i>Product performance</div></div>"+
+      (_rptLabel?"<p style=\"font-size:10px;color:var(--tx2);margin:-8px 0 8px;padding:0 2px\">"+_rptLabel+"</p>":"")+
+
         (can("vRev")?
           "<div class=\"tw\"><table><thead><tr><th>Product</th><th>Units</th><th>Revenue</th></tr></thead><tbody>"+
           Object.entries(pRevs).sort(function(a,b){return b[1].rev-a[1].rev;}).map(function(e){return "<tr><td style=\"font-weight:700\">"+e[0]+"</td><td>"+e[1].qty+"</td><td>KSh "+e[1].rev.toLocaleString()+"</td></tr>";}).join("")+
           "</tbody></table></div>":
           "<div class=\"te\" style=\"padding:20px\"><i class=\"ti ti-eye-off\"></i><p>Hidden for your role</p></div>")+
       "</div>"+
-      "<div class=\"card\"><div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-map-pin\"></i>Sales by area</div></div>"+
+      "<div class=\"card\"><div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-map-pin\"></i>Sales by area</div></div>"+(_rptLabel?"<p style=\"font-size:10px;color:var(--tx2);margin:-8px 0 8px\">"+_rptLabel+"</p>":"")+
         "<div class=\"tw\"><table><thead><tr><th>Area</th><th>Customers</th><th>Orders</th></tr></thead><tbody>"+
         (zones.length?zones.map(function(z){
           var cu=D.customers.filter(function(c){return c.estate===z||c.zone===z;}).length;
-          var or=D.orders.filter(function(o){var c=D.customers.find(function(x){return x.id===o.cId;});return c&&o.status==="Delivered"&&(c.estate===z||c.zone===z);}).length;
+          var or=del.filter(function(o){var cu2=D.customers.find(function(x){return x.id===o.cId;});return cu2&&(cu2.estate===z||cu2.zone===z);}).length;
           return "<tr><td>"+z+"</td><td>"+cu+"</td><td>"+or+"</td></tr>";
         }).join(""):"<tr><td colspan=\"3\" style=\"text-align:center;padding:18px;color:var(--tx2)\">No area data yet</td></tr>")+
         "</tbody></table></div>"+
       "</div>"+
       "<div class=\"card\"><div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-steering-wheel\"></i>Driver performance</div></div>"+
+      (_rptLabel?"<p style=\"font-size:10px;color:var(--tx2);margin:-8px 0 8px;padding:0 2px\">"+_rptLabel+"</p>":"")+
+
         (can("vRev")?
-          "<div class=\"tw\"><table><thead><tr><th>Driver</th><th>Deliveries</th><th>Units</th></tr></thead><tbody>"+
-          (drvPerf.length?drvPerf.map(function(d){
-            return "<tr><td style=\"font-weight:700\">"+d.name+"</td><td>"+d.deliveries+"</td><td>"+d.qty+"</td></tr>";
-          }).join(""):"<tr><td colspan=\"3\" style=\"text-align:center;padding:18px;color:var(--tx2)\">No deliveries in period</td></tr>")+
-          "</tbody></table></div>":'<div class="te" style="padding:20px"><i class="ti ti-eye-off"></i><p>Hidden for your role</p></div>')+
+          "<div class=\"tw\"><table><thead><tr>"
+          +"<th>Driver / Completed by</th><th style=\"text-align:center\">Deliveries</th><th style=\"text-align:center\">Units</th>"+(can("vRev")?"<th style=\"text-align:right\">Revenue</th>":"")
+          +"</tr></thead><tbody>"
+          +(drvPerf.length?drvPerf.map(function(d){
+            return "<tr>"
+              +"<td><div style=\"font-weight:700\">"+d.name+"</div>"
+              +(d.assigned?"<div class=\"ca\">Assigned: "+d.assigned+"</div>":"")
+              +"</td>"
+              +"<td style=\"text-align:center;font-weight:700\">"+d.deliveries+"</td>"
+              +"<td style=\"text-align:center\">"+d.qty+"</td>"
+              +(can("vRev")?"<td style=\"text-align:right;font-weight:700\">KSh "+d.rev.toLocaleString()+"</td>":"")
+              +"</tr>";
+          }).join(""):"<tr><td colspan=\"4\" style=\"text-align:center;padding:18px;color:var(--tx2)\">No deliveries in period</td></tr>")
+          +"</tbody></table></div>":'<div class="te" style="padding:20px"><i class="ti ti-eye-off"></i><p>Hidden for your role</p></div>')+
       "</div>"+
-      "<div class=\"card\"><div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-clock-exclamation\"></i>Payment aging</div></div>"+
+      "<div class=\"card\"><div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-clock-exclamation\"></i>Payment aging</div></div>"+(_rptLabel?"<p style=\"font-size:10px;color:var(--tx2);margin:-8px 0 8px\">"+_rptLabel+"</p>":"")+
         (can("vDebt")?
           "<div class=\"tw\"><table><thead><tr><th>Overdue by</th><th>Amount</th><th>Risk</th></tr></thead><tbody>"+
           "<tr><td>0-7 days</td><td>KSh "+aging.d7.toLocaleString()+"</td><td><span class=\"badge bg\">Low</span></td></tr>"+
