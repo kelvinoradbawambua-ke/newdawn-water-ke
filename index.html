@@ -3822,6 +3822,7 @@ function rStock(q,pg){
 
 }
 function prepStAdd(){
+  if(el("sw"))el("sw").checked=false;
   el("s-edit-id").value="";
   ["sn","ss","sp","sc","sq","sm"].forEach(function(id){el(id).value="";});
   el("m-s-title").innerHTML="<i class=\"ti ti-package\" style=\"color:var(--gd);margin-right:7px\"></i>Add Product";
@@ -3837,8 +3838,12 @@ function saveSt(){
     if(s){
       s.name=n;s.size=el("ss").value;s.price=parseFloat(el("sp").value)||0;
       s.cost=parseFloat(el("sc").value)||0;s.qty=parseInt(el("sq").value)||0;s.min=parseInt(el("sm").value)||10;
-      auditLog("STOCK_UPDATED","Product saved by "+CU.name+" ("+CU.role+"): "+n);
-      cm("m-s");rStock();dirty();toast(n+" updated");
+      s.isWater=el("sw")&&el("sw").checked?true:undefined;
+      auditLog("STOCK_UPDATED","Product saved by "+CU.name+" ("+CU.role+"): "+n+(s.isWater?" [water cycle product]":""));
+      cm("m-s");rStock();dirty();
+      // Re-run water cycle sync so isWater change takes effect immediately
+      setTimeout(function(){runIntegrityCheck();},500);
+      toast(n+" updated"+(s.isWater?" — water cycle tracking enabled":""));
       return;
     }
   }
@@ -3852,6 +3857,7 @@ function editSt(id){
   el("s-edit-id").value=s.id;
   el("sn").value=s.name||"";el("ss").value=s.size||"";el("sp").value=s.price||0;
   el("sc").value=s.cost||0;el("sq").value=s.qty||0;el("sm").value=s.min||10;
+  if(el("sw"))el("sw").checked=!!s.isWater;
   el("m-s-title").innerHTML="<i class=\"ti ti-edit\" style=\"color:var(--gd);margin-right:7px\"></i>Edit Product";
   el("m-s-save").innerHTML="<i class=\"ti ti-check\"></i> Update";
   om("m-s");
