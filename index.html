@@ -2207,7 +2207,7 @@ function rCusts(q,pg,sort,type){
           var allPays=D.invoices.filter(function(i){return i.cId===c.id&&i.payments&&i.payments.length;}).reduce(function(a,i){return a.concat(i.payments);},[]).sort(function(a,b){return b.date>a.date?1:-1;});
           var lp=allPays[0];
           return "<tr class=\""+(debt>0?"dr":"")+"\">"+
-            "<td><div style=\"font-weight:700\">"+(can("vPhone")?c.name:maskName(c.name))+"</div><div class=\"ca\">"+cAddr(c)+"</div>"+(c.waterCycle>0?"<div style=\"margin-top:3px\"><span class=\"badge ba\" style=\"cursor:pointer;font-size:9px\" onclick=\"showCycleHistory("+c.id+")\" title=\"Water cycle\"><i class=\"ti ti-droplet\"></i> "+c.waterCycle+"/8</span></div>":"")+"</td>"+
+            "<td><div style=\"font-weight:700\">"+(can("vPhone")?c.name:maskName(c.name))+"</div><div class=\"ca\">"+cAddr(c)+"</div>"+(c.waterCycle>0||(c.waterCycle===0&&c.cycleHistory&&c.cycleHistory.length>0)?"<div style=\"margin-top:3px\"><span class=\"badge ba\" style=\"cursor:pointer;font-size:9px\" onclick=\"showCycleHistory("+c.id+")\" title=\"Water cycle\"><i class=\"ti ti-droplet\"></i> "+c.waterCycle+"/8</span></div>":"")+"</td>"+
             "<td>"+(can("vPhone")?c.phone+(c.phone2?"<div class=\"ca\">"+c.phone2+"</div>":""):maskPhone(c.phone))+"</td>"+
             "<td><span class=\"badge "+(c.ctype==="Distributor"?"bp":c.ctype==="Commercial"?"bb":c.ctype==="Institution"?"ba":"bg")+"\">"+c.ctype+"</span></td>"+
             "<td style=\"font-weight:700\">"+ords.length+"</td>"+
@@ -3532,6 +3532,7 @@ function completeDlv(){
   }
   cm("m-dlv");rOrds(undefined,ORD_PAGE);rDel();
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
+  if(el("pg-customers")&&el("pg-customers").classList.contains("act"))rCusts();
   updateStockBadge();
   dirty();
   toast(isCat?"Delivery completed — "+o.prod+" confirmed!":"Delivery completed!");
@@ -5753,7 +5754,11 @@ function runIntegrityCheck(){
     cu.cycleHistory=newHistory.concat(manualEntries);
     if(changed)bootstrapped++;
   });
-  if(bootstrapped>0){dirty();issues.push("Water cycle synced for "+bootstrapped+" customer(s) — quantities recomputed from delivered orders");}
+  if(bootstrapped>0){
+    dirty();
+    issues.push("Water cycle synced for "+bootstrapped+" customer(s) — quantities recomputed from delivered orders");
+    if(el("pg-customers")&&el("pg-customers").classList.contains("act"))rCusts();
+  }
   // Check 1: negative stock
   D.stock.forEach(function(s){
     if(s.qty<0){s.qty=0;issues.push("Stock: "+s.name+" had negative qty — reset to 0");}
