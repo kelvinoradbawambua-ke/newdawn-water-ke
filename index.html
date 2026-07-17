@@ -3046,6 +3046,7 @@ function calcO(){
     if(can("vRev")){e.textContent="KSh "+(p*q).toLocaleString();}
     else{e.textContent=String.fromCharCode(8226,8226,8226,8226);}
   }
+  checkCycleWarn(); // update cycle banner when qty changes
 }
 function checkCycleWarn(){
   var warn=el("m-o-cycle-warn");if(!warn)return;
