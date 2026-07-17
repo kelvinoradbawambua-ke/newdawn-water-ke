@@ -1658,7 +1658,7 @@ function buildMods(){
             "<div id=\"op-sel\" style=\"font-size:11px;color:var(--gd);font-weight:700;margin-top:4px;min-height:16px\"></div>"+
           "</div>"+
           "<div id=\"o-cat-wrap\" style=\"display:none\">"+
-            "<select class=\"fi\" id=\"op-cat\">"+
+            "<select class=\"fi\" id=\"op-cat\" onchange=\"checkCycleWarn()\">"+
               "<option value=\"\">Select category...</option>"+
               "<option value=\"6kg Gas\">6kg Gas (brand confirmed on delivery)</option>"+
               "<option value=\"13kg Gas\">13kg Gas (brand confirmed on delivery)</option>"+
@@ -1684,6 +1684,7 @@ function buildMods(){
       "<input type=\"hidden\" id=\"o-edit-id\" value=\"\">"+
       "<input type=\"hidden\" id=\"o-mode\" value=\"exact\">"+
     "</div>"+
+    "<div id=\"m-o-cycle-warn\" style=\"display:none;margin:0 0 10px\"></div>"+
     "<div class=\"mft\"><button class=\"btn\" onclick=\"cm('m-o')\">Cancel</button><button class=\"btn btn-gold\" id=\"m-o-save\" onclick=\"saveOrd()\"><i class=\"ti ti-check\"></i> Place order</button></div>"+
   "</div></div>";
 
@@ -2835,6 +2836,7 @@ function ocSelect(cId,e){
   }
   if(el("odlvr")&&!el("odlvr").value)el("odlvr").value=addr;
   el("oc-drop").style.display="none";
+  checkCycleWarn();
 }
 function opSearch(q){
   var drop=el("op-drop");if(!drop)return;
@@ -2968,6 +2970,7 @@ function prepO(){
   if(totRow)totRow.style.display=can("vRev")?"":"none";
   el("m-o-title").innerHTML="<i class=\"ti ti-shopping-cart\" style=\"color:var(--gd);margin-right:7px\"></i>New Order";
   el("m-o-save").innerHTML="<i class=\"ti ti-check\"></i> Place order";
+  var _cw=el("m-o-cycle-warn");if(_cw){_cw.style.display="none";_cw.innerHTML="";}
   calcO();om("m-o");
   setTimeout(function(){
     if(el("oc-search")){
@@ -3039,6 +3042,44 @@ function calcO(){
   if(e){
     if(can("vRev")){e.textContent="KSh "+(p*q).toLocaleString();}
     else{e.textContent=String.fromCharCode(8226,8226,8226,8226);}
+  }
+}
+function checkCycleWarn(){
+  var warn=el("m-o-cycle-warn");if(!warn)return;
+  // Get current customer
+  var cId=parseInt(el("oc")&&el("oc").value)||0;
+  if(!cId){warn.style.display="none";return;}
+  // Get current product — category or exact
+  var mode=el("o-mode")&&el("o-mode").value;
+  var prod="";
+  if(mode==="cat")prod=el("op-cat")&&el("op-cat").value;
+  else{
+    // Exact mode: read from the stock select or prod name field
+    var ps=el("prod-select");if(ps)prod=ps.options[ps.selectedIndex]&&ps.options[ps.selectedIndex].text;
+    if(!prod){var sn=el("sn");if(sn)prod=sn.value;}
+  }
+  // Only show for 20ltr water products
+  var isWater=prod&&prod.toLowerCase().indexOf("20ltr")!==-1;
+  if(!isWater){warn.style.display="none";return;}
+  var cu=D.customers.find(function(x){return x.id===cId;});if(!cu){warn.style.display="none";return;}
+  var cur=cu.waterCycle||0;
+  var next=cur+1;
+  var name=can("vPhone")?cu.name:maskName(cu.name);
+  if(next===4){
+    warn.style.display="block";
+    warn.innerHTML="<div class=\"notif nw\" style=\"margin:0;border-radius:8px\">"
+      +"<i class=\"ti ti-droplet\"></i>"
+      +"<span><strong>Milestone:</strong> This will be "+name+"'s <strong>4th water delivery</strong> this cycle ("+next+"/8). Halfway there!</span></div>";
+  }else if(next===8){
+    warn.style.display="block";
+    warn.innerHTML="<div class=\"notif ni\" style=\"margin:0;border-radius:8px\">"
+      +"<i class=\"ti ti-trophy\"></i>"
+      +"<span><strong>Cycle complete!</strong> This will be "+name+"'s <strong>8th water delivery</strong> — cycle resets after delivery.</span></div>";
+  }else if(next>8){
+    // Already beyond 8 — cycle counter may not have reset yet (order not delivered)
+    warn.style.display="none";
+  }else{
+    warn.style.display="none";
   }
 }
 function saveOrd(){
@@ -3201,16 +3242,6 @@ function saveOrd(){
   // Always create invoice for exact orders — provides full financial trail
   D.invoices.push({id:nIId++,cId:cId,amount:total,paid:amtPaid,due:(function(){var dd=new Date((el("od").value||tday())+"T12:00:00");dd.setDate(dd.getDate()+7);return dd.toISOString().split("T")[0];})(),notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
   auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty);
-  // Water cycle milestone alert at order creation
-  var _ow=pn&&pn.toLowerCase().indexOf("20ltr")!==-1;
-  if(_ow){
-    var _oc=D.customers.find(function(x){return x.id===cId;});
-    if(_oc){
-      var _next=(_oc.waterCycle||0)+1;
-      if(_next===4)toast((can("vPhone")?_oc.name:maskName(_oc.name))+": will be their 4th water delivery this cycle!","ok");
-      else if(_next===8)toast((can("vPhone")?_oc.name:maskName(_oc.name))+": will complete their 8-delivery water cycle!","ok");
-    }
-  }
   cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+newOrdId+" placed");
 }
 function openDlv(oid){
