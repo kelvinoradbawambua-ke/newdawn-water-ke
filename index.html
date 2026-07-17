@@ -3579,10 +3579,12 @@ function rDel(q){
   if(_dc)_dc.innerHTML=
     "<div class=\"stat sa\" style=\"cursor:pointer\" onclick=\"nav('orders',null);setTimeout(function(){filterOrds('Pending');},80)\"><div class=\"sl\">Pending</div><div class=\"sv\">"+pend.length+"</div><div class=\"ss\">view all &rarr;</div></div>"+
     "<div class=\"stat sk\" style=\"cursor:pointer\" onclick=\"nav('orders',null);setTimeout(function(){ORD_STATUS_F='Delivered';ORD_DATE_F=tday();rOrds(undefined,0);},80)\"><div class=\"sl\">Delivered today</div><div class=\"sv\">"+todayDel+"</div><div class=\"ss\">view &rarr;</div></div>"+
+    (CU&&CU.role==="staff"?
+    "<div class=\"stat sb\"><div class=\"sl\">Routes</div><div class=\"sv\">"+D.routes.length+"</div></div>":// staff see Pending, Today, Routes only
     "<div class=\"stat sn\"><div class=\"sl\">This week</div><div class=\"sv\">"+weekDel+"</div><div class=\"ss\">delivered</div></div>"+
     "<div class=\"stat sb\"><div class=\"sl\">This month</div><div class=\"sv\">"+monthDel+"</div><div class=\"ss\">delivered</div></div>"+
     "<div class=\"stat sn\" style=\"cursor:pointer\" onclick=\"nav('orders',null);setTimeout(function(){filterOrds('Delivered');},80)\"><div class=\"sl\">Total delivered</div><div class=\"sv\">"+totalDel+"</div><div class=\"ss\">view all &rarr;</div></div>"+
-    "<div class=\"stat sb\"><div class=\"sl\">Routes</div><div class=\"sv\">"+D.routes.length+"</div></div>";
+    "<div class=\"stat sb\"><div class=\"sl\">Routes</div><div class=\"sv\">"+D.routes.length+"</div></div>")
   var _dr=el("del-results");
   if(_dr)_dr.innerHTML=
     "<div class=\"tw\"><table>"+
