@@ -2356,7 +2356,7 @@ function showCycleHistory(cId){
   // Calculate total delivered waters from all orders for this customer
   var _wOrds=D.orders.filter(function(o){
     return o.cId===cId&&o.status==="Delivered"
-      &&o.prod&&o.prod.toLowerCase().indexOf("20ltr")!==-1;
+      &&is20ltr(o.prod);
   });
   var totalWater=_wOrds.reduce(function(s,o){return s+(o.qty||1);},0);
   var html="<div class=\"mbdy\">";
@@ -3048,6 +3048,21 @@ function calcO(){
   }
   checkCycleWarn(); // update cycle banner when qty changes
 }
+function is20ltr(prodName){
+  if(!prodName)return false;
+  var n=prodName.toLowerCase().replace(/\s+/g,"");
+  // Check the name itself
+  if(n.indexOf("20ltr")!==-1||n.indexOf("20ltrs")!==-1)return true;
+  // Check the size field of the matching stock product
+  var st=D.stock.find(function(s){
+    return s.name.toLowerCase()===prodName.toLowerCase();
+  });
+  if(st&&st.size){
+    var sz=st.size.toLowerCase().replace(/\s+/g,"");
+    if(sz.indexOf("20ltr")!==-1||sz.indexOf("20ltrs")!==-1)return true;
+  }
+  return false;
+}
 function checkCycleWarn(){
   var warn=el("m-o-cycle-warn");if(!warn)return;
   // Get current customer
@@ -3062,7 +3077,7 @@ function checkCycleWarn(){
     var opEl=el("op");if(opEl)prod=opEl.value;
   }
   // Only show for 20ltr water products
-  var isWater=prod&&prod.toLowerCase().indexOf("20ltr")!==-1;
+  var isWater=is20ltr(prod);
   if(!isWater){warn.style.display="none";return;}
   var cu=D.customers.find(function(x){return x.id===cId;});if(!cu){warn.style.display="none";return;}
   var cur=cu.waterCycle||0;
@@ -3450,7 +3465,7 @@ function completeDlv(){
   var assignedStr=o.driver&&o.driver!==CU.name?" (assigned to "+o.driver+")":" (self-assigned)";
   auditLog("DELIVERY_COMPLETE","Order #"+o.id+" completed by "+CU.name+" ("+CU.role+")"+assignedStr+". Product: "+o.prod+", Qty: "+o.qty+". Cash collected: "+(el("dlv-amt")&&el("dlv-amt").value>0?"KSh "+el("dlv-amt").value:"none"));
   // Water delivery cycle counter
-  var _isWater=o.prod&&o.prod.toLowerCase().indexOf("20ltr")!==-1;
+  var _isWater=is20ltr(o.prod);
   if(_isWater){
     var _cu=D.customers.find(function(x){return x.id===o.cId;});
     if(_cu){
@@ -5640,37 +5655,54 @@ function runIntegrityCheck(){
     }
   });
   if(migrated>0){issues.push("Migrated "+migrated+" customer(s): moved form-set credit to creditLimit field");dirty();}
-  // Bootstrap water cycle from existing order history
-  // Count delivered water orders since last cycle reset for each customer
+  // ── Water cycle sync — always recompute from delivered orders ────────
+  // Source of truth: sum of o.qty for all delivered 20ltr orders per customer
+  // Runs every director login to auto-correct any drift
   var bootstrapped=0;
   D.customers.forEach(function(cu){
-    if(cu.waterCycle!==undefined)return; // already tracked
-    // Find all delivered water orders for this customer
+    // Find ALL delivered 20ltr water orders for this customer, sorted by date
     var waterOrds=D.orders.filter(function(o){
-      return o.cId===cu.id&&o.status==="Delivered"
-        &&o.prod&&(o.prod.toLowerCase().indexOf("20ltr")!==-1);
-    }).sort(function(a,b){return a.date>b.date?1:-1;});
-    // Sum total bottles delivered (use qty not order count)
+      return o.cId===cu.id&&o.status==="Delivered"&&is20ltr(o.prod);
+    }).sort(function(a,b){
+      var da=o&&o.deliveredAt||a.date||"";
+      var db=o&&o.deliveredAt||b.date||"";
+      return da>db?1:da<db?-1:0;
+    });
+    // Sum total bottles from quantities
     var totalBottles=waterOrds.reduce(function(s,o){return s+(o.qty||1);},0);
-    cu.waterCycle=totalBottles%8;
-    // Rebuild cycle history — one entry per 8-bottle cycle
+    var correctCycle=totalBottles%8;
+    var correctResets=Math.floor(totalBottles/8);
+    // Only update if changed — avoids unnecessary dirty/sync
+    var changed=cu.waterCycle!==correctCycle;
+    cu.waterCycle=correctCycle;
+    // Rebuild cycle history from scratch based on cumulative bottle counts
     if(!cu.cycleHistory)cu.cycleHistory=[];
-    var resets=Math.floor(totalBottles/8);
-    // Log one history entry per completed cycle
-    for(var ri=0;ri<resets;ri++){
-      var _resetOrd=waterOrds[ri]; // approximate — use first order of each cycle
-      cu.cycleHistory.push({
-        ts:_resetOrd?_resetOrd.date:tday(),
-        cycle:8,
-        event:"cycle_complete",
-        cycleNum:ri+1, // which cycle number (1st, 2nd, 3rd...)
-        ordId:_resetOrd?_resetOrd.id:0,
-        by:"System (bootstrap)"
-      });
+    // Build history entries for each cycle reset using cumulative bottle tally
+    var newHistory=[];
+    var cumBottles=0;
+    var cycleCount=0;
+    for(var oi=0;oi<waterOrds.length;oi++){
+      var ord=waterOrds[oi];
+      var prevCum=cumBottles;
+      cumBottles+=(ord.qty||1);
+      // Check if we crossed the 4-bottle milestone in this order
+      if(prevCum<4&&cumBottles>=4&&cumBottles<8){
+        // Keep existing milestone_4 entry if same order, else add
+        newHistory.push({ts:ord.deliveredAt||ord.date||tday(),bottles:cumBottles,event:"milestone_4",ordId:ord.id,qty:ord.qty,by:"System (sync)"});
+      }
+      // Check if we crossed an 8-bottle cycle completion
+      while(cumBottles>=8){
+        cycleCount++;
+        newHistory.push({ts:ord.deliveredAt||ord.date||tday(),bottles:8,event:"cycle_complete",cycleNum:cycleCount,ordId:ord.id,qty:ord.qty,by:"System (sync)"});
+        cumBottles-=8; // carry over excess
+      }
     }
-    bootstrapped++;
+    // Preserve any manual history entries (not system-generated)
+    var manualEntries=(cu.cycleHistory||[]).filter(function(h){return h.by&&h.by!=="System (bootstrap)"&&h.by!=="System (sync)";});
+    cu.cycleHistory=newHistory.concat(manualEntries);
+    if(changed)bootstrapped++;
   });
-  if(bootstrapped>0){dirty();issues.push("Water cycle bootstrapped for "+bootstrapped+" customer(s) from order history");}
+  if(bootstrapped>0){dirty();issues.push("Water cycle synced for "+bootstrapped+" customer(s) — quantities recomputed from delivered orders");}
   // Check 1: negative stock
   D.stock.forEach(function(s){
     if(s.qty<0){s.qty=0;issues.push("Stock: "+s.name+" had negative qty — reset to 0");}
