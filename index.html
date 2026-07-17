@@ -1652,7 +1652,7 @@ function buildMods(){
             "</div>"+
           "</div>"+
           "<div id=\"o-exact-wrap\" style=\"position:relative\">"+
-            "<input class=\"fi\" id=\"op-search\" placeholder=\"Type product name or size...\" oninput=\"opSearch(this.value)\" onblur=\"setTimeout(function(){el('op-drop').style.display='none';},200)\" autocomplete=\"off\">"+
+            "<input class=\"fi\" id=\"op-search\" placeholder=\"Type product name or size...\" oninput=\"opSearch(this.value);checkCycleWarn()\" onblur=\"setTimeout(function(){el('op-drop').style.display='none';},200)\" autocomplete=\"off\">"+
             "<div id=\"op-drop\" style=\"display:none;position:absolute;top:100%;left:0;right:0;background:#fff;border:1.5px solid var(--gd);border-radius:0 0 8px 8px;max-height:200px;overflow-y:auto;z-index:999;box-shadow:0 4px 16px rgba(0,0,0,.15)\"></div>"+
             "<input type=\"hidden\" id=\"op\" data-p=\"0\">"+
             "<div id=\"op-sel\" style=\"font-size:11px;color:var(--gd);font-weight:700;margin-top:4px;min-height:16px\"></div>"+
@@ -2902,6 +2902,7 @@ function opSelect(name,price,e){
   el("op-search").value=name;
   el("op-sel").innerHTML="<i class=\"ti ti-check\"></i> "+(can("vRev")?"KSh "+price+" per unit":"Selected");
   el("op-drop").style.display="none";
+  checkCycleWarn();
   calcO();
 }
 function setOrderMode(mode){
@@ -3054,9 +3055,8 @@ function checkCycleWarn(){
   var prod="";
   if(mode==="cat")prod=el("op-cat")&&el("op-cat").value;
   else{
-    // Exact mode: read from the stock select or prod name field
-    var ps=el("prod-select");if(ps)prod=ps.options[ps.selectedIndex]&&ps.options[ps.selectedIndex].text;
-    if(!prod){var sn=el("sn");if(sn)prod=sn.value;}
+    // Exact mode: product name is in el("op") (the search/selected field)
+    var opEl=el("op");if(opEl)prod=opEl.value;
   }
   // Only show for 20ltr water products
   var isWater=prod&&prod.toLowerCase().indexOf("20ltr")!==-1;
