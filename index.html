@@ -2354,17 +2354,18 @@ function showCycleHistory(cId){
   var log=(cu.cycleHistory||[]).slice().reverse();
   var cyc=cu.waterCycle||0;
   // Calculate total delivered waters from all orders for this customer
-  var totalWater=D.orders.filter(function(o){
+  var _wOrds=D.orders.filter(function(o){
     return o.cId===cId&&o.status==="Delivered"
       &&o.prod&&o.prod.toLowerCase().indexOf("20ltr")!==-1;
-  }).length;
+  });
+  var totalWater=_wOrds.reduce(function(s,o){return s+(o.qty||1);},0);
   var html="<div class=\"mbdy\">";
   // Current cycle banner
   html+="<div class=\"notif "+(cyc>=4?"nw":"ni")+"\" style=\"margin-bottom:14px\">"
     +"<i class=\"ti ti-droplet\"></i>"
-    +"<div><strong>Current cycle: "+cyc+"/8 deliveries</strong>"
+    +"<div><strong>Current cycle: "+cyc+"/8 bottles</strong>"
     +"<div style=\"margin:6px 0 2px\"><div class=\"prog\" style=\"height:8px\"><div class=\"progb\" style=\"width:"+Math.round(cyc/8*100)+"%;background:"+(cyc>=4?"#f39c12":"var(--nv2)")+";border-radius:4px\"></div></div></div>"
-    +"<div style=\"font-size:11px;color:var(--tx2)\">Total water deliveries all-time: "+totalWater+"</div>"
+    +"<div style=\"font-size:11px;color:var(--tx2)\">Total 20ltr bottles delivered: "+totalWater+"</div>"
     +"</div></div>";
   if(!log.length){
     html+="<div class=\"te\"><i class=\"ti ti-history\"></i><p>No cycle history yet</p></div>";
@@ -2374,7 +2375,7 @@ function showCycleHistory(cId){
       var isCmp=e.event==="cycle_complete";
       var icon=isCmp?"ti-circle-check":"ti-alert-circle";
       var col=isCmp?"#27ae60":"#f39c12";
-      var label=isCmp?"Cycle complete (reset to 0)":"Milestone: "+e.cycle+" deliveries";
+      var label=isCmp?"Cycle complete at "+e.bottles+" bottles (reset)":"Milestone: "+e.bottles+" bottles";
       return "<div style=\"display:flex;align-items:center;gap:12px;padding:11px 14px;border-bottom:1px solid var(--bd)\">"
         +"<div style=\"width:32px;height:32px;border-radius:50%;background:"+(isCmp?"#e8f8f2":"#fff8e1")+";display:flex;align-items:center;justify-content:center;flex-shrink:0\">"
         +"<i class=\"ti "+icon+"\" style=\"color:"+col+"\"></i></div>"
@@ -3064,32 +3065,39 @@ function checkCycleWarn(){
   if(!isWater){warn.style.display="none";return;}
   var cu=D.customers.find(function(x){return x.id===cId;});if(!cu){warn.style.display="none";return;}
   var cur=cu.waterCycle||0;
-  var next=cur+1;
+  var qty=parseInt(el("oq")&&el("oq").value)||1; // bottles in this order
+  var next=cur+qty; // total after this order delivers
   var name=can("vPhone")?cu.name:maskName(cu.name);
-  if(next===4){
-    warn.style.display="block";
-    warn.innerHTML="<div style=\"background:#fff8e1;border:1.5px solid #f39c12;border-radius:8px;padding:10px 14px;display:flex;align-items:center;gap:10px\">"
-      +"<i class=\"ti ti-droplet\" style=\"color:#f39c12;font-size:18px;flex-shrink:0\"></i>"
-      +"<div><div style=\"font-weight:800;font-size:12px;color:#856404\">4th water delivery this cycle</div>"
-      +"<div style=\"font-size:11px;color:#856404;margin-top:2px\">"+name+" is halfway through their 8-delivery cycle (4/8)</div></div></div>";
-  }else if(next===8){
-    warn.style.display="block";
-    warn.innerHTML="<div style=\"background:#e8f8f2;border:1.5px solid #27ae60;border-radius:8px;padding:10px 14px;display:flex;align-items:center;gap:10px\">"
+  // Progress bar always shown
+  var _pct=Math.min(100,Math.round((cur/8)*100));
+  var _pctAfter=Math.min(100,Math.round((next/8)*100));
+  warn.style.display="block";
+  // Determine message
+  var _msg="";
+  if(next>=8){
+    // Will complete (or exceed) the cycle
+    var excess=next-8;
+    _msg="<div style=\"background:#e8f8f2;border:1.5px solid #27ae60;border-radius:8px;padding:10px 14px;margin-bottom:6px;display:flex;align-items:center;gap:10px\">"
       +"<i class=\"ti ti-trophy\" style=\"color:#27ae60;font-size:18px;flex-shrink:0\"></i>"
-      +"<div><div style=\"font-weight:800;font-size:12px;color:#1a7a4a\">8th delivery — cycle complete!</div>"
-      +"<div style=\"font-size:11px;color:#1a7a4a;margin-top:2px\">"+name+" completes their water cycle with this order. Counter resets after delivery.</div></div></div>";
-  }else{
-    // Show current position for all water orders (non-milestone)
-    warn.style.display="block";
-    var _pct=Math.round((cur/8)*100);
-    warn.innerHTML="<div style=\"background:var(--bg);border:1.5px solid var(--bd);border-radius:8px;padding:10px 14px;display:flex;align-items:center;gap:10px\">"
-      +"<i class=\"ti ti-droplet\" style=\"color:var(--nv2);font-size:16px;flex-shrink:0\"></i>"
-      +"<div style=\"flex:1\">"
-      +"<div style=\"font-weight:700;font-size:12px;color:var(--tx)\">Water cycle: "+next+"/8</div>"
-      +"<div style=\"margin-top:5px;height:5px;background:var(--bd);border-radius:3px\">"
-      +"<div style=\"height:5px;background:var(--nv2);border-radius:3px;width:"+_pct+"%;transition:width .3s\"></div></div>"
-      +"</div></div>";
+      +"<div><div style=\"font-weight:800;font-size:12px;color:#1a7a4a\">Completes 8-bottle cycle!</div>"
+      +"<div style=\"font-size:11px;color:#1a7a4a;margin-top:2px\">"+name+(excess>0?" — "+excess+" bottle"+(excess>1?"s":"")+" carry to next cycle":"")+"</div></div></div>";
+  } else if(cur<4&&next>=4){
+    // Will cross the 4-bottle halfway mark
+    _msg="<div style=\"background:#fff8e1;border:1.5px solid #f39c12;border-radius:8px;padding:10px 14px;margin-bottom:6px;display:flex;align-items:center;gap:10px\">"
+      +"<i class=\"ti ti-droplet\" style=\"color:#f39c12;font-size:18px;flex-shrink:0\"></i>"
+      +"<div><div style=\"font-weight:800;font-size:12px;color:#856404\">Reaches halfway (4 bottles)!</div>"
+      +"<div style=\"font-size:11px;color:#856404;margin-top:2px\">"+name+" will be at "+next+"/8 bottles after this order</div></div></div>";
   }
+  // Always show cycle progress bar
+  warn.innerHTML=_msg
+    +"<div style=\"background:var(--bg);border:1.5px solid var(--bd);border-radius:8px;padding:10px 14px\">"
+    +"<div style=\"display:flex;justify-content:space-between;font-size:11px;font-weight:700;margin-bottom:6px\">"
+    +"<span><i class=\"ti ti-droplet\"></i> "+name+"'s 20ltr cycle</span>"
+    +"<span style=\"color:var(--tx2)\">"+cur+" → <strong>"+Math.min(next,8)+"</strong>/8 bottles</span></div>"
+    +"<div style=\"height:8px;background:var(--bd);border-radius:4px;overflow:hidden\">"
+    +"<div style=\"height:8px;border-radius:4px;background:linear-gradient(90deg,var(--nv2),var(--gd));width:"+_pctAfter+"%;transition:width .3s\"></div></div>"
+    +"<div style=\"font-size:10px;color:var(--tx2);margin-top:4px;text-align:right\">"+(next>=8?"Cycle resets after delivery":""+(8-next)+" more bottle"+(8-next===1?"":"s")+" to complete cycle")+"</div>"
+    +"</div>";
 }
 function saveOrd(){
   if(!can("aOrd")&&!can("eOrd"))return;
@@ -3445,16 +3453,18 @@ function completeDlv(){
   if(_isWater){
     var _cu=D.customers.find(function(x){return x.id===o.cId;});
     if(_cu){
-      _cu.waterCycle=(_cu.waterCycle||0)+1;
+      var _prevCycle=_cu.waterCycle||0;
+      _cu.waterCycle=_prevCycle+o.qty; // add bottles delivered
       if(!_cu.cycleHistory)_cu.cycleHistory=[];
-      // Milestone alerts
-      if(_cu.waterCycle===4){
-        toast((can("vPhone")?_cu.name:maskName(_cu.name))+" has received 4 water deliveries this cycle — halfway!","ok");
-        _cu.cycleHistory.push({ts:tday(),cycle:_cu.waterCycle,event:"milestone_4",ordId:o.id,by:CU.name});
-      } else if(_cu.waterCycle>=8){
-        toast((can("vPhone")?_cu.name:maskName(_cu.name))+" completed 8 water deliveries — cycle reset!","ok");
-        _cu.cycleHistory.push({ts:tday(),cycle:8,event:"cycle_complete",ordId:o.id,by:CU.name});
-        _cu.waterCycle=0; // reset
+      // Milestone: crossed 4 bottles (halfway)
+      if(_prevCycle<4&&_cu.waterCycle>=4&&_cu.waterCycle<8){
+        toast((can("vPhone")?_cu.name:maskName(_cu.name))+" has reached 4 bottles this cycle — halfway!","ok");
+        _cu.cycleHistory.push({ts:tday(),bottles:_cu.waterCycle,event:"milestone_4",ordId:o.id,qty:o.qty,by:CU.name});
+      }
+      if(_cu.waterCycle>=8){
+        toast((can("vPhone")?_cu.name:maskName(_cu.name))+" reached "+_cu.waterCycle+" bottles — cycle resets!","ok");
+        _cu.cycleHistory.push({ts:tday(),bottles:_cu.waterCycle,event:"cycle_complete",ordId:o.id,qty:o.qty,by:CU.name});
+        _cu.waterCycle=_cu.waterCycle-8; // carry over excess bottles to next cycle
       }
     }
   }
@@ -5639,14 +5649,15 @@ function runIntegrityCheck(){
       return o.cId===cu.id&&o.status==="Delivered"
         &&o.prod&&(o.prod.toLowerCase().indexOf("20ltr")!==-1);
     }).sort(function(a,b){return a.date>b.date?1:-1;});
-    // Count modulo 8 from the beginning
-    cu.waterCycle=waterOrds.length%8;
-    // Rebuild cycle history from resets
+    // Sum total bottles delivered (use qty not order count)
+    var totalBottles=waterOrds.reduce(function(s,o){return s+(o.qty||1);},0);
+    cu.waterCycle=totalBottles%8;
+    // Rebuild cycle history — one entry per 8-bottle cycle
     if(!cu.cycleHistory)cu.cycleHistory=[];
-    var resets=Math.floor(waterOrds.length/8);
+    var resets=Math.floor(totalBottles/8);
     // Log one history entry per completed cycle
     for(var ri=0;ri<resets;ri++){
-      var _resetOrd=waterOrds[(ri+1)*8-1]; // the 8th order of this cycle
+      var _resetOrd=waterOrds[ri]; // approximate — use first order of each cycle
       cu.cycleHistory.push({
         ts:_resetOrd?_resetOrd.date:tday(),
         cycle:8,
