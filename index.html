@@ -4465,7 +4465,7 @@ function editCmp(id){
   om("m-cmp");
 }
 function resolveCmp(id){if(!can("mCmp")){toast("Only managers can resolve complaints","err");return;}var c=D.complaints.find(function(x){return x.id===id;});if(c)c.status="Resolved";rCmps(undefined,CMP_PAGE);dirty();toast("Complaint resolved");}
-function delCmp(id){if(!can("dCmp")){toast("Only managers can delete complaints","err");return;}if(!confirm("Delete complaint?"))return;D.complaints=D.complaints.filter(function(c){return c.id!==id;});rCmps(undefined,CMP_PAGE);dirty();}
+function delCmp(id){if(!can("dCmp")){toast("Only managers can delete complaints","err");return;}var cmp=D.complaints.find(function(x){return x.id===id;});if(!cmp)return;var cu=D.customers.find(function(x){return x.id===cmp.cId;});var msg="Delete complaint from "+(cu?(can("vPhone")?cu.name:"this customer"):"unknown")+"?\n\n\""+cmp.text.slice(0,80)+(cmp.text.length>80?"…":"")+"\"\n\nThis cannot be undone.";if(!confirm(msg))return;D.complaints=D.complaints.filter(function(c){return c.id!==id;});rCmps(undefined,CMP_PAGE);dirty();}
 
 function addRoute(){
   if(!can("eOrd")){toast("Managers only","err");return;}
@@ -4494,9 +4494,13 @@ addRoute._save=function(){
 }
 function delRoute(id){
   if(!can("eOrd"))return;
-  if(!confirm("Remove this route?"))return;
+  var rt=(D.routes||[]).find(function(r){return r.id===id;});if(!rt)return;
+  var areas=(rt.estates||[]).slice(0,3).join(", ")+((rt.estates||[]).length>3?" +"+((rt.estates||[]).length-3)+" more":"");
+  var msg="Remove route: \""+rt.name+"\"?"+(areas?"\nCovers: "+areas:"")+"\n\nThis cannot be undone.";
+  if(!confirm(msg))return;
   D.routes=(D.routes||[]).filter(function(r){return r.id!==id;});
   dirty();rOffers();
+  toast("Route \""+rt.name+"\" removed");
 }
 function rOffers(){
   var pg=el("pg-offers");if(!pg)return;
@@ -4565,7 +4569,7 @@ function editOf(id){
   el("m-of-save").innerHTML="<i class=\"ti ti-check\"></i> Update";
   om("m-of");
 }
-function delOf(id){if(!can("dOff"))return;D.offers=D.offers.filter(function(o){return o.id!==id;});rOffers();dirty();}
+function delOf(id){if(!can("dOff"))return;var of=D.offers.find(function(x){return x.id===id;});if(!of)return;var msg="Delete offer: \""+of.prod+" — "+of.disc+"% off\"?\n\nThis cannot be undone.";if(!confirm(msg))return;D.offers=D.offers.filter(function(o){return o.id!==id;});auditLog("DATA_EXPORTED","Offer deleted by "+CU.name+" ("+CU.role+"): "+of.prod+" "+of.disc+"%");rOffers();dirty();toast("Offer removed");}
 
 var RPT_FROM="";var RPT_TO="";
 function exportReportXL(){
@@ -5223,7 +5227,7 @@ function savePin(){
   dirty();
   toast(u.id===CU.id?"Your PIN updated — use it from next login":"PIN updated for "+u.name);
 }
-function delU(id){if(!can("mUsers"))return;var toDel=USERS.find(function(u){return u.id===id;});if(!confirm("Remove this team member?"))return;auditLog("USER_DELETED","Team member removed by "+CU.name+" ("+CU.role+"): "+(toDel?toDel.name:"unknown"));USERS=USERS.filter(function(u){return u.id!==id;});rUsers();dirty();}
+function delU(id){if(!can("mUsers"))return;var toDel=USERS.find(function(u){return u.id===id;});if(!toDel)return;var msg="Remove team member: "+toDel.name+" ("+toDel.role+")?\n\nThey will lose all system access immediately.\n\nThis cannot be undone.";if(!confirm(msg))return;auditLog("USER_DELETED","Team member removed by "+CU.name+" ("+CU.role+"): "+(toDel?toDel.name:"unknown"));USERS=USERS.filter(function(u){return u.id!==id;});rUsers();dirty();}
 
 function buildBackupWB(){
   if(!can("exp"))return null;
