@@ -5591,6 +5591,7 @@ function runIntegrityCheck(){
   if(migrated>0){issues.push("Migrated "+migrated+" customer(s): moved form-set credit to creditLimit field");dirty();}
   // Bootstrap water cycle from existing order history
   // Count delivered water orders since last cycle reset for each customer
+  var bootstrapped=0;
   D.customers.forEach(function(cu){
     if(cu.waterCycle!==undefined)return; // already tracked
     // Find all delivered water orders for this customer
@@ -5615,8 +5616,9 @@ function runIntegrityCheck(){
         by:"System (bootstrap)"
       });
     }
+    bootstrapped++;
   });
-  if(D.customers.some(function(cu){return cu.waterCycle!==undefined&&!cu.cycleHistory;})){dirty();}
+  if(bootstrapped>0){dirty();issues.push("Water cycle bootstrapped for "+bootstrapped+" customer(s) from order history");}
   // Check 1: negative stock
   D.stock.forEach(function(s){
     if(s.qty<0){s.qty=0;issues.push("Stock: "+s.name+" had negative qty — reset to 0");}
@@ -5640,9 +5642,14 @@ function runIntegrityCheck(){
   // Check 5: payment status sync
   syncPaymentStatuses();
   if(issues.length>0){
-    // Fix silently, log to audit
     if(D.stock.some(function(s){return s.qty===0&&issues.some(function(i){return i.indexOf(s.name)>-1});}))dirty();
-    auditLog("CUSTOMER_UPDATED","Data integrity check: "+issues.length+" issue(s) found — "+issues.slice(0,3).join("; "));
+    auditLog("CUSTOMER_UPDATED","Data integrity check: "+issues.length+" issue(s) — "+issues.slice(0,3).join("; "));
+    // Show director what was fixed
+    toast("✓ Data check: "+issues.length+" item(s) corrected — see audit log","ok");
+  }
+  // Always confirm bootstrap status
+  if(bootstrapped>0){
+    toast("✓ Water cycle tracker set for "+bootstrapped+" existing customer(s)","ok");
   }
 }
 function syncIdCounters(){
