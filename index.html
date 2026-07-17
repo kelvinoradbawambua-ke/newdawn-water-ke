@@ -1914,6 +1914,8 @@ function rDash(){
   var pg=el("pg-dashboard");if(!pg)return;
   var del=D.orders.filter(function(o){return o.status==="Delivered";});
   // ── Period filter for financial stats ──────────────────────────────
+  // Staff locked to today — no financial period access
+  if(CU&&CU.role==="staff")DASH_PERIOD="today";
   var now=new Date();
   var yr=now.getFullYear();
   var mo=now.getMonth(); // 0-based
@@ -1999,6 +2001,7 @@ function rDash(){
   var _urgency={nr:0,nw:1,ni:2,nok:3};alerts.sort(function(a,b){return(_urgency[a.t]||2)-(_urgency[b.t]||2);});
   pg.innerHTML=
     "<div class=\"ph\"><h1>Dashboard</h1><p>Welcome back, "+CU.name+" &middot; "+new Date().toLocaleDateString("en-GB",{weekday:"long",day:"numeric",month:"long",year:"numeric"})+"</p></div>"+
+    (can("vRev")?
     "<div style=\"display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px\">"
     +"<div style=\"font-size:12px;color:var(--tx2);font-weight:600\"><i class=\"ti ti-calendar\" style=\"margin-right:5px\"></i>Financial period</div>"
     +"<div style=\"display:flex;gap:3px;flex-wrap:wrap\">"
@@ -2009,7 +2012,8 @@ function rDash(){
         +(active?"var(--nv);background:var(--nv);color:#fff":"var(--bd);background:#fff;color:var(--tx2)")
         +";font-size:11px;font-weight:700;cursor:pointer;font-family:inherit\">"+lbl+"</button>";
     }).join("")
-    +"</div></div>"
+    +"</div></div>":
+    "<div style=\"font-size:11px;color:var(--tx2);margin-bottom:12px\"><i class=\"ti ti-calendar-today\"></i> Today's deliveries</div>")+
     +"<div class=\"stats\">"+
       "<div class=\"stat sg\" style=\"cursor:pointer\" onclick=\"nav('reports',null)\" title=\"View reports\">"
       +"<div class=\"sic\" style=\"background:#e8faf2;color:#27ae60\"><i class=\"ti ti-trending-up\"></i></div>"
@@ -2193,7 +2197,7 @@ function rCusts(q,pg,sort,type){
           var allPays=D.invoices.filter(function(i){return i.cId===c.id&&i.payments&&i.payments.length;}).reduce(function(a,i){return a.concat(i.payments);},[]).sort(function(a,b){return b.date>a.date?1:-1;});
           var lp=allPays[0];
           return "<tr class=\""+(debt>0?"dr":"")+"\">"+
-            "<td><div style=\"font-weight:700\">"+(can("vPhone")?c.name:maskName(c.name))+"</div><div class=\"ca\">"+cAddr(c)+"</div></td>"+
+            "<td><div style=\"font-weight:700\">"+(can("vPhone")?c.name:maskName(c.name))+"</div><div class=\"ca\">"+cAddr(c)+"</div>"+(c.waterCycle>0?"<div style=\"margin-top:3px\"><span class=\"badge ba\" style=\"cursor:pointer;font-size:9px\" onclick=\"showCycleHistory("+c.id+")\" title=\"Water cycle\"><i class=\"ti ti-droplet\"></i> "+c.waterCycle+"/8</span></div>":"")+"</td>"+
             "<td>"+(can("vPhone")?c.phone+(c.phone2?"<div class=\"ca\">"+c.phone2+"</div>":""):maskPhone(c.phone))+"</td>"+
             "<td><span class=\"badge "+(c.ctype==="Distributor"?"bp":c.ctype==="Commercial"?"bb":c.ctype==="Institution"?"ba":"bg")+"\">"+c.ctype+"</span></td>"+
             "<td style=\"font-weight:700\">"+ords.length+"</td>"+
@@ -2338,6 +2342,51 @@ function openPay(cId){
   var pc2=el("pay-calc");if(pc2)pc2.style.display="none";
   om("m-pay");
   setTimeout(function(){var pa=el("pay-amt");if(pa)pa.focus();},300);
+}
+function showCycleHistory(cId){
+  if(!can("eCust")&&CU.role!=="director"){toast("Director/Manager only","err");return;}
+  var cu=D.customers.find(function(x){return x.id===cId;});if(!cu)return;
+  var tt=el("m-generic-title");
+  if(tt)tt.innerHTML="<i class=\"ti ti-refresh\" style=\"color:var(--nv);margin-right:8px\"></i>"
+    +(can("vPhone")?cu.name:maskName(cu.name))+" — Water Cycle History";
+  var gb=el("m-generic-body");if(!gb)return;
+  var log=(cu.cycleHistory||[]).slice().reverse();
+  var cyc=cu.waterCycle||0;
+  // Calculate total delivered waters from all orders for this customer
+  var totalWater=D.orders.filter(function(o){
+    return o.cId===cId&&o.status==="Delivered"
+      &&o.prod&&o.prod.toLowerCase().indexOf("20ltr")!==-1;
+  }).length;
+  var html="<div class=\"mbdy\">";
+  // Current cycle banner
+  html+="<div class=\"notif "+(cyc>=4?"nw":"ni")+"\" style=\"margin-bottom:14px\">"
+    +"<i class=\"ti ti-droplet\"></i>"
+    +"<div><strong>Current cycle: "+cyc+"/8 deliveries</strong>"
+    +"<div style=\"margin:6px 0 2px\"><div class=\"prog\" style=\"height:8px\"><div class=\"progb\" style=\"width:"+Math.round(cyc/8*100)+"%;background:"+(cyc>=4?"#f39c12":"var(--nv2)")+";border-radius:4px\"></div></div></div>"
+    +"<div style=\"font-size:11px;color:var(--tx2)\">Total water deliveries all-time: "+totalWater+"</div>"
+    +"</div></div>";
+  if(!log.length){
+    html+="<div class=\"te\"><i class=\"ti ti-history\"></i><p>No cycle history yet</p></div>";
+  }else{
+    html+="<div style=\"border:1px solid var(--bd);border-radius:var(--r2);overflow:hidden\">";
+    html+=log.map(function(e){
+      var isCmp=e.event==="cycle_complete";
+      var icon=isCmp?"ti-circle-check":"ti-alert-circle";
+      var col=isCmp?"#27ae60":"#f39c12";
+      var label=isCmp?"Cycle complete (reset to 0)":"Milestone: "+e.cycle+" deliveries";
+      return "<div style=\"display:flex;align-items:center;gap:12px;padding:11px 14px;border-bottom:1px solid var(--bd)\">"
+        +"<div style=\"width:32px;height:32px;border-radius:50%;background:"+(isCmp?"#e8f8f2":"#fff8e1")+";display:flex;align-items:center;justify-content:center;flex-shrink:0\">"
+        +"<i class=\"ti "+icon+"\" style=\"color:"+col+"\"></i></div>"
+        +"<div style=\"flex:1\">"
+        +"<div style=\"font-weight:700;font-size:12px;color:"+col+"\">"+label+"</div>"
+        +"<div style=\"font-size:11px;color:var(--tx2)\">"+e.ts+" &bull; Order #"+e.ordId+" &bull; "+e.by+"</div>"
+        +"</div></div>";
+    }).join("");
+    html+="</div>";
+  }
+  html+="</div>";
+  if(gb)gb.innerHTML=html;
+  om("m-generic");
 }
 function showCreditLog(cId){
   if(!can("vRev")){toast("Manager+ only","err");return;}
@@ -3152,6 +3201,16 @@ function saveOrd(){
   // Always create invoice for exact orders — provides full financial trail
   D.invoices.push({id:nIId++,cId:cId,amount:total,paid:amtPaid,due:(function(){var dd=new Date((el("od").value||tday())+"T12:00:00");dd.setDate(dd.getDate()+7);return dd.toISOString().split("T")[0];})(),notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
   auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty);
+  // Water cycle milestone alert at order creation
+  var _ow=pn&&pn.toLowerCase().indexOf("20ltr")!==-1;
+  if(_ow){
+    var _oc=D.customers.find(function(x){return x.id===cId;});
+    if(_oc){
+      var _next=(_oc.waterCycle||0)+1;
+      if(_next===4)toast((can("vPhone")?_oc.name:maskName(_oc.name))+": will be their 4th water delivery this cycle!","ok");
+      else if(_next===8)toast((can("vPhone")?_oc.name:maskName(_oc.name))+": will complete their 8-delivery water cycle!","ok");
+    }
+  }
   cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+newOrdId+" placed");
 }
 function openDlv(oid){
@@ -3341,6 +3400,24 @@ function completeDlv(){
   if(el("dlv-notes").value)o.notes=el("dlv-notes").value;
   var assignedStr=o.driver&&o.driver!==CU.name?" (assigned to "+o.driver+")":" (self-assigned)";
   auditLog("DELIVERY_COMPLETE","Order #"+o.id+" completed by "+CU.name+" ("+CU.role+")"+assignedStr+". Product: "+o.prod+", Qty: "+o.qty+". Cash collected: "+(el("dlv-amt")&&el("dlv-amt").value>0?"KSh "+el("dlv-amt").value:"none"));
+  // Water delivery cycle counter
+  var _isWater=o.prod&&o.prod.toLowerCase().indexOf("20ltr")!==-1;
+  if(_isWater){
+    var _cu=D.customers.find(function(x){return x.id===o.cId;});
+    if(_cu){
+      _cu.waterCycle=(_cu.waterCycle||0)+1;
+      if(!_cu.cycleHistory)_cu.cycleHistory=[];
+      // Milestone alerts
+      if(_cu.waterCycle===4){
+        toast((can("vPhone")?_cu.name:maskName(_cu.name))+" has received 4 water deliveries this cycle — halfway!","ok");
+        _cu.cycleHistory.push({ts:tday(),cycle:_cu.waterCycle,event:"milestone_4",ordId:o.id,by:CU.name});
+      } else if(_cu.waterCycle>=8){
+        toast((can("vPhone")?_cu.name:maskName(_cu.name))+" completed 8 water deliveries — cycle reset!","ok");
+        _cu.cycleHistory.push({ts:tday(),cycle:8,event:"cycle_complete",ordId:o.id,by:CU.name});
+        _cu.waterCycle=0; // reset
+      }
+    }
+  }
   cm("m-dlv");rOrds(undefined,ORD_PAGE);rDel();
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   updateStockBadge();
@@ -3459,7 +3536,14 @@ function rDel(q){
   var prevFocus=document.activeElement&&document.activeElement.id==="del-srch";
   var pg=el("pg-delivery");if(!pg)return;
   var allPend=D.orders.filter(function(o){return o.status==="Pending"||o.status==="Processing"||o.status==="Out for delivery";});
-  var pend=CU&&CU.role==="driver"?allPend.filter(function(o){return o.driver===CU.name;}):allPend;
+  // Staff: see only pending orders assigned to them (today focus)
+  // Driver: see only pending orders assigned to them
+  // Manager/Director: see all pending
+  var pend=(CU&&CU.role==="driver")
+    ?allPend.filter(function(o){return o.driver===CU.name;})
+    :(CU&&CU.role==="staff")
+      ?allPend.filter(function(o){return o.driver===CU.name||o.deliver===CU.name;})
+      :allPend;
   var _dlvNow=new Date();
   var _dlvTd=tday();
   var _dlvDow=_dlvNow.getDay();
@@ -3931,6 +4015,7 @@ function openPayInv(id){
     +"<span>Total: <strong>KSh "+i.amount.toLocaleString()+"</strong></span>"
     +"<span style=\"color:#c0392b\">Balance: <strong>KSh "+bal.toLocaleString()+"</strong></span>"
     +(c&&c.credit>0?"<span style=\"color:#3498db;cursor:pointer\" onclick=\"showCreditLog("+id+");event.stopPropagation()\" title=\"View credit history\"><i class=\"ti ti-gift\"></i> Credit: <strong>KSh "+c.credit.toLocaleString()+"</strong> &rarr;</span>":"")
+    +(c&&c.waterCycle>0?"<span class=\"badge ba\" style=\"cursor:pointer\" onclick=\"showCycleHistory("+id+");event.stopPropagation()\" title=\"Water delivery cycle\"><i class=\"ti ti-droplet\"></i> Cycle: "+c.waterCycle+"/8</span>":"")
     +"</div>";
   el("pay-date").value=tday();
   // Leave amount blank — director enters what was actually received
@@ -5502,6 +5587,34 @@ function runIntegrityCheck(){
     }
   });
   if(migrated>0){issues.push("Migrated "+migrated+" customer(s): moved form-set credit to creditLimit field");dirty();}
+  // Bootstrap water cycle from existing order history
+  // Count delivered water orders since last cycle reset for each customer
+  D.customers.forEach(function(cu){
+    if(cu.waterCycle!==undefined)return; // already tracked
+    // Find all delivered water orders for this customer
+    var waterOrds=D.orders.filter(function(o){
+      return o.cId===cu.id&&o.status==="Delivered"
+        &&o.prod&&(o.prod.toLowerCase().indexOf("20ltr")!==-1);
+    }).sort(function(a,b){return a.date>b.date?1:-1;});
+    // Count modulo 8 from the beginning
+    cu.waterCycle=waterOrds.length%8;
+    // Rebuild cycle history from resets
+    if(!cu.cycleHistory)cu.cycleHistory=[];
+    var resets=Math.floor(waterOrds.length/8);
+    // Log one history entry per completed cycle
+    for(var ri=0;ri<resets;ri++){
+      var _resetOrd=waterOrds[(ri+1)*8-1]; // the 8th order of this cycle
+      cu.cycleHistory.push({
+        ts:_resetOrd?_resetOrd.date:tday(),
+        cycle:8,
+        event:"cycle_complete",
+        cycleNum:ri+1, // which cycle number (1st, 2nd, 3rd...)
+        ordId:_resetOrd?_resetOrd.id:0,
+        by:"System (bootstrap)"
+      });
+    }
+  });
+  if(D.customers.some(function(cu){return cu.waterCycle!==undefined&&!cu.cycleHistory;})){dirty();}
   // Check 1: negative stock
   D.stock.forEach(function(s){
     if(s.qty<0){s.qty=0;issues.push("Stock: "+s.name+" had negative qty — reset to 0");}
