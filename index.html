@@ -624,6 +624,7 @@ function restoreFromLatestBackup(onSuccess,onFail){
 }
 var FB_AUDIT_UNSUB=null;
 function _mergeAuditEvents(remote){
+  if(D.auditLog&&D.auditLog.length>500)D.auditLog=D.auditLog.slice(-500);
   // Core merge — used by both listener and one-time load
   // NEVER replaces D.auditLog — only adds new entries
   if(!remote||!remote.length)return;
@@ -816,6 +817,11 @@ function startCloudListener(){
     // 3. Customers: only take remote if they have MORE (prevent reduction)
     var remoteCustomers=data.D.customers||[];
     var localCustomers=D.customers||[];
+    if(remoteCustomers.length>localCustomers.length){
+      // Log silently-added customers from sync
+      var added=remoteCustomers.length-localCustomers.length;
+      if(added>0&&CU)auditLog("CUSTOMER_UPDATED","Sync: "+added+" customer(s) added from another session");
+    }
     if(remoteCustomers.length>=localCustomers.length){
       // Remote has same or more customers — safe to take
       D.customers=remoteCustomers;
@@ -1321,6 +1327,7 @@ function buildApp(){
   setTimeout(updateStockBadge,2000); // low stock badge on nav
   // Restart audit listener after login — ensures live connection with auth established
   setTimeout(startAuditListener,1000);
+  startIdleWatcher();
   setTimeout(runIntegrityCheck,3500);
   if(!FB_SETUP_DONE&&CU&&CU.role==="director"){
     setTimeout(showSetupWizard,600);
@@ -1579,6 +1586,7 @@ function wizFinish(){
 function logout(){
   stopAutoSaveLoop();
   if(CU&&CU.role==="director"&&FB_READY){
+  stopIdleWatcher();
     try{runAutoBackup();}catch(e){}
   }
   if(FB_UNSUB){try{FB_UNSUB();}catch(e){}FB_UNSUB=null;}
@@ -1734,6 +1742,7 @@ function buildMods(){
       "<div class=\"fg\"><label class=\"flabel\">Product name *</label><input class=\"fi\" id=\"sn\" placeholder=\"20ltr Refill\"></div>"+
       "<div class=\"fg\"><label class=\"flabel\">Size / Category</label>"+
         "<input class=\"fi\" id=\"ss\" placeholder=\"e.g. 20ltr\" list=\"size-options\">"+
+        "<label class=\"flabel\" style=\"display:flex;align-items:center;gap:6px;margin-top:8px;cursor:pointer\"><input type=\"checkbox\" id=\"sw\" style=\"width:16px;height:16px;cursor:pointer\"> Count as 20ltr water (cycle tracker)</label>"+
         "<datalist id=\"size-options\">"+
           "<option value=\"5ltr\"><option value=\"10ltr\"><option value=\"13ltr\">"+
           "<option value=\"20ltr\"><option value=\"25ltr\"><option value=\"50ltr\">"+
@@ -3048,18 +3057,45 @@ function calcO(){
   }
   checkCycleWarn(); // update cycle banner when qty changes
 }
+var _idleTimer=null;
+var _idleLast=Date.now();
+function resetIdleTimer(){
+  _idleLast=Date.now();
+  if(_idleTimer)clearTimeout(_idleTimer);
+  if(!CU)return;
+  var limit=CU.role==="staff"?60000:CU.role==="manager"?300000:600000;
+  _idleTimer=setTimeout(function(){
+    if(!CU)return;
+    toast("Session expired due to inactivity — logging out","err");
+    setTimeout(logout,1500);
+  },limit);
+}
+function startIdleWatcher(){
+  ["click","keydown","touchstart","mousemove"].forEach(function(ev){
+    document.addEventListener(ev,resetIdleTimer,{passive:true});
+  });
+  resetIdleTimer();
+}
+function stopIdleWatcher(){
+  if(_idleTimer){clearTimeout(_idleTimer);_idleTimer=null;}
+}
 function is20ltr(prodName){
   if(!prodName)return false;
   var n=prodName.toLowerCase().replace(/\s+/g,"");
-  // Check the name itself
-  if(n.indexOf("20ltr")!==-1||n.indexOf("20ltrs")!==-1)return true;
-  // Check the size field of the matching stock product
+  // Check name: 20ltr / 20ltrs / 20litre / 20litres / 20l
+  if(/20lt?r?s?/i.test(n)||n.indexOf("20litre")!==-1||n.indexOf("20litres")!==-1)return true;
+  // Check matching stock product size field
   var st=D.stock.find(function(s){
-    return s.name.toLowerCase()===prodName.toLowerCase();
+    return s.name.toLowerCase()===prodName.toLowerCase()||
+           (s.name.toLowerCase().replace(/\s+/g,"")===n);
   });
-  if(st&&st.size){
-    var sz=st.size.toLowerCase().replace(/\s+/g,"");
-    if(sz.indexOf("20ltr")!==-1||sz.indexOf("20ltrs")!==-1)return true;
+  if(st){
+    // Check isWater flag (director can tag any product)
+    if(st.isWater===true)return true;
+    if(st.size){
+      var sz=st.size.toLowerCase().replace(/\s+/g,"");
+      if(/20lt?r?s?/i.test(sz)||sz.indexOf("20litre")!==-1||sz.indexOf("20litres")!==-1)return true;
+    }
   }
   return false;
 }
@@ -3605,11 +3641,10 @@ function rDel(q){
   // Staff: see only pending orders assigned to them (today focus)
   // Driver: see only pending orders assigned to them
   // Manager/Director: see all pending
-  var pend=(CU&&CU.role==="driver")
-    ?allPend.filter(function(o){return o.driver===CU.name;})
-    :(CU&&CU.role==="staff")
-      ?allPend.filter(function(o){return o.driver===CU.name||o.deliver===CU.name;})
-      :allPend;
+  // All roles see all pending orders on the board
+  // Delivery board gives full operational visibility to everyone
+  // completeDlv enforces who can actually mark complete
+  var pend=allPend;
   var _dlvNow=new Date();
   var _dlvTd=tday();
   var _dlvDow=_dlvNow.getDay();
@@ -3807,7 +3842,7 @@ function saveSt(){
       return;
     }
   }
-  D.stock.push({id:uid(),name:n,size:el("ss").value,price:parseFloat(el("sp").value)||0,cost:parseFloat(el("sc").value)||0,qty:parseInt(el("sq").value)||0,min:parseInt(el("sm").value)||10});
+  D.stock.push({id:uid(),name:n,size:el("ss").value,price:parseFloat(el("sp").value)||0,cost:parseFloat(el("sc").value)||0,qty:parseInt(el("sq").value)||0,min:parseInt(el("sm").value)||10,isWater:el("sw")&&el("sw").checked?true:undefined});
   ["sn","ss","sp","sc","sq","sm"].forEach(function(id){el(id).value="";});cm("m-s");rStock();dirty();toast(n+" added");
 }
 function editSt(id){
@@ -4540,7 +4575,7 @@ function exportReportXL(){
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(Object.values(drvMap2).sort(function(a,b){return b.Deliveries-a.Deliveries;})),"Driver Performance");
   // Audit log sheet (last 100 events)
   if(D.auditLog&&D.auditLog.length){
-    var auditRows=(D.auditLog||[]).slice(-100).reverse().map(function(e){return{Timestamp:e.ts,User:e.user,Role:e.role,Action:e.action,Details:e.details||""};});
+    var auditRows=(D.auditLog||[]).slice(-200).reverse().map(function(e){return{Timestamp:e.ts,User:e.user,Role:e.role,Action:e.action,Details:e.details||""};});
     XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(auditRows),"Audit Log");
   }
   XLSX.writeFile(wb,"NewDawn_Report_"+new Date().toISOString().slice(0,10)+".xlsx");
