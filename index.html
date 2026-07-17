@@ -624,7 +624,6 @@ function restoreFromLatestBackup(onSuccess,onFail){
 }
 var FB_AUDIT_UNSUB=null;
 function _mergeAuditEvents(remote){
-  if(D.auditLog&&D.auditLog.length>500)D.auditLog=D.auditLog.slice(-500);
   // Core merge — used by both listener and one-time load
   // NEVER replaces D.auditLog — only adds new entries
   if(!remote||!remote.length)return;
@@ -4592,7 +4591,7 @@ function exportReportXL(){
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(Object.values(drvMap2).sort(function(a,b){return b.Deliveries-a.Deliveries;})),"Driver Performance");
   // Audit log sheet (last 100 events)
   if(D.auditLog&&D.auditLog.length){
-    var auditRows=(D.auditLog||[]).slice(-200).reverse().map(function(e){return{Timestamp:e.ts,User:e.user,Role:e.role,Action:e.action,Details:e.details||""};});
+    var auditRows=(D.auditLog||[]).slice().reverse().map(function(e){return{Timestamp:e.ts,User:e.user,Role:e.role,Action:e.action,Details:e.details||""};});
     XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(auditRows),"Audit Log");
   }
   XLSX.writeFile(wb,"NewDawn_Report_"+new Date().toISOString().slice(0,10)+".xlsx");
