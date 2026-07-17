@@ -3082,20 +3082,30 @@ function stopIdleWatcher(){
 function is20ltr(prodName){
   if(!prodName)return false;
   var n=prodName.toLowerCase().replace(/\s+/g,"");
-  // Check name: 20ltr / 20ltrs / 20litre / 20litres / 20l
+  // 1. Name contains 20ltr variant
   if(/20lt?r?s?/i.test(n)||n.indexOf("20litre")!==-1||n.indexOf("20litres")!==-1)return true;
-  // Check matching stock product size field
+  // 2. Find matching stock item by exact or normalised name
   var st=D.stock.find(function(s){
-    return s.name.toLowerCase()===prodName.toLowerCase()||
-           (s.name.toLowerCase().replace(/\s+/g,"")===n);
+    var sn=s.name.toLowerCase().replace(/\s+/g,"");
+    return sn===n||s.name.toLowerCase()===prodName.toLowerCase();
   });
   if(st){
-    // Check isWater flag (director can tag any product)
     if(st.isWater===true)return true;
     if(st.size){
       var sz=st.size.toLowerCase().replace(/\s+/g,"");
-      if(/20lt?r?s?/i.test(sz)||sz.indexOf("20litre")!==-1||sz.indexOf("20litres")!==-1)return true;
+      if(/20lt?r?s?/i.test(sz)||sz.indexOf("20litre")!==-1)return true;
     }
+  }
+  // 3. Check if ANY isWater-flagged stock item name is contained in prodName
+  //    Handles renamed products (e.g. old orders say "Pick Bottle",
+  //    stock now says "Pick Bottle 20ltr" which is isWater=true)
+  var waterStocks=D.stock.filter(function(s){return s.isWater===true;});
+  for(var wi=0;wi<waterStocks.length;wi++){
+    var ws=waterStocks[wi];
+    var wsn=ws.name.toLowerCase();
+    var pn2=prodName.toLowerCase();
+    // Match if either name is contained in the other (handles renaming)
+    if(wsn.indexOf(pn2)!==-1||pn2.indexOf(wsn)!==-1)return true;
   }
   return false;
 }
@@ -3838,7 +3848,7 @@ function saveSt(){
     if(s){
       s.name=n;s.size=el("ss").value;s.price=parseFloat(el("sp").value)||0;
       s.cost=parseFloat(el("sc").value)||0;s.qty=parseInt(el("sq").value)||0;s.min=parseInt(el("sm").value)||10;
-      s.isWater=el("sw")&&el("sw").checked?true:undefined;
+      s.isWater=el("sw")&&el("sw").checked?true:false;
       auditLog("STOCK_UPDATED","Product saved by "+CU.name+" ("+CU.role+"): "+n+(s.isWater?" [water cycle product]":""));
       cm("m-s");rStock();dirty();
       // Re-run water cycle sync so isWater change takes effect immediately
@@ -3847,7 +3857,7 @@ function saveSt(){
       return;
     }
   }
-  D.stock.push({id:uid(),name:n,size:el("ss").value,price:parseFloat(el("sp").value)||0,cost:parseFloat(el("sc").value)||0,qty:parseInt(el("sq").value)||0,min:parseInt(el("sm").value)||10,isWater:el("sw")&&el("sw").checked?true:undefined});
+  D.stock.push({id:uid(),name:n,size:el("ss").value,price:parseFloat(el("sp").value)||0,cost:parseFloat(el("sc").value)||0,qty:parseInt(el("sq").value)||0,min:parseInt(el("sm").value)||10,isWater:el("sw")&&el("sw").checked?true:false});
   ["sn","ss","sp","sc","sq","sm"].forEach(function(id){el(id).value="";});cm("m-s");rStock();dirty();toast(n+" added");
 }
 function editSt(id){
@@ -5705,8 +5715,8 @@ function runIntegrityCheck(){
     var waterOrds=D.orders.filter(function(o){
       return o.cId===cu.id&&o.status==="Delivered"&&is20ltr(o.prod);
     }).sort(function(a,b){
-      var da=o&&o.deliveredAt||a.date||"";
-      var db=o&&o.deliveredAt||b.date||"";
+      var da=a.deliveredAt||a.date||"";
+      var db=b.deliveredAt||b.date||"";
       return da>db?1:da<db?-1:0;
     });
     // Sum total bottles from quantities
