@@ -1338,7 +1338,21 @@ function buildApp(){
     "<div id=\"mods\"></div>";
   el("tbml").innerHTML=makeLogo(48);
   buildMods();
-  nav(first,null);
+  // Show loading skeleton until Firestore delivers data
+  // refreshCurrentPage() in startCloudListener does the real first render
+  var _fpg=el("pg-"+first);
+  if(_fpg){
+    _fpg.classList.add("act");
+    _fpg.innerHTML="<div style=\"display:flex;align-items:center;justify-content:center;height:60vh;flex-direction:column;gap:16px\">"
+      +"<div style=\"width:36px;height:36px;border:3px solid var(--bd);border-top-color:var(--nv);border-radius:50%;animation:spin .8s linear infinite\"></div>"
+      +"<div style=\"color:var(--tx2);font-size:13px\">Loading your data...</div></div>";
+  }
+  // Activate the correct nav button
+  document.querySelectorAll("#tnav button").forEach(function(b,i){
+    if(i===0)b.classList.add("act");
+  });
+  // Store first page for refreshCurrentPage
+  window._FIRST_PAGE=first;
   startAutoSaveLoop();
   scheduleEmailBackup();
   startAutoBackup();
