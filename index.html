@@ -340,7 +340,7 @@ function auditLog(action,details){
   // Keep local cache for immediate display
   if(!D.auditLog)D.auditLog=[];
   D.auditLog.push(entry);
-  if(D.auditLog.length>AUDIT_HOT_MAX)D.auditLog=D.auditLog.slice(-AUDIT_HOT_MAX);
+  if((D.auditLog||[]).length>AUDIT_HOT_MAX)D.auditLog=D.auditLog.slice(-AUDIT_HOT_MAX);
   // Refresh audit view immediately if visible — don't wait for Firestore roundtrip
   try{
     var _ap=document.getElementById("pg-excel");
@@ -348,7 +348,7 @@ function auditLog(action,details){
   }catch(e){}
 }
 function archiveAuditLogs(){
-  if(!D.auditLog||D.auditLog.length<AUDIT_ARCHIVE_THRESHOLD)return;
+  if(!D.auditLog||(D.auditLog||[]).length<AUDIT_ARCHIVE_THRESHOLD)return;
   // Only archive when online — never drop entries without confirming write
   if(!FB_READY||!FB_BACKUP_COL)return;
   var toArchive=D.auditLog.slice(0,AUDIT_ARCHIVE_THRESHOLD);
@@ -430,7 +430,7 @@ function scheduleCloudSync(){
 }
 function pushToCloud(){
   if(!FB_READY||!FB_DOC_REF)return;
-  var isEmpty=(!D.customers||D.customers.length===0)&&(!D.orders||D.orders.length===0)&&(!D.stock||D.stock.length===0);
+  var isEmpty=(!D.customers||D.customers.length===0)&&(!D.orders||D.orders.length===0)&&(!D.stock||(D.stock||[]).length===0);
   if(isEmpty&&FB_SETUP_DONE)return; // empty data guard — silently skip
   // Queue the write — process one at a time to prevent race conditions
   FB_WRITE_QUEUE.push(Date.now());
@@ -518,7 +518,7 @@ function getBackupPayload(){
 }
 function writeBackup(docId){
   if(!FB_BACKUP_COL)return;
-  var isEmpty=(!D.customers||D.customers.length===0)&&(!D.orders||D.orders.length===0);
+  var isEmpty=(!D.customers||D.customers.length===0)&&(!D.orders||(D.orders||[]).length===0);
   if(isEmpty&&FB_SETUP_DONE)return; // never backup empty data
   try{
     var payload=JSON.parse(JSON.stringify(getBackupPayload()));
@@ -551,7 +551,7 @@ function pruneOldBackups(prefix,keepCount){
 function runAutoBackup(){
   if(!CU||CU.role!=="director")return; // backups director-only
   if(!FB_READY||!FB_BACKUP_COL)return;
-  var isEmpty=(!D.customers||D.customers.length===0)&&(!D.orders||D.orders.length===0);
+  var isEmpty=(!D.customers||D.customers.length===0)&&(!D.orders||(D.orders||[]).length===0);
   if(isEmpty)return;
   var now=new Date();
   var dateStr=now.getFullYear()+"-"+String(now.getMonth()+1).padStart(2,"0")+"-"+String(now.getDate()).padStart(2,"0");
@@ -831,7 +831,20 @@ function startCloudListener(){
     }
     if(remoteCustomers.length>=localCustomers.length){
       // Remote has same or more customers — safe to take
+      // BUT: preserve local waterCycle/cycleHistory if local is higher
+      // (prevents slow cloud roundtrip overwriting just-completed delivery)
+      var localCustMap={};
+      localCustomers.forEach(function(lc){localCustMap[lc.id]=lc;});
+      remoteCustomers.forEach(function(rc){
+        var lc=localCustMap[rc.id];
+        if(lc&&(lc.waterCycle||0)>(rc.waterCycle||0)){
+          rc.waterCycle=lc.waterCycle;
+          rc.cycleHistory=lc.cycleHistory;
+        }
+      });
       D.customers=remoteCustomers;
+      // Refresh customer page if visible (badge update after sync)
+      if(el("pg-customers")&&el("pg-customers").classList.contains("act"))rCusts();
     } else if(!isOwnWrite&&remoteCustomers.length>0){
       // Remote has fewer but it's not our write — merge (add missing local)
       var remCustIds={};
@@ -1592,17 +1605,23 @@ function wizFinish(){
 }
 function logout(){
   stopAutoSaveLoop();
-  // Flush any queued audit events before clearing session
-  if(FB_EVENTS_COL&&FB_READY){
-    var pq=(window._auditQueue||[]).concat(window._auditFailQ||[]);
-    window._auditQueue=[];window._auditFailQ=[];
-    pq.forEach(function(e){try{FB_EVENTS_COL.add(e);}catch(ex){}});
-  }
-  if(CU&&CU.role==="director"&&FB_READY){
+  // Stop idle timer for ALL roles immediately
   stopIdleWatcher();
+  // Cancel any pending cloud sync timer
+  if(FB_SYNC_TIMER){clearTimeout(FB_SYNC_TIMER);FB_SYNC_TIMER=null;}
+  // Clear write queue to prevent post-logout writes
+  FB_WRITE_QUEUE=[];FB_WRITING=false;
+  // Flush queued audit events before disconnecting
+  if(FB_EVENTS_COL&&FB_READY){
+    var aq=(window._auditQueue||[]).concat(window._auditFailQ||[]);
+    window._auditQueue=[];window._auditFailQ=[];
+    aq.forEach(function(e){try{FB_EVENTS_COL.add(e);}catch(ex){}});
+  }
+  // Director: run backup
+  if(CU&&CU.role==="director"&&FB_READY){
     try{runAutoBackup();}catch(e){}
   }
-  // Attempt final sync push before disconnecting
+  // Final sync push before disconnecting
   try{
     if(FB_READY&&FB_DOC_REF&&typeof D==="object"){
       var snap=JSON.parse(JSON.stringify({D:D}));
@@ -1612,8 +1631,11 @@ function logout(){
   }catch(e){}
   if(FB_UNSUB){try{FB_UNSUB();}catch(e){}FB_UNSUB=null;}
   if(FB_AUDIT_UNSUB){try{FB_AUDIT_UNSUB();}catch(e){}FB_AUDIT_UNSUB=null;}
-  D.auditLog=[];
-  FB_READY=false;CU=null;SU=null;PE="";
+  FB_READY=false;FB_DOC_REF=null;
+  // Clear all session data — security: prevent data leak to next user
+  D={customers:[],stock:[],orders:[],offers:[],invoices:[],routes:[],
+     complaints:[],pendingPayments:[],auditLog:[]};
+  CU=null;SU=null;PE="";
   renderLogin();
 }
 function nav(p,btn){
@@ -1943,7 +1965,7 @@ function buildMods(){
 
 function rDash(){
   var pg=el("pg-dashboard");if(!pg)return;
-  var del=D.orders.filter(function(o){return o.status==="Delivered";});
+  var del=(D.orders||[]).filter(function(o){return o.status==="Delivered";});
   // ── Period filter for financial stats ──────────────────────────────
   // Staff locked to today — no financial period access
   if(CU&&CU.role==="staff")DASH_PERIOD="today";
@@ -1988,10 +2010,10 @@ function rDash(){
   var cost=periodDel.reduce(function(a,o){return a+o.qty*(o.cost||0);},0);
   var pend=D.orders.filter(function(o){return o.status==="Pending"||o.status==="Processing";}).length;
   var low=(D.stock||[]).filter(function(s){return s.qty<=s.min;}).length;
-  var dashDebtMap={};D.customers.forEach(function(cu){dashDebtMap[cu.id]=custDebt(cu.id);});
+  var dashDebtMap={};(D.customers||[]).forEach(function(cu){dashDebtMap[cu.id]=custDebt(cu.id);});
   var debts=D.customers.filter(function(c){return dashDebtMap[c.id]>0;});
   var totD=debts.reduce(function(a,c){return a+dashDebtMap[c.id];},0);
-  var oCmp=D.complaints.filter(function(c){return c.status!=="Resolved";}).length;
+  var oCmp=(D.complaints||[]).filter(function(c){return c.status!=="Resolved";}).length;
   var mns=["J","F","M","A","M","J","J","A","S","O","N","D"];
   var mRevs=mns.map(function(_,i){var m2=String(i+1).padStart(2,"0");return del.filter(function(o){var dd=o.deliveredAt||o.date;return dd&&dd.startsWith(yr+"-"+m2);}).reduce(function(a,o){return a+o.qty*o.price;},0);});
   var mMax=Math.max.apply(null,mRevs.concat([1]));
@@ -2027,7 +2049,7 @@ function rDash(){
       if(pendingPay.length>3)alerts.push({t:"nw",i:"ti-cash",m:(pendingPay.length-3)+" more pending cash collection(s) awaiting acknowledgement",dest:"invoices"});
     }
   }
-  D.complaints.filter(function(c){return c.status==="Open";}).slice(0,2).forEach(function(c){var cu=D.customers.find(function(x){return x.id===c.cId;});alerts.push({t:"nw",i:"ti-message-report",m:"Complaint: <strong>"+(cu?(can("vPhone")?cu.name:maskName(cu.name)):"?")+"</strong> &mdash; "+c.type,dest:"complaints"});});
+  (D.complaints||[]).filter(function(c){return c.status==="Open";}).slice(0,2).forEach(function(c){var cu=D.customers.find(function(x){return x.id===c.cId;});alerts.push({t:"nw",i:"ti-message-report",m:"Complaint: <strong>"+(cu?(can("vPhone")?cu.name:maskName(cu.name)):"?")+"</strong> &mdash; "+c.type,dest:"complaints"});});
   D.orders.filter(function(o){return o.status==="Pending";}).slice(0,3).forEach(function(o){alerts.push({t:"ni",i:"ti-truck",m:"Pending: <strong>#"+o.id+"</strong> &mdash; "+custName(o.cId)+": "+o.qty+"&times; "+o.prod,dest:"orders"});});
   var _urgency={nr:0,nw:1,ni:2,nok:3};alerts.sort(function(a,b){return(_urgency[a.t]||2)-(_urgency[b.t]||2);});
   pg.innerHTML=
@@ -2155,7 +2177,7 @@ function rCusts(q,pg,sort,type){
   var q2=CUST_Q||"";var sort2=CUST_SORT||"recent";var type2=CUST_TYPE||"";
   var pg2=el("pg-customers");if(!pg2)return;
   // Filter by search
-  var fil=D.customers.filter(function(c){
+  var fil=(D.customers||[]).filter(function(c){
     if(type2&&c.ctype!==type2)return false;
     if(!q2)return true;
     var lq=q2.toLowerCase();
@@ -2474,7 +2496,7 @@ function showCreditLog(cId){
 }
 function showPayments(invId){
   if(!can("rest")){toast("Director only","err");return;}
-  var inv=D.invoices.find(function(x){return x.id===invId;});if(!inv){toast("Invoice not found","err");return;}
+  var inv=(D.invoices||[]).find(function(x){return x.id===invId;});if(!inv){toast("Invoice not found","err");return;}
   var cu=D.customers.find(function(x){return x.id===inv.cId;});
   var pays=inv.payments||[];
   // Set modal title
@@ -2536,7 +2558,7 @@ showPayments._confirm=function(invId,idx){
 }
 function reversePayment(invId,payIdx){
   if(!can("rest")){toast("Director only","err");return;}
-  var inv=D.invoices.find(function(x){return x.id===invId;});
+  var inv=(D.invoices||[]).find(function(x){return x.id===invId;});
   if(!inv){toast("Invoice not found","err");return;}
   var pays=inv.payments||[];
   if(payIdx<0||payIdx>=pays.length){toast("Payment not found","err");return;}
@@ -2626,7 +2648,7 @@ function recPay(){
   var ref=el("pay-ref")?el("pay-ref").value:"";
   // ── INVOICE-SPECIFIC PAYMENT ──────────────────────────────────────────
   if(invId){
-    var inv=D.invoices.find(function(x){return x.id===invId;});if(!inv){toast("Invoice not found","err");return;}
+    var inv=(D.invoices||[]).find(function(x){return x.id===invId;});if(!inv){toast("Invoice not found","err");return;}
     var bal=inv.amount-inv.paid;
     var credit=0;
     if(amt>bal){
@@ -2638,7 +2660,7 @@ function recPay(){
     inv.paid=inv.payments.reduce(function(s,p){return s+(p.amt||0);},0);
     // Store overpayment as customer credit balance
     if(credit>0){
-      var cu=D.customers.find(function(x){return x.id===cId;});
+      var cu=(D.customers||[]).find(function(x){return x.id===cId;});
       if(cu){
         cu.credit=(cu.credit||0)+credit;
         if(!cu.creditLog)cu.creditLog=[];
@@ -2649,7 +2671,7 @@ function recPay(){
     // Sync linked order
     var ordMatch=inv.notes&&inv.notes.match(/#(\d+)/);
     if(ordMatch){
-      var o=D.orders.find(function(x){return String(x.id)===ordMatch[1];});
+      var o=(D.orders||[]).find(function(x){return String(x.id)===ordMatch[1];});
       if(o){
         if(inv.paid>=inv.amount){o.paid="Paid";}else if(inv.paid>0){o.paid="Partial";}else{o.paid="Unpaid";}
         o.amtPaid=inv.paid;
@@ -2658,7 +2680,7 @@ function recPay(){
     auditLog("PAYMENT_RECORDED","KSh "+amt.toLocaleString()+" on Invoice #"+invId+" by "+CU.name+" ("+CU.role+"). Method: "+method+(ref?" Ref: "+ref:"")+(credit>0?" | KSh "+credit.toLocaleString()+" overpayment added to credit":"")+". Balance: KSh "+(inv.amount-inv.paid).toLocaleString());
   }else{
   // ── CUSTOMER-LEVEL PAYMENT — distribute oldest-first ─────────────────
-    var cu2=D.customers.find(function(x){return x.id===cId;});
+    var cu2=(D.customers||[]).find(function(x){return x.id===cId;});
     var existingCredit=(cu2&&cu2.credit>0)?cu2.credit:0;
     var totalDebt=D.invoices.filter(function(i){return i.cId===cId&&i.paid<i.amount&&!i.voided;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
     // Apply any existing credit balance first
@@ -2693,7 +2715,7 @@ function recPay(){
         rem-=tap;
         var ordId=inv.notes&&inv.notes.match(/#(\d+)/);
         if(ordId){
-          var o2=D.orders.find(function(x){return String(x.id)===ordId[1];});
+          var o2=(D.orders||[]).find(function(x){return String(x.id)===ordId[1];});
           if(o2){
             if(inv.paid>=inv.amount){o2.paid="Paid";}else if(inv.paid>0){o2.paid="Partial";}else{o2.paid="Unpaid";}
             o2.amtPaid=inv.paid;
@@ -2721,7 +2743,7 @@ function rOrds(q,pg,sort){
   var q2=ORD_Q||"";var sort2=ORD_SORT||"newest";var sf=ORD_STATUS_F||"";
   var pgEl=el("pg-orders");if(!pgEl)return;
   var df=ORD_DATE_F||"";
-  var fil=D.orders.filter(function(o){
+  var fil=(D.orders||[]).filter(function(o){
     if(sf&&o.status!==sf)return false;
     if(df){var dd=o.deliveredAt||o.date;if(!dd||!dd.startsWith(df))return false;}
     if(!q2)return true;
@@ -3014,7 +3036,7 @@ function prepO(){
 }
 function editOrd(oid){
   if(!can("eOrd"))return;
-  var o=D.orders.find(function(x){return x.id===oid;});if(!o)return;
+  var o=(D.orders||[]).find(function(x){return x.id===oid;});if(!o)return;
   if(o.status==="Delivered"||o.status==="Cancelled"){editOrdLimited(oid);return;}
   prepO();
   el("o-edit-id").value=o.id;
@@ -3185,7 +3207,7 @@ function checkCycleWarn(){
 function saveOrd(){
   if(!can("aOrd")&&!can("eOrd"))return;
   if(!D.customers.length){toast("Add a customer first","err");return;}
-  var cId=parseInt(el("oc").value);
+  var cId=parseInt(el("oc")&&el("oc").value)||0;
   if(!cId){toast("Please select a customer","err");if(el("oc-search"))el("oc-search").focus();return;}
 
   // Determine order mode
@@ -3561,7 +3583,7 @@ function completeDlv(){
 }
 function delO(id){
   if(!can("dOrd"))return;
-  var o=D.orders.find(function(x){return x.id===id;});if(!o)return;
+  var o=(D.orders||[]).find(function(x){return x.id===id;});if(!o)return;
   var hasPaid=D.invoices.some(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+id)!==-1&&i.paid>0;});
   var msg=hasPaid?
     "Delete order #"+id+"?\n\nThis order has payments on record. The invoice will be kept for your financial records, but the order will be removed.":
@@ -3593,7 +3615,7 @@ function delO(id){
 
 function cancelO(id){
   if(!can("eOrd"))return;
-  var o=D.orders.find(function(x){return x.id===id;});if(!o)return;
+  var o=(D.orders||[]).find(function(x){return x.id===id;});if(!o)return;
   if(o.status==="Cancelled"){toast("Already cancelled");return;}
   if(o.status==="Delivered"){toast("Cannot cancel a delivered order — delete it if needed","err");return;}
   var inv=D.invoices.find(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+id)!==-1;});
@@ -4030,14 +4052,14 @@ function editInv(id){
 }
 function saveInv(){
   if(!can("aInv")&&!can("eInv"))return;
-  var cId=parseInt(el("ivc").value);var a=parseFloat(el("iva").value)||0;var p=parseFloat(el("ivp").value)||0;
+  var cId=parseInt(el("ivc")&&el("ivc").value)||0;var a=parseFloat(el("iva").value)||0;var p=parseFloat(el("ivp").value)||0;
   if(!a||a<=0){toast("Amount must be greater than 0","err");return;}
   // Default due date to 30 days from today if not set
   if(el("ivd")&&!el("ivd").value){var d30=new Date();d30.setDate(d30.getDate()+30);el("ivd").value=d30.toISOString().split("T")[0];}
   if(p>a){toast("Amount paid cannot exceed invoice total","err");return;}
   var editId=el("iv-edit-id").value;
   if(editId){
-    var i=D.invoices.find(function(x){return String(x.id)===String(editId);});
+    var i=(D.invoices||[]).find(function(x){return String(x.id)===String(editId);});
     if(i){
       if(i.payments&&i.payments.length){
         if(!can("rest")){toast("Cannot edit — payments recorded. Director only.","err");return;}
@@ -4058,7 +4080,7 @@ function saveInv(){
       }
       // Sync linked order
       var ordMatch=i.notes&&i.notes.match(/#(\d+)/);
-      if(ordMatch){var o=D.orders.find(function(x){return String(x.id)===ordMatch[1];});if(o){if(i.paid>=i.amount){o.paid="Paid";}else if(i.paid>0){o.paid="Partial";}else{o.paid="Unpaid";}o.amtPaid=i.paid;}}
+      if(ordMatch){var o=(D.orders||[]).find(function(x){return String(x.id)===ordMatch[1];});if(o){if(i.paid>=i.amount){o.paid="Paid";}else if(i.paid>0){o.paid="Partial";}else{o.paid="Unpaid";}o.amtPaid=i.paid;}}
       cm("m-iv");rInvs(undefined,INV_PAGE);dirty();toast("Invoice #"+editId+" updated");
       return;
     }
@@ -4069,7 +4091,7 @@ function saveInv(){
 function ackPendingPay(id){
   if(!can("mPaid")){toast("No permission","err");return;}
   if(!D.pendingPayments)return;
-  var pp=D.pendingPayments.find(function(x){return x.id===id;});
+  var pp=(D.pendingPayments||[]).find(function(x){return x.id===id;});
   if(!pp||pp.ack){toast("Already acknowledged","warn");return;}
   // Apply payment to linked invoice
   var inv=D.invoices.find(function(i){return i.cId===pp.cId&&i.paid<i.amount;});
@@ -4198,15 +4220,15 @@ function rDebts(q,pg){
   var _dwkStart=new Date(_dnow);_dwkStart.setDate(_dnow.getDate()-(_ddow===0?6:_ddow-1));
   var _dwkS=_dwkStart.toISOString().slice(0,10);
   var _dmo=_dnow.getFullYear()+"-"+String(_dnow.getMonth()+1).padStart(2,"0");
-  var debtors=D.customers.map(function(c){
+  var debtors=(D.customers||[]).map(function(c){
     // Period-scoped debt: find orders in this period and their unpaid invoices
-    var allInvs=D.invoices.filter(function(i){return i.cId===c.id&&i.paid<i.amount&&!i.voided;});
+    var allInvs=(D.invoices||[]).filter(function(i){return i.cId===c.id&&i.paid<i.amount&&!i.voided;});
     var periodInvs=(DEBT_PERIOD==="all")?allInvs:allInvs.filter(function(i){
       // Use the linked order's date — the actual date the debt was created
       var ordDate="";
       var ordMatch=i.notes&&i.notes.match(/#(\d+)/);
       if(ordMatch){
-        var _o=D.orders.find(function(x){return String(x.id)===ordMatch[1];});
+        var _o=(D.orders||[]).find(function(x){return String(x.id)===ordMatch[1];});
         if(_o)ordDate=_o.date||"";
       }
       if(!ordDate)return false; // no linked order = exclude from period views
@@ -4280,7 +4302,7 @@ function rDebts(q,pg){
   var _dcards=el("debt-cards");
   if(_dcards)_dcards.innerHTML=
     "<div class=\"stat sr\"><div class=\"sl\">Total outstanding</div><div class=\"sv\" style=\"color:#c0392b\">KSh "+total.toLocaleString()+"</div><div class=\"ss\">"+debtors.length+" customers</div></div>"+
-    "<div class=\"stat sa\"><div class=\"sl\">Overdue invoices</div><div class=\"sv\">"+D.invoices.filter(function(i){return i.paid<i.amount&&i.due<td;}).length+"</div></div>"+
+    "<div class=\"stat sa\"><div class=\"sl\">Overdue invoices</div><div class=\"sv\">"+(D.invoices||[]).filter(function(i){return i.paid<i.amount&&i.due<td;}).length+"</div></div>"+
     "<div class=\"stat sn\"><div class=\"sl\">Largest debt</div><div class=\"sv\">"+(debtors.length?"KSh "+debtors[0].debt.toLocaleString():"KSh 0")+"</div><div class=\"ss\">"+(debtors.length?(can("vPhone")?debtors[0].c.name:maskName(debtors[0].c.name)):"")+"</div></div>";
   var _dsort=el("debt-sort");
   if(_dsort)_dsort.innerHTML=
@@ -4626,7 +4648,7 @@ function exportReportXL(){
 }
 function rReports(){
   var pg=el("pg-reports");if(!pg)return;
-  var del=D.orders.filter(function(o){
+  var del=(D.orders||[]).filter(function(o){
     if(o.status!=="Delivered")return false;
     if(RPT_FROM||RPT_TO){
       // Date range selected: use deliveredAt for accuracy
@@ -5278,7 +5300,7 @@ function saveXL(){
 }
 function printInvoice(invId){
   var i=D.invoices.find(function(x){return x.id===invId;});if(!i)return;
-  var cu=D.customers.find(function(x){return x.id===i.cId;});
+  var cu=D.customers.find(function(x){return x.id===i.cId;});if(!cu)cu={name:"Unknown",address:""};
   var pays=(i.payments||[]).map(function(p){
     return "<tr><td>"+fmt(p.date)+"</td><td>"+p.method+"</td><td>"+( p.ref||"")+"</td><td style='text-align:right'>KSh "+p.amt.toLocaleString()+"</td></tr>";
   }).join("");
@@ -5322,8 +5344,8 @@ function printInvoice(invId){
   w.document.close();
 }
 function printStatement(cId){
-  var cu=D.customers.find(function(x){return x.id===cId;});if(!cu)return;
-  var invs=D.invoices.filter(function(i){return i.cId===cId;}).sort(function(a,b){return a.date>b.date?1:-1;});
+  var cu=D.customers.find(function(x){return x.id===cId;});if(!cu){toast("Customer not found","err");return;}
+  var invs=(D.invoices||[]).filter(function(i){return i.cId===cId;}).sort(function(a,b){return a.date>b.date?1:-1;});
   var totalAmt=invs.reduce(function(s,i){return s+i.amount;},0);
   var totalPaid=invs.reduce(function(s,i){return s+i.paid;},0);
   var rows=invs.map(function(i){
@@ -5821,7 +5843,7 @@ function runIntegrityCheck(){
     if(el("pg-customers")&&el("pg-customers").classList.contains("act"))rCusts();
   }
   // Check 1: negative stock
-  D.stock.forEach(function(s){
+  (D.stock||[]).forEach(function(s){
     if(s.qty<0){s.qty=0;issues.push("Stock: "+s.name+" had negative qty — reset to 0");}
   });
   // Check 2: orders referencing missing customers
@@ -5830,7 +5852,7 @@ function runIntegrityCheck(){
     if(!custIds[o.cId])issues.push("Order #"+o.id+" references missing customer ID "+o.cId);
   });
   // Check 3: orphaned invoices (no matching order, amount unpaid)
-  D.invoices.forEach(function(inv){
+  (D.invoices||[]).forEach(function(inv){
     if(inv.paid>=inv.amount||inv.voided)return; // paid or voided — ignore
     var ordMatch=inv.notes&&inv.notes.match(/#(\d+)/);
     if(ordMatch){
@@ -5854,16 +5876,16 @@ function runIntegrityCheck(){
   }
 }
 function syncIdCounters(){
-  var maxO=D.orders.reduce(function(m,o){return Math.max(m,Number(o.id)||0);},1000);
-  var maxI=D.invoices.reduce(function(m,i){return Math.max(m,Number(i.id)||0);},2000);
-  var maxCust=D.customers.reduce(function(m,cu){return Math.max(m,Number(cu.id)||0);},3000);
-  var maxCmp=D.complaints.reduce(function(m,x){return Math.max(m,Number(x.id)||0);},4000);
+  var maxO=(D.orders||[]).reduce(function(m,o){return Math.max(m,Number(o.id)||0);},1000);
+  var maxI=(D.invoices||[]).reduce(function(m,i){return Math.max(m,Number(i.id)||0);},2000);
+  var maxCust=(D.customers||[]).reduce(function(m,cu){return Math.max(m,Number(cu.id)||0);},3000);
+  var maxCmp=(D.complaints||[]).reduce(function(m,x){return Math.max(m,Number(x.id)||0);},4000);
   nOId=maxO+1;nIId=maxI+1;nCId=maxCust+1;nCmpId=maxCmp+1;
 }
 function syncPaymentStatuses(){
   // Fix any order whose payment badge doesn't match its invoice reality
-  D.orders.forEach(function(o){
-    var inv=D.invoices.find(function(i){
+  (D.orders||[]).forEach(function(o){
+    var inv=(D.invoices||[]).find(function(i){
       return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+o.id)!==-1;
     });
     if(inv){
