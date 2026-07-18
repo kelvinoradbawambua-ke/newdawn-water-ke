@@ -1969,8 +1969,11 @@ function buildMods(){
 
 function rDash(){
   var pg=el("pg-dashboard");if(!pg)return;
-  if(!_APP_READY){
-    pg.innerHTML="<div style=\"display:flex;align-items:center;justify-content:center;height:60vh;flex-direction:column;gap:14px\"><div style=\"width:32px;height:32px;border:3px solid var(--bd);border-top-color:var(--nv);border-radius:50%;animation:spin .8s linear infinite\"></div><div style=\"color:var(--tx2);font-size:13px\">Connecting...</div></div>";
+  // If data not yet loaded from Firestore, show brief connecting state
+  var _hasData=(D.customers||[]).length>0||(D.orders||[]).length>0||(D.stock||[]).length>0;
+  if(!_hasData&&FB_READY&&!_APP_READY){
+    pg.innerHTML="<div style=\"display:flex;align-items:center;justify-content:center;height:60vh;flex-direction:column;gap:14px\"><div style=\"width:32px;height:32px;border:3px solid var(--bd);border-top-color:var(--nv);border-radius:50%;animation:spin .8s linear infinite\"></div><div style=\"color:var(--tx2);font-size:13px\">Loading...</div></div>";
+    setTimeout(rDash,800);
     return;
   }
   var del=(D.orders||[]).filter(function(o){return o.status==="Delivered";});
