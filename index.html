@@ -2292,7 +2292,8 @@ function saveCust(){
       c.htype=el("chtype").value;c.road=el("croad").value;c.zone=el("czone").value;
       c.ctype=el("ctype").value;c.creditLimit=parseFloat(el("ccl").value)||0;c.notes=el("cnotes").value;
       auditLog("CUSTOMER_UPDATED","Customer updated by "+CU.name+" ("+CU.role+"): "+n);
-      cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer updated");
+      if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
+cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer updated");
       return;
     }
   }
@@ -2309,7 +2310,8 @@ function saveCust(){
   }
   (D.customers||[]).push({id:uid(),name:n,phone:ph,phone2:el("cph2").value,idno:el("cid").value,estate:el("cestate").value,court:el("ccourt").value,house:el("chouse").value,htype:el("chtype").value,road:el("croad").value,zone:el("czone").value,ctype:el("ctype").value,creditLimit:parseFloat(el("ccl").value)||0,notes:el("cnotes").value,created:tday()});
   ["cn","cph","cph2","cid","cestate","ccourt","chouse","croad","czone","cnotes"].forEach(function(id){el(id).value="";});el("ccl").value="0";
-  cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer added");
+  if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
+cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer added");
 }
 function editCust(id){
   if(!can("eCust"))return;
@@ -2578,6 +2580,7 @@ function reversePayment(invId,payIdx){
     }
   }
   auditLog("PAYMENT_RECORDED","REVERSAL: KSh "+pay.amt+" removed from Invoice #"+invId+" by "+CU.name+". Method: "+pay.method+". New paid total: KSh "+inv.paid);
+  if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   dirty();
   if(el("pg-invoices")&&el("pg-invoices").classList.contains("act"))rInvs(undefined,INV_PAGE);
   if(el("pg-orders")&&el("pg-orders").classList.contains("act"))rOrds(undefined,ORD_PAGE);
@@ -2632,7 +2635,8 @@ voidInvoice._confirm=function(invId){
   var ordMatch=inv.notes&&inv.notes.match(/#(\d+)/);
   if(ordMatch){var o=D.orders.find(function(x){return String(x.id)===ordMatch[1];});if(o&&o.status!=="Delivered")o.paid="Voided";}
   auditLog("PAYMENT_RECORDED","VOID: Invoice #"+invId+" voided by "+CU.name+". Reason: "+reason+". Amount written off: KSh "+bal);
-  dirty();cm("m-generic");
+    if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
+dirty();cm("m-generic");
   if(el("pg-invoices")&&el("pg-invoices").classList.contains("act"))rInvs(undefined,INV_PAGE);
   if(el("pg-debts")&&el("pg-debts").classList.contains("act"))rDebts();
   toast("Invoice #"+invId+" voided — KSh "+bal.toLocaleString()+" written off","ok");
@@ -3324,7 +3328,8 @@ function saveOrd(){
     }else if(linkedInv){
       linkedInv.amount=price*qty;linkedInv.paid=price*qty;
     }
-    auditLog("ORDER_UPDATED","Order #"+o.id+" edited by "+CU.name+" ("+CU.role+")");
+    if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
+auditLog("ORDER_UPDATED","Order #"+o.id+" edited by "+CU.name+" ("+CU.role+")");
     cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+o.id+" updated");
     return;
   }
@@ -3336,7 +3341,8 @@ function saveOrd(){
     // Category order: no stock deduction, no invoice yet, payment at delivery
     (D.orders||[]).push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:0,cost:0,date:el("od").value,status:"Pending",paid:"Unpaid",amtPaid:0,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?el("onotes").value:"",prodConfirmed:false,_ts:Date.now()});
     auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty+" (category/TBC)");
-    cm("m-o");rOrds(undefined,ORD_PAGE);dirty();
+    if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
+  cm("m-o");rOrds(undefined,ORD_PAGE);dirty();
     toast("Order #"+newOrdId+" placed — driver confirms brand & collects payment at delivery");
     return;
   }
@@ -3365,7 +3371,8 @@ function saveOrd(){
   // Always create invoice for exact orders — provides full financial trail
   (D.invoices||[]).push({id:nIId++,cId:cId,amount:total,paid:amtPaid,due:(function(){var dd=new Date((el("od").value||tday())+"T12:00:00");dd.setDate(dd.getDate()+7);return dd.toISOString().split("T")[0];})(),notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
   auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty);
-  cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+newOrdId+" placed");
+  if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
+cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+newOrdId+" placed");
 }
 function openDlv(oid){
   var o=(D.orders||[]).find(function(x){return x.id===oid;});if(!o)return;
@@ -3476,6 +3483,7 @@ function completeDlv(){
     var confirmedPrice=parseInt(parts[1])||0;
     // Deduct stock now
     var st=(D.stock||[]).find(function(s){return s.name===confirmedProd;});
+    var stCost=st; // read cost BEFORE stock deduction
     if(st){
       if(st.qty<o.qty){
         if(!confirm("⚠️ Only "+st.qty+" in stock but delivering "+o.qty+".\n\nStock will go to 0. Continue?"))return;
@@ -3485,7 +3493,6 @@ function completeDlv(){
       st.history.push({ts:tday(),type:"sale",qty:-o.qty,by:CU.name,ordId:o.id,bal:st.qty});
       if(st.history.length>50)st.history=st.history.slice(-50);
     }
-    var stCost=(D.stock||[]).find(function(s){return s.name===confirmedProd;});
     // Update order with confirmed product
     o.prod=confirmedProd;
     o.price=confirmedPrice;
@@ -3895,7 +3902,8 @@ function saveSt(){
       s.cost=parseFloat(el("sc").value)||0;s.qty=parseInt(el("sq").value)||0;s.min=parseInt(el("sm").value)||10;
       s.isWater=el("sw")&&el("sw").checked?true:false;
       auditLog("STOCK_UPDATED","Product saved by "+CU.name+" ("+CU.role+"): "+n+(s.isWater?" [water cycle product]":""));
-      cm("m-s");rStock();dirty();
+      if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
+cm("m-s");rStock();dirty();
       // Re-sync water cycles after isWater change (targeted, no race with dirty)
       if(s.isWater)setTimeout(syncWaterCycles,1500);
       toast(n+" updated"+(s.isWater?" — water cycle tracking enabled":""));
@@ -4489,6 +4497,7 @@ function saveCmp(){
       cm("m-cmp");rCmps(undefined,CMP_PAGE);dirty();toast("Complaint updated");return;
     }
   }(D.complaints||[]).push({id:nCmpId++,cId:parseInt(el("cmp-c").value),type:el("cmp-t").value,details:det,action:el("cmp-act").value,status:el("cmp-s").value,date:el("cmp-d").value});el("cmp-det").value="";el("cmp-act").value="";auditLog("COMPLAINT_LOGGED","Complaint logged by "+CU.name+" ("+CU.role+"): "+el("cmp-t").value);
+  if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   cm("m-cmp");rCmps(undefined,CMP_PAGE);dirty();toast("Complaint logged");}
 function editCmp(id){
   if(!can("mCmp")){toast("Only managers can edit complaints","err");return;}
@@ -4510,6 +4519,7 @@ function editCmp(id){
   om("m-cmp");
 }
 function resolveCmp(id){if(!can("mCmp")){toast("Only managers can resolve complaints","err");return;}var c=(D.complaints||[]).find(function(x){return x.id===id;});if(c)c.status="Resolved";rCmps(undefined,CMP_PAGE);dirty();toast("Complaint resolved");}
+  if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
 function delCmp(id){if(!can("dCmp")){toast("Only managers can delete complaints","err");return;}var cmp=(D.complaints||[]).find(function(x){return x.id===id;});if(!cmp)return;var cu=(D.customers||[]).find(function(x){return x.id===cmp.cId;});var msg="Delete complaint from "+(cu?(can("vPhone")?cu.name:"this customer"):"unknown")+"?\n\n\""+cmp.text.slice(0,80)+(cmp.text.length>80?"…":"")+"\"\n\nThis cannot be undone.";if(!confirm(msg))return;D.complaints=(D.complaints||[]).filter(function(c){return c.id!==id;});rCmps(undefined,CMP_PAGE);dirty();}
 
 function addRoute(){
@@ -4544,6 +4554,7 @@ function delRoute(id){
   var msg="Remove route: \""+rt.name+"\"?"+(areas?"\nCovers: "+areas:"")+"\n\nThis cannot be undone.";
   if(!confirm(msg))return;
   D.routes=(D.routes||[]).filter(function(r){return r.id!==id;});
+  if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   dirty();rOffers();
   toast("Route \""+rt.name+"\" removed");
 }
