@@ -198,6 +198,7 @@ var FB_DOC_REF=null;
 var FB_BACKUP_COL=null; // backup collection reference
 var FB_EVENTS_COL=null; // audit events subcollection — 1 doc per event
 var FB_READY=false;
+var _APP_READY=false; // true after first Firestore snapshot received
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
@@ -711,7 +712,7 @@ function startCloudListener(){
         }
         /* Main doc missing — restoring from local data and pushing to cloud */
         setTimeout(function(){FB_LAST_LOCAL_WRITE=Date.now();pushToCloud();},1000);
-        FB_READY=true;
+        FB_READY=true;_APP_READY=true;
         if(CU){refreshCurrentPage();}else{renderUG();}
         return;
       }
@@ -725,6 +726,7 @@ function startCloudListener(){
           FB_READY=true;
           var c2=el("cloud-status");
           if(c2)c2.innerHTML="<i class=\"ti ti-cloud-check\"></i> Restored from backup &middot; "+count+" customers";
+          _APP_READY=true;
           if(CU){refreshCurrentPage();}else{renderUG();}
           if(CU&&CU.role==="director"){
             toast("⚠️ Main data was missing — auto-restored from backup! Check your data and save a manual backup now.","warn");
@@ -891,6 +893,7 @@ function startCloudListener(){
       if(stillExists.pin!==CU.pin||stillExists.role!==CU.role||stillExists.name!==CU.name){
         CU=stillExists;
       }
+      _APP_READY=true;
       refreshCurrentPage();
     }else{
       renderUG();
@@ -968,6 +971,7 @@ function initCloudConnection(cb){
           nOId=snap.nOId||nOId;nIId=snap.nIId||nIId;
           FB_SETUP_DONE=snap.setupDone===true;
           syncIdCounters();
+          _APP_READY=true;
           toast("Working offline — cloud sync unavailable","warn");
         }
         finish();
@@ -1631,7 +1635,7 @@ function logout(){
   }catch(e){}
   if(FB_UNSUB){try{FB_UNSUB();}catch(e){}FB_UNSUB=null;}
   if(FB_AUDIT_UNSUB){try{FB_AUDIT_UNSUB();}catch(e){}FB_AUDIT_UNSUB=null;}
-  FB_READY=false;FB_DOC_REF=null;
+  FB_READY=false;FB_DOC_REF=null;_APP_READY=false;
   // Clear all session data — security: prevent data leak to next user
   D={customers:[],stock:[],orders:[],offers:[],invoices:[],routes:[],
      complaints:[],pendingPayments:[],auditLog:[]};
@@ -1965,6 +1969,10 @@ function buildMods(){
 
 function rDash(){
   var pg=el("pg-dashboard");if(!pg)return;
+  if(!_APP_READY){
+    pg.innerHTML="<div style=\"display:flex;align-items:center;justify-content:center;height:60vh;flex-direction:column;gap:14px\"><div style=\"width:32px;height:32px;border:3px solid var(--bd);border-top-color:var(--nv);border-radius:50%;animation:spin .8s linear infinite\"></div><div style=\"color:var(--tx2);font-size:13px\">Connecting...</div></div>";
+    return;
+  }
   var del=(D.orders||[]).filter(function(o){return o.status==="Delivered";});
   // ── Period filter for financial stats ──────────────────────────────
   // Staff locked to today — no financial period access
