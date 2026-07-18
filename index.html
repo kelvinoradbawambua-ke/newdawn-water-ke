@@ -275,7 +275,7 @@ function btl(v){if(!v||v==="Good")return "<span class=\"badge bg\">Good</span>";
 function custDebt(id){
   var cu=D.customers.find(function(x){return x.id===id;});
   var credit=(cu&&cu.credit>0)?cu.credit:0;
-  var gross=D.invoices.filter(function(i){
+  var gross=(D.invoices||[]).filter(function(i){
     if(i.cId!==id)return false;
     if(i.paid>=i.amount)return false; // fully paid, no debt
     if(i.voided)return false; // voided/written-off — excluded from debt
@@ -326,9 +326,11 @@ function auditLog(action,details){
   // Write to Firestore subcollection — queue if not yet ready
   if(FB_EVENTS_COL&&FB_READY){
     FB_EVENTS_COL.add(entry).catch(function(err){
-      // Show actual error to director for diagnosis
+      // Retry: queue failed audit writes for re-attempt
+      if(!window._auditFailQ)window._auditFailQ=[];
+      window._auditFailQ.push(entry);
       var msg=err&&err.message?err.message:(err&&err.code?err.code:"unknown");
-      if(CU&&CU.role==="director")toast("Audit write failed: "+msg,"err");
+      if(CU&&CU.role==="director")toast("Audit write queued for retry: "+msg,"ok");
     });
   }else if(FB_EVENTS_COL&&!FB_READY){
     // Queue events fired before Firestore is ready — flush on connection
@@ -436,6 +438,7 @@ function pushToCloud(){
 }
 function processWriteQueue(){
   if(!FB_WRITE_QUEUE.length){FB_WRITING=false;return;}
+  if(!D||typeof D!=="object"){FB_WRITING=false;return;} // safety: never write null data
   FB_WRITING=true;
   FB_WRITE_QUEUE=[];// collapse multiple pending writes into one
   FB_LAST_LOCAL_WRITE=Date.now();
@@ -624,6 +627,11 @@ function restoreFromLatestBackup(onSuccess,onFail){
 }
 var FB_AUDIT_UNSUB=null;
 function _mergeAuditEvents(remote){
+  // Flush any previously-failed audit writes now connection is confirmed good
+  if(window._auditFailQ&&window._auditFailQ.length&&FB_EVENTS_COL){
+    var fq=window._auditFailQ.splice(0);
+    fq.forEach(function(e){FB_EVENTS_COL.add(e).catch(function(){window._auditFailQ.push(e);});});
+  }
   // Core merge — used by both listener and one-time load
   // NEVER replaces D.auditLog — only adds new entries
   if(!remote||!remote.length)return;
@@ -1584,10 +1592,24 @@ function wizFinish(){
 }
 function logout(){
   stopAutoSaveLoop();
+  // Flush any queued audit events before clearing session
+  if(FB_EVENTS_COL&&FB_READY){
+    var pq=(window._auditQueue||[]).concat(window._auditFailQ||[]);
+    window._auditQueue=[];window._auditFailQ=[];
+    pq.forEach(function(e){try{FB_EVENTS_COL.add(e);}catch(ex){}});
+  }
   if(CU&&CU.role==="director"&&FB_READY){
   stopIdleWatcher();
     try{runAutoBackup();}catch(e){}
   }
+  // Attempt final sync push before disconnecting
+  try{
+    if(FB_READY&&FB_DOC_REF&&typeof D==="object"){
+      var snap=JSON.parse(JSON.stringify({D:D}));
+      delete snap.D.auditLog;
+      FB_DOC_REF.set(snap,{merge:true});
+    }
+  }catch(e){}
   if(FB_UNSUB){try{FB_UNSUB();}catch(e){}FB_UNSUB=null;}
   if(FB_AUDIT_UNSUB){try{FB_AUDIT_UNSUB();}catch(e){}FB_AUDIT_UNSUB=null;}
   D.auditLog=[];
@@ -1965,7 +1987,7 @@ function rDash(){
   var rev=periodDel.reduce(function(a,o){return a+o.qty*o.price;},0);
   var cost=periodDel.reduce(function(a,o){return a+o.qty*(o.cost||0);},0);
   var pend=D.orders.filter(function(o){return o.status==="Pending"||o.status==="Processing";}).length;
-  var low=D.stock.filter(function(s){return s.qty<=s.min;}).length;
+  var low=(D.stock||[]).filter(function(s){return s.qty<=s.min;}).length;
   var dashDebtMap={};D.customers.forEach(function(cu){dashDebtMap[cu.id]=custDebt(cu.id);});
   var debts=D.customers.filter(function(c){return dashDebtMap[c.id]>0;});
   var totD=debts.reduce(function(a,c){return a+dashDebtMap[c.id];},0);
@@ -2597,7 +2619,7 @@ function recPay(){
   if(!can("mPaid")){toast("No permission to record payments","err");return;}
   var cId=parseInt(el("pay-cid").value),amt=parseFloat(el("pay-amt").value)||0;
   if(!cId||isNaN(cId)){toast("Invalid customer","err");return;}
-  if(!amt){toast("Enter amount","err");return;}
+  if(!amt||amt<=0){toast("Enter a valid amount greater than zero","err");return;}
   var invId=el("pay-inv-id")&&el("pay-inv-id").value?parseInt(el("pay-inv-id").value):0;
   var payDate=el("pay-date")&&el("pay-date").value?el("pay-date").value:tday();
   var method=el("pay-method")?el("pay-method").value:"Cash";
@@ -3084,7 +3106,7 @@ function is20ltr(prodName){
   // 1. Name contains 20ltr variant
   if(/20lt?r?s?/i.test(n)||n.indexOf("20litre")!==-1||n.indexOf("20litres")!==-1)return true;
   // 2. Find matching stock item by exact or normalised name
-  var st=D.stock.find(function(s){
+  var st=(D.stock||[]).find(function(s){
     var sn=s.name.toLowerCase().replace(/\s+/g,"");
     return sn===n||s.name.toLowerCase()===prodName.toLowerCase();
   });
@@ -3098,7 +3120,7 @@ function is20ltr(prodName){
   // 3. Check if ANY isWater-flagged stock item name is contained in prodName
   //    Handles renamed products (e.g. old orders say "Pick Bottle",
   //    stock now says "Pick Bottle 20ltr" which is isWater=true)
-  var waterStocks=D.stock.filter(function(s){return s.isWater===true;});
+  var waterStocks=(D.stock||[]).filter(function(s){return s.isWater===true;});
   for(var wi=0;wi<waterStocks.length;wi++){
     var ws=waterStocks[wi];
     var wsn=ws.name.toLowerCase();
@@ -3280,6 +3302,7 @@ function saveOrd(){
     }else if(linkedInv){
       linkedInv.amount=price*qty;linkedInv.paid=price*qty;
     }
+    auditLog("ORDER_UPDATED","Order #"+o.id+" edited by "+CU.name+" ("+CU.role+")");
     cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+o.id+" updated");
     return;
   }
@@ -3691,7 +3714,7 @@ function rDel(q){
     "<div class=\"stat sa\" style=\"cursor:pointer\" onclick=\"nav('orders',null);setTimeout(function(){filterOrds('Pending');},80)\"><div class=\"sl\">Pending</div><div class=\"sv\">"+pend.length+"</div><div class=\"ss\">view all &rarr;</div></div>"+
     "<div class=\"stat sk\" style=\"cursor:pointer\" onclick=\"nav('orders',null);setTimeout(function(){ORD_STATUS_F='Delivered';ORD_DATE_F=tday();rOrds(undefined,0);},80)\"><div class=\"sl\">Delivered today</div><div class=\"sv\">"+todayDel+"</div><div class=\"ss\">view &rarr;</div></div>"+
     (CU&&CU.role==="staff"?
-    "<div class=\"stat sb\"><div class=\"sl\">Routes</div><div class=\"sv\">"+D.routes.length+"</div></div>":// staff see Pending, Today, Routes only
+    "<div class=\"stat sb\"><div class=\"sl\">Routes</div><div class=\"sv\">"+(D.routes||[]).length+"</div></div>":// staff see Pending, Today, Routes only
     "<div class=\"stat sn\"><div class=\"sl\">This week</div><div class=\"sv\">"+weekDel+"</div><div class=\"ss\">delivered</div></div>"+
     "<div class=\"stat sb\"><div class=\"sl\">This month</div><div class=\"sv\">"+monthDel+"</div><div class=\"ss\">delivered</div></div>"+
     "<div class=\"stat sn\" style=\"cursor:pointer\" onclick=\"nav('orders',null);setTimeout(function(){filterOrds('Delivered');},80)\"><div class=\"sl\">Total delivered</div><div class=\"sv\">"+totalDel+"</div><div class=\"ss\">view all &rarr;</div></div>"+
@@ -3772,7 +3795,7 @@ function showStockHistory(sid){
   om("m-generic");
 }
 function updateStockBadge(){
-  var low=D.stock.filter(function(s){return s.qty<=s.min;}).length;
+  var low=(D.stock||[]).filter(function(s){return s.qty<=s.min;}).length;
   var btn=document.getElementById("nav-stock-btn");
   if(!btn)return;
   // Remove existing badge
@@ -5699,8 +5722,8 @@ function syncWaterCycles(){
   // Safe to call after stock edit without racing the main dirty() write
   if(!CU||CU.role!=="director"||!FB_READY)return;
   var changed=0;
-  D.customers.forEach(function(cu){
-    var waterOrds=D.orders.filter(function(o){
+  (D.customers||[]).forEach(function(cu){
+    var waterOrds=(D.orders||[]).filter(function(o){
       return o.cId===cu.id&&o.status==="Delivered"&&is20ltr(o.prod);
     }).sort(function(a,b){
       var da=a.deliveredAt||a.date||"";var db=b.deliveredAt||b.date||"";
@@ -5736,7 +5759,7 @@ function runIntegrityCheck(){
   // If c.credit > 0 but creditLog is empty or missing, it was set via the form
   // (old behaviour before the split) — move it to creditLimit and zero credit
   var migrated=0;
-  D.customers.forEach(function(cu){
+  (D.customers||[]).forEach(function(cu){
     if((cu.credit>0)&&(!cu.creditLog||!cu.creditLog.length)){
       // No payment history means this was set via the form as creditLimit
       if(!cu.creditLimit||cu.creditLimit===0){cu.creditLimit=cu.credit;}
@@ -5751,7 +5774,7 @@ function runIntegrityCheck(){
   var bootstrapped=0;
   D.customers.forEach(function(cu){
     // Find ALL delivered 20ltr water orders for this customer, sorted by date
-    var waterOrds=D.orders.filter(function(o){
+    var waterOrds=(D.orders||[]).filter(function(o){
       return o.cId===cu.id&&o.status==="Delivered"&&is20ltr(o.prod);
     }).sort(function(a,b){
       var da=a.deliveredAt||a.date||"";
