@@ -1351,6 +1351,9 @@ function buildApp(){
   setTimeout(updateStockBadge,2000); // low stock badge on nav
   // Restart audit listener after login — ensures live connection with auth established
   setTimeout(startAuditListener,1000);
+  // Restart cloud listener if it was killed by previous logout
+  if(!FB_UNSUB&&FB_DOC_REF)startCloudListener();
+  else if(!FB_UNSUB&&!FB_DOC_REF)initCloudConnection(function(){});
   startIdleWatcher();
   setTimeout(runIntegrityCheck,3500);
   if(!FB_SETUP_DONE&&CU&&CU.role==="director"){
