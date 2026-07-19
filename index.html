@@ -329,7 +329,9 @@ function auditLog(action,details){
   // Use CU (logged-in user) or SU (selected but not yet verified) for pre-login events
   var actor=CU||SU;
   if(!actor)return;
+  var _clientId=Date.now()+"-"+Math.random().toString(36).slice(2,9); // stable ID for idempotent retries
   var entry={
+    _cid:_clientId,
     ts:new Date().toISOString(),
     user:actor.name,
     role:actor.role,
@@ -339,7 +341,7 @@ function auditLog(action,details){
   };
   // Write to Firestore subcollection — queue if not yet ready
   if(FB_EVENTS_COL&&FB_READY){
-    FB_EVENTS_COL.add(entry).catch(function(err){
+    FB_EVENTS_COL.doc(_clientId).set(entry).catch(function(err){
       // Retry: queue failed audit writes for re-attempt
       if(!window._auditFailQ)window._auditFailQ=[];
       window._auditFailQ.push(entry);
@@ -644,7 +646,7 @@ function _mergeAuditEvents(remote){
   // Flush any previously-failed audit writes now connection is confirmed good
   if(window._auditFailQ&&window._auditFailQ.length&&FB_EVENTS_COL){
     var fq=window._auditFailQ.splice(0);
-    fq.forEach(function(e){FB_EVENTS_COL.add(e).catch(function(){window._auditFailQ.push(e);});});
+    fq.forEach(function(e){var _id=e._cid||(e.ts+"-"+Math.random().toString(36).slice(2,9));FB_EVENTS_COL.doc(_id).set(e).catch(function(){window._auditFailQ.push(e);});});
   }
   // Core merge — used by both listener and one-time load
   // NEVER replaces D.auditLog — only adds new entries
@@ -893,7 +895,7 @@ function startCloudListener(){
     // Flush any audit events queued before Firestore was ready
     if(window._auditQueue&&window._auditQueue.length&&FB_EVENTS_COL){
       var q=window._auditQueue.splice(0);
-      q.forEach(function(e){FB_EVENTS_COL.add(e).catch(function(){});});
+      q.forEach(function(e){var _id=e._cid||(e.ts+"-"+Math.random().toString(36).slice(2,9));FB_EVENTS_COL.doc(_id).set(e).catch(function(){});});
     }
     var c=el("cloud-status");
     var custN=(D&&D.customers&&(D.customers||[]).length)||0;
@@ -937,19 +939,25 @@ function _reconnectCloudListener(){
   },delay);
 }
 function _startHeartbeat(){
-  // Every 20s, verify the listener is still actually alive.
-  // A backgrounded/throttled tab can silently stall onSnapshot without
-  // ever firing an error — heartbeat catches this case the error handler misses.
+  // A backgrounded/throttled/sleeping tab can silently stall onSnapshot
+  // WITHOUT ever nulling FB_UNSUB or firing an error — a listener reference
+  // can look "alive" while delivering nothing. Detecting that reliably from
+  // JS alone is not possible, so instead of guessing, we force a full
+  // teardown-and-resubscribe on a fixed schedule regardless of apparent
+  // health. This guarantees no device can ever drift more than a few
+  // minutes out of sync, no matter the failure mode.
   if(FB_HEARTBEAT_TIMER)clearInterval(FB_HEARTBEAT_TIMER);
   FB_HEARTBEAT_TIMER=setInterval(function(){
-    if(!FB_DOC_REF)return;
+    if(!FB_DOC_REF||!CU)return;
+    // Explicit-death case: FB_UNSUB already nulled by the error handler —
+    // reconnect immediately rather than waiting for the next cycle.
+    if(!FB_UNSUB){_reconnectCloudListener();return;}
+    // Proactive safety net: force a fresh subscribe every 3 minutes even if
+    // the listener LOOKS healthy — this is the only reliable way to recover
+    // from a silent stall, and costs nothing but one extra read.
     var silentFor=Date.now()-FB_LAST_SNAPSHOT;
-    // Firestore listeners normally receive a snapshot within seconds of subscribing,
-    // and stay silent only while nothing changes — 90s of total silence with no
-    // confirmed listener is a strong signal the connection stalled.
-    if(!FB_UNSUB&&silentFor>15000){
-      // Listener is confirmed dead (nulled by error handler) — reconnect now
-      _reconnectCloudListener();
+    if(silentFor>180000){
+      startCloudListener(); // tears down old listener internally, re-subscribes fresh
     }
   },20000);
 }
@@ -1681,7 +1689,7 @@ function logout(){
   if(FB_EVENTS_COL&&FB_READY){
     var aq=(window._auditQueue||[]).concat(window._auditFailQ||[]);
     window._auditQueue=[];window._auditFailQ=[];
-    aq.forEach(function(e){try{FB_EVENTS_COL.add(e);}catch(ex){}});
+    aq.forEach(function(e){try{var _id=e._cid||(e.ts+"-"+Math.random().toString(36).slice(2,9));FB_EVENTS_COL.doc(_id).set(e);}catch(ex){}});
   }
   // Director: run backup
   if(CU&&CU.role==="director"&&FB_READY){
@@ -5679,7 +5687,7 @@ function sendEmailBackup(manual){
     var el2=el("ej-last");if(el2)el2.textContent="Last sent: "+today+" at "+new Date().toLocaleTimeString();
   }).catch(function(err){
     var msg=err.text||err.message||JSON.stringify(err)||"unknown error";
-    toast("Email failed: "+msg,"err");
+    toast("Backup email failed (unrelated to order sync — check EmailJS settings): "+msg,"err");
     // EmailJS error — Service:"+EJ_SERVICE_ID+" Template:"+EJ_TEMPLATE_ID);
   });
 }
