@@ -205,6 +205,7 @@ var _APP_READY=false; // true after first Firestore snapshot received
 var FB_RECONNECT_ATTEMPTS=0; // for exponential backoff
 var _idleWarnTimer=null;
 var _recentlyDeletedOrderIds={}; // id->timestamp, prevents sync from resurrecting a just-deleted order
+var _recentlyVoidedInvoiceIds={}; // id->timestamp, prevents sync from silently un-voiding an invoice
 var _idleWarnEl=null;
 var FB_RECONNECT_TIMER=null;
 var FB_LAST_SNAPSHOT=0; // timestamp of last successful snapshot — for heartbeat
@@ -842,8 +843,28 @@ function startCloudListener(){
           });
         }
       }
-      // Invoices: take remote (payments recorded on any device)
-      if(data.D.invoices)D.invoices=data.D.invoices;
+      // Invoices: take remote (payments recorded on any device) — but respect
+      // any recently-voided invoice here for 60s, and never blindly overwrite
+      // during our own write window, so a void action can never be silently
+      // undone by a stale/in-flight incoming snapshot.
+      if(data.D.invoices){
+        if(isOwnWrite){
+          // Trust local entirely during our own write window — remote has not
+          // caught up yet, so blindly overwriting would revert our own change.
+        }else{
+          Object.keys(_recentlyVoidedInvoiceIds).forEach(function(k){
+            if(Date.now()-_recentlyVoidedInvoiceIds[k]>60000)delete _recentlyVoidedInvoiceIds[k];
+          });
+          var localInvMap={};
+          (D.invoices||[]).forEach(function(i){localInvMap[i.id]=i;});
+          D.invoices=data.D.invoices.map(function(ri){
+            var tombAt=_recentlyVoidedInvoiceIds[ri.id];
+            var li=localInvMap[ri.id];
+            if(li&&li.voided&&tombAt&&Date.now()-tombAt<60000)return li; // respect our recent void
+            return ri;
+          });
+        }
+      }
       // Stock: take remote (restocks on any device)
       if(data.D.stock)D.stock=data.D.stock;
       // Pending payments: merge (staff collections from multiple devices)
@@ -2798,6 +2819,7 @@ voidInvoice._confirm=function(invId){
   var inv=D.invoices.find(function(x){return x.id===invId;});if(!inv)return;
   var bal=inv.amount-inv.paid;
   inv.voided=true;inv.voidedBy=CU.name;inv.voidedAt=tday();inv.voidReason=reason;
+  _recentlyVoidedInvoiceIds[invId]=Date.now();
   var ordMatch=inv.notes&&inv.notes.match(/#(\d+)/);
   if(ordMatch){var o=D.orders.find(function(x){return String(x.id)===ordMatch[1];});if(o&&o.status!=="Delivered")o.paid="Voided";}
   auditLog("PAYMENT_RECORDED","VOID: Invoice #"+invId+" voided by "+CU.name+". Reason: "+reason+". Amount written off: KSh "+bal);
