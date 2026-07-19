@@ -4151,10 +4151,25 @@ function findMissingOrders(){
     var rec=placed[id];
     var inv=(D.invoices||[]).find(function(i){return i.notes&&i.notes.indexOf("#"+id)!==-1;});
     var cust=inv?(D.customers||[]).find(function(c){return c.id===inv.cId;}):null;
+    var viaCycle=false;
+    if(!cust){
+      // Fallback: check water-cycle history (20L milestone deliveries reference
+      // ordId directly) — only covers a subset of orders but adds a second
+      // recovery source when the invoice is unavailable.
+      var found=null;
+      (D.customers||[]).forEach(function(c){
+        if(found)return;
+        (c.cycleHistory||[]).forEach(function(h){
+          if(String(h.ordId)===String(id))found=c;
+        });
+      });
+      if(found){cust=found;viaCycle=true;}
+    }
     missing.push({
       origId:rec.id,prod:rec.prod,qty:rec.qty,ts:rec.ts,
       cId:cust?cust.id:null,cName:cust?cust.name:"Unknown — select manually",
-      price:inv?(inv.amount/rec.qty):null
+      price:inv?(inv.amount/rec.qty):null,
+      source:inv?"invoice":(viaCycle?"cycle history (price unknown — enter manually)":"none found")
     });
   });
   return missing;
@@ -4165,18 +4180,20 @@ function showMissingOrders(){
   if(!missing.length){body.innerHTML="<div style=\'padding:20px;text-align:center;color:var(--tx2)\'>No missing orders found — audit log matches live orders.</div>";cm("m-recon");return;}
   var rows=missing.map(function(m,i){
     var custOpts=(D.customers||[]).map(function(c){return "<option value=\'"+c.id+"\'"+(c.id===m.cId?" selected":"")+">"+c.name+"</option>";}).join("");
+    var srcColor=m.source==="invoice"?"#27ae60":m.source.indexOf("cycle")===0?"#e67e22":"#c0392b";
     return "<tr data-idx=\'"+i+"\'>"+
       "<td>#"+m.origId+"</td>"+
       "<td><select class=\'recon-cust\' style=\'width:140px\'>"+"<option value=\'\'>Select customer\u2026</option>"+custOpts+"</select></td>"+
       "<td><input class=\'recon-prod\' value=\'"+m.prod+"\' style=\'width:110px\'></td>"+
       "<td><input class=\'recon-qty\' type=\'number\' value=\'"+m.qty+"\' style=\'width:50px\'></td>"+
       "<td><input class=\'recon-price\' type=\'number\' value=\'"+(m.price?Math.round(m.price):"")+"\' style=\'width:70px\' placeholder=\'KSh\'></td>"+
+      "<td style=\'color:"+srcColor+";font-size:10px;font-weight:600\'>"+m.source+"</td>"+
       "<td><button class=\'btn btn-xs btn-navy\' onclick=\'recreateOrder("+i+")\'>Recreate</button></td>"+
       "</tr>";
   }).join("");
-  body.innerHTML="<div style=\'font-size:12px;color:var(--tx2);margin-bottom:10px\'>Found "+missing.length+" order(s) in the audit log with no matching live order. Customer/product/price are pre-filled from the linked invoice where found — review before recreating.</div>"+
+  body.innerHTML="<div style=\'font-size:12px;color:var(--tx2);margin-bottom:10px\'>Found "+missing.length+" order(s) in the audit log with no matching live order. Green source = recovered from invoice (most reliable). Orange = recovered from water-cycle history (price not available — enter manually). Red = no source found, verify manually before recreating.</div>"+
     "<table style=\'width:100%;font-size:12px;border-collapse:collapse\'>"+
-    "<thead><tr style=\'background:var(--nv);color:#fff\'><th style=\'padding:5px 8px\'>Orig #</th><th style=\'padding:5px 8px\'>Customer</th><th style=\'padding:5px 8px\'>Product</th><th style=\'padding:5px 8px\'>Qty</th><th style=\'padding:5px 8px\'>Price</th><th style=\'padding:5px 8px\'>Action</th></tr></thead>"+
+    "<thead><tr style=\'background:var(--nv);color:#fff\'><th style=\'padding:5px 8px\'>Orig #</th><th style=\'padding:5px 8px\'>Customer</th><th style=\'padding:5px 8px\'>Product</th><th style=\'padding:5px 8px\'>Qty</th><th style=\'padding:5px 8px\'>Price</th><th style=\'padding:5px 8px\'>Source</th><th style=\'padding:5px 8px\'>Action</th></tr></thead>"+
     "<tbody>"+rows+"</tbody></table>";
   window._reconMissing=missing;
   cm("m-recon");
