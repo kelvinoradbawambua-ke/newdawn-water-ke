@@ -886,8 +886,18 @@ function startCloudListener(){
     D.auditLog=_prevAuditLog;
 
     // 5. Users and setup
-    if(data.USERS&&data.USERS.length)USERS=data.USERS;
-    else USERS=[{id:1,name:"Director",role:"director",pin:"1234",ini:"DR",col:"#1a1560"}];
+    // Only accept a non-empty USERS list from remote. If this snapshot has
+    // no USERS (transient glitch, race, or corrupted read) — NEVER replace
+    // the real local list with a fake default; that would falsely trigger
+    // the "account removed" check below and lock out the real director.
+    var _usersFromRemote=false;
+    if(data.USERS&&data.USERS.length){USERS=data.USERS;_usersFromRemote=true;}
+    else if(!USERS||!USERS.length){
+      // Only fall back to the bootstrap default if we truly have NEVER had
+      // any users this session (genuine brand-new setup) — not as a reaction
+      // to a single empty snapshot mid-session.
+      USERS=[{id:1,name:"Director",role:"director",pin:"1234",ini:"DR",col:"#1a1560"}];
+    }
     FB_SETUP_DONE=data.setupDone===true;
     // Carry backup stamp
     if(data.D._lastDailyBackup)D._lastDailyBackup=data.D._lastDailyBackup;
@@ -906,7 +916,10 @@ function startCloudListener(){
     // Security check: if current user was deleted, force logout immediately
     if(CU){
       var stillExists=(USERS||[]).find(function(u){return u.id===CU.id;});
-      if(!stillExists){
+      // Only treat this as a genuine removal if the USERS list actually came
+      // from remote this round (a trustworthy, complete read) — never act on
+      // a locally-retained/fallback list, which could be stale or incomplete.
+      if(!stillExists&&_usersFromRemote){
         toast("Your account has been removed. Logging out.","err");
         setTimeout(function(){logout();},1500);
         return;
