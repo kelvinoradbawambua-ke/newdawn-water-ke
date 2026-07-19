@@ -2564,10 +2564,11 @@ function delC(id){
     if(st)st.qty+=o.qty;
   });
   D.customers=(D.customers||[]).filter(function(x){return x.id!==id;});
+  var _deletedOrdCount=(D.orders||[]).filter(function(o){return o.cId===id;}).length;
   D.orders=(D.orders||[]).filter(function(o){return o.cId!==id;});
   D.invoices=(D.invoices||[]).filter(function(i){if(i.cId!==id)return true;return i.paid>0;});
   D.complaints=(D.complaints||[]).filter(function(x){return x.cId!==id;});
-  auditLog("CUSTOMER_DELETED","Customer deleted by "+CU.name+" ("+CU.role+"): "+(can("vPhone")?c.name:"[masked]")+". "+(D.orders||[]).length+" orders, "+paidInvs.length+" paid invoices retained.");
+  auditLog("CUSTOMER_DELETED","Customer deleted by "+CU.name+" ("+CU.role+"): "+(can("vPhone")?c.name:"[masked]")+". "+_deletedOrdCount+" orders removed, "+paidInvs.length+" paid invoices retained.");
   rCusts(undefined,CUST_PAGE);
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   dirty();toast("Customer removed"+(paidInvs.length?" — "+paidInvs.length+" paid invoice(s) retained":""));
@@ -3837,7 +3838,11 @@ function completeDlv(){
         toast((can("vPhone")?_cu.name:maskName(_cu.name))+" has reached 4 bottles this cycle — halfway!","ok");
         _cu.cycleHistory.push({ts:tday(),bottles:_cu.waterCycle,event:"milestone_4",ordId:o.id,qty:o.qty,by:CU.name});
       }
-      if(_cu.waterCycle>=8){
+      // Use a while loop, not a single if — a bulk order (e.g. 18 bottles in one
+      // delivery) can cross MULTIPLE cycle boundaries at once. A single "if"
+      // only ever subtracts 8 once, leaving the counter stuck above 8 forever
+      // (e.g. 18 -> 10, which is still >=8 but never gets corrected again).
+      while(_cu.waterCycle>=8){
         toast((can("vPhone")?_cu.name:maskName(_cu.name))+" reached "+_cu.waterCycle+" bottles — cycle resets!","ok");
         _cu.cycleHistory.push({ts:tday(),bottles:_cu.waterCycle,event:"cycle_complete",ordId:o.id,qty:o.qty,by:CU.name});
         _cu.waterCycle=_cu.waterCycle-8; // carry over excess bottles to next cycle
@@ -4890,7 +4895,7 @@ function editCmp(id){
 }
 function resolveCmp(id){if(!can("mCmp")){toast("Only managers can resolve complaints","err");return;}var c=(D.complaints||[]).find(function(x){return x.id===id;});if(c)c.status="Resolved";rCmps(undefined,CMP_PAGE);dirty();toast("Complaint resolved");}
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
-function delCmp(id){if(!can("dCmp")){toast("Only managers can delete complaints","err");return;}var cmp=(D.complaints||[]).find(function(x){return x.id===id;});if(!cmp)return;var cu=(D.customers||[]).find(function(x){return x.id===cmp.cId;});var msg="Delete complaint from "+(cu?(can("vPhone")?cu.name:"this customer"):"unknown")+"?\n\n\""+cmp.text.slice(0,80)+(cmp.text.length>80?"…":"")+"\"\n\nThis cannot be undone.";if(!confirm(msg))return;D.complaints=(D.complaints||[]).filter(function(c){return c.id!==id;});rCmps(undefined,CMP_PAGE);dirty();}
+function delCmp(id){if(!can("dCmp")){toast("Only managers can delete complaints","err");return;}var cmp=(D.complaints||[]).find(function(x){return x.id===id;});if(!cmp)return;var cu=(D.customers||[]).find(function(x){return x.id===cmp.cId;});var cmpText=cmp.details||"";var msg="Delete complaint from "+(cu?(can("vPhone")?cu.name:"this customer"):"unknown")+"?\n\n\""+cmpText.slice(0,80)+(cmpText.length>80?"…":"")+"\"\n\nThis cannot be undone.";if(!confirm(msg))return;D.complaints=(D.complaints||[]).filter(function(c){return c.id!==id;});rCmps(undefined,CMP_PAGE);dirty();}
 
 function addRoute(){
   if(!can("eOrd")){toast("Managers only","err");return;}
