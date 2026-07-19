@@ -10,9 +10,6 @@
 <meta name="theme-color" content="#0f0f3d">
 <title>New Dawn Pure Drinking Water</title>
 <link rel="dns-prefetch" href="https://www.gstatic.com">
-<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
-<meta http-equiv="Pragma" content="no-cache">
-<meta http-equiv="Expires" content="0">
 <link rel="dns-prefetch" href="https://firestore.googleapis.com">
 <link rel="dns-prefetch" href="https://cdnjs.cloudflare.com">
 <link rel="dns-prefetch" href="https://cdn.jsdelivr.net">
@@ -201,17 +198,10 @@ var FB_DOC_REF=null;
 var FB_BACKUP_COL=null; // backup collection reference
 var FB_EVENTS_COL=null; // audit events subcollection — 1 doc per event
 var FB_READY=false;
-var _APP_READY=false; // true after first Firestore snapshot received
-var FB_RECONNECT_ATTEMPTS=0; // for exponential backoff
-var _idleWarnTimer=null;
-var _idleWarnEl=null;
-var FB_RECONNECT_TIMER=null;
-var FB_LAST_SNAPSHOT=0; // timestamp of last successful snapshot — for heartbeat
-var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-19-sync-v2";
+var APP_VERSION="2026-07-10";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -243,14 +233,7 @@ var CU=null,SU=null,PE="";
 
 function can(p){return !!(CU&&R[CU.role]&&R[CU.role].p[p]);}
 function el(id){return document.getElementById(id);}
-function _ymd(d){
-  // Local-timezone-safe YYYY-MM-DD — NEVER use toISOString() for this,
-  // it converts to UTC and silently shifts the date near midnight in
-  // any timezone ahead of UTC (e.g. East Africa Time, UTC+3).
-  var y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,"0"),dd=String(d.getDate()).padStart(2,"0");
-  return y+"-"+m+"-"+dd;
-}
-function tday(){return _ymd(new Date());}
+function tday(){return new Date().toISOString().split("T")[0];}
 function maskPhone(p){if(!p)return"";var s=String(p).replace(/\s/g,"");if(s.length<5)return"•••••";return s.slice(0,2)+"•".repeat(Math.max(0,s.length-4))+s.slice(-2);}
 function maskName(n){if(!n)return"Customer";var parts=n.trim().split(" ");return parts[0].slice(0,1)+"••• "+(parts[1]?parts[1].slice(0,1)+"•••":"");}
 function vName(){return can("vPhone");}
@@ -290,9 +273,9 @@ function sb(s){var m={"Delivered":"bg","Pending":"ba","Out for delivery":"bp","P
 function pb(p){if(p==="Cancelled")return "<span class=\"badge\" style=\"background:#f0f0f0;color:#999;border:1px solid #ddd\"><i class=\"ti ti-x\" style=\"font-size:10px;margin-right:2px\"></i>Cancelled</span>";var ic=p==="Paid"?"ti-check":p==="Partial"?"ti-clock":"ti-alert-circle";return "<span class=\"badge "+(p==="Paid"?"bg":p==="Partial"?"ba":"br")+"\"><i class=\"ti "+ic+"\" style=\"font-size:10px;margin-right:2px\"></i>"+p+"</span>";}
 function btl(v){if(!v||v==="Good")return "<span class=\"badge bg\">Good</span>";if(v==="Damaged")return "<span class=\"badge br\">Damaged</span>";if(v==="Cracked")return "<span class=\"badge ba\">Cracked</span>";return "<span class=\"badge bgr\">"+v+"</span>";}
 function custDebt(id){
-  var cu=(D.customers||[]).find(function(x){return x.id===id;});
+  var cu=D.customers.find(function(x){return x.id===id;});
   var credit=(cu&&cu.credit>0)?cu.credit:0;
-  var gross=(D.invoices||[]).filter(function(i){
+  var gross=D.invoices.filter(function(i){
     if(i.cId!==id)return false;
     if(i.paid>=i.amount)return false; // fully paid, no debt
     if(i.voided)return false; // voided/written-off — excluded from debt
@@ -301,7 +284,7 @@ function custDebt(id){
       var match=i.notes.match(/#(\d+)/);
       if(match){
         var oid=parseInt(match[1]);
-        var o=(D.orders||[]).find(function(x){return x.id===oid;});
+        var o=D.orders.find(function(x){return x.id===oid;});
         if(!o||o.status==="Cancelled")return false; // order gone or cancelled
       }
     }
@@ -309,7 +292,7 @@ function custDebt(id){
   }).reduce(function(a,i){return a+(i.amount-i.paid);},0);
   return Math.max(0,gross-credit); // net debt after credit
 }
-function custName(id){var c=(D.customers||[]).find(function(x){return x.id===id;});if(!c)return"—";return can("vPhone")?c.name:maskName(c.name);}
+function custName(id){var c=D.customers.find(function(x){return x.id===id;});if(!c)return"—";return can("vPhone")?c.name:maskName(c.name);}
 function cAddr(c){if(!c)return "";return [c.estate,c.court,c.house?"No."+c.house:""].filter(Boolean).join(", ");}
 function om(id){var e=el(id);if(e)e.classList.add("open");}
 function cm(id){var e=el(id);if(e)e.classList.remove("open");}
@@ -332,9 +315,7 @@ function auditLog(action,details){
   // Use CU (logged-in user) or SU (selected but not yet verified) for pre-login events
   var actor=CU||SU;
   if(!actor)return;
-  var _clientId=Date.now()+"-"+Math.random().toString(36).slice(2,9); // stable ID for idempotent retries
   var entry={
-    _cid:_clientId,
     ts:new Date().toISOString(),
     user:actor.name,
     role:actor.role,
@@ -344,12 +325,10 @@ function auditLog(action,details){
   };
   // Write to Firestore subcollection — queue if not yet ready
   if(FB_EVENTS_COL&&FB_READY){
-    FB_EVENTS_COL.doc(_clientId).set(entry).catch(function(err){
-      // Retry: queue failed audit writes for re-attempt
-      if(!window._auditFailQ)window._auditFailQ=[];
-      window._auditFailQ.push(entry);
+    FB_EVENTS_COL.add(entry).catch(function(err){
+      // Show actual error to director for diagnosis
       var msg=err&&err.message?err.message:(err&&err.code?err.code:"unknown");
-      if(CU&&CU.role==="director")toast("Audit write queued for retry: "+msg,"ok");
+      if(CU&&CU.role==="director")toast("Audit write failed: "+msg,"err");
     });
   }else if(FB_EVENTS_COL&&!FB_READY){
     // Queue events fired before Firestore is ready — flush on connection
@@ -358,8 +337,8 @@ function auditLog(action,details){
   }
   // Keep local cache for immediate display
   if(!D.auditLog)D.auditLog=[];
-  (D.auditLog||[]).push(entry);
-  if((D.auditLog||[]).length>AUDIT_HOT_MAX)D.auditLog=D.auditLog.slice(-AUDIT_HOT_MAX);
+  D.auditLog.push(entry);
+  if(D.auditLog.length>AUDIT_HOT_MAX)D.auditLog=D.auditLog.slice(-AUDIT_HOT_MAX);
   // Refresh audit view immediately if visible — don't wait for Firestore roundtrip
   try{
     var _ap=document.getElementById("pg-excel");
@@ -367,10 +346,10 @@ function auditLog(action,details){
   }catch(e){}
 }
 function archiveAuditLogs(){
-  if(!D.auditLog||(D.auditLog||[]).length<AUDIT_ARCHIVE_THRESHOLD)return;
+  if(!D.auditLog||D.auditLog.length<AUDIT_ARCHIVE_THRESHOLD)return;
   // Only archive when online — never drop entries without confirming write
   if(!FB_READY||!FB_BACKUP_COL)return;
-  var toArchive=(D.auditLog||[]).slice(0,AUDIT_ARCHIVE_THRESHOLD);
+  var toArchive=D.auditLog.slice(0,AUDIT_ARCHIVE_THRESHOLD);
   var archiveId="auditlog-"+new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
   FB_BACKUP_COL.doc(archiveId).set({
     type:"audit_archive",
@@ -424,13 +403,13 @@ function loadAuditArchives(cb){
 function manualPurgeAuditLog(daysOld){
   // Director-triggered: purge hot log entries older than N days
   if(!can("exp")){toast("Director only","err");return;}
-  if(!D.auditLog||!(D.auditLog||[]).length){toast("Audit log is already empty");return;}
+  if(!D.auditLog||!D.auditLog.length){toast("Audit log is already empty");return;}
   var cutoff=new Date();
   cutoff.setDate(cutoff.getDate()-daysOld);
   var cutoffStr=cutoff.toISOString();
-  var before=(D.auditLog||[]).length;
-  D.auditLog=(D.auditLog||[]).filter(function(e){return e.ts&&e.ts>cutoffStr;});
-  var removed=before-(D.auditLog||[]).length;
+  var before=D.auditLog.length;
+  D.auditLog=D.auditLog.filter(function(e){return e.ts&&e.ts>cutoffStr;});
+  var removed=before-D.auditLog.length;
   if(removed>0){
     dirty();
     toast("Purged "+removed+" log entries older than "+daysOld+" days");
@@ -449,7 +428,7 @@ function scheduleCloudSync(){
 }
 function pushToCloud(){
   if(!FB_READY||!FB_DOC_REF)return;
-  var isEmpty=(!D.customers||(D.customers||[]).length===0)&&(!D.orders||(D.orders||[]).length===0)&&(!D.stock||(D.stock||[]).length===0);
+  var isEmpty=(!D.customers||D.customers.length===0)&&(!D.orders||D.orders.length===0)&&(!D.stock||D.stock.length===0);
   if(isEmpty&&FB_SETUP_DONE)return; // empty data guard — silently skip
   // Queue the write — process one at a time to prevent race conditions
   FB_WRITE_QUEUE.push(Date.now());
@@ -457,7 +436,6 @@ function pushToCloud(){
 }
 function processWriteQueue(){
   if(!FB_WRITE_QUEUE.length){FB_WRITING=false;return;}
-  if(!D||typeof D!=="object"){FB_WRITING=false;return;} // safety: never write null data
   FB_WRITING=true;
   FB_WRITE_QUEUE=[];// collapse multiple pending writes into one
   FB_LAST_LOCAL_WRITE=Date.now();
@@ -504,7 +482,7 @@ function processWriteQueue(){
     FB_WRITING=false;
     var e=el("sts");if(e){e.className="sts saved";e.innerHTML="<i class=\"ti ti-cloud-check\"></i> Synced "+new Date().toLocaleTimeString();}
     var cs=el("cloud-status");
-    var custN=(D&&D.customers&&(D.customers||[]).length)||0;
+    var custN=(D&&D.customers&&D.customers.length)||0;
     if(cs)cs.innerHTML="<span style=\"display:inline-block;width:7px;height:7px;background:#27ae60;border-radius:50%;margin-right:5px;animation:pulse 2s infinite\"></span>Live"+(custN>0?" &middot; "+custN+" customers":"");
     // Process any writes that came in while we were writing
     if(FB_WRITE_QUEUE.length)processWriteQueue();
@@ -537,7 +515,7 @@ function getBackupPayload(){
 }
 function writeBackup(docId){
   if(!FB_BACKUP_COL)return;
-  var isEmpty=(!D.customers||(D.customers||[]).length===0)&&(!D.orders||(D.orders||[]).length===0);
+  var isEmpty=(!D.customers||D.customers.length===0)&&(!D.orders||D.orders.length===0);
   if(isEmpty&&FB_SETUP_DONE)return; // never backup empty data
   try{
     var payload=JSON.parse(JSON.stringify(getBackupPayload()));
@@ -570,7 +548,7 @@ function pruneOldBackups(prefix,keepCount){
 function runAutoBackup(){
   if(!CU||CU.role!=="director")return; // backups director-only
   if(!FB_READY||!FB_BACKUP_COL)return;
-  var isEmpty=(!D.customers||(D.customers||[]).length===0)&&(!D.orders||(D.orders||[]).length===0);
+  var isEmpty=(!D.customers||D.customers.length===0)&&(!D.orders||D.orders.length===0);
   if(isEmpty)return;
   var now=new Date();
   var dateStr=now.getFullYear()+"-"+String(now.getMonth()+1).padStart(2,"0")+"-"+String(now.getDate()).padStart(2,"0");
@@ -625,18 +603,18 @@ function restoreFromLatestBackup(onSuccess,onFail){
           if(!D.routes)D.routes=[];
           if(!D.complaints)D.complaints=[];
           if(!D.offers)D.offers=[];
-          if(best.USERS&&(best.USERS||[]).length)USERS=best.USERS;
+          if(best.USERS&&best.USERS.length)USERS=best.USERS;
           nOId=best.nOId||nOId;nIId=best.nIId||nIId;nCId=best.nCId||nCId;
           FB_SETUP_DONE=true;
           syncIdCounters();
           syncPaymentStatuses();
           // Merge hot audit log from localStorage (auditLog not in main doc)
           var snap=autoSaveCheckLocal();
-          if(snap&&snap.D&&snap.D.auditLog&&(snap.D.auditLog||[]).length>0){
+          if(snap&&snap.D&&snap.D.auditLog&&snap.D.auditLog.length>0){
             if(!D.auditLog)D.auditLog=[];
             var existTs={};
-            (D.auditLog||[]).forEach(function(e){existTs[e.ts]=true;});
-            (snap.D.auditLog||[]).forEach(function(e){if(!existTs[e.ts])(D.auditLog||[]).push(e);});
+            D.auditLog.forEach(function(e){existTs[e.ts]=true;});
+            snap.D.auditLog.forEach(function(e){if(!existTs[e.ts])D.auditLog.push(e);});
           }
           if(onSuccess)onSuccess(best);
         }else{tryNext();}
@@ -646,24 +624,19 @@ function restoreFromLatestBackup(onSuccess,onFail){
 }
 var FB_AUDIT_UNSUB=null;
 function _mergeAuditEvents(remote){
-  // Flush any previously-failed audit writes now connection is confirmed good
-  if(window._auditFailQ&&window._auditFailQ.length&&FB_EVENTS_COL){
-    var fq=window._auditFailQ.splice(0);
-    fq.forEach(function(e){var _id=e._cid||(e.ts+"-"+Math.random().toString(36).slice(2,9));FB_EVENTS_COL.doc(_id).set(e).catch(function(){window._auditFailQ.push(e);});});
-  }
   // Core merge — used by both listener and one-time load
   // NEVER replaces D.auditLog — only adds new entries
   if(!remote||!remote.length)return;
   if(!D.auditLog)D.auditLog=[];
   var existing={};
-  (D.auditLog||[]).forEach(function(e){if(e.ts)existing[e.ts]=true;});
+  D.auditLog.forEach(function(e){if(e.ts)existing[e.ts]=true;});
   var added=0;
   remote.forEach(function(e){
-    if(e.ts&&!existing[e.ts]){(D.auditLog||[]).push(e);existing[e.ts]=true;added++;}
+    if(e.ts&&!existing[e.ts]){D.auditLog.push(e);existing[e.ts]=true;added++;}
   });
   if(added>0){
-    (D.auditLog||[]).sort(function(a,b){return a.ts<b.ts?-1:a.ts>b.ts?1:0;});
-    if((D.auditLog||[]).length>AUDIT_HOT_MAX)D.auditLog=(D.auditLog||[]).slice(-AUDIT_HOT_MAX);
+    D.auditLog.sort(function(a,b){return a.ts<b.ts?-1:a.ts>b.ts?1:0;});
+    if(D.auditLog.length>AUDIT_HOT_MAX)D.auditLog=D.auditLog.slice(-AUDIT_HOT_MAX);
     var pg=document.getElementById("pg-excel");
     if(pg&&pg.classList.contains("act"))rAuditLog();
   }
@@ -687,7 +660,7 @@ function startAuditListener(){
       snap.forEach(function(d){remote.push(d.data());});
       _mergeAuditEvents(remote);
       // If listener returned empty but we expect data, also do unordered get as safety
-      if(remote.length===0&&(!D.auditLog||(D.auditLog||[]).length===0)){
+      if(remote.length===0&&(!D.auditLog||D.auditLog.length===0)){
         FB_EVENTS_COL.limit(200).get().then(function(s2){
           var r2=[];s2.forEach(function(d){r2.push(d.data());});_mergeAuditEvents(r2);
         }).catch(function(){});
@@ -714,12 +687,11 @@ function startCloudListener(){
   if(!FB_DOC_REF)return;
   if(FB_UNSUB)FB_UNSUB();
   FB_UNSUB=FB_DOC_REF.onSnapshot(function(doc){
-    FB_LAST_SNAPSHOT=Date.now();FB_RECONNECT_ATTEMPTS=0; // reset backoff on success
     if(!doc.exists){
       // SAFETY GUARD: Check all recovery sources before writing clean slate
       var snap=autoSaveCheckLocal();
-      var hasLocalData=D&&((D.customers&&(D.customers||[]).length>0)||(D.orders&&(D.orders||[]).length>0)||(D.stock&&(D.stock||[]).length>0));
-      var hasSnapData=snap&&snap.D&&((snap.D.customers&&(snap.D.customers||[]).length>0)||(snap.D.orders&&(snap.D.orders||[]).length>0)||(snap.D.stock&&(snap.D.stock||[]).length>0));
+      var hasLocalData=D&&((D.customers&&D.customers.length>0)||(D.orders&&D.orders.length>0)||(D.stock&&D.stock.length>0));
+      var hasSnapData=snap&&snap.D&&((snap.D.customers&&snap.D.customers.length>0)||(snap.D.orders&&snap.D.orders.length>0)||(snap.D.stock&&snap.D.stock.length>0));
       if(hasLocalData||hasSnapData){
         // Restore from local memory/autosave and push back up
         if(!hasLocalData&&hasSnapData){
@@ -731,7 +703,7 @@ function startCloudListener(){
         }
         /* Main doc missing — restoring from local data and pushing to cloud */
         setTimeout(function(){FB_LAST_LOCAL_WRITE=Date.now();pushToCloud();},1000);
-        FB_READY=true;_APP_READY=true;scheduleCloudSync(); // flush any changes made while disconnected
+        FB_READY=true;
         if(CU){refreshCurrentPage();}else{renderUG();}
         return;
       }
@@ -745,7 +717,6 @@ function startCloudListener(){
           FB_READY=true;
           var c2=el("cloud-status");
           if(c2)c2.innerHTML="<i class=\"ti ti-cloud-check\"></i> Restored from backup &middot; "+count+" customers";
-          _APP_READY=true;
           if(CU){refreshCurrentPage();}else{renderUG();}
           if(CU&&CU.role==="director"){
             toast("⚠️ Main data was missing — auto-restored from backup! Check your data and save a manual backup now.","warn");
@@ -759,7 +730,7 @@ function startCloudListener(){
             setupDone:false,
             updatedAt:Date.now()
           };
-          FB_DOC_REF.set(cleanSlate).then(function(){FB_READY=true;scheduleCloudSync();});
+          FB_DOC_REF.set(cleanSlate).then(function(){FB_READY=true;});
         });
         return;
       }
@@ -771,7 +742,7 @@ function startCloudListener(){
         setupDone:false,
         updatedAt:Date.now()
       };
-      FB_DOC_REF.set(cleanSlate).then(function(){FB_READY=true;scheduleCloudSync();});
+      FB_DOC_REF.set(cleanSlate).then(function(){FB_READY=true;});
       return;
     }
     var data=doc.data();
@@ -787,7 +758,7 @@ function startCloudListener(){
     // Audit log: always merge, never replace
 
     // 1. Preserve current audit log across merge
-    var _prevAuditLog=D.auditLog&&(D.auditLog||[]).length?D.auditLog.slice():[];
+    var _prevAuditLog=D.auditLog&&D.auditLog.length?D.auditLog.slice():[];
     if(data.D.auditLog&&data.D.auditLog.length){
       var _ex={};_prevAuditLog.forEach(function(e){if(e.ts)_ex[e.ts]=true;});
       data.D.auditLog.forEach(function(e){if(e.ts&&!_ex[e.ts]){_prevAuditLog.push(e);_ex[e.ts]=true;}});
@@ -805,7 +776,7 @@ function startCloudListener(){
         (D.orders||[]).forEach(function(o){localOrdMap[o.id]=o;});
         data.D.orders.forEach(function(ro){
           var lo=localOrdMap[ro.id];
-          if(!lo){(D.orders||[]).push(ro);} // new order from remote
+          if(!lo){D.orders.push(ro);} // new order from remote
           else if(ro.status==="Delivered"&&lo.status!=="Delivered"){
             // Remote shows delivered — always accept (staff completed it)
             Object.assign(lo,ro);
@@ -816,15 +787,12 @@ function startCloudListener(){
             Object.assign(lo,ro);
           }
         });
-        // Remove orders deleted remotely — but NEVER infer deletion for a Delivered
-        // order (financial record — only explicit delO() may remove it) or for an
-        // order placed in the last 5 minutes (protects against a lost/delayed/raced
-        // write being misread as "deleted" and permanently wiping real data).
+        // Remove orders deleted remotely — but protect orders placed in last 60s
         var remoteOrdIds={};
         data.D.orders.forEach(function(o){remoteOrdIds[o.id]=true;});
-        var fiveMinAgo=Date.now()-300000;
-        D.orders=(D.orders||[]).filter(function(o){
-          return remoteOrdIds[o.id]||o.status==="Delivered"||(o._ts&&o._ts>fiveMinAgo);
+        var sixtyAgo=Date.now()-60000;
+        D.orders=D.orders.filter(function(o){
+          return remoteOrdIds[o.id]||(o._ts&&o._ts>sixtyAgo); // keep recent local orders
         });
       }
       // Invoices: take remote (payments recorded on any device)
@@ -848,27 +816,9 @@ function startCloudListener(){
     // 3. Customers: only take remote if they have MORE (prevent reduction)
     var remoteCustomers=data.D.customers||[];
     var localCustomers=D.customers||[];
-    if(remoteCustomers.length>localCustomers.length){
-      // Log silently-added customers from sync
-      var added=remoteCustomers.length-localCustomers.length;
-      if(added>0&&CU)auditLog("CUSTOMER_UPDATED","Sync: "+added+" customer(s) added from another session");
-    }
     if(remoteCustomers.length>=localCustomers.length){
       // Remote has same or more customers — safe to take
-      // BUT: preserve local waterCycle/cycleHistory if local is higher
-      // (prevents slow cloud roundtrip overwriting just-completed delivery)
-      var localCustMap={};
-      localCustomers.forEach(function(lc){localCustMap[lc.id]=lc;});
-      remoteCustomers.forEach(function(rc){
-        var lc=localCustMap[rc.id];
-        if(lc&&(lc.waterCycle||0)>(rc.waterCycle||0)){
-          rc.waterCycle=lc.waterCycle;
-          rc.cycleHistory=lc.cycleHistory;
-        }
-      });
       D.customers=remoteCustomers;
-      // Refresh customer page if visible (badge update after sync)
-      if(el("pg-customers")&&el("pg-customers").classList.contains("act"))rCusts();
     } else if(!isOwnWrite&&remoteCustomers.length>0){
       // Remote has fewer but it's not our write — merge (add missing local)
       var remCustIds={};
@@ -886,40 +836,27 @@ function startCloudListener(){
     D.auditLog=_prevAuditLog;
 
     // 5. Users and setup
-    // Only accept a non-empty USERS list from remote. If this snapshot has
-    // no USERS (transient glitch, race, or corrupted read) — NEVER replace
-    // the real local list with a fake default; that would falsely trigger
-    // the "account removed" check below and lock out the real director.
-    var _usersFromRemote=false;
-    if(data.USERS&&data.USERS.length){USERS=data.USERS;_usersFromRemote=true;}
-    else if(!USERS||!USERS.length){
-      // Only fall back to the bootstrap default if we truly have NEVER had
-      // any users this session (genuine brand-new setup) — not as a reaction
-      // to a single empty snapshot mid-session.
-      USERS=[{id:1,name:"Director",role:"director",pin:"1234",ini:"DR",col:"#1a1560"}];
-    }
+    if(data.USERS&&data.USERS.length)USERS=data.USERS;
+    else USERS=[{id:1,name:"Director",role:"director",pin:"1234",ini:"DR",col:"#1a1560"}];
     FB_SETUP_DONE=data.setupDone===true;
     // Carry backup stamp
     if(data.D._lastDailyBackup)D._lastDailyBackup=data.D._lastDailyBackup;
     else if(data._lastDailyBackup)D._lastDailyBackup=data._lastDailyBackup;
     syncIdCounters();
     syncPaymentStatuses();
-    FB_READY=true;scheduleCloudSync(); // flush any changes made while disconnected
+    FB_READY=true;
     // Flush any audit events queued before Firestore was ready
     if(window._auditQueue&&window._auditQueue.length&&FB_EVENTS_COL){
       var q=window._auditQueue.splice(0);
-      q.forEach(function(e){var _id=e._cid||(e.ts+"-"+Math.random().toString(36).slice(2,9));FB_EVENTS_COL.doc(_id).set(e).catch(function(){});});
+      q.forEach(function(e){FB_EVENTS_COL.add(e).catch(function(){});});
     }
     var c=el("cloud-status");
-    var custN=(D&&D.customers&&(D.customers||[]).length)||0;
+    var custN=(D&&D.customers&&D.customers.length)||0;
     if(c)c.innerHTML="<span style=\"display:inline-block;width:7px;height:7px;background:#27ae60;border-radius:50%;margin-right:5px;animation:pulse 2s infinite\"></span>Live"+(custN>0?" &middot; "+custN+" customers":"");
     // Security check: if current user was deleted, force logout immediately
     if(CU){
-      var stillExists=(USERS||[]).find(function(u){return u.id===CU.id;});
-      // Only treat this as a genuine removal if the USERS list actually came
-      // from remote this round (a trustworthy, complete read) — never act on
-      // a locally-retained/fallback list, which could be stale or incomplete.
-      if(!stillExists&&_usersFromRemote){
+      var stillExists=USERS.find(function(u){return u.id===CU.id;});
+      if(!stillExists){
         toast("Your account has been removed. Logging out.","err");
         setTimeout(function(){logout();},1500);
         return;
@@ -928,73 +865,13 @@ function startCloudListener(){
       if(stillExists.pin!==CU.pin||stillExists.role!==CU.role||stillExists.name!==CU.name){
         CU=stillExists;
       }
-      _APP_READY=true;
       refreshCurrentPage();
     }else{
       renderUG();
     }
   },function(err){
-    var c=el("cloud-status");if(c)c.innerHTML="<i class=\"ti ti-cloud-off\"></i> Reconnecting\u2026";
-    FB_UNSUB=null;
-    _reconnectCloudListener();
+    var c=el("cloud-status");if(c)c.innerHTML="<i class=\"ti ti-cloud-off\"></i> Offline - changes saved locally";
   });
-}
-function _reconnectCloudListener(){
-  // Exponential backoff: 2s, 4s, 8s, 16s, capped at 30s — auto-heals without
-  // ever requiring a manual page refresh
-  if(FB_RECONNECT_TIMER)clearTimeout(FB_RECONNECT_TIMER);
-  FB_RECONNECT_ATTEMPTS++;
-  var delay=Math.min(30000,2000*Math.pow(2,FB_RECONNECT_ATTEMPTS-1));
-  FB_RECONNECT_TIMER=setTimeout(function(){
-    if(!fbAuth||!fbAuth.currentUser){
-      // Auth session lost too — re-authenticate then reconnect
-      fbAuth&&fbAuth.signInAnonymously().then(function(){startCloudListener();}).catch(function(){_reconnectCloudListener();});
-    }else{
-      startCloudListener();
-    }
-  },delay);
-}
-var _visRecoveryAttached=false;
-function _initVisibilityRecovery(){
-  if(_visRecoveryAttached)return; // never attach twice across multiple logins in one tab
-  _visRecoveryAttached=true;
-  // The Page Visibility API is NOT throttled by browsers the way setInterval
-  // is — it fires immediately the instant a tab/app regains focus, even after
-  // being backgrounded for hours (common on tablets/phones where switching
-  // apps or locking the screen can silently suspend the WebSocket connection).
-  // This is the standard pattern real-time enterprise apps (Gmail, Slack, etc.)
-  // use to guarantee instant freshness on return, instead of waiting on a timer.
-  document.addEventListener("visibilitychange",function(){
-    if(document.visibilityState==="visible"&&CU&&FB_DOC_REF){
-      // Force a completely fresh subscribe — guarantees current state is
-      // pulled immediately regardless of what happened while backgrounded
-      startCloudListener();
-      var c=el("cloud-status");if(c)c.innerHTML="<i class=\"ti ti-refresh\"></i> Refreshing\u2026";
-    }
-  });
-}
-function _startHeartbeat(){
-  // A backgrounded/throttled/sleeping tab can silently stall onSnapshot
-  // WITHOUT ever nulling FB_UNSUB or firing an error — a listener reference
-  // can look "alive" while delivering nothing. Detecting that reliably from
-  // JS alone is not possible, so instead of guessing, we force a full
-  // teardown-and-resubscribe on a fixed schedule regardless of apparent
-  // health. This guarantees no device can ever drift more than a few
-  // minutes out of sync, no matter the failure mode.
-  if(FB_HEARTBEAT_TIMER)clearInterval(FB_HEARTBEAT_TIMER);
-  FB_HEARTBEAT_TIMER=setInterval(function(){
-    if(!FB_DOC_REF||!CU)return;
-    // Explicit-death case: FB_UNSUB already nulled by the error handler —
-    // reconnect immediately rather than waiting for the next cycle.
-    if(!FB_UNSUB){_reconnectCloudListener();return;}
-    // Proactive safety net: force a fresh subscribe every 3 minutes even if
-    // the listener LOOKS healthy — this is the only reliable way to recover
-    // from a silent stall, and costs nothing but one extra read.
-    var silentFor=Date.now()-FB_LAST_SNAPSHOT;
-    if(silentFor>45000){
-      startCloudListener(); // tears down old listener internally, re-subscribes fresh
-    }
-  },20000);
 }
 function refreshCurrentPage(){
   var activePg=document.querySelector(".pg.act");
@@ -1018,8 +895,8 @@ function refreshCurrentPage(){
   if(fns[pid])fns[pid]();
   // Update notification badges
   if(el("tnav")&&CU){
-    var pO=(D.orders||[]).filter(function(o){return o.status==="Pending"||o.status==="Processing";}).length;
-    var pC=(D.complaints||[]).filter(function(c){return c.status!=="Resolved";}).length;
+    var pO=D.orders.filter(function(o){return o.status==="Pending"||o.status==="Processing";}).length;
+    var pC=D.complaints.filter(function(c){return c.status!=="Resolved";}).length;
     document.querySelectorAll("#tnav button").forEach(function(b){
       var oc=b.getAttribute("onclick")||"";
       if(oc.indexOf("'orders'")!==-1){
@@ -1039,14 +916,14 @@ function initCloudConnection(cb){
   var done=false;
   function finish(){if(!done){done=true;if(cb)cb();}}
   var timeout=setTimeout(function(){
-    FB_READY=true;scheduleCloudSync();finish();
+    FB_READY=true;finish();
   },8000);
   var authRetries=0;
   function tryAuth(){
     fbAuth.signInAnonymously().then(function(){
       startCloudListener();
       startAuditListener();
-      setTimeout(function(){clearTimeout(timeout);FB_READY=true;scheduleCloudSync();finish();},1500);
+      setTimeout(function(){clearTimeout(timeout);FB_READY=true;finish();},1500);
     }).catch(function(err){
       authRetries++;
       if(authRetries<3){
@@ -1065,7 +942,6 @@ function initCloudConnection(cb){
           nOId=snap.nOId||nOId;nIId=snap.nIId||nIId;
           FB_SETUP_DONE=snap.setupDone===true;
           syncIdCounters();
-          _APP_READY=true;
           toast("Working offline — cloud sync unavailable","warn");
         }
         finish();
@@ -1075,7 +951,7 @@ function initCloudConnection(cb){
   tryAuth();
 }
 function skipCloud(){
-  FB_READY=true;scheduleCloudSync();renderLogin();
+  FB_READY=true;renderLogin();
   var c=el("cloud-status");if(c)c.innerHTML="<i class=\"ti ti-cloud-off\"></i> Offline mode";
 }
 
@@ -1198,8 +1074,8 @@ function renderLogin(){
 }
 function renderUG(){
   if(!el("usg"))return; // login screen not active — ignore
-  var isDefault=(USERS||[]).length===1&&USERS[0].name==="Director"&&!FB_READY;
-  el("usg").innerHTML=(USERS||[]).map(function(u){
+  var isDefault=USERS.length===1&&USERS[0].name==="Director"&&!FB_READY;
+  el("usg").innerHTML=USERS.map(function(u){
     var rl=R[u.role]||{label:u.role};
     return "<div class=\"usc"+(SU&&SU.id===u.id?" sel":"")+"\" onclick=\"selU("+u.id+")\">"+
       "<div class=\"uav\" style=\"background:"+u.col+"22;color:"+u.col+"\">"+u.ini+"</div>"+
@@ -1207,13 +1083,9 @@ function renderUG(){
       "<div class=\"urole\">"+rl.label+"</div>"+
       "</div>";
   }).join("")+(isDefault?"<div style=\"text-align:center;padding:12px;font-size:11px;color:var(--tx2)\"><i class=\"ti ti-loader\" style=\"animation:spin 1s linear infinite\"></i> Loading accounts...</div>":"");
-  // Self-heal: if still showing the placeholder because real data hasn't
-  // arrived yet, keep re-checking every 500ms until it does — never rely on
-  // a manual reload happening to have better timing.
-  if(isDefault)setTimeout(renderUG,500);
 }
 function selU(id){
-  SU=(USERS||[]).find(function(u){return u.id===id;});
+  SU=USERS.find(function(u){return u.id===id;});
   if(!SU)return;
   PE="";
   el("usg").style.display="none";
@@ -1304,14 +1176,14 @@ function pk(k){
 function checkAutoSaveRecovery(){
   // Always restore auditLog from localStorage first (it is never in Firestore)
   var _localSnap=autoSaveCheckLocal();
-  if(_localSnap&&_localSnap.D&&_localSnap.D.auditLog&&(_localSnap.D.auditLog||[]).length){
+  if(_localSnap&&_localSnap.D&&_localSnap.D.auditLog&&_localSnap.D.auditLog.length){
     var _existing={};
     (D.auditLog||[]).forEach(function(e){if(e.ts)_existing[e.ts]=true;});
     if(!D.auditLog)D.auditLog=[];
-    (_localSnap.D.auditLog||[]).forEach(function(e){
-      if(e.ts&&!_existing[e.ts])(D.auditLog||[]).push(e);
+    _localSnap.D.auditLog.forEach(function(e){
+      if(e.ts&&!_existing[e.ts])D.auditLog.push(e);
     });
-    (D.auditLog||[]).sort(function(a,b){return a.ts>b.ts?1:-1;});
+    D.auditLog.sort(function(a,b){return a.ts>b.ts?1:-1;});
   }
   // Non-director/manager roles: skip localStorage restore — trust Firestore
   if(!CU||( CU.role!=="director"&&CU.role!=="manager")){
@@ -1319,17 +1191,14 @@ function checkAutoSaveRecovery(){
     return;
   }
   var snap=autoSaveCheckLocal();
-  var hasCurrentData=(D.customers||[]).length||(D.orders||[]).length||(D.invoices||[]).length;
+  var hasCurrentData=D.customers.length||D.orders.length||D.invoices.length;
   if(snap&&snap.D){
-    var snapHasData=(snap.D.customers&&(snap.D.customers||[]).length)||(snap.D.orders&&(snap.D.orders||[]).length);
+    var snapHasData=(snap.D.customers&&snap.D.customers.length)||(snap.D.orders&&snap.D.orders.length);
     var snapCusts=(snap.D.customers||[]).length;
     var snapOrds=(snap.D.orders||[]).length;
-    var currCusts=D.customers?(D.customers||[]).length:0;
-    var currOrds=D.orders?(D.orders||[]).length:0;
-    // NEVER consider a snapshot "better" if it has FEWER customers than live data —
-    // customers are the foundational record; a higher order count in a stale local
-    // snapshot must never be allowed to justify losing real customers added elsewhere.
-    var snapIsBetter=!hasCurrentData||(snapCusts>=currCusts&&(snapCusts>currCusts+5||snapOrds>currOrds+10));
+    var currCusts=D.customers?D.customers.length:0;
+    var currOrds=D.orders?D.orders.length:0;
+    var snapIsBetter=!hasCurrentData||(snapCusts>currCusts+5)||(snapOrds>currOrds+10);
     // Check if local snapshot is more recent than Firestore
     var snapTs=snap.ts?new Date(snap.ts).getTime():0;
     var snapIsNewer=snapTs>0&&snapTs>Date.now()-30*60*1000; // within 30 min
@@ -1354,8 +1223,7 @@ function checkAutoSaveRecovery(){
         // Ask director to confirm (older local data or smaller difference)
         var snapTime=snap.ts?new Date(snap.ts).toLocaleString():"earlier session";
         var msg="Found an auto-saved session from "+snapTime+" on this device with "+snapCusts+" customers and "+snapOrds+" orders.";
-        if(hasCurrentData)msg+="\n\nLive cloud data currently has "+currCusts+" customers and "+currOrds+" orders.";
-        msg+="\n\n\u26a0\ufe0f Restoring will REPLACE the live cloud data with this local snapshot.";
+        if(hasCurrentData)msg+="\n\nCloud has "+currCusts+" customers. The local save has more data.";
         msg+="\n\nRestore this data now?";
         if(confirm(msg)){
           D=snap.D;
@@ -1398,8 +1266,8 @@ function buildApp(){
   ].filter(function(n){return can(n.k);});
   var first=pages[0]?pages[0].k:"delivery";
   var rl=R[CU.role];
-  var pO=(D.orders||[]).filter(function(o){return o.status==="Pending"||o.status==="Processing";}).length;
-  var pC=(D.complaints||[]).filter(function(c){return c.status!=="Resolved";}).length;
+  var pO=D.orders.filter(function(o){return o.status==="Pending"||o.status==="Processing";}).length;
+  var pC=D.complaints.filter(function(c){return c.status!=="Resolved";}).length;
   el("root").innerHTML=
     "<div class=\"topbar\">"+
       "<div class=\"tb-brand\">"+
@@ -1416,7 +1284,6 @@ function buildApp(){
       "</div>"+
       "<div class=\"topright\">"+
         "<div class=\"sts ready\" id=\"sts\"><i class=\"ti ti-circle\"></i> Ready</div>"+
-        "<div style=\"font-size:9px;color:#999;padding:2px 8px\" title=\"Build version — check this after every update to confirm the latest fixes actually loaded\">v"+APP_VERSION+"</div>"+
         "<div class=\"sts ready\" id=\"as-indicator\" style=\"font-size:10px\"><i class=\"ti ti-refresh\"></i> Auto-save on</div>"+
         (can("exp")?"<button class=\"bsv\" onclick=\"saveXL()\"><i class=\"ti ti-device-floppy\"></i> Save</button>":"")+
         "<div class=\"upill\" onclick=\"toggleUM()\">"+
@@ -1454,19 +1321,6 @@ function buildApp(){
   setTimeout(updateStockBadge,2000); // low stock badge on nav
   // Restart audit listener after login — ensures live connection with auth established
   setTimeout(startAuditListener,1000);
-  _startHeartbeat();
-  _initVisibilityRecovery();
-  // Restart cloud listener if killed by logout
-  if(!FB_UNSUB){
-    if(FB_DOC_REF){startCloudListener();}
-    else if(typeof fbDb!=="undefined"){
-      // Restore FB_DOC_REF (was nulled on logout) then restart
-      FB_DOC_REF=fbDb.collection("newdawn").doc("main");
-      FB_READY=true;scheduleCloudSync();
-      startCloudListener();
-    }
-  }
-  startIdleWatcher();
   setTimeout(runIntegrityCheck,3500);
   if(!FB_SETUP_DONE&&CU&&CU.role==="director"){
     setTimeout(showSetupWizard,600);
@@ -1641,7 +1495,7 @@ function wizSavePin(){
   if(!p1||p1.length!==4||!/^\d{4}$/.test(p1)){err.textContent="PIN must be exactly 4 digits";return;}
   if(p1!==p2){err.textContent="PINs do not match";return;}
   if(p1==="1234"){err.textContent="⚠ 1234 is the default PIN — choose something more secure.";return;}
-  var director=(USERS||[]).find(function(u){return u.role==="director";});
+  var director=USERS.find(function(u){return u.role==="director";});
   if(director){director.name=name;director.pin=p1;director.ini=ini.slice(0,2);}
   CU=director;
   var nm=el("um-name");if(nm)nm.textContent=name;
@@ -1653,7 +1507,7 @@ function wizAddTeam(){
   var pin=el("wiz-tpin").value.trim();
   var ini=el("wiz-tini").value.trim().toUpperCase();
   if(!name||!pin||pin.length!==4||!/^\d{4}$/.test(pin)){toast("Name and 4-digit PIN required","err");return;}
-  if((USERS||[]).find(function(u){return u.pin===pin;})){toast("That PIN is already used by another team member","err");return;}
+  if(USERS.find(function(u){return u.pin===pin;})){toast("That PIN is already used by another team member","err");return;}
   var cols=["#185FA5","#856404","#534AB7","#155724","#0c5460"];
   if(!ini)ini=(name.split(" ").map(function(w){return w[0]||"";}).join("").toUpperCase()||"XX").slice(0,2);
   WIZ_TEAM.push({id:uid(),name:name,role:role,pin:pin,ini:ini,col:cols[WIZ_TEAM.length%cols.length]});
@@ -1681,7 +1535,7 @@ function wizFinish(){
   var foot=el("wiz-foot");if(foot)foot.innerHTML="";
 
   // Build FINAL clean USERS list: Director (already updated in step 1) + wizard team
-  var finalUsers=[].concat((USERS||[]).filter(function(u){return u.role==="director";}));
+  var finalUsers=[].concat(USERS.filter(function(u){return u.role==="director";}));
   WIZ_TEAM.forEach(function(u){finalUsers.push(u);});
 
   // Build FINAL clean D: everything empty except stock entered in wizard
@@ -1724,40 +1578,13 @@ function wizFinish(){
 }
 function logout(){
   stopAutoSaveLoop();
-  // Stop idle timer for ALL roles immediately
-  stopIdleWatcher();
-  // Cancel any pending cloud sync timer
-  if(FB_SYNC_TIMER){clearTimeout(FB_SYNC_TIMER);FB_SYNC_TIMER=null;}
-  // Clear write queue to prevent post-logout writes
-  FB_WRITE_QUEUE=[];FB_WRITING=false;
-  // Flush queued audit events before disconnecting
-  if(FB_EVENTS_COL&&FB_READY){
-    var aq=(window._auditQueue||[]).concat(window._auditFailQ||[]);
-    window._auditQueue=[];window._auditFailQ=[];
-    aq.forEach(function(e){try{var _id=e._cid||(e.ts+"-"+Math.random().toString(36).slice(2,9));FB_EVENTS_COL.doc(_id).set(e);}catch(ex){}});
-  }
-  // Director: run backup
   if(CU&&CU.role==="director"&&FB_READY){
     try{runAutoBackup();}catch(e){}
   }
-  // Final sync push before disconnecting
-  try{
-    if(FB_READY&&FB_DOC_REF&&typeof D==="object"){
-      var snap=JSON.parse(JSON.stringify({D:D}));
-      delete snap.D.auditLog;
-      FB_DOC_REF.set(snap,{merge:true});
-    }
-  }catch(e){}
-  if(FB_HEARTBEAT_TIMER){clearInterval(FB_HEARTBEAT_TIMER);FB_HEARTBEAT_TIMER=null;}
-  if(FB_RECONNECT_TIMER){clearTimeout(FB_RECONNECT_TIMER);FB_RECONNECT_TIMER=null;}
-  FB_RECONNECT_ATTEMPTS=0;
   if(FB_UNSUB){try{FB_UNSUB();}catch(e){}FB_UNSUB=null;}
   if(FB_AUDIT_UNSUB){try{FB_AUDIT_UNSUB();}catch(e){}FB_AUDIT_UNSUB=null;}
-  FB_READY=false;FB_DOC_REF=null;_APP_READY=false;
-  // Clear all session data — security: prevent data leak to next user
-  D={customers:[],stock:[],orders:[],offers:[],invoices:[],routes:[],
-     complaints:[],pendingPayments:[],auditLog:[]};
-  CU=null;SU=null;PE="";
+  D.auditLog=[];
+  FB_READY=false;CU=null;SU=null;PE="";
   renderLogin();
 }
 function nav(p,btn){
@@ -1907,7 +1734,6 @@ function buildMods(){
       "<div class=\"fg\"><label class=\"flabel\">Product name *</label><input class=\"fi\" id=\"sn\" placeholder=\"20ltr Refill\"></div>"+
       "<div class=\"fg\"><label class=\"flabel\">Size / Category</label>"+
         "<input class=\"fi\" id=\"ss\" placeholder=\"e.g. 20ltr\" list=\"size-options\">"+
-        "<label class=\"flabel\" style=\"display:flex;align-items:center;gap:6px;margin-top:8px;cursor:pointer\"><input type=\"checkbox\" id=\"sw\" style=\"width:16px;height:16px;cursor:pointer\"> Count as 20ltr water (cycle tracker)</label>"+
         "<datalist id=\"size-options\">"+
           "<option value=\"5ltr\"><option value=\"10ltr\"><option value=\"13ltr\">"+
           "<option value=\"20ltr\"><option value=\"25ltr\"><option value=\"50ltr\">"+
@@ -2087,30 +1913,22 @@ function buildMods(){
 
 function rDash(){
   var pg=el("pg-dashboard");if(!pg)return;
-  // If data not yet loaded from Firestore, show brief connecting state
-  var _hasData=(D.customers||[]).length>0||(D.orders||[]).length>0||(D.stock||[]).length>0;
-  if(!_hasData&&CU){
-    // Logged in but no data yet — show spinner and retry regardless of FB_READY
-    pg.innerHTML="<div style=\"display:flex;align-items:center;justify-content:center;height:60vh;flex-direction:column;gap:14px\"><div style=\"width:32px;height:32px;border:3px solid var(--bd);border-top-color:var(--nv);border-radius:50%;animation:spin .8s linear infinite\"></div><div style=\"color:var(--tx2);font-size:13px\">Loading data...</div></div>";
-    setTimeout(rDash,500);
-    return;
-  }
-  var del=(D.orders||[]).filter(function(o){return o.status==="Delivered";});
+  var del=D.orders.filter(function(o){return o.status==="Delivered";});
   // ── Period filter for financial stats ──────────────────────────────
   // Staff locked to today — no financial period access
   if(CU&&CU.role==="staff")DASH_PERIOD="today";
   var now=new Date();
   var yr=now.getFullYear();
   var mo=now.getMonth(); // 0-based
-  var td=_ymd(now); // local-timezone-safe — matches tday() used for order/delivery dates
+  var td=now.toISOString().slice(0,10);
   var qStart=Math.floor(mo/3)*3; // quarter start month (0-based)
   var qEnd=qStart+2; // quarter end month (0-based)
   // ── Week bounds ───────────────────────────────────────────────────
   var dow=now.getDay(); // 0=Sun
   var weekStart=new Date(now); weekStart.setDate(now.getDate()-(dow===0?6:dow-1)); // Mon
   var weekEnd=new Date(weekStart); weekEnd.setDate(weekStart.getDate()+6); // Sun
-  var wkS=_ymd(weekStart);
-  var wkE=_ymd(weekEnd);
+  var wkS=weekStart.toISOString().slice(0,10);
+  var wkE=weekEnd.toISOString().slice(0,10);
   var periodDel=del.filter(function(o){
     var dd=(o.deliveredAt||o.date)||"";
     if(!dd)return DASH_PERIOD==="all";
@@ -2131,19 +1949,19 @@ function rDash(){
   var wkDays=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
   var wkRevs=wkDays.map(function(_,i){
     var d=new Date(weekStart);d.setDate(weekStart.getDate()+i);
-    var ds=_ymd(d); // local-safe — must match order dates for chart bars to populate correctly
+    var ds=d.toISOString().slice(0,10);
     return del.filter(function(o){var dd=o.deliveredAt||o.date;return dd===ds;}).reduce(function(a,o){return a+o.qty*o.price;},0);
   });
   var wkMax=Math.max.apply(null,wkRevs.concat([1]));
   var todayDow=dow===0?6:dow-1; // 0=Mon…6=Sun
   var rev=periodDel.reduce(function(a,o){return a+o.qty*o.price;},0);
   var cost=periodDel.reduce(function(a,o){return a+o.qty*(o.cost||0);},0);
-  var pend=(D.orders||[]).filter(function(o){return o.status==="Pending"||o.status==="Processing";}).length;
-  var low=(D.stock||[]).filter(function(s){return s.qty<=s.min;}).length;
-  var dashDebtMap={};(D.customers||[]).forEach(function(cu){dashDebtMap[cu.id]=custDebt(cu.id);});
-  var debts=(D.customers||[]).filter(function(c){return dashDebtMap[c.id]>0;});
+  var pend=D.orders.filter(function(o){return o.status==="Pending"||o.status==="Processing";}).length;
+  var low=D.stock.filter(function(s){return s.qty<=s.min;}).length;
+  var dashDebtMap={};D.customers.forEach(function(cu){dashDebtMap[cu.id]=custDebt(cu.id);});
+  var debts=D.customers.filter(function(c){return dashDebtMap[c.id]>0;});
   var totD=debts.reduce(function(a,c){return a+dashDebtMap[c.id];},0);
-  var oCmp=(D.complaints||[]).filter(function(c){return c.status!=="Resolved";}).length;
+  var oCmp=D.complaints.filter(function(c){return c.status!=="Resolved";}).length;
   var mns=["J","F","M","A","M","J","J","A","S","O","N","D"];
   var mRevs=mns.map(function(_,i){var m2=String(i+1).padStart(2,"0");return del.filter(function(o){var dd=o.deliveredAt||o.date;return dd&&dd.startsWith(yr+"-"+m2);}).reduce(function(a,o){return a+o.qty*o.price;},0);});
   var mMax=Math.max.apply(null,mRevs.concat([1]));
@@ -2155,11 +1973,11 @@ function rDash(){
   var thisRev=del.filter(function(o){var dd=o.deliveredAt||o.date;return dd&&dd.startsWith(thisMonth);}).reduce(function(s,o){return s+o.qty*o.price;},0);
   var lastRev=del.filter(function(o){var dd=o.deliveredAt||o.date;return dd&&dd.startsWith(lastMonth);}).reduce(function(s,o){return s+o.qty*o.price;},0);
   if(can("vRev")&&lastRev>0){var tp=Math.round((thisRev-lastRev)/lastRev*100);if(Math.abs(tp)>=10){var tc=tp>0?"#27ae60":"#c0392b";alerts.push({t:"ni",i:(tp>0?"ti-trending-up":"ti-trending-down"),m:"Revenue "+(tp>0?"+":"")+tp+"% vs last month — KSh "+thisRev.toLocaleString()+" this month",dest:"reports"});}}
-  var churnDate=_ymd(new Date(Date.now()-30*86400000)); // local-safe
-  var churned=(D.customers||[]).filter(function(cu){var lo=(D.orders||[]).filter(function(o){return o.cId===cu.id&&o.status==="Delivered";}).sort(function(a,b){return b.date>a.date?1:-1;})[0];return lo&&lo.date<churnDate;}).length;
+  var churnDate=new Date(Date.now()-30*86400000).toISOString().slice(0,10);
+  var churned=D.customers.filter(function(cu){var lo=D.orders.filter(function(o){return o.cId===cu.id&&o.status==="Delivered";}).sort(function(a,b){return b.date>a.date?1:-1;})[0];return lo&&lo.date<churnDate;}).length;
   if(churned>0)alerts.push({t:"nw",i:"ti-user-exclamation",m:churned+" customer(s) have not ordered in 30+ days",dest:"customers"});
 
-  var lowStock=(D.stock||[]).filter(function(s){return s.qty<=s.min;});
+  var lowStock=D.stock.filter(function(s){return s.qty<=s.min;});
   lowStock.slice(0,3).forEach(function(s){alerts.push({t:"nw",i:"ti-alert-triangle",m:"Low stock: <strong>"+s.name+"</strong> &mdash; "+s.qty+" left (min "+s.min+")",dest:"stock"});});
   if(lowStock.length>3)alerts.push({t:"nw",i:"ti-package",m:(lowStock.length-3)+" more product(s) below minimum stock level",dest:"stock"});
   if(can("vDebt")){
@@ -2168,19 +1986,19 @@ function rDash(){
     if(topDebts.length>3)alerts.push({t:"nr",i:"ti-users",m:(topDebts.length-3)+" more customer(s) with outstanding balances — KSh "+(totD-topDebts.slice(0,3).reduce(function(s,cc){return s+custDebt(cc.id);},0)).toLocaleString()+" remaining",dest:"debts"});
   }
   // Pending cash payment acknowledgements (staff collected, director must confirm)
-  if(can("mPaid")&&D.pendingPayments&&(D.pendingPayments||[]).length){
-    var pendingPay=(D.pendingPayments||[]).filter(function(p){return !p.ack;});
+  if(can("mPaid")&&D.pendingPayments&&D.pendingPayments.length){
+    var pendingPay=D.pendingPayments.filter(function(p){return !p.ack;});
     if(pendingPay.length){
       pendingPay.slice(0,3).forEach(function(p){
-        var oc=(D.customers||[]).find(function(x){return x.id===p.cId;});
+        var oc=D.customers.find(function(x){return x.id===p.cId;});
         alerts.push({t:"nw",i:"ti-cash",m:"<strong>Cash to acknowledge:</strong> KSh "+p.amt.toLocaleString()+" from "+(oc?oc.name:"customer")+" — collected by "+p.collectedBy+
           " <button onclick=\"ackPendingPay("+p.id+");event.stopPropagation()\" class=\"btn btn-xs btn-gold\" style=\"margin-left:8px\"><i class=\"ti ti-check\"></i> Acknowledge</button>"});
       });
       if(pendingPay.length>3)alerts.push({t:"nw",i:"ti-cash",m:(pendingPay.length-3)+" more pending cash collection(s) awaiting acknowledgement",dest:"invoices"});
     }
   }
-  (D.complaints||[]).filter(function(c){return c.status==="Open";}).slice(0,2).forEach(function(c){var cu=(D.customers||[]).find(function(x){return x.id===c.cId;});alerts.push({t:"nw",i:"ti-message-report",m:"Complaint: <strong>"+(cu?(can("vPhone")?cu.name:maskName(cu.name)):"?")+"</strong> &mdash; "+c.type,dest:"complaints"});});
-  (D.orders||[]).filter(function(o){return o.status==="Pending";}).slice(0,3).forEach(function(o){alerts.push({t:"ni",i:"ti-truck",m:"Pending: <strong>#"+o.id+"</strong> &mdash; "+custName(o.cId)+": "+o.qty+"&times; "+o.prod,dest:"orders"});});
+  D.complaints.filter(function(c){return c.status==="Open";}).slice(0,2).forEach(function(c){var cu=D.customers.find(function(x){return x.id===c.cId;});alerts.push({t:"nw",i:"ti-message-report",m:"Complaint: <strong>"+(cu?(can("vPhone")?cu.name:maskName(cu.name)):"?")+"</strong> &mdash; "+c.type,dest:"complaints"});});
+  D.orders.filter(function(o){return o.status==="Pending";}).slice(0,3).forEach(function(o){alerts.push({t:"ni",i:"ti-truck",m:"Pending: <strong>#"+o.id+"</strong> &mdash; "+custName(o.cId)+": "+o.qty+"&times; "+o.prod,dest:"orders"});});
   var _urgency={nr:0,nw:1,ni:2,nok:3};alerts.sort(function(a,b){return(_urgency[a.t]||2)-(_urgency[b.t]||2);});
   pg.innerHTML=
     "<div class=\"ph\"><h1>Dashboard</h1><p>Welcome back, "+CU.name+" &middot; "+new Date().toLocaleDateString("en-GB",{weekday:"long",day:"numeric",month:"long",year:"numeric"})+"</p></div>"+
@@ -2207,7 +2025,7 @@ function rDash(){
       +"<div class=\"sic\" style=\"background:#eef2ff;color:#534AB7\"><i class=\"ti ti-chart-pie\"></i></div>"
       +"<div class=\"sl\">Profit &mdash; "+periodLabel+"</div>"
       +"<div class=\"sv\">"+(can("vProfit")?"KSh "+(rev-cost).toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>")+"</div><div class=\"ss\">"+(can("vProfit")&&rev>0?Math.round((rev-cost)/rev*100)+"% margin &rarr;":(periodDel.length===0?"No deliveries yet":"No cost data"))+"</div></div>"+
-      "<div class=\"stat sb\" style=\"cursor:pointer\" onclick=\"nav('customers',null)\" title=\"View all customers\"><div class=\"sic\" style=\"background:#eaf0ff;color:#185FA5\"><i class=\"ti ti-users\"></i></div><div class=\"sl\">Customers</div><div class=\"sv\">"+(D.customers||[]).length+"</div><div class=\"ss\">"+(D.customers||[]).filter(function(c){return c.ctype==="Distributor";}).length+" distributors &rarr;</div></div>"+
+      "<div class=\"stat sb\" style=\"cursor:pointer\" onclick=\"nav('customers',null)\" title=\"View all customers\"><div class=\"sic\" style=\"background:#eaf0ff;color:#185FA5\"><i class=\"ti ti-users\"></i></div><div class=\"sl\">Customers</div><div class=\"sv\">"+D.customers.length+"</div><div class=\"ss\">"+D.customers.filter(function(c){return c.ctype==="Distributor";}).length+" distributors &rarr;</div></div>"+
       "<div class=\"stat sa\" style=\"cursor:pointer\" onclick=\"nav('orders',null);setTimeout(function(){filterOrds('Pending');},100)\" title=\"View pending orders\"><div class=\"sic\" style=\"background:#fff8e1;color:#f39c12\"><i class=\"ti ti-clipboard-list\"></i></div><div class=\"sl\">Active orders</div><div class=\"sv\">"+pend+"</div><div class=\"ss\">pending / processing &rarr;</div></div>"+
       "<div class=\"stat sr\" style=\"cursor:pointer\" onclick=\"nav('debts',null)\" title=\"View debts\"><div class=\"sic\" style=\"background:#fff0f0;color:#c0392b\"><i class=\"ti ti-alert-circle\"></i></div><div class=\"sl\">Outstanding debt</div><div class=\"sv\">"+(can("vDebt")?"KSh "+totD.toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>")+"</div><div class=\"ss\">"+(can("vDebt")?debts.length+" customers &rarr;":"&mdash;&mdash;")+"</div></div>"+
       "<div class=\"stat sk\" style=\"cursor:pointer\" onclick=\"nav('stock',null)\" title=\"View stock levels\"><div class=\"sic\" style=\"background:#fff8e1;color:#e67e22\"><i class=\"ti ti-package\"></i></div><div class=\"sl\">Stock alerts</div><div class=\"sv\">"+low+"</div><div class=\"ss\">below minimum &rarr;</div></div>"+
@@ -2245,7 +2063,7 @@ function rDash(){
             "<div style=\"padding:28px;text-align:center;color:var(--tx2)\"><i class=\"ti ti-eye-off\" style=\"font-size:22px;display:block;margin-bottom:6px;opacity:.4\"></i><span style=\"font-size:12px\">Revenue hidden for your role</span></div>")+
         "</div>"+
         "<div class=\"card\"><div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-clock\"></i>Recent orders</div><button class=\"btn btn-sm btn-navy\" onclick=\"nav('orders',null)\">View all</button></div>"+
-          ((D.orders||[]).length?
+          (D.orders.length?
             "<div class=\"tw\"><table><thead><tr><th>#</th><th>Customer</th><th>Product</th><th>Total</th><th>Status</th></tr></thead><tbody>"+
             [].concat(D.orders).reverse().slice(0,6).map(function(o){return "<tr><td style=\"font-weight:700\">#"+o.id+"</td><td>"+custName(o.cId)+"</td><td>"+o.prod+"</td><td>"+kshS(o.qty*o.price)+"</td><td>"+sb(o.status)+"</td></tr>";}).join("")+
             "</tbody></table></div>":
@@ -2261,7 +2079,7 @@ return "<div class=\"notif "+a.t+"\" style=\""+style+"\"><i class=\"ti "+a.i+"\"
         "<div class=\"card\" style=\"padding-bottom:0\">"+
         "<div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-package\"></i>Stock levels</div></div>"+
         (function(){
-          if(!(D.stock||[]).length)
+          if(!D.stock.length)
             return "<div class=\"te\" style=\"padding:18px\"><i class=\"ti ti-package\"></i><p>No products</p></div>";
           var _ss=[].concat(D.stock).sort(function(a,b){
             var at=a.qty<=a.min?0:a.qty<=a.min*1.5?1:2;
@@ -2307,7 +2125,7 @@ function rCusts(q,pg,sort,type){
   var q2=CUST_Q||"";var sort2=CUST_SORT||"recent";var type2=CUST_TYPE||"";
   var pg2=el("pg-customers");if(!pg2)return;
   // Filter by search
-  var fil=(D.customers||[]).filter(function(c){
+  var fil=D.customers.filter(function(c){
     if(type2&&c.ctype!==type2)return false;
     if(!q2)return true;
     var lq=q2.toLowerCase();
@@ -2317,14 +2135,14 @@ function rCusts(q,pg,sort,type){
     return searchFields.some(function(v){return v&&String(v).toLowerCase().indexOf(lq)!==-1;});
   });
   // Sort
-  var del=(D.orders||[]).filter(function(o){return o.status==="Delivered";});
-  var revMap={};var delCusts=(D.orders||[]).filter(function(o){return o.status==="Delivered";});delCusts.forEach(function(o){revMap[o.cId]=(revMap[o.cId]||0)+o.qty*o.price;});
-  var debtMap={};(D.customers||[]).forEach(function(cu){debtMap[cu.id]=custDebt(cu.id);});
+  var del=D.orders.filter(function(o){return o.status==="Delivered";});
+  var revMap={};var delCusts=D.orders.filter(function(o){return o.status==="Delivered";});delCusts.forEach(function(o){revMap[o.cId]=(revMap[o.cId]||0)+o.qty*o.price;});
+  var debtMap={};D.customers.forEach(function(cu){debtMap[cu.id]=custDebt(cu.id);});
   fil=fil.slice().sort(function(a,b){
     if(sort2==="debt"){return custDebt(b.id)-custDebt(a.id);}
     if(sort2==="orders"){
-      return (D.orders||[]).filter(function(o){return o.cId===b.id;}).length-
-             (D.orders||[]).filter(function(o){return o.cId===a.id;}).length;
+      return D.orders.filter(function(o){return o.cId===b.id;}).length-
+             D.orders.filter(function(o){return o.cId===a.id;}).length;
     }
     if(sort2==="revenue"){
       return (revMap[b.id]||0)-(revMap[a.id]||0);
@@ -2339,7 +2157,7 @@ function rCusts(q,pg,sort,type){
   // Partial render: only rebuild results, never destroy search input
   if(!el("cust-srch")){
   pg2.innerHTML=
-    "<div class=\"ph\"><h1>Customers</h1><p id=\"cust-stats\">"+(D.customers||[]).length+" registered &middot; "+fil.length+(type2||q2?" matched":"")+"</p></div>"+
+    "<div class=\"ph\"><h1>Customers</h1><p id=\"cust-stats\">"+D.customers.length+" registered &middot; "+fil.length+(type2||q2?" matched":"")+"</p></div>"+
     "<div class=\"toolbar\">"+
       "<div class=\"srch\"><i class=\"ti ti-search\"></i><input id=\"cust-srch\" type=\"text\" placeholder=\"Search name, phone, court, house...\" oninput=\"rCusts(this.value,0)\" value=\""+q2+"\" autocomplete=\"off\" autocorrect=\"off\" spellcheck=\"false\" inputmode=\"search\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
       "<select class=\"fsel\" onchange=\"rCusts(undefined,0,undefined,this.value)\">"+
@@ -2375,12 +2193,12 @@ function rCusts(q,pg,sort,type){
       "<tbody>"+
         (paged.items.length?paged.items.map(function(c){
           var debt=(debtMap[c.id]||0);
-          var ords=(D.orders||[]).filter(function(o){return o.cId===c.id;});
+          var ords=D.orders.filter(function(o){return o.cId===c.id;});
           var lastOrd=ords.filter(function(o){return o.status==="Delivered";}).sort(function(a,b){return b.date>a.date?1:-1;})[0];
-          var allPays=(D.invoices||[]).filter(function(i){return i.cId===c.id&&i.payments&&i.payments.length;}).reduce(function(a,i){return a.concat(i.payments);},[]).sort(function(a,b){return b.date>a.date?1:-1;});
+          var allPays=D.invoices.filter(function(i){return i.cId===c.id&&i.payments&&i.payments.length;}).reduce(function(a,i){return a.concat(i.payments);},[]).sort(function(a,b){return b.date>a.date?1:-1;});
           var lp=allPays[0];
           return "<tr class=\""+(debt>0?"dr":"")+"\">"+
-            "<td><div style=\"font-weight:700\">"+(can("vPhone")?c.name:maskName(c.name))+"</div><div class=\"ca\">"+cAddr(c)+"</div>"+(c.waterCycle>0||(c.waterCycle===0&&c.cycleHistory&&c.cycleHistory.length>0)?"<div style=\"margin-top:3px\"><span class=\"badge ba\" style=\"cursor:pointer;font-size:9px\" onclick=\"showCycleHistory("+c.id+")\" title=\"Water cycle\"><i class=\"ti ti-droplet\"></i> "+c.waterCycle+"/8</span></div>":"")+"</td>"+
+            "<td><div style=\"font-weight:700\">"+(can("vPhone")?c.name:maskName(c.name))+"</div><div class=\"ca\">"+cAddr(c)+"</div>"+(c.waterCycle>0?"<div style=\"margin-top:3px\"><span class=\"badge ba\" style=\"cursor:pointer;font-size:9px\" onclick=\"showCycleHistory("+c.id+")\" title=\"Water cycle\"><i class=\"ti ti-droplet\"></i> "+c.waterCycle+"/8</span></div>":"")+"</td>"+
             "<td>"+(can("vPhone")?c.phone+(c.phone2?"<div class=\"ca\">"+c.phone2+"</div>":""):maskPhone(c.phone))+"</td>"+
             "<td><span class=\"badge "+(c.ctype==="Distributor"?"bp":c.ctype==="Commercial"?"bb":c.ctype==="Institution"?"ba":"bg")+"\">"+c.ctype+"</span></td>"+
             "<td style=\"font-weight:700\">"+ords.length+"</td>"+
@@ -2415,22 +2233,21 @@ function saveCust(){
   if(!n||!ph){toast("Name and phone required","err");return;}
   var editId=el("c-edit-id").value;
   if(editId){
-    var c=(D.customers||[]).find(function(x){return String(x.id)===String(editId);});
+    var c=D.customers.find(function(x){return String(x.id)===String(editId);});
     if(c){
       c.name=n;c.phone=ph;c.phone2=el("cph2").value;c.idno=el("cid").value;
       c.estate=el("cestate").value;c.court=el("ccourt").value;c.house=el("chouse").value;
       c.htype=el("chtype").value;c.road=el("croad").value;c.zone=el("czone").value;
       c.ctype=el("ctype").value;c.creditLimit=parseFloat(el("ccl").value)||0;c.notes=el("cnotes").value;
       auditLog("CUSTOMER_UPDATED","Customer updated by "+CU.name+" ("+CU.role+"): "+n);
-      if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
-cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer updated");
+      cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer updated");
       return;
     }
   }
   // Duplicate detection: same house+court combination
   var house2=el("chouse").value.trim();var court2=el("ccourt").value.trim();
   if(house2&&court2){
-    var dupAddr=(D.customers||[]).find(function(x){
+    var dupAddr=D.customers.find(function(x){
       return String(x.house).trim()===house2&&String(x.court).trim()===court2;
     });
     if(dupAddr){
@@ -2438,14 +2255,13 @@ cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer updated");
         +(can("vPhone")?dupAddr.name:maskName(dupAddr.name))+"\n\nContinue adding a new customer?"))return;
     }
   }
-  (D.customers||[]).push({id:uid(),name:n,phone:ph,phone2:el("cph2").value,idno:el("cid").value,estate:el("cestate").value,court:el("ccourt").value,house:el("chouse").value,htype:el("chtype").value,road:el("croad").value,zone:el("czone").value,ctype:el("ctype").value,creditLimit:parseFloat(el("ccl").value)||0,notes:el("cnotes").value,created:tday()});
+  D.customers.push({id:uid(),name:n,phone:ph,phone2:el("cph2").value,idno:el("cid").value,estate:el("cestate").value,court:el("ccourt").value,house:el("chouse").value,htype:el("chtype").value,road:el("croad").value,zone:el("czone").value,ctype:el("ctype").value,creditLimit:parseFloat(el("ccl").value)||0,notes:el("cnotes").value,created:tday()});
   ["cn","cph","cph2","cid","cestate","ccourt","chouse","croad","czone","cnotes"].forEach(function(id){el(id).value="";});el("ccl").value="0";
-  if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
-cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer added");
+  cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer added");
 }
 function editCust(id){
   if(!can("eCust"))return;
-  var c=(D.customers||[]).find(function(x){return x.id===id;});
+  var c=D.customers.find(function(x){return x.id===id;});
   if(!c)return;
   el("c-edit-id").value=c.id;
   el("cn").value=c.name||"";el("cph").value=c.phone||"";el("cph2").value=c.phone2||"";
@@ -2459,8 +2275,8 @@ function editCust(id){
 }
 function delC(id){
   if(!can("dCust"))return;
-  var c=(D.customers||[]).find(function(x){return x.id===id;});if(!c)return;
-  var paidInvs=(D.invoices||[]).filter(function(i){return i.cId===id&&i.paid>0;});
+  var c=D.customers.find(function(x){return x.id===id;});if(!c)return;
+  var paidInvs=D.invoices.filter(function(i){return i.cId===id&&i.paid>0;});
   var debt=custDebt(id);
   var msg="Remove "+(can("vPhone")?c.name:"this customer")+"?\n\n";
   if(debt>0)msg+="They have KSh "+debt.toLocaleString()+" outstanding debt — this will be written off.\n\n";
@@ -2468,15 +2284,15 @@ function delC(id){
   msg+="Their orders and unpaid invoices will be removed. Cannot be undone.";
   if(!confirm(msg))return;
   // Restore stock for any pending orders before removing customer
-  (D.orders||[]).filter(function(o){return o.cId===id&&o.status!=="Delivered"&&o.status!=="Cancelled"&&o.prodConfirmed!==false;}).forEach(function(o){
-    var st=(D.stock||[]).find(function(s){return s.name===o.prod;});
+  D.orders.filter(function(o){return o.cId===id&&o.status!=="Delivered"&&o.status!=="Cancelled"&&o.prodConfirmed!==false;}).forEach(function(o){
+    var st=D.stock.find(function(s){return s.name===o.prod;});
     if(st)st.qty+=o.qty;
   });
-  D.customers=(D.customers||[]).filter(function(x){return x.id!==id;});
-  D.orders=(D.orders||[]).filter(function(o){return o.cId!==id;});
-  D.invoices=(D.invoices||[]).filter(function(i){if(i.cId!==id)return true;return i.paid>0;});
-  D.complaints=(D.complaints||[]).filter(function(x){return x.cId!==id;});
-  auditLog("CUSTOMER_DELETED","Customer deleted by "+CU.name+" ("+CU.role+"): "+(can("vPhone")?c.name:"[masked]")+". "+(D.orders||[]).length+" orders, "+paidInvs.length+" paid invoices retained.");
+  D.customers=D.customers.filter(function(x){return x.id!==id;});
+  D.orders=D.orders.filter(function(o){return o.cId!==id;});
+  D.invoices=D.invoices.filter(function(i){if(i.cId!==id)return true;return i.paid>0;});
+  D.complaints=D.complaints.filter(function(x){return x.cId!==id;});
+  auditLog("CUSTOMER_DELETED","Customer deleted by "+CU.name+" ("+CU.role+"): "+(can("vPhone")?c.name:"[masked]")+". "+D.orders.length+" orders, "+paidInvs.length+" paid invoices retained.");
   rCusts(undefined,CUST_PAGE);
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   dirty();toast("Customer removed"+(paidInvs.length?" — "+paidInvs.length+" paid invoice(s) retained":""));
@@ -2484,7 +2300,7 @@ function delC(id){
 var _fuCid=0;
 function addFollowUp(cId){
   if(!can("vRev")){toast("Director only","err");return;}
-  var cu=(D.customers||[]).find(function(x){return x.id===cId;});if(!cu)return;
+  var cu=D.customers.find(function(x){return x.id===cId;});if(!cu)return;
   _fuCid=cId;
   var nm=el("fu-cust-name");
   if(nm)nm.innerHTML=(can("vPhone")?cu.name:maskName(cu.name))+" &nbsp;<span style=\"color:var(--tx2);font-weight:400\">"+(can("vPhone")?cu.phone||"":"")+"</span>";
@@ -2502,7 +2318,7 @@ function addFollowUp(cId){
   om("m-followup");
 }
 function saveFollowUp(){
-  var cu=(D.customers||[]).find(function(x){return x.id===_fuCid;});if(!cu)return;
+  var cu=D.customers.find(function(x){return x.id===_fuCid;});if(!cu)return;
   if(!cu.followups)cu.followups=[];
   var entry={
     date:tday(),by:CU.name,
@@ -2517,7 +2333,7 @@ function saveFollowUp(){
   toast("Follow-up saved — "+entry.type+" · "+entry.outcome);
 }
 function openPay(cId){
-  var c=(D.customers||[]).find(function(x){return x.id===cId;});if(!c)return;
+  var c=D.customers.find(function(x){return x.id===cId;});if(!c)return;
   var debt=custDebt(cId);
   el("pay-cid").value=cId;
   el("pay-info").innerHTML="<div style=\"font-weight:800;font-size:14px;margin-bottom:4px\">"+(can("vPhone")?c.name:maskName(c.name))+"</div><div style=\"color:var(--tx2);font-size:12px\">"+cAddr(c)+"</div><div style=\"margin-top:7px;font-size:13px;color:#c0392b;font-weight:700\">Outstanding: KSh "+debt.toLocaleString()+"</div>";
@@ -2529,8 +2345,8 @@ function openPay(cId){
   setTimeout(function(){var pa=el("pay-amt");if(pa)pa.focus();},300);
 }
 function showCycleHistory(cId){
-  if(!can("eCust")){toast("Manager+ required","err");return;}
-  var cu=(D.customers||[]).find(function(x){return x.id===cId;});if(!cu)return;
+  if(!can("eCust")&&CU.role!=="director"){toast("Director/Manager only","err");return;}
+  var cu=D.customers.find(function(x){return x.id===cId;});if(!cu)return;
   var tt=el("m-generic-title");
   if(tt)tt.innerHTML="<i class=\"ti ti-refresh\" style=\"color:var(--nv);margin-right:8px\"></i>"
     +(can("vPhone")?cu.name:maskName(cu.name))+" — Water Cycle History";
@@ -2538,7 +2354,7 @@ function showCycleHistory(cId){
   var log=(cu.cycleHistory||[]).slice().reverse();
   var cyc=cu.waterCycle||0;
   // Calculate total delivered waters from all orders for this customer
-  var _wOrds=(D.orders||[]).filter(function(o){
+  var _wOrds=D.orders.filter(function(o){
     return o.cId===cId&&o.status==="Delivered"
       &&is20ltr(o.prod);
   });
@@ -2576,7 +2392,7 @@ function showCycleHistory(cId){
 }
 function showCreditLog(cId){
   if(!can("vRev")){toast("Manager+ only","err");return;}
-  var cu=(D.customers||[]).find(function(x){return x.id===cId;});
+  var cu=D.customers.find(function(x){return x.id===cId;});
   if(!cu)return;
   var log=(cu.creditLog||[]).slice().reverse(); // newest first
   var tt=el("m-generic-title");
@@ -2628,8 +2444,8 @@ function showCreditLog(cId){
 }
 function showPayments(invId){
   if(!can("rest")){toast("Director only","err");return;}
-  var inv=(D.invoices||[]).find(function(x){return x.id===invId;});if(!inv){toast("Invoice not found","err");return;}
-  var cu=(D.customers||[]).find(function(x){return x.id===inv.cId;});
+  var inv=D.invoices.find(function(x){return x.id===invId;});if(!inv){toast("Invoice not found","err");return;}
+  var cu=D.customers.find(function(x){return x.id===inv.cId;});
   var pays=inv.payments||[];
   // Set modal title
   var tt=el("m-generic-title");
@@ -2690,7 +2506,7 @@ showPayments._confirm=function(invId,idx){
 }
 function reversePayment(invId,payIdx){
   if(!can("rest")){toast("Director only","err");return;}
-  var inv=(D.invoices||[]).find(function(x){return x.id===invId;});
+  var inv=D.invoices.find(function(x){return x.id===invId;});
   if(!inv){toast("Invoice not found","err");return;}
   var pays=inv.payments||[];
   if(payIdx<0||payIdx>=pays.length){toast("Payment not found","err");return;}
@@ -2703,14 +2519,13 @@ function reversePayment(invId,payIdx){
   // Sync linked order payment status
   var ordMatch=inv.notes&&inv.notes.match(/#(\d+)/);
   if(ordMatch){
-    var o=(D.orders||[]).find(function(x){return String(x.id)===ordMatch[1];});
+    var o=D.orders.find(function(x){return String(x.id)===ordMatch[1];});
     if(o){
       if(inv.paid>=inv.amount){o.paid="Paid";}else if(inv.paid>0){o.paid="Partial";}else{o.paid="Unpaid";}
       o.amtPaid=inv.paid;
     }
   }
   auditLog("PAYMENT_RECORDED","REVERSAL: KSh "+pay.amt+" removed from Invoice #"+invId+" by "+CU.name+". Method: "+pay.method+". New paid total: KSh "+inv.paid);
-  if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   dirty();
   if(el("pg-invoices")&&el("pg-invoices").classList.contains("act"))rInvs(undefined,INV_PAGE);
   if(el("pg-orders")&&el("pg-orders").classList.contains("act"))rOrds(undefined,ORD_PAGE);
@@ -2719,9 +2534,9 @@ function reversePayment(invId,payIdx){
 }
 function voidInvoice(invId){
   if(!can("rest")){toast("Director only","err");return;}
-  var inv=(D.invoices||[]).find(function(x){return x.id===invId;});if(!inv){toast("Invoice not found","err");return;}
+  var inv=D.invoices.find(function(x){return x.id===invId;});if(!inv){toast("Invoice not found","err");return;}
   if(inv.voided){toast("Already voided","err");return;}
-  var cu=(D.customers||[]).find(function(x){return x.id===inv.cId;});
+  var cu=D.customers.find(function(x){return x.id===inv.cId;});
   var bal=inv.amount-inv.paid;
   var tt=el("m-generic-title");
   if(tt)tt.innerHTML="<i class=\"ti ti-ban\" style=\"color:#e74c3c;margin-right:8px\"></i>Void Invoice #"+invId;
@@ -2765,8 +2580,7 @@ voidInvoice._confirm=function(invId){
   var ordMatch=inv.notes&&inv.notes.match(/#(\d+)/);
   if(ordMatch){var o=D.orders.find(function(x){return String(x.id)===ordMatch[1];});if(o&&o.status!=="Delivered")o.paid="Voided";}
   auditLog("PAYMENT_RECORDED","VOID: Invoice #"+invId+" voided by "+CU.name+". Reason: "+reason+". Amount written off: KSh "+bal);
-    if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
-dirty();cm("m-generic");
+  dirty();cm("m-generic");
   if(el("pg-invoices")&&el("pg-invoices").classList.contains("act"))rInvs(undefined,INV_PAGE);
   if(el("pg-debts")&&el("pg-debts").classList.contains("act"))rDebts();
   toast("Invoice #"+invId+" voided — KSh "+bal.toLocaleString()+" written off","ok");
@@ -2775,14 +2589,14 @@ function recPay(){
   if(!can("mPaid")){toast("No permission to record payments","err");return;}
   var cId=parseInt(el("pay-cid").value),amt=parseFloat(el("pay-amt").value)||0;
   if(!cId||isNaN(cId)){toast("Invalid customer","err");return;}
-  if(!amt||amt<=0){toast("Enter a valid amount greater than zero","err");return;}
+  if(!amt){toast("Enter amount","err");return;}
   var invId=el("pay-inv-id")&&el("pay-inv-id").value?parseInt(el("pay-inv-id").value):0;
   var payDate=el("pay-date")&&el("pay-date").value?el("pay-date").value:tday();
   var method=el("pay-method")?el("pay-method").value:"Cash";
   var ref=el("pay-ref")?el("pay-ref").value:"";
   // ── INVOICE-SPECIFIC PAYMENT ──────────────────────────────────────────
   if(invId){
-    var inv=(D.invoices||[]).find(function(x){return x.id===invId;});if(!inv){toast("Invoice not found","err");return;}
+    var inv=D.invoices.find(function(x){return x.id===invId;});if(!inv){toast("Invoice not found","err");return;}
     var bal=inv.amount-inv.paid;
     var credit=0;
     if(amt>bal){
@@ -2794,7 +2608,7 @@ function recPay(){
     inv.paid=inv.payments.reduce(function(s,p){return s+(p.amt||0);},0);
     // Store overpayment as customer credit balance
     if(credit>0){
-      var cu=(D.customers||[]).find(function(x){return x.id===cId;});
+      var cu=D.customers.find(function(x){return x.id===cId;});
       if(cu){
         cu.credit=(cu.credit||0)+credit;
         if(!cu.creditLog)cu.creditLog=[];
@@ -2805,7 +2619,7 @@ function recPay(){
     // Sync linked order
     var ordMatch=inv.notes&&inv.notes.match(/#(\d+)/);
     if(ordMatch){
-      var o=(D.orders||[]).find(function(x){return String(x.id)===ordMatch[1];});
+      var o=D.orders.find(function(x){return String(x.id)===ordMatch[1];});
       if(o){
         if(inv.paid>=inv.amount){o.paid="Paid";}else if(inv.paid>0){o.paid="Partial";}else{o.paid="Unpaid";}
         o.amtPaid=inv.paid;
@@ -2814,9 +2628,9 @@ function recPay(){
     auditLog("PAYMENT_RECORDED","KSh "+amt.toLocaleString()+" on Invoice #"+invId+" by "+CU.name+" ("+CU.role+"). Method: "+method+(ref?" Ref: "+ref:"")+(credit>0?" | KSh "+credit.toLocaleString()+" overpayment added to credit":"")+". Balance: KSh "+(inv.amount-inv.paid).toLocaleString());
   }else{
   // ── CUSTOMER-LEVEL PAYMENT — distribute oldest-first ─────────────────
-    var cu2=(D.customers||[]).find(function(x){return x.id===cId;});
+    var cu2=D.customers.find(function(x){return x.id===cId;});
     var existingCredit=(cu2&&cu2.credit>0)?cu2.credit:0;
-    var totalDebt=(D.invoices||[]).filter(function(i){return i.cId===cId&&i.paid<i.amount&&!i.voided;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
+    var totalDebt=D.invoices.filter(function(i){return i.cId===cId&&i.paid<i.amount&&!i.voided;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
     // Apply any existing credit balance first
     if(existingCredit>0&&totalDebt>0){
       var useCredit=Math.min(existingCredit,totalDebt);
@@ -2838,7 +2652,7 @@ function recPay(){
       amt=totalDebt;
     }
     var rem=amt;
-    (D.invoices||[]).filter(function(i){return i.cId===cId&&i.paid<i.amount&&!i.voided;})
+    D.invoices.filter(function(i){return i.cId===cId&&i.paid<i.amount&&!i.voided;})
       .sort(function(a,b){return a.date>b.date?1:-1;})
       .forEach(function(inv){
         if(rem<=0)return;
@@ -2849,7 +2663,7 @@ function recPay(){
         rem-=tap;
         var ordId=inv.notes&&inv.notes.match(/#(\d+)/);
         if(ordId){
-          var o2=(D.orders||[]).find(function(x){return String(x.id)===ordId[1];});
+          var o2=D.orders.find(function(x){return String(x.id)===ordId[1];});
           if(o2){
             if(inv.paid>=inv.amount){o2.paid="Paid";}else if(inv.paid>0){o2.paid="Partial";}else{o2.paid="Unpaid";}
             o2.amtPaid=inv.paid;
@@ -2877,12 +2691,12 @@ function rOrds(q,pg,sort){
   var q2=ORD_Q||"";var sort2=ORD_SORT||"newest";var sf=ORD_STATUS_F||"";
   var pgEl=el("pg-orders");if(!pgEl)return;
   var df=ORD_DATE_F||"";
-  var fil=(D.orders||[]).filter(function(o){
+  var fil=D.orders.filter(function(o){
     if(sf&&o.status!==sf)return false;
     if(df){var dd=o.deliveredAt||o.date;if(!dd||!dd.startsWith(df))return false;}
     if(!q2)return true;
     var lq=q2.toLowerCase();
-    var c=(D.customers||[]).find(function(x){return x.id===o.cId;});
+    var c=D.customers.find(function(x){return x.id===o.cId;});
     // vPhone gate: staff search by address/order#/product only — not customer name
     var custMatch=c&&(
       (can("vPhone")&&c.name.toLowerCase().indexOf(lq)!==-1)||
@@ -2899,8 +2713,8 @@ function rOrds(q,pg,sort){
     if(sort2==="partial")return(a.paid==="Partial"?0:1)-(b.paid==="Partial"?0:1);
     if(sort2==="highval")return(b.qty*b.price)-(a.qty*a.price);
     if(sort2==="customer"){
-      var ca=(D.customers||[]).find(function(x){return x.id===a.cId;});
-      var cb=(D.customers||[]).find(function(x){return x.id===b.cId;});
+      var ca=D.customers.find(function(x){return x.id===a.cId;});
+      var cb=D.customers.find(function(x){return x.id===b.cId;});
       return((ca?ca.name:"")>=(cb?cb.name:""))?1:-1;
     }
     return b.id-a.id; // newest
@@ -2909,7 +2723,7 @@ function rOrds(q,pg,sort){
   var sBtn=function(v,lbl){return "<button onclick=\"rOrds(undefined,0,'"+v+"')\" style=\"padding:5px 9px;font-size:11px;border:1.5px solid "+(sort2===v?"var(--nv)":"var(--bd)")+";background:"+(sort2===v?"var(--nv)":"#fff")+";color:"+(sort2===v?"#fff":"var(--tx)")+";border-radius:6px;cursor:pointer;font-weight:"+(sort2===v?"700":"400")+"\">"+lbl+"</button>";};
   if(!el("ords-srch")){
     pgEl.innerHTML=
-    "<div class=\"ph\"><h1>Orders</h1><p>"+(D.orders||[]).length+" total &middot; "+(D.orders||[]).filter(function(o){return o.status==="Pending"||o.status==="Processing";}).length+" active</p></div>"+
+    "<div class=\"ph\"><h1>Orders</h1><p>"+D.orders.length+" total &middot; "+D.orders.filter(function(o){return o.status==="Pending"||o.status==="Processing";}).length+" active</p></div>"+
     "<div class=\"toolbar\">"+
       "<div class=\"srch\"><i class=\"ti ti-search\"></i><input id=\"ords-srch\" type=\"text\" autocomplete=\"off\" autocorrect=\"off\" autocapitalize=\"off\" spellcheck=\"false\" inputmode=\"search\" placeholder=\"Search by order #, product, address, driver...\" oninput=\"rOrds(this.value,0)\" value=\""+q2+"\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
       "<select class=\"fsel\" onchange=\"filterOrds(this.value)\">"+
@@ -2949,7 +2763,7 @@ function filterOrds(f){
 function ordRows(fil){
   if(!fil.length)return "<tr><td colspan=\""+(can("vRev")?"11":"10")+"\"><div class=\"te\"><i class=\"ti ti-clipboard-list\"></i><p>No orders found</p></div></td></tr>";
   return fil.map(function(o){
-    var c=(D.customers||[]).find(function(x){return x.id===o.cId;});
+    var c=D.customers.find(function(x){return x.id===o.cId;});
     return "<tr><td style=\"font-weight:700\">#"+o.id+"</td>"+
       "<td><div style=\"font-weight:700\">"+(c?(can("vPhone")?c.name:maskName(c.name)):"&mdash;")+"</div><div class=\"ca\">"+(c?[c.court,c.house?"No."+c.house:""].filter(Boolean).join(" "):"")+"</div></td>"+
       "<td>"+o.prod+(o.prodConfirmed===false?" <span style=\"background:#fff3cd;color:#856404;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:700\">TBC</span>":"")+"</td><td style=\"font-weight:700\">"+o.qty+"</td>"+
@@ -2972,7 +2786,7 @@ function ocSearch(q){
   var drop=el("oc-drop");if(!drop)return;
   if(!q||q.length<2){drop.style.display="none";return;}
   var lq=q.toLowerCase();
-  var matches=(D.customers||[]).filter(function(c){
+  var matches=D.customers.filter(function(c){
     if(can("vPhone")){
       // Director/Manager: search by name, phone, address, house, court, estate
       return c.name.toLowerCase().indexOf(lq)!==-1||
@@ -3010,7 +2824,7 @@ function ocSearch(q){
 }
 function ocSelect(cId,e){
   if(e)e.preventDefault();
-  var c=(D.customers||[]).find(function(x){return x.id===cId;});if(!c)return;
+  var c=D.customers.find(function(x){return x.id===cId;});if(!c)return;
   el("oc").value=cId;
   el("oc-search").value=can("vPhone")?c.name:maskName(c.name);
   var addr=cAddr(c);
@@ -3030,7 +2844,7 @@ function opSearch(q){
   if(!q||q.length<1){drop.style.display="none";return;}
   var lq=q.toLowerCase().trim();
   // Match by name OR size
-  var matches=(D.stock||[]).filter(function(s){
+  var matches=D.stock.filter(function(s){
     return s.name.toLowerCase().indexOf(lq)!==-1||
       (s.size&&s.size.toLowerCase().indexOf(lq)!==-1);
   });
@@ -3038,7 +2852,7 @@ function opSearch(q){
     // Try numeric match — "13" finds "13kg", "6" finds "6kg"
     var num=q.replace(/[^0-9]/g,"");
     if(num){
-      matches=(D.stock||[]).filter(function(s){
+      matches=D.stock.filter(function(s){
         return(s.size&&s.size.indexOf(num)!==-1)||s.name.indexOf(num)!==-1;
       });
     }
@@ -3071,7 +2885,7 @@ function opSearch(q){
       var inStock=s.qty>0;
       var stockTxt=can("eSt")?" &middot; "+(inStock?"<span style=\"color:#27ae60\">"+s.qty+" in stock</span>":"<span style=\"color:#dc3545\">Out of stock</span>"):"";
       var priceTxt=can("vRev")?" &nbsp;<span style=\"color:var(--gd);font-weight:800\">KSh "+s.price+"</span>":"";
-      var _ofr=(D.offers||[]).find(function(o){return o.active&&o.prod===s.name&&o.end>=tday()&&o.start<=tday();});
+      var _ofr=D.offers.find(function(o){return o.active&&o.prod===s.name&&o.end>=tday()&&o.start<=tday();});
       var offerBadge=_ofr?"<span style=\"background:var(--gd);color:var(--nv);padding:1px 6px;border-radius:3px;font-size:10px;font-weight:800;margin-left:5px\">"+_ofr.disc+"% OFF</span>":"";
       html+="<div onmousedown=\"opSelect('"+s.name.replace(/'/g,"\\'")+"',"+s.price+",event)\" "+
         "style=\"padding:9px 14px;cursor:pointer;border-bottom:1px solid var(--bd);font-size:12px;"+(inStock?"":"opacity:.7")+"\">"+
@@ -3140,9 +2954,9 @@ function prepO(){
   if(el("op-sel"))el("op-sel").innerHTML="";
   if(el("op-drop"))el("op-drop").style.display="none";
   var // All staff and drivers can be assigned to an order
-  drvs=(USERS||[]).filter(function(u){return u.role==="driver"||u.role==="staff";});
+  drvs=USERS.filter(function(u){return u.role==="driver"||u.role==="staff";});
   odrv.innerHTML="<option value=\"\">Unassigned</option>"+drvs.map(function(d){
-    var pending=(D.orders||[]).filter(function(o){
+    var pending=D.orders.filter(function(o){
       return o.driver===d.name&&(o.status==="Pending"||o.status==="Processing"||o.status==="Out for delivery");
     }).length;
     var warn=pending>=5?" ⚠ "+pending+" pending":"";
@@ -3170,19 +2984,19 @@ function prepO(){
 }
 function editOrd(oid){
   if(!can("eOrd"))return;
-  var o=(D.orders||[]).find(function(x){return x.id===oid;});if(!o)return;
+  var o=D.orders.find(function(x){return x.id===oid;});if(!o)return;
   if(o.status==="Delivered"||o.status==="Cancelled"){editOrdLimited(oid);return;}
   prepO();
   el("o-edit-id").value=o.id;
   // Populate autocomplete customer
-  var c=(D.customers||[]).find(function(x){return x.id===o.cId;});
+  var c=D.customers.find(function(x){return x.id===o.cId;});
   if(c){
     el("oc").value=o.cId;
     if(el("oc-search"))el("oc-search").value=can("vPhone")?c.name:maskName(c.name);
     if(el("oc-sel"))el("oc-sel").innerHTML="<i class=\"ti ti-check\"></i> "+cAddr(c);
   }
   // Populate autocomplete product
-  var s=(D.stock||[]).find(function(x){return x.name===o.prod;});
+  var s=D.stock.find(function(x){return x.name===o.prod;});
   if(s){
     el("op").value=o.prod;el("op").setAttribute("data-p",o.price||s.price);
     if(el("op-search"))el("op-search").value=o.prod;
@@ -3201,11 +3015,11 @@ function editOrd(oid){
 }
 function editOrdLimited(oid){
   if(!can("eOrd"))return;
-  var o=(D.orders||[]).find(function(x){return x.id===oid;});if(!o)return;
+  var o=D.orders.find(function(x){return x.id===oid;});if(!o)return;
   el("oe-id").value=o.id;
-  var drvs=(USERS||[]).filter(function(u){return u.role==="driver"||u.role==="staff";});
+  var drvs=USERS.filter(function(u){return u.role==="driver"||u.role==="staff";});
   el("oe-drv").innerHTML="<option value=\"\">Unassigned</option>"+drvs.map(function(d){
-    var pending=(D.orders||[]).filter(function(o){return o.driver===d.name&&(o.status==="Pending"||o.status==="Processing"||o.status==="Out for delivery");}).length;
+    var pending=D.orders.filter(function(o){return o.driver===d.name&&(o.status==="Pending"||o.status==="Processing"||o.status==="Out for delivery");}).length;
     var warn=pending>=5?" ⚠ "+pending+" pending":"";
     return "<option"+(d.name===o.driver?" selected":"")+">"+d.name+warn+"</option>";
   }).join("");
@@ -3216,7 +3030,7 @@ function editOrdLimited(oid){
 function saveOrdEdit(){
   if(!can("eOrd"))return;
   var oid=parseInt(el("oe-id").value);
-  var o=(D.orders||[]).find(function(x){return x.id===oid;});if(!o)return;
+  var o=D.orders.find(function(x){return x.id===oid;});if(!o)return;
   o.driver=el("oe-drv").value;
   if(o.status==="Delivered")o.bottle_after=el("oe-btl").value;else o.bottle_before=el("oe-btl").value;
   o.notes=el("oe-notes").value;
@@ -3234,90 +3048,18 @@ function calcO(){
   }
   checkCycleWarn(); // update cycle banner when qty changes
 }
-var _idleTimer=null;
-var _idleLast=Date.now();
-function resetIdleTimer(){
-  _idleLast=Date.now();
-  if(_idleTimer)clearTimeout(_idleTimer);
-  if(_idleWarnTimer)clearTimeout(_idleWarnTimer);
-  _dismissIdleWarning();
-  if(!CU)return;
-  var limit=CU.role==="staff"?60000:CU.role==="manager"?300000:600000;
-  var warnWindow=CU.role==="staff"?10000:20000; // show warning 10s (staff) or 20s (mgr/dir) before logout
-  _idleWarnTimer=setTimeout(function(){
-    if(CU)_showIdleWarning(warnWindow/1000);
-  },limit-warnWindow);
-  _idleTimer=setTimeout(function(){
-    if(!CU)return;
-    _dismissIdleWarning();
-    toast("Session expired due to inactivity — logging out","err");
-    setTimeout(logout,1500);
-  },limit);
-}
-function _showIdleWarning(seconds){
-  _dismissIdleWarning();
-  var d=document.createElement("div");
-  d.id="idle-warn-banner";
-  d.style.cssText="position:fixed;top:0;left:0;right:0;z-index:99999;background:#c0392b;color:#fff;padding:12px 16px;text-align:center;font-size:14px;font-weight:600;box-shadow:0 2px 8px rgba(0,0,0,.2);display:flex;align-items:center;justify-content:center;gap:14px;flex-wrap:wrap";
-  var span=document.createElement("span");
-  span.id="idle-warn-count";
-  span.textContent="You will be logged out in "+seconds+"s due to inactivity";
-  var btn=document.createElement("button");
-  btn.textContent="Stay logged in";
-  btn.style.cssText="background:#fff;color:#c0392b;border:none;border-radius:6px;padding:6px 16px;font-weight:700;font-size:13px;cursor:pointer";
-  btn.onclick=function(){resetIdleTimer();};
-  d.appendChild(span);d.appendChild(btn);
-  document.body.appendChild(d);
-  _idleWarnEl=d;
-  var remaining=seconds;
-  var tick=setInterval(function(){
-    remaining--;
-    if(!_idleWarnEl){clearInterval(tick);return;}
-    if(remaining<=0){clearInterval(tick);return;}
-    span.textContent="You will be logged out in "+remaining+"s due to inactivity";
-  },1000);
-}
-function _dismissIdleWarning(){
-  if(_idleWarnEl){try{_idleWarnEl.remove();}catch(e){}_idleWarnEl=null;}
-}
-function startIdleWatcher(){
-  ["click","keydown","touchstart","mousemove"].forEach(function(ev){
-    document.addEventListener(ev,resetIdleTimer,{passive:true});
-  });
-  resetIdleTimer();
-}
-function stopIdleWatcher(){
-  if(_idleTimer){clearTimeout(_idleTimer);_idleTimer=null;}
-  if(_idleWarnTimer){clearTimeout(_idleWarnTimer);_idleWarnTimer=null;}
-  _dismissIdleWarning();
-}
 function is20ltr(prodName){
   if(!prodName)return false;
   var n=prodName.toLowerCase().replace(/\s+/g,"");
-  // 1. Name contains 20ltr variant
-  if(/20lt?r?s?/i.test(n)||n.indexOf("20litre")!==-1||n.indexOf("20litres")!==-1)return true;
-  // 2. Find matching stock item by exact or normalised name
-  var st=(D.stock||[]).find(function(s){
-    var sn=s.name.toLowerCase().replace(/\s+/g,"");
-    return sn===n||s.name.toLowerCase()===prodName.toLowerCase();
+  // Check the name itself
+  if(n.indexOf("20ltr")!==-1||n.indexOf("20ltrs")!==-1)return true;
+  // Check the size field of the matching stock product
+  var st=D.stock.find(function(s){
+    return s.name.toLowerCase()===prodName.toLowerCase();
   });
-  if(st){
-    if(st.isWater===true)return true;
-    if(st.size){
-      var sz=st.size.toLowerCase().replace(/\s+/g,"");
-      if(/20lt?r?s?/i.test(sz)||sz.indexOf("20litre")!==-1)return true;
-    }
-  }
-  // 3. Check if ANY isWater-flagged stock item name is contained in prodName
-  //    Handles renamed products (e.g. old orders say "Pick Bottle",
-  //    stock now says "Pick Bottle 20ltr" which is isWater=true)
-  var waterStocks=(D.stock||[]).filter(function(s){return s.isWater===true;});
-  for(var wi=0;wi<waterStocks.length;wi++){
-    var ws=waterStocks[wi];
-    var wsn=ws.name.toLowerCase();
-    var pn2=prodName.toLowerCase();
-    // Match if either name is contained in the other (handles renaming)
-    if(wsn.indexOf(pn2)!==-1||pn2.indexOf(wsn)!==-1)return true;
+  if(st&&st.size){
+    var sz=st.size.toLowerCase().replace(/\s+/g,"");
+    if(sz.indexOf("20ltr")!==-1||sz.indexOf("20ltrs")!==-1)return true;
   }
   return false;
 }
@@ -3337,7 +3079,7 @@ function checkCycleWarn(){
   // Only show for 20ltr water products
   var isWater=is20ltr(prod);
   if(!isWater){warn.style.display="none";return;}
-  var cu=(D.customers||[]).find(function(x){return x.id===cId;});if(!cu){warn.style.display="none";return;}
+  var cu=D.customers.find(function(x){return x.id===cId;});if(!cu){warn.style.display="none";return;}
   var cur=cu.waterCycle||0;
   var qty=parseInt(el("oq")&&el("oq").value)||1; // bottles in this order
   var next=cur+qty; // total after this order delivers
@@ -3375,8 +3117,8 @@ function checkCycleWarn(){
 }
 function saveOrd(){
   if(!can("aOrd")&&!can("eOrd"))return;
-  if(!(D.customers||[]).length){toast("Add a customer first","err");return;}
-  var cId=parseInt(el("oc")&&el("oc").value)||0;
+  if(!D.customers.length){toast("Add a customer first","err");return;}
+  var cId=parseInt(el("oc").value);
   if(!cId){toast("Please select a customer","err");if(el("oc-search"))el("oc-search").focus();return;}
 
   // Determine order mode
@@ -3391,7 +3133,7 @@ function saveOrd(){
     price=0; // price unknown until delivery
   }else{
     // Exact product mode
-    if(!(D.stock||[]).length){toast("Add a product first","err");return;}
+    if(!D.stock.length){toast("Add a product first","err");return;}
     var opEl=el("op");pn=opEl?opEl.value:"";
     if(!pn){toast("Please select a product","err");if(el("op-search"))el("op-search").focus();return;}
     price=parseInt((opEl?opEl.getAttribute("data-p"):0)||0);
@@ -3402,7 +3144,7 @@ function saveOrd(){
   if(qty<1){toast("Quantity must be at least 1","err");return;}
   // Auto-apply active offer discount — qty now defined for minqty check
   if(price>0&&!isCat){
-    var _of=(D.offers||[]).find(function(o){
+    var _of=D.offers.find(function(o){
       return o.active&&o.prod===pn&&o.end>=tday()&&o.start<=tday()&&qty>=(o.minqty||1);
     });
     if(_of){
@@ -3418,7 +3160,7 @@ function saveOrd(){
   // ── DEBT ALERT (new orders only, not edits) ──
   if(!editId){
     var existingDebt=custDebt(cId);
-    var cust=(D.customers||[]).find(function(x){return x.id===cId;});
+    var cust=D.customers.find(function(x){return x.id===cId;});
     var creditLimit=cust?(cust.creditLimit||0):0; // creditLimit is separate from credit balance
     var orderTotal=price*qty;
     var projectedDebt=existingDebt+orderTotal;
@@ -3437,7 +3179,7 @@ function saveOrd(){
   if(!editId){
     var driverName=el("odrv")&&el("odrv").value;
     if(driverName){
-      var driverPending=(D.orders||[]).filter(function(o){
+      var driverPending=D.orders.filter(function(o){
         return o.driver===driverName&&(o.status==="Pending"||o.status==="Processing"||o.status==="Out for delivery");
       }).length;
       if(driverPending>=5){
@@ -3448,11 +3190,11 @@ function saveOrd(){
   }
 
   if(editId){
-    var o=(D.orders||[]).find(function(x){return String(x.id)===String(editId);});
+    var o=D.orders.find(function(x){return String(x.id)===String(editId);});
     if(!o){toast("Order not found","err");return;}
     if(o.status==="Delivered"||o.status==="Cancelled"){toast("This order can no longer be fully edited","err");return;}
-    var oldStock=(D.stock||[]).find(function(s){return s.name===o.prod;});
-    var newStock=(D.stock||[]).find(function(s){return s.name===pn;});
+    var oldStock=D.stock.find(function(s){return s.name===o.prod;});
+    var newStock=D.stock.find(function(s){return s.name===pn;});
     if(oldStock===newStock){
       var netChange=qty-o.qty;
       if(netChange>0&&newStock&&newStock.qty<netChange){
@@ -3466,7 +3208,7 @@ function saveOrd(){
       if(oldStock)oldStock.qty+=o.qty;
       if(newStock)newStock.qty-=qty;
     }
-    var stCostE=(D.stock||[]).find(function(s){return s.name===pn;});
+    var stCostE=D.stock.find(function(s){return s.name===pn;});
     o.cId=cId;o.prod=pn;o.qty=qty;o.price=price;o.cost=stCostE?stCostE.cost:0;o.date=el("od").value;
     o.driver=el("odrv").value;o.deliver=el("odlvr").value;o.bottle_before=el("obtl").value;
     var amtPaid=parseFloat(el("oamt").value)||0;
@@ -3477,7 +3219,7 @@ function saveOrd(){
     else if(amtPaid>0){payStatus="Partial";}
     else{payStatus="Unpaid";}
     o.paid=payStatus;o.amtPaid=amtPaid;
-    var linkedInv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+o.id)!==-1;});
+    var linkedInv=D.invoices.find(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+o.id)!==-1;});
     if(payStatus!=="Paid"){
       if(linkedInv){
         linkedInv.amount=price*qty;
@@ -3488,33 +3230,29 @@ function saveOrd(){
         }
         linkedInv.paid=amtPaid;
       }else{
-        (D.invoices||[]).push({id:nIId++,cId:cId,amount:price*qty,paid:amtPaid,due:o.date,notes:"Order #"+o.id,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order edit"}]:[]});
+        D.invoices.push({id:nIId++,cId:cId,amount:price*qty,paid:amtPaid,due:o.date,notes:"Order #"+o.id,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order edit"}]:[]});
       }
     }else if(linkedInv){
       linkedInv.amount=price*qty;linkedInv.paid=price*qty;
     }
-    if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
-auditLog("ORDER_UPDATED","Order #"+o.id+" edited by "+CU.name+" ("+CU.role+")");
     cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+o.id+" updated");
     return;
   }
 
   var newOrdId=nOId++;
-  var stCost=(D.stock||[]).find(function(s){return s.name===pn;});var costAtSale=stCost?stCost.cost:0;
+  var stCost=D.stock.find(function(s){return s.name===pn;});var costAtSale=stCost?stCost.cost:0;
 
   if(isCat){
     // Category order: no stock deduction, no invoice yet, payment at delivery
-    (D.orders||[]).push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:0,cost:0,date:el("od").value,status:"Pending",paid:"Unpaid",amtPaid:0,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?el("onotes").value:"",prodConfirmed:false,_ts:Date.now()});
+    D.orders.push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:0,cost:0,date:el("od").value,status:"Pending",paid:"Unpaid",amtPaid:0,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?el("onotes").value:"",prodConfirmed:false,_ts:Date.now()});
     auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty+" (category/TBC)");
-    if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
-  rDel();
-  cm("m-o");rOrds(undefined,ORD_PAGE);dirty();
+    cm("m-o");rOrds(undefined,ORD_PAGE);dirty();
     toast("Order #"+newOrdId+" placed — driver confirms brand & collects payment at delivery");
     return;
   }
 
   // Exact product order — normal flow
-  var st=(D.stock||[]).find(function(s){return s.name===pn;});
+  var st=D.stock.find(function(s){return s.name===pn;});
   if(st&&st.qty<=0){
     if(!confirm("⚠️ Stock Alert\n\n"+pn+" is OUT OF STOCK (0 units).\n\nThe order will be recorded but cannot be fulfilled until restocked.\n\nContinue placing this order?"))return;
   }else if(st&&st.qty<qty){
@@ -3533,16 +3271,14 @@ auditLog("ORDER_UPDATED","Order #"+o.id+" edited by "+CU.name+" ("+CU.role+")");
   if(amtPaid>=total){payStatus="Paid";}
   else if(amtPaid>0){payStatus="Partial";}
   else{payStatus="Unpaid";}
-  (D.orders||[]).push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:price,cost:costAtSale,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?el("onotes").value:"",_ts:Date.now(),prodConfirmed:true});
+  D.orders.push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:price,cost:costAtSale,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?el("onotes").value:"",_ts:Date.now(),prodConfirmed:true});
   // Always create invoice for exact orders — provides full financial trail
-  (D.invoices||[]).push({id:nIId++,cId:cId,amount:total,paid:amtPaid,due:(function(){var dd=new Date((el("od").value||tday())+"T12:00:00");dd.setDate(dd.getDate()+7);return dd.toISOString().split("T")[0];})(),notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
+  D.invoices.push({id:nIId++,cId:cId,amount:total,paid:amtPaid,due:(function(){var dd=new Date((el("od").value||tday())+"T12:00:00");dd.setDate(dd.getDate()+7);return dd.toISOString().split("T")[0];})(),notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
   auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty);
-  if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
-  rDel();
-cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+newOrdId+" placed");
+  cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+newOrdId+" placed");
 }
 function openDlv(oid){
-  var o=(D.orders||[]).find(function(x){return x.id===oid;});if(!o)return;
+  var o=D.orders.find(function(x){return x.id===oid;});if(!o)return;
   // Ownership enforcement: driver/staff can only open their own assigned orders
   if(!can("eOrd")){
     if(o.driver&&o.driver!==CU.name){
@@ -3551,7 +3287,7 @@ function openDlv(oid){
       return;
     }
   }
-  var c=(D.customers||[]).find(function(x){return x.id===o.cId;});
+  var c=D.customers.find(function(x){return x.id===o.cId;});
   el("dlv-oid").value=oid;
   var _b=el("dlv-btl");if(_b)_b.value=o.bottle_before||"";
   var isCat=o.prodConfirmed===false;
@@ -3574,7 +3310,7 @@ function openDlv(oid){
       if(dlvProd){
         // Smart filter — match by size number in category name
         var num=(o.prod.match(/\d+/)||[""])[0];
-        var suggestions=(D.stock||[]).filter(function(s){
+        var suggestions=D.stock.filter(function(s){
           return num&&(s.name.indexOf(num)!==-1||(s.size&&s.size.indexOf(num)!==-1));
         });
         if(!suggestions.length)suggestions=D.stock;
@@ -3620,7 +3356,7 @@ function openDlv(oid){
 }
 function completeDlv(){
   var oid=parseInt(el("dlv-oid").value);
-  var o=(D.orders||[]).find(function(x){return x.id===oid;});if(!o)return;
+  var o=D.orders.find(function(x){return x.id===oid;});if(!o)return;
   // Triple-enforced ownership check — cannot be bypassed
   if(!can("eOrd")&&o.driver&&o.driver!==CU.name){
     toast("Security: you are not assigned to Order #"+oid,"err");
@@ -3649,8 +3385,7 @@ function completeDlv(){
     var confirmedProd=parts[0];
     var confirmedPrice=parseInt(parts[1])||0;
     // Deduct stock now
-    var st=(D.stock||[]).find(function(s){return s.name===confirmedProd;});
-    var stCost=st; // read cost BEFORE stock deduction
+    var st=D.stock.find(function(s){return s.name===confirmedProd;});
     if(st){
       if(st.qty<o.qty){
         if(!confirm("⚠️ Only "+st.qty+" in stock but delivering "+o.qty+".\n\nStock will go to 0. Continue?"))return;
@@ -3660,6 +3395,7 @@ function completeDlv(){
       st.history.push({ts:tday(),type:"sale",qty:-o.qty,by:CU.name,ordId:o.id,bal:st.qty});
       if(st.history.length>50)st.history=st.history.slice(-50);
     }
+    var stCost=D.stock.find(function(s){return s.name===confirmedProd;});
     // Update order with confirmed product
     o.prod=confirmedProd;
     o.price=confirmedPrice;
@@ -3677,11 +3413,11 @@ function completeDlv(){
     var amt=parseFloat(el("dlv-amt").value)||0;
     var total=o.qty*o.price;
     // Find or create invoice
-    var inv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+oid)!==-1;});
+    var inv=D.invoices.find(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+oid)!==-1;});
     if(isCat&&!inv&&total>0){
       // Create invoice now for category orders (was deferred until delivery)
       inv={id:nIId++,cId:o.cId,amount:total,paid:0,due:tday(),notes:"Order #"+oid,date:tday(),payments:[]};
-      (D.invoices||[]).push(inv);
+      D.invoices.push(inv);
     }
     if(amt>0&&inv){
       if(!inv.payments)inv.payments=[];
@@ -3693,7 +3429,7 @@ function completeDlv(){
         // Overpayment → customer credit
         var dlvOver=amt-dlvAmt;
         if(dlvOver>0){
-          var dlvCu=(D.customers||[]).find(function(x){return x.id===o.cId;});
+          var dlvCu=D.customers.find(function(x){return x.id===o.cId;});
           if(dlvCu){
             dlvCu.credit=(dlvCu.credit||0)+dlvOver;
             if(!dlvCu.creditLog)dlvCu.creditLog=[];
@@ -3720,7 +3456,7 @@ function completeDlv(){
     if(staffCash>0){
       if(!D.pendingPayments)D.pendingPayments=[];
       var dlvMeth=el("dlv-method")?el("dlv-method").value:"Cash";
-      (D.pendingPayments||[]).push({id:uid(),ordId:o.id,cId:o.cId,amt:staffCash,method:dlvMeth,collectedBy:CU.name,collectedRole:CU.role,date:tday(),ack:false});
+      D.pendingPayments.push({id:uid(),ordId:o.id,cId:o.cId,amt:staffCash,method:dlvMeth,collectedBy:CU.name,collectedRole:CU.role,date:tday(),ack:false});
       auditLog("CASH_PENDING","KSh "+staffCash+" cash collected by "+CU.name+" ("+CU.role+") at delivery of Order #"+o.id+" — pending director acknowledgement");
       toast("KSh "+staffCash.toLocaleString()+" cash recorded — awaiting director confirmation","warn");
     }
@@ -3731,7 +3467,7 @@ function completeDlv(){
   // Water delivery cycle counter
   var _isWater=is20ltr(o.prod);
   if(_isWater){
-    var _cu=(D.customers||[]).find(function(x){return x.id===o.cId;});
+    var _cu=D.customers.find(function(x){return x.id===o.cId;});
     if(_cu){
       var _prevCycle=_cu.waterCycle||0;
       _cu.waterCycle=_prevCycle+o.qty; // add bottles delivered
@@ -3750,21 +3486,20 @@ function completeDlv(){
   }
   cm("m-dlv");rOrds(undefined,ORD_PAGE);rDel();
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
-  if(el("pg-customers")&&el("pg-customers").classList.contains("act"))rCusts();
   updateStockBadge();
   dirty();
   toast(isCat?"Delivery completed — "+o.prod+" confirmed!":"Delivery completed!");
 }
 function delO(id){
   if(!can("dOrd"))return;
-  var o=(D.orders||[]).find(function(x){return x.id===id;});if(!o)return;
-  var hasPaid=(D.invoices||[]).some(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+id)!==-1&&i.paid>0;});
+  var o=D.orders.find(function(x){return x.id===id;});if(!o)return;
+  var hasPaid=D.invoices.some(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+id)!==-1&&i.paid>0;});
   var msg=hasPaid?
     "Delete order #"+id+"?\n\nThis order has payments on record. The invoice will be kept for your financial records, but the order will be removed.":
     "Delete order #"+id+"? The linked invoice will also be removed.";
   if(!confirm(msg))return;
   // Restore stock — skip for category orders (prodConfirmed===false means no stock was deducted)
-  var st=(D.stock||[]).find(function(s){return s.name===o.prod;});
+  var st=D.stock.find(function(s){return s.name===o.prod;});
   var wasStockDeducted=(o.prodConfirmed!==false);
   if(st&&o.status!=="Delivered"&&o.status!=="Cancelled"&&wasStockDeducted){
     st.qty+=o.qty;
@@ -3774,9 +3509,9 @@ function delO(id){
     updateStockBadge();
   }
   // Remove order
-  D.orders=(D.orders||[]).filter(function(x){return x.id!==id;});
+  D.orders=D.orders.filter(function(x){return x.id!==id;});
   // Remove unpaid invoices only — keep paid ones for records
-  D.invoices=(D.invoices||[]).filter(function(i){
+  D.invoices=D.invoices.filter(function(i){
     var linked=i.notes&&i.notes.indexOf("#"+id)!==-1;
     if(linked&&i.paid<=0)return false;
     return true;
@@ -3789,10 +3524,10 @@ function delO(id){
 
 function cancelO(id){
   if(!can("eOrd"))return;
-  var o=(D.orders||[]).find(function(x){return x.id===id;});if(!o)return;
+  var o=D.orders.find(function(x){return x.id===id;});if(!o)return;
   if(o.status==="Cancelled"){toast("Already cancelled");return;}
   if(o.status==="Delivered"){toast("Cannot cancel a delivered order — delete it if needed","err");return;}
-  var inv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+id)!==-1;});
+  var inv=D.invoices.find(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+id)!==-1;});
   var hasPaid=inv&&inv.paid>0;
   var isCatOrder=(o.prodConfirmed===false);
   var msg=hasPaid?
@@ -3801,7 +3536,7 @@ function cancelO(id){
   if(!confirm(msg))return;
   // Restore stock
   var skipStockRestore=(o.prodConfirmed===false);
-  var st=(D.stock||[]).find(function(s){return s.name===o.prod;});
+  var st=D.stock.find(function(s){return s.name===o.prod;});
   if(st&&!skipStockRestore){
     st.qty+=o.qty;
     if(!st.history)st.history=[];
@@ -3819,27 +3554,27 @@ function cancelO(id){
       inv.amount=inv.paid;
     }else{
       // Remove fully unpaid invoice
-      D.invoices=(D.invoices||[]).filter(function(i){return i.id!==inv.id;});
+      D.invoices=D.invoices.filter(function(i){return i.id!==inv.id;});
     }
   }
   auditLog("ORDER_CANCELLED","Order #"+id+" cancelled by "+CU.name+" ("+CU.role+"). Product: "+o.prod+", Qty: "+o.qty+(hasPaid?", KSh "+inv.paid+" already paid — invoice kept":""));
-  rOrds(undefined,ORD_PAGE);rDel();
+  rOrds(undefined,ORD_PAGE);
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   dirty();toast("Order #"+id+" cancelled"+(skipStockRestore?" — category order":" — stock restored"));
 }
 var _assignOid=0;
 function assignDriver(oid){
   if(!can("eOrd")){toast("Managers only","err");return;}
-  var o=(D.orders||[]).find(function(x){return x.id===oid;});if(!o)return;
+  var o=D.orders.find(function(x){return x.id===oid;});if(!o)return;
   _assignOid=oid;
-  var drivers=(USERS||[]).filter(function(u){return u.role==="driver"||u.role==="staff";});
+  var drivers=USERS.filter(function(u){return u.role==="driver"||u.role==="staff";});
   var info=el("assign-order-info");
   if(info)info.innerHTML="#"+oid+" &mdash; "+o.prod+" &times;"+o.qty+(o.driver?" <span style=\"color:var(--tx2)\">(currently: "+o.driver+")</span>":"");
   var sel=el("assign-who");
   if(sel){
     sel.innerHTML="<option value=\"\">— Unassigned —</option>";
     drivers.forEach(function(d){
-      var pend=(D.orders||[]).filter(function(x){return x.driver===d.name&&x.status!=="Delivered"&&x.status!=="Cancelled";}).length;
+      var pend=D.orders.filter(function(x){return x.driver===d.name&&x.status!=="Delivered"&&x.status!=="Cancelled";}).length;
       var opt=document.createElement("option");
       opt.value=d.name;
       opt.textContent=d.name+" ("+d.role+")"+(pend?" · "+pend+" pending":"· free");
@@ -3852,7 +3587,7 @@ function assignDriver(oid){
   om("m-assign");
 }
 function doAssignDriver(){
-  var o=(D.orders||[]).find(function(x){return x.id===_assignOid;});if(!o)return;
+  var o=D.orders.find(function(x){return x.id===_assignOid;});if(!o)return;
   var name=el("assign-who")?el("assign-who").value:"";
   var prev=o.driver||"Unassigned";
   o.driver=name;
@@ -3866,33 +3601,34 @@ function rDel(q){
   if(q!==undefined)DEL_Q=q;
   var prevFocus=document.activeElement&&document.activeElement.id==="del-srch";
   var pg=el("pg-delivery");if(!pg)return;
-  var allPend=(D.orders||[]).filter(function(o){return o.status==="Pending"||o.status==="Processing"||o.status==="Out for delivery";});
+  var allPend=D.orders.filter(function(o){return o.status==="Pending"||o.status==="Processing"||o.status==="Out for delivery";});
   // Staff: see only pending orders assigned to them (today focus)
   // Driver: see only pending orders assigned to them
   // Manager/Director: see all pending
-  // All roles see all pending orders on the board
-  // Delivery board gives full operational visibility to everyone
-  // completeDlv enforces who can actually mark complete
-  var pend=allPend;
+  var pend=(CU&&CU.role==="driver")
+    ?allPend.filter(function(o){return o.driver===CU.name;})
+    :(CU&&CU.role==="staff")
+      ?allPend.filter(function(o){return o.driver===CU.name||o.deliver===CU.name;})
+      :allPend;
   var _dlvNow=new Date();
   var _dlvTd=tday();
   var _dlvDow=_dlvNow.getDay();
   var _dlvWkStart=new Date(_dlvNow);_dlvWkStart.setDate(_dlvNow.getDate()-(_dlvDow===0?6:_dlvDow-1));
-  var _dlvWkS=_ymd(_dlvWkStart); // local-safe
+  var _dlvWkS=_dlvWkStart.toISOString().slice(0,10);
   var _dlvMo=_dlvNow.getFullYear()+"-"+String(_dlvNow.getMonth()+1).padStart(2,"0");
-  var todayDel=(D.orders||[]).filter(function(o){return o.status==="Delivered"&&(o.deliveredAt===_dlvTd||(!o.deliveredAt&&o.date===_dlvTd));}).length;
+  var todayDel=D.orders.filter(function(o){return o.status==="Delivered"&&(o.deliveredAt===_dlvTd||(!o.deliveredAt&&o.date===_dlvTd));}).length;
   // Use deliveredAt (set by completeDlv) for accuracy; fall back to o.date
-  var weekDel=(D.orders||[]).filter(function(o){
+  var weekDel=D.orders.filter(function(o){
     if(o.status!=="Delivered")return false;
     var dd=o.deliveredAt||o.date;return dd&&dd>=_dlvWkS&&dd<=_dlvTd;
   }).length;
-  var monthDel=(D.orders||[]).filter(function(o){
+  var monthDel=D.orders.filter(function(o){
     if(o.status!=="Delivered")return false;
     var dd=o.deliveredAt||o.date;return dd&&dd.startsWith(_dlvMo);
   }).length;
-  var totalDel=(D.orders||[]).filter(function(o){return o.status==="Delivered";}).length;
+  var totalDel=D.orders.filter(function(o){return o.status==="Delivered";}).length;
   var q2=DEL_Q||"";
-  var pendFil=q2?pend.filter(function(o){var cu=(D.customers||[]).find(function(x){return x.id===o.cId;});var lq=q2.toLowerCase();return(cu&&((can("vPhone")&&cu.name.toLowerCase().indexOf(lq)!==-1)||cAddr(cu).toLowerCase().indexOf(lq)!==-1))||String(o.id).indexOf(DEL_Q)!==-1||o.prod.toLowerCase().indexOf(lq)!==-1||(o.driver&&o.driver.toLowerCase().indexOf(lq)!==-1);}):pend;
+  var pendFil=q2?pend.filter(function(o){var cu=D.customers.find(function(x){return x.id===o.cId;});var lq=q2.toLowerCase();return(cu&&((can("vPhone")&&cu.name.toLowerCase().indexOf(lq)!==-1)||cAddr(cu).toLowerCase().indexOf(lq)!==-1))||String(o.id).indexOf(DEL_Q)!==-1||o.prod.toLowerCase().indexOf(lq)!==-1||(o.driver&&o.driver.toLowerCase().indexOf(lq)!==-1);}):pend;
   // Partial render: build shell once, only update results on search
   if(!el("del-srch")){
     pg.innerHTML=
@@ -3910,18 +3646,18 @@ function rDel(q){
     "<div class=\"stat sa\" style=\"cursor:pointer\" onclick=\"nav('orders',null);setTimeout(function(){filterOrds('Pending');},80)\"><div class=\"sl\">Pending</div><div class=\"sv\">"+pend.length+"</div><div class=\"ss\">view all &rarr;</div></div>"+
     "<div class=\"stat sk\" style=\"cursor:pointer\" onclick=\"nav('orders',null);setTimeout(function(){ORD_STATUS_F='Delivered';ORD_DATE_F=tday();rOrds(undefined,0);},80)\"><div class=\"sl\">Delivered today</div><div class=\"sv\">"+todayDel+"</div><div class=\"ss\">view &rarr;</div></div>"+
     (CU&&CU.role==="staff"?
-    "<div class=\"stat sb\"><div class=\"sl\">Routes</div><div class=\"sv\">"+(D.routes||[]).length+"</div></div>":// staff see Pending, Today, Routes only
+    "<div class=\"stat sb\"><div class=\"sl\">Routes</div><div class=\"sv\">"+D.routes.length+"</div></div>":// staff see Pending, Today, Routes only
     "<div class=\"stat sn\"><div class=\"sl\">This week</div><div class=\"sv\">"+weekDel+"</div><div class=\"ss\">delivered</div></div>"+
     "<div class=\"stat sb\"><div class=\"sl\">This month</div><div class=\"sv\">"+monthDel+"</div><div class=\"ss\">delivered</div></div>"+
     "<div class=\"stat sn\" style=\"cursor:pointer\" onclick=\"nav('orders',null);setTimeout(function(){filterOrds('Delivered');},80)\"><div class=\"sl\">Total delivered</div><div class=\"sv\">"+totalDel+"</div><div class=\"ss\">view all &rarr;</div></div>"+
-    "<div class=\"stat sb\"><div class=\"sl\">Routes</div><div class=\"sv\">"+(D.routes||[]).length+"</div></div>")
+    "<div class=\"stat sb\"><div class=\"sl\">Routes</div><div class=\"sv\">"+D.routes.length+"</div></div>")
   var _dr=el("del-results");
   if(_dr)_dr.innerHTML=
     "<div class=\"tw\"><table>"+
     "<thead><tr><th>#</th><th>Customer</th><th>Full address</th><th>Product</th><th>Qty</th><th>Bottle before</th><th>Assigned</th><th>Payment</th><th>Status</th><th style=\"width:30px\" title=\"Notes/Instructions\">&#128196;</th><th></th></tr></thead>"+
     "<tbody>"+
       (pendFil.length?pendFil.map(function(o){
-        var c=(D.customers||[]).find(function(x){return x.id===o.cId;});
+        var c=D.customers.find(function(x){return x.id===o.cId;});
         return "<tr><td style=\"font-weight:700\">#"+o.id+"</td>"+
           "<td><div style=\"font-weight:700\">"+(c?(can("vPhone")?c.name:maskName(c.name)):"&mdash;")+"</div><div class=\"ca\">"+(c&&can("vPhone")?c.phone:"")+"</div></td>"+
           "<td style=\"font-size:11px\">"+(c?[c.estate,c.court,c.house?"No."+c.house:"",c.htype].filter(Boolean).join(", "):(o.deliver||"&mdash;"))+"</td>"+
@@ -3957,7 +3693,7 @@ function rDel(q){
 }
 
 function showStockHistory(sid){
-  var s=(D.stock||[]).find(function(x){return x.id===sid;});if(!s)return;
+  var s=D.stock.find(function(x){return x.id===sid;});if(!s)return;
   var hist=(s.history||[]).slice().reverse(); // newest first
   var html="<div style=\"padding:16px 20px\">"
     +"<div style=\"font-size:14px;font-weight:800;margin-bottom:12px;color:var(--nv)\">"
@@ -3991,7 +3727,7 @@ function showStockHistory(sid){
   om("m-generic");
 }
 function updateStockBadge(){
-  var low=(D.stock||[]).filter(function(s){return s.qty<=s.min;}).length;
+  var low=D.stock.filter(function(s){return s.qty<=s.min;}).length;
   var btn=document.getElementById("nav-stock-btn");
   if(!btn)return;
   // Remove existing badge
@@ -4010,7 +3746,7 @@ function rStock(q,pg){
   if(pg!==undefined)STK_PAGE=pg;
   var q2=STK_Q||"";
   var pgEl=el("pg-stock");if(!pgEl)return;
-  var fil=(D.stock||[]).filter(function(s){if(!q2)return true;var lq=q2.toLowerCase();return s.name.toLowerCase().indexOf(lq)!==-1||(s.size&&s.size.toLowerCase().indexOf(lq)!==-1);});
+  var fil=D.stock.filter(function(s){if(!q2)return true;var lq=q2.toLowerCase();return s.name.toLowerCase().indexOf(lq)!==-1||(s.size&&s.size.toLowerCase().indexOf(lq)!==-1);});
   // Sort: low stock first (critical → warning → ok), then alphabetical within each tier
   fil=fil.slice().sort(function(a,b){
     var aLow=a.qty<=a.min?0:a.qty<=a.min*1.5?1:2;
@@ -4021,7 +3757,7 @@ function rStock(q,pg){
   var paged=paginate(fil,STK_PAGE);
   if(!el("stk-srch")){
     pgEl.innerHTML=
-    "<div class=\"ph\"><h1>Stock Management</h1><p>"+(D.stock||[]).length+" products &middot; "+(D.stock||[]).filter(function(s){return s.qty<=s.min;}).length+" low stock</p></div>"+
+    "<div class=\"ph\"><h1>Stock Management</h1><p>"+D.stock.length+" products &middot; "+D.stock.filter(function(s){return s.qty<=s.min;}).length+" low stock</p></div>"+
     "<div class=\"toolbar\">"+
       "<div class=\"srch\"><i class=\"ti ti-search\"></i><input id=\"stk-srch\" type=\"text\" autocomplete=\"off\" autocorrect=\"off\" autocapitalize=\"off\" spellcheck=\"false\" inputmode=\"search\" placeholder=\"Search product name or size...\" oninput=\"rStock(this.value,0)\" value=\""+q2+"\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
       (can("aSt")?"<button class=\"btn btn-gold\" onclick=\"prepStAdd()\"><i class=\"ti ti-plus\"></i> Add product</button>":"")+
@@ -4051,7 +3787,6 @@ function rStock(q,pg){
 
 }
 function prepStAdd(){
-  if(el("sw"))el("sw").checked=false;
   el("s-edit-id").value="";
   ["sn","ss","sp","sc","sq","sm"].forEach(function(id){el(id).value="";});
   el("m-s-title").innerHTML="<i class=\"ti ti-package\" style=\"color:var(--gd);margin-right:7px\"></i>Add Product";
@@ -4063,62 +3798,42 @@ function saveSt(){
   var n=el("sn").value.trim();if(!n){toast("Name required","err");return;}
   var editId=el("s-edit-id").value;
   if(editId){
-    var s=(D.stock||[]).find(function(x){return String(x.id)===String(editId);});
+    var s=D.stock.find(function(x){return String(x.id)===String(editId);});
     if(s){
       s.name=n;s.size=el("ss").value;s.price=parseFloat(el("sp").value)||0;
       s.cost=parseFloat(el("sc").value)||0;s.qty=parseInt(el("sq").value)||0;s.min=parseInt(el("sm").value)||10;
-      s.isWater=el("sw")&&el("sw").checked?true:false;
-      auditLog("STOCK_UPDATED","Product saved by "+CU.name+" ("+CU.role+"): "+n+(s.isWater?" [water cycle product]":""));
-      if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
-cm("m-s");rStock();dirty();
-      // Re-sync water cycles after isWater change (targeted, no race with dirty)
-      if(s.isWater)setTimeout(syncWaterCycles,1500);
-      toast(n+" updated"+(s.isWater?" — water cycle tracking enabled":""));
+      auditLog("STOCK_UPDATED","Product saved by "+CU.name+" ("+CU.role+"): "+n);
+      cm("m-s");rStock();dirty();toast(n+" updated");
       return;
     }
   }
-  (D.stock||[]).push({id:uid(),name:n,size:el("ss").value,price:parseFloat(el("sp").value)||0,cost:parseFloat(el("sc").value)||0,qty:parseInt(el("sq").value)||0,min:parseInt(el("sm").value)||10,isWater:el("sw")&&el("sw").checked?true:false});
+  D.stock.push({id:uid(),name:n,size:el("ss").value,price:parseFloat(el("sp").value)||0,cost:parseFloat(el("sc").value)||0,qty:parseInt(el("sq").value)||0,min:parseInt(el("sm").value)||10});
   ["sn","ss","sp","sc","sq","sm"].forEach(function(id){el(id).value="";});cm("m-s");rStock();dirty();toast(n+" added");
 }
 function editSt(id){
   if(!can("eSt"))return;
-  var s=(D.stock||[]).find(function(x){return x.id===id;});
+  var s=D.stock.find(function(x){return x.id===id;});
   if(!s)return;
   el("s-edit-id").value=s.id;
   el("sn").value=s.name||"";el("ss").value=s.size||"";el("sp").value=s.price||0;
   el("sc").value=s.cost||0;el("sq").value=s.qty||0;el("sm").value=s.min||10;
-  if(el("sw"))el("sw").checked=!!s.isWater;
   el("m-s-title").innerHTML="<i class=\"ti ti-edit\" style=\"color:var(--gd);margin-right:7px\"></i>Edit Product";
   el("m-s-save").innerHTML="<i class=\"ti ti-check\"></i> Update";
   om("m-s");
 }
-function prepRS(){var rp=el("rp");if(rp)rp.innerHTML=(D.stock||[]).map(function(x){return "<option value=\""+x.id+"\">"+x.name+" ("+x.qty+" in stock)</option>";}).join("");om("m-rs");}
-function doRS(){if(!can("aSt")){toast("Permission denied","err");return;}var id=parseInt(el("rp").value);var q=parseInt(el("rq").value)||0;if(q<=0){toast("Enter quantity to add","err");return;}var p=(D.stock||[]).find(function(s){return s.id===id;});if(p){p.qty+=q;
+function prepRS(){var rp=el("rp");if(rp)rp.innerHTML=D.stock.map(function(x){return "<option value=\""+x.id+"\">"+x.name+" ("+x.qty+" in stock)</option>";}).join("");om("m-rs");}
+function doRS(){if(!can("aSt")){toast("Permission denied","err");return;}var id=parseInt(el("rp").value);var q=parseInt(el("rq").value)||0;if(q<=0){toast("Enter quantity to add","err");return;}var p=D.stock.find(function(s){return s.id===id;});if(p){p.qty+=q;
   if(!p.history)p.history=[];p.history.push({ts:tday(),type:"restock",qty:q,by:CU.name,bal:p.qty});if(p.history.length>50)p.history=p.history.slice(-50);
-  // Auto-fulfil pending orders for this product
-  var _pending=(D.orders||[]).filter(function(o){
-    return o.status==="Pending"&&o.prod===p.name&&o.prodConfirmed!==false;
-  }).sort(function(a,b){return (a.id||0)-(b.id||0);}); // oldest first
-  var _fulfilled=0;
-  _pending.forEach(function(o){
-    if(p.qty>=o.qty){
-      p.qty-=o.qty;
-      p.history.push({ts:tday(),type:"sale",qty:-o.qty,by:"Auto (restock)",ordId:o.id,bal:p.qty});
-      auditLog("STOCK_UPDATED","Auto-deducted "+o.qty+" "+p.name+" for Order #"+o.id+" (pending fulfilment after restock by "+CU.name+")");
-      _fulfilled++;
-    }
-  });
-  var _fmsg=_fulfilled>0?" — auto-deducted for "+_fulfilled+" pending order"+(+(_fulfilled>1)?"s":""):"";
-  auditLog("STOCK_RESTOCKED","+"+q+" units of "+p.name+" by "+CU.name+" ("+CU.role+"). Now: "+p.qty+(_fulfilled>0?". Fulfilled "+_fulfilled+" pending order(s)":""));toast(p.name+" restocked +"+q+" — now "+p.qty+" in stock"+_fmsg);}el("rq").value="";cm("m-rs");rStock(undefined,STK_PAGE);rDel();if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();updateStockBadge();dirty();}
+  auditLog("STOCK_RESTOCKED","+"+q+" units of "+p.name+" by "+CU.name+" ("+CU.role+"). Now: "+p.qty);toast(p.name+" restocked +"+q+" — now "+p.qty+" in stock");}el("rq").value="";cm("m-rs");rStock(undefined,STK_PAGE);if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();updateStockBadge();dirty();}
 function delS(id){
   if(!can("dSt"))return;
-  var s=(D.stock||[]).find(function(x){return x.id===id;});if(!s)return;
-  var activeOrds=(D.orders||[]).filter(function(o){return o.prod===s.name&&o.status!=="Delivered"&&o.status!=="Cancelled";});
+  var s=D.stock.find(function(x){return x.id===id;});if(!s)return;
+  var activeOrds=D.orders.filter(function(o){return o.prod===s.name&&o.status!=="Delivered"&&o.status!=="Cancelled";});
   var msg="Remove "+s.name+"?";
   if(activeOrds.length)msg+="\n\n⚠ "+activeOrds.length+" active order(s) reference this product.";
   msg+="\n\nThis cannot be undone.";
   if(!confirm(msg))return;
-  D.stock=(D.stock||[]).filter(function(x){return x.id!==id;});rStock();dirty();toast(s.name+" removed from stock");
+  D.stock=D.stock.filter(function(x){return x.id!==id;});rStock();dirty();toast(s.name+" removed from stock");
 }
 
 function rInvs(q,pg){
@@ -4128,17 +3843,17 @@ function rInvs(q,pg){
   var pgEl=el("pg-invoices");if(!pgEl)return;
   var td=tday();
   var fil=[].concat(D.invoices).reverse();
-  if(q2){var lq=q2.toLowerCase();fil=fil.filter(function(i){var c=(D.customers||[]).find(function(x){return x.id===i.cId;});return(c&&(can("vPhone")&&c.name.toLowerCase().indexOf(lq)!==-1))||String(i.id).indexOf(q2)!==-1||String(i.amount).indexOf(q2)!==-1;});}
+  if(q2){var lq=q2.toLowerCase();fil=fil.filter(function(i){var c=D.customers.find(function(x){return x.id===i.cId;});return(c&&(can("vPhone")&&c.name.toLowerCase().indexOf(lq)!==-1))||String(i.id).indexOf(q2)!==-1||String(i.amount).indexOf(q2)!==-1;});}
   var paged=paginate(fil,INV_PAGE);
   // Show pending cash payments requiring acknowledgement (director/manager only)
   var pendingBanner="";
-  if(can("mPaid")&&D.pendingPayments&&(D.pendingPayments||[]).length){
-    var pendUnacked=(D.pendingPayments||[]).filter(function(p){return !p.ack;});
+  if(can("mPaid")&&D.pendingPayments&&D.pendingPayments.length){
+    var pendUnacked=D.pendingPayments.filter(function(p){return !p.ack;});
     if(pendUnacked.length){
       pendingBanner="<div style=\"background:#fff8e1;border:2px solid #f39c12;border-radius:12px;padding:14px 16px;margin-bottom:14px\">"+
         "<div style=\"font-weight:800;font-size:13px;color:#856404;margin-bottom:10px\"><i class=\"ti ti-cash\" style=\"margin-right:6px\"></i>"+pendUnacked.length+" Cash Collection(s) Awaiting Acknowledgement</div>"+
         pendUnacked.map(function(p){
-          var oc=(D.customers||[]).find(function(x){return x.id===p.cId;});
+          var oc=D.customers.find(function(x){return x.id===p.cId;});
           return "<div style=\"display:flex;align-items:center;justify-content:space-between;background:#fff;border-radius:8px;padding:10px 12px;margin-bottom:7px;border:1px solid #f39c12\">"+
             "<div>"+
               "<div style=\"font-weight:700;font-size:13px\">KSh "+p.amt.toLocaleString()+" &bull; "+(oc?oc.name:"Customer")+"</div>"+
@@ -4163,7 +3878,7 @@ function rInvs(q,pg){
       "<div id=\"inv-results\"></div>";
   }
   var _is=el("inv-stats");
-  if(_is)_is.innerHTML=(D.invoices||[]).length+" total &middot; "+(D.invoices||[]).filter(function(i){return i.paid>=i.amount;}).length+" paid &middot; "+(D.invoices||[]).filter(function(i){return i.paid<i.amount&&i.due&&i.due<td;}).length+" overdue";
+  if(_is)_is.innerHTML=D.invoices.length+" total &middot; "+D.invoices.filter(function(i){return i.paid>=i.amount;}).length+" paid &middot; "+D.invoices.filter(function(i){return i.paid<i.amount&&i.due&&i.due<td;}).length+" overdue";
   var _ip=el("inv-pending");if(_ip)_ip.innerHTML=pendingBanner;
   var _ir=el("inv-results");
   if(_ir)_ir.innerHTML=
@@ -4173,7 +3888,7 @@ function rInvs(q,pg){
 }function invRows(fil){
   var td=tday();if(!fil.length)return "<tr><td colspan=\"9\"><div class=\"te\"><i class=\"ti ti-receipt\"></i><p>No invoices found</p></div></td></tr>";
   return fil.map(function(i){
-    var c=(D.customers||[]).find(function(x){return x.id===i.cId;});var bal=i.amount-i.paid;var ov=bal>0&&i.due&&i.due<td;
+    var c=D.customers.find(function(x){return x.id===i.cId;});var bal=i.amount-i.paid;var ov=bal>0&&i.due&&i.due<td;
     var st=bal<=0?"<span class=\"badge bg\"><i class=\"ti ti-check\"></i>Paid</span>":ov?"<span class=\"badge br\"><i class=\"ti ti-alert-circle\"></i>Overdue</span>":"<span class=\"badge ba\">Unpaid</span>";
     var lp=(i.payments||[]).slice().sort(function(a,b){return b.date>a.date?1:-1;})[0];
     var iph=c?(can("vPhone")?c.phone:maskPhone(c.phone)):"";
@@ -4205,7 +3920,7 @@ function filterInvs(f){
 }
 function prepIv(){
   el("iv-edit-id").value="";
-  var s=el("ivc");if(s)s.innerHTML=(D.customers||[]).map(function(c){return "<option value=\""+c.id+"\">"+c.name+"</option>";}).join("");
+  var s=el("ivc");if(s)s.innerHTML=D.customers.map(function(c){return "<option value=\""+c.id+"\">"+c.name+"</option>";}).join("");
   var d=el("ivd");if(d)d.value=new Date(Date.now()+30*86400000).toISOString().split("T")[0];
   el("iva").value="";el("ivp").value="0";el("ivn").value="";
   el("m-iv-title").innerHTML="<i class=\"ti ti-receipt\" style=\"color:var(--gd);margin-right:7px\"></i>New Invoice";
@@ -4214,12 +3929,12 @@ function prepIv(){
 }
 function editInv(id){
   if(!can("eInv"))return;
-  var i=(D.invoices||[]).find(function(x){return x.id===id;});if(!i)return;
+  var i=D.invoices.find(function(x){return x.id===id;});if(!i)return;
   // Directors can edit even with payments — generates audit trail
   if(i.payments&&i.payments.length&&!can("rest")){
     toast("Cannot edit — payments recorded. Only a Director can override.","err");return;
   }
-  var s=el("ivc");if(s)s.innerHTML=(D.customers||[]).map(function(c){return "<option value=\""+c.id+"\""+(c.id===i.cId?" selected":"")+">"+c.name+"</option>";}).join("");
+  var s=el("ivc");if(s)s.innerHTML=D.customers.map(function(c){return "<option value=\""+c.id+"\""+(c.id===i.cId?" selected":"")+">"+c.name+"</option>";}).join("");
   el("iv-edit-id").value=i.id;
   el("iva").value=i.amount;el("ivp").value=i.paid;el("ivd").value=i.due;el("ivn").value=i.notes||"";
   // If invoice has payments, make paid field read-only — it's recalculated from payments
@@ -4241,14 +3956,14 @@ function editInv(id){
 }
 function saveInv(){
   if(!can("aInv")&&!can("eInv"))return;
-  var cId=parseInt(el("ivc")&&el("ivc").value)||0;var a=parseFloat(el("iva").value)||0;var p=parseFloat(el("ivp").value)||0;
+  var cId=parseInt(el("ivc").value);var a=parseFloat(el("iva").value)||0;var p=parseFloat(el("ivp").value)||0;
   if(!a||a<=0){toast("Amount must be greater than 0","err");return;}
   // Default due date to 30 days from today if not set
   if(el("ivd")&&!el("ivd").value){var d30=new Date();d30.setDate(d30.getDate()+30);el("ivd").value=d30.toISOString().split("T")[0];}
   if(p>a){toast("Amount paid cannot exceed invoice total","err");return;}
   var editId=el("iv-edit-id").value;
   if(editId){
-    var i=(D.invoices||[]).find(function(x){return String(x.id)===String(editId);});
+    var i=D.invoices.find(function(x){return String(x.id)===String(editId);});
     if(i){
       if(i.payments&&i.payments.length){
         if(!can("rest")){toast("Cannot edit — payments recorded. Director only.","err");return;}
@@ -4269,27 +3984,27 @@ function saveInv(){
       }
       // Sync linked order
       var ordMatch=i.notes&&i.notes.match(/#(\d+)/);
-      if(ordMatch){var o=(D.orders||[]).find(function(x){return String(x.id)===ordMatch[1];});if(o){if(i.paid>=i.amount){o.paid="Paid";}else if(i.paid>0){o.paid="Partial";}else{o.paid="Unpaid";}o.amtPaid=i.paid;}}
+      if(ordMatch){var o=D.orders.find(function(x){return String(x.id)===ordMatch[1];});if(o){if(i.paid>=i.amount){o.paid="Paid";}else if(i.paid>0){o.paid="Partial";}else{o.paid="Unpaid";}o.amtPaid=i.paid;}}
       cm("m-iv");rInvs(undefined,INV_PAGE);dirty();toast("Invoice #"+editId+" updated");
       return;
     }
   }
-  (D.invoices||[]).push({id:nIId++,cId:cId,amount:a,paid:p,due:el("ivd").value,notes:el("ivn").value,date:tday(),payments:p>0?[{date:tday(),amt:p,method:"Cash",ref:"Opening"}]:[]});
+  D.invoices.push({id:nIId++,cId:cId,amount:a,paid:p,due:el("ivd").value,notes:el("ivn").value,date:tday(),payments:p>0?[{date:tday(),amt:p,method:"Cash",ref:"Opening"}]:[]});
   el("iva").value="";el("ivp").value="0";el("ivn").value="";cm("m-iv");rInvs(undefined,INV_PAGE);dirty();toast("Invoice created");
 }
 function ackPendingPay(id){
   if(!can("mPaid")){toast("No permission","err");return;}
   if(!D.pendingPayments)return;
-  var pp=(D.pendingPayments||[]).find(function(x){return x.id===id;});
+  var pp=D.pendingPayments.find(function(x){return x.id===id;});
   if(!pp||pp.ack){toast("Already acknowledged","warn");return;}
   // Apply payment to linked invoice
-  var inv=(D.invoices||[]).find(function(i){return i.cId===pp.cId&&i.paid<i.amount;});
+  var inv=D.invoices.find(function(i){return i.cId===pp.cId&&i.paid<i.amount;});
   if(inv){
     var apply=Math.min(pp.amt,inv.amount-inv.paid);
     inv.paid+=apply;
     if(!inv.payments)inv.payments=[];
     inv.payments.push({date:tday(),amt:apply,method:pp.method,ref:"Staff collection by "+pp.collectedBy+" — ack by "+CU.name});
-    if(inv.paid>=inv.amount){var o=(D.orders||[]).find(function(x){return x.id===pp.ordId;});if(o)o.paid="Paid";}
+    if(inv.paid>=inv.amount){var o=D.orders.find(function(x){return x.id===pp.ordId;});if(o)o.paid="Paid";}
   }
   pp.ack=true;pp.ackedBy=CU.name;pp.ackedDate=tday();
   auditLog("CASH_ACKNOWLEDGED","Director "+CU.name+" acknowledged KSh "+pp.amt+" cash collected by "+pp.collectedBy+" for Order #"+pp.ordId);
@@ -4305,7 +4020,7 @@ function ackPendingPay(id){
 // payI: open payment modal pre-filled for full balance
 function payI(id){
   if(!can("mPaid")){toast("No permission","err");return;}
-  var i=(D.invoices||[]).find(function(x){return x.id===id;});if(!i)return;
+  var i=D.invoices.find(function(x){return x.id===id;});if(!i)return;
   var bal=i.amount-i.paid;
   if(bal<=0){toast("Invoice already fully paid","err");return;}
   openPayInv(id); // opens standard payment modal pre-filled
@@ -4320,7 +4035,7 @@ function payCalc(){
   pc.style.display="block";
   if(invId){
     // Invoice-specific: show balance for this invoice only
-    var inv=(D.invoices||[]).find(function(x){return x.id===invId;});
+    var inv=D.invoices.find(function(x){return x.id===invId;});
     if(!inv){pc.style.display="none";return;}
     var bal=inv.amount-inv.paid;
     var after=Math.max(0,bal-amt);
@@ -4335,9 +4050,9 @@ function payCalc(){
       +"</div></div>";
     pc.style.borderColor=over?"#e67e22":"#27ae60";
   }else{
-    var cu3=(D.customers||[]).find(function(x){return x.id===cId;});
+    var cu3=D.customers.find(function(x){return x.id===cId;});
     var existCr=(cu3&&cu3.credit>0)?cu3.credit:0;
-    var debt=(D.invoices||[]).filter(function(i){return i.cId===cId&&i.paid<i.amount&&!i.voided;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
+    var debt=D.invoices.filter(function(i){return i.cId===cId&&i.paid<i.amount&&!i.voided;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
     var effectiveAmt=amt+existCr; // credit applied first
     var after2=Math.max(0,debt-effectiveAmt);
     var over2=effectiveAmt>debt;
@@ -4354,8 +4069,8 @@ function payCalc(){
   }
 }
 function openPayInv(id){
-  var i=(D.invoices||[]).find(function(x){return x.id===id;});if(!i)return;
-  var c=(D.customers||[]).find(function(x){return x.id===i.cId;});
+  var i=D.invoices.find(function(x){return x.id===id;});if(!i)return;
+  var c=D.customers.find(function(x){return x.id===i.cId;});
   var bal=i.amount-i.paid;
   el("pay-cid").value=i.cId;
   // Store invoice id so recPay can sync it
@@ -4385,7 +4100,7 @@ function openPayInv(id){
 function ageing(cId){
   var td=tday();
   var tdMs=new Date(td+"T12:00:00").getTime();
-  var invs=(D.invoices||[]).filter(function(i){return i.cId===cId&&i.paid<i.amount&&i.due;});
+  var invs=D.invoices.filter(function(i){return i.cId===cId&&i.paid<i.amount&&i.due;});
   var d30=invs.filter(function(i){var dMs=new Date(i.due+"T12:00:00").getTime();return dMs>=tdMs||(tdMs-dMs)<=30*86400000;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
   var d60=invs.filter(function(i){var dMs=new Date(i.due+"T12:00:00").getTime();var diff=tdMs-dMs;return diff>30*86400000&&diff<=60*86400000;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
   var d90=invs.filter(function(i){var dMs=new Date(i.due+"T12:00:00").getTime();var diff=tdMs-dMs;return diff>60*86400000&&diff<=90*86400000;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
@@ -4407,17 +4122,17 @@ function rDebts(q,pg){
   var _dnow=new Date();
   var _ddow=_dnow.getDay();
   var _dwkStart=new Date(_dnow);_dwkStart.setDate(_dnow.getDate()-(_ddow===0?6:_ddow-1));
-  var _dwkS=_ymd(_dwkStart); // local-safe
+  var _dwkS=_dwkStart.toISOString().slice(0,10);
   var _dmo=_dnow.getFullYear()+"-"+String(_dnow.getMonth()+1).padStart(2,"0");
-  var debtors=(D.customers||[]).map(function(c){
+  var debtors=D.customers.map(function(c){
     // Period-scoped debt: find orders in this period and their unpaid invoices
-    var allInvs=(D.invoices||[]).filter(function(i){return i.cId===c.id&&i.paid<i.amount&&!i.voided;});
+    var allInvs=D.invoices.filter(function(i){return i.cId===c.id&&i.paid<i.amount&&!i.voided;});
     var periodInvs=(DEBT_PERIOD==="all")?allInvs:allInvs.filter(function(i){
       // Use the linked order's date — the actual date the debt was created
       var ordDate="";
       var ordMatch=i.notes&&i.notes.match(/#(\d+)/);
       if(ordMatch){
-        var _o=(D.orders||[]).find(function(x){return String(x.id)===ordMatch[1];});
+        var _o=D.orders.find(function(x){return String(x.id)===ordMatch[1];});
         if(_o)ordDate=_o.date||"";
       }
       if(!ordDate)return false; // no linked order = exclude from period views
@@ -4491,7 +4206,7 @@ function rDebts(q,pg){
   var _dcards=el("debt-cards");
   if(_dcards)_dcards.innerHTML=
     "<div class=\"stat sr\"><div class=\"sl\">Total outstanding</div><div class=\"sv\" style=\"color:#c0392b\">KSh "+total.toLocaleString()+"</div><div class=\"ss\">"+debtors.length+" customers</div></div>"+
-    "<div class=\"stat sa\"><div class=\"sl\">Overdue invoices</div><div class=\"sv\">"+(D.invoices||[]).filter(function(i){return i.paid<i.amount&&i.due<td;}).length+"</div></div>"+
+    "<div class=\"stat sa\"><div class=\"sl\">Overdue invoices</div><div class=\"sv\">"+D.invoices.filter(function(i){return i.paid<i.amount&&i.due<td;}).length+"</div></div>"+
     "<div class=\"stat sn\"><div class=\"sl\">Largest debt</div><div class=\"sv\">"+(debtors.length?"KSh "+debtors[0].debt.toLocaleString():"KSh 0")+"</div><div class=\"ss\">"+(debtors.length?(can("vPhone")?debtors[0].c.name:maskName(debtors[0].c.name)):"")+"</div></div>";
   var _dsort=el("debt-sort");
   if(_dsort)_dsort.innerHTML=
@@ -4531,7 +4246,7 @@ function rCmps(q,pg){
   var q2=CMP_Q||"";
   var pgEl=el("pg-complaints");if(!pgEl)return;
   var fil=[].concat(D.complaints).reverse();
-  if(q2){var lq=q2.toLowerCase();fil=fil.filter(function(c){var cu=(D.customers||[]).find(function(x){return x.id===c.cId;});return(cu&&cu.name.toLowerCase().indexOf(lq)!==-1)||c.type.toLowerCase().indexOf(lq)!==-1||(c.details&&c.details.toLowerCase().indexOf(lq)!==-1);});}
+  if(q2){var lq=q2.toLowerCase();fil=fil.filter(function(c){var cu=D.customers.find(function(x){return x.id===c.cId;});return(cu&&cu.name.toLowerCase().indexOf(lq)!==-1)||c.type.toLowerCase().indexOf(lq)!==-1||(c.details&&c.details.toLowerCase().indexOf(lq)!==-1);});}
   var paged=paginate(fil,CMP_PAGE);
   if(!el("cmp-srch")){
     pgEl.innerHTML=
@@ -4545,13 +4260,13 @@ function rCmps(q,pg){
       "<div id=\"cmp-results\"></div>";
   }
   var _cs=el("cmp-stats");
-  if(_cs)_cs.innerHTML=(D.complaints||[]).length+" total &middot; "+(D.complaints||[]).filter(function(c){return c.status==="Open";}).length+" open";
+  if(_cs)_cs.innerHTML=D.complaints.length+" total &middot; "+D.complaints.filter(function(c){return c.status==="Open";}).length+" open";
   var _cc=el("cmp-cards");
   if(_cc)_cc.innerHTML=
-    "<div class=\"stat sn\"><div class=\"sl\">Total</div><div class=\"sv\">"+(D.complaints||[]).length+"</div></div>"+
-    "<div class=\"stat sr\"><div class=\"sl\">Open</div><div class=\"sv\" style=\"color:#c0392b\">"+(D.complaints||[]).filter(function(c){return c.status==="Open";}).length+"</div></div>"+
-    "<div class=\"stat sa\"><div class=\"sl\">In progress</div><div class=\"sv\">"+(D.complaints||[]).filter(function(c){return c.status==="In progress";}).length+"</div></div>"+
-    "<div class=\"stat sk\"><div class=\"sl\">Resolved</div><div class=\"sv\">"+(D.complaints||[]).filter(function(c){return c.status==="Resolved";}).length+"</div></div>";
+    "<div class=\"stat sn\"><div class=\"sl\">Total</div><div class=\"sv\">"+D.complaints.length+"</div></div>"+
+    "<div class=\"stat sr\"><div class=\"sl\">Open</div><div class=\"sv\" style=\"color:#c0392b\">"+D.complaints.filter(function(c){return c.status==="Open";}).length+"</div></div>"+
+    "<div class=\"stat sa\"><div class=\"sl\">In progress</div><div class=\"sv\">"+D.complaints.filter(function(c){return c.status==="In progress";}).length+"</div></div>"+
+    "<div class=\"stat sk\"><div class=\"sl\">Resolved</div><div class=\"sv\">"+D.complaints.filter(function(c){return c.status==="Resolved";}).length+"</div></div>";
   var _cr2=el("cmp-results");
   if(_cr2)_cr2.innerHTML=
     "<div class=\"tw\"><table><thead><tr><th>#</th><th>Customer</th><th>Type</th><th>Details</th><th>Action taken</th><th>Date</th><th>Status</th><th></th></tr></thead>"+
@@ -4562,7 +4277,7 @@ function cmpRows(fil){
   var sm={"Open":"br","In progress":"ba","Resolved":"bg"};
   if(!fil.length)return "<tr><td colspan=\"8\"><div class=\"te\"><i class=\"ti ti-message-report\"></i><p>No complaints</p></div></td></tr>";
   return fil.map(function(c){
-    var cu=(D.customers||[]).find(function(x){return x.id===c.cId;});
+    var cu=D.customers.find(function(x){return x.id===c.cId;});
     return "<tr><td>#"+c.id+"</td>"+
       "<td>"+
       (can("vPhone")?"<div style=\"font-weight:700\">"+(cu?cu.name:"&mdash;")+"</div><div class=\"ca\">"+(cu?(cu.phone||""):"")+"</div>":"<div style=\"font-weight:700\">"+(cu?[cu.estate,cu.court,cu.house?"No."+cu.house:""].filter(Boolean).join(", "):"&mdash;")+"</div>")+
@@ -4591,7 +4306,7 @@ function cmpCustSearch(q){
   if(!q||q.length<1){drop.style.display="none";return;}
   var lq=q.toLowerCase();
   var canSeeName=can("vPhone"); // vPhone controls name/phone visibility
-  var matches=(D.customers||[]).filter(function(cu){
+  var matches=D.customers.filter(function(cu){
     if(canSeeName){
       return cu.name.toLowerCase().indexOf(lq)!==-1||
         (cu.court&&cu.court.toLowerCase().indexOf(lq)!==-1)||
@@ -4668,7 +4383,7 @@ function saveCmp(){
   if(editId){
     // Editing existing complaint requires mCmp permission
     if(!can("mCmp")){toast("Manager permission required to edit complaints","err");return;}
-    var ex=(D.complaints||[]).find(function(x){return x.id===parseInt(editId);});
+    var ex=D.complaints.find(function(x){return x.id===parseInt(editId);});
     if(ex){
       ex.cId=parseInt(el("cmp-c").value);ex.type=el("cmp-t").value;
       ex.details=det;ex.action=el("cmp-act").value;ex.status=el("cmp-s").value;
@@ -4677,17 +4392,16 @@ function saveCmp(){
       if(editIdEl)editIdEl.value="";
       cm("m-cmp");rCmps(undefined,CMP_PAGE);dirty();toast("Complaint updated");return;
     }
-  }(D.complaints||[]).push({id:nCmpId++,cId:parseInt(el("cmp-c").value),type:el("cmp-t").value,details:det,action:el("cmp-act").value,status:el("cmp-s").value,date:el("cmp-d").value});el("cmp-det").value="";el("cmp-act").value="";auditLog("COMPLAINT_LOGGED","Complaint logged by "+CU.name+" ("+CU.role+"): "+el("cmp-t").value);
-  if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
+  }D.complaints.push({id:nCmpId++,cId:parseInt(el("cmp-c").value),type:el("cmp-t").value,details:det,action:el("cmp-act").value,status:el("cmp-s").value,date:el("cmp-d").value});el("cmp-det").value="";el("cmp-act").value="";auditLog("COMPLAINT_LOGGED","Complaint logged by "+CU.name+" ("+CU.role+"): "+el("cmp-t").value);
   cm("m-cmp");rCmps(undefined,CMP_PAGE);dirty();toast("Complaint logged");}
 function editCmp(id){
   if(!can("mCmp")){toast("Only managers can edit complaints","err");return;}
-  var cmp=(D.complaints||[]).find(function(x){return x.id===id;});if(!cmp)return;
+  var cmp=D.complaints.find(function(x){return x.id===id;});if(!cmp)return;
   var ci=el("cmp-id");if(ci)ci.value=id;
   // Set search input to show customer name, set hidden to cId
   var cc=el("cmp-c");if(cc)cc.value=cmp.cId;
   var cs=el("cmp-c-search");
-  var cu=(D.customers||[]).find(function(x){return x.id===cmp.cId;});
+  var cu=D.customers.find(function(x){return x.id===cmp.cId;});
   if(cs){cs.value=cu?cu.name:"Customer #"+cmp.cId;cs.disabled=true;}// lock customer in edit
   var drop=el("cmp-c-drop");if(drop)drop.style.display="none";
   // Show all fields for manager
@@ -4699,9 +4413,8 @@ function editCmp(id){
   var ct=el("cmp-t");if(ct)ct.value=cmp.type||"Water quality";
   om("m-cmp");
 }
-function resolveCmp(id){if(!can("mCmp")){toast("Only managers can resolve complaints","err");return;}var c=(D.complaints||[]).find(function(x){return x.id===id;});if(c)c.status="Resolved";rCmps(undefined,CMP_PAGE);dirty();toast("Complaint resolved");}
-  if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
-function delCmp(id){if(!can("dCmp")){toast("Only managers can delete complaints","err");return;}var cmp=(D.complaints||[]).find(function(x){return x.id===id;});if(!cmp)return;var cu=(D.customers||[]).find(function(x){return x.id===cmp.cId;});var msg="Delete complaint from "+(cu?(can("vPhone")?cu.name:"this customer"):"unknown")+"?\n\n\""+cmp.text.slice(0,80)+(cmp.text.length>80?"…":"")+"\"\n\nThis cannot be undone.";if(!confirm(msg))return;D.complaints=(D.complaints||[]).filter(function(c){return c.id!==id;});rCmps(undefined,CMP_PAGE);dirty();}
+function resolveCmp(id){if(!can("mCmp")){toast("Only managers can resolve complaints","err");return;}var c=D.complaints.find(function(x){return x.id===id;});if(c)c.status="Resolved";rCmps(undefined,CMP_PAGE);dirty();toast("Complaint resolved");}
+function delCmp(id){if(!can("dCmp")){toast("Only managers can delete complaints","err");return;}if(!confirm("Delete complaint?"))return;D.complaints=D.complaints.filter(function(c){return c.id!==id;});rCmps(undefined,CMP_PAGE);dirty();}
 
 function addRoute(){
   if(!can("eOrd")){toast("Managers only","err");return;}
@@ -4726,32 +4439,25 @@ addRoute._save=function(){
   var estates=el("route-areas-inp")?el("route-areas-inp").value:"";
   if(!D.routes)D.routes=[];
   D.routes.push({id:uid(),name:name,estates:(estates||"").split(",").map(function(e){return e.trim();}).filter(Boolean),created:tday()});
-  dirty();
-  if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
-  rDel();cm("m-generic");rOffers();toast("Route \""+name+"\" added");
+  dirty();cm("m-generic");rOffers();toast("Route \""+name+"\" added");
 }
 function delRoute(id){
   if(!can("eOrd"))return;
-  var rt=(D.routes||[]).find(function(r){return r.id===id;});if(!rt)return;
-  var areas=(rt.estates||[]).slice(0,3).join(", ")+((rt.estates||[]).length>3?" +"+((rt.estates||[]).length-3)+" more":"");
-  var msg="Remove route: \""+rt.name+"\"?"+(areas?"\nCovers: "+areas:"")+"\n\nThis cannot be undone.";
-  if(!confirm(msg))return;
+  if(!confirm("Remove this route?"))return;
   D.routes=(D.routes||[]).filter(function(r){return r.id!==id;});
-  if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   dirty();rOffers();
-  toast("Route \""+rt.name+"\" removed");
 }
 function rOffers(){
   var pg=el("pg-offers");if(!pg)return;
   pg.innerHTML=
-    "<div class=\"ph\"><h1>Promotions &amp; Offers</h1><p>"+(D.offers||[]).filter(function(o){return o.active;}).length+" active</p></div>"+
+    "<div class=\"ph\"><h1>Promotions &amp; Offers</h1><p>"+D.offers.filter(function(o){return o.active;}).length+" active</p></div>"+
     "<div class=\"toolbar\">"+(can("aOff")?"<button class=\"btn btn-gold\" onclick=\"prepOf()\"><i class=\"ti ti-plus\"></i> New promotion</button>":"")+"</div>"+
     "<div style=\"margin-bottom:14px;padding:12px;background:var(--bg);border-radius:10px;border:1px solid var(--bd)\">"+
-    "<div style=\"display:flex;align-items:center;justify-content:space-between;margin-bottom:8px\"><strong><i class=\"ti ti-route\" style=\"color:var(--gd)\"></i> Delivery Routes ("+(D.routes||[]).length+")</strong>"+(can("eOrd")?"<button class=\"btn btn-sm\" onclick=\"addRoute()\"><i class=\"ti ti-plus\"></i> Add</button>":"")+"</div>"+
-    (D.routes&&(D.routes||[]).length?D.routes.map(function(r){return "<span style=\"display:inline-flex;align-items:center;gap:5px;background:#fff;border:1px solid var(--bd);border-radius:6px;padding:4px 10px;margin:3px;font-size:11px\">"+(r.name)+"<span style=\"color:var(--tx2)\"> "+((r.estates||[]).slice(0,2).join(", "))+"</span>"+(can("eOrd")?"<i class=\"ti ti-x\" style=\"cursor:pointer;color:#c0392b\" onclick=\"delRoute("+r.id+")\"></i>":"")+"</span>";}).join(""):"<span style=\"font-size:11px;color:var(--tx2)\">No routes — add delivery zones.</span>")+
+    "<div style=\"display:flex;align-items:center;justify-content:space-between;margin-bottom:8px\"><strong><i class=\"ti ti-route\" style=\"color:var(--gd)\"></i> Delivery Routes ("+D.routes.length+")</strong>"+(can("eOrd")?"<button class=\"btn btn-sm\" onclick=\"addRoute()\"><i class=\"ti ti-plus\"></i> Add</button>":"")+"</div>"+
+    (D.routes&&D.routes.length?D.routes.map(function(r){return "<span style=\"display:inline-flex;align-items:center;gap:5px;background:#fff;border:1px solid var(--bd);border-radius:6px;padding:4px 10px;margin:3px;font-size:11px\">"+(r.name)+"<span style=\"color:var(--tx2)\"> "+((r.estates||[]).slice(0,2).join(", "))+"</span>"+(can("eOrd")?"<i class=\"ti ti-x\" style=\"cursor:pointer;color:#c0392b\" onclick=\"delRoute("+r.id+")\"></i>":"")+"</span>";}).join(""):"<span style=\"font-size:11px;color:var(--tx2)\">No routes — add delivery zones.</span>")+
     "</div>"+
     "<div style=\"display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:13px\">"+
-      ((D.offers||[]).length?(D.offers||[]).map(function(o){
+      (D.offers.length?D.offers.map(function(o){
         return "<div style=\"background:"+(o.active?"var(--nv)":"#fff")+";border:"+(o.active?"2px solid var(--gd)":"1px solid var(--bd)")+";border-radius:14px;padding:18px;box-shadow:var(--sh)\">"+
           "<span style=\"background:"+(o.active?"var(--gd)":"var(--bg)")+";color:"+(o.active?"var(--nv)":"var(--tx2)")+";padding:3px 9px;border-radius:99px;font-size:10px;font-weight:800;display:inline-block;margin-bottom:10px\">"+(o.active?"ACTIVE":"Inactive")+"</span>"+
           "<div style=\"font-size:14px;font-weight:800;color:"+(o.active?"#fff":"var(--tx)")+";margin-bottom:5px\">"+o.title+"</div>"+
@@ -4767,7 +4473,7 @@ function rOffers(){
     "</div>";
 }
 function prepOf(){
-  var s=el("ofp");if(s)s.innerHTML="<option>All products</option>"+(D.stock||[]).map(function(x){return "<option>"+x.name+"</option>";}).join("");
+  var s=el("ofp");if(s)s.innerHTML="<option>All products</option>"+D.stock.map(function(x){return "<option>"+x.name+"</option>";}).join("");
   el("of-edit-id").value="";
   el("oft").value="";el("ofd").value="";el("ofmq").value="1";el("ofs").value="";el("ofe").value="";el("ofdesc").value="";
   el("m-of-title").innerHTML="<i class=\"ti ti-tag\" style=\"color:var(--gd);margin-right:7px\"></i>New Promotion";
@@ -4780,7 +4486,7 @@ function saveOff(){
   var t=el("oft").value.trim();if(!t){toast("Title required","err");return;}
   var editId=el("of-edit-id").value;
   if(editId){
-    var o=(D.offers||[]).find(function(x){return String(x.id)===String(editId);});
+    var o=D.offers.find(function(x){return String(x.id)===String(editId);});
     if(o){
       o.title=t;o.disc=parseInt(el("ofd").value)||0;o.minqty=parseInt(el("ofmq").value)||1;
       o.prod=el("ofp").value;o.start=el("ofs").value;o.end=el("ofe").value;o.desc=el("ofdesc").value;
@@ -4788,15 +4494,15 @@ function saveOff(){
       return;
     }
   }
-  (D.offers||[]).push({id:uid(),title:t,disc:parseInt(el("ofd").value)||0,minqty:parseInt(el("ofmq").value)||1,prod:el("ofp").value,start:el("ofs").value,end:el("ofe").value,desc:el("ofdesc").value,active:true});
+  D.offers.push({id:uid(),title:t,disc:parseInt(el("ofd").value)||0,minqty:parseInt(el("ofmq").value)||1,prod:el("ofp").value,start:el("ofs").value,end:el("ofe").value,desc:el("ofdesc").value,active:true});
   el("oft").value="";el("ofd").value="";el("ofmq").value="1";el("ofdesc").value="";cm("m-of");rOffers();dirty();toast("Offer created");
 }
-function togOf(id){if(!can("aOff"))return;var o=(D.offers||[]).find(function(x){return x.id===id;});if(o)o.active=!o.active;rOffers();dirty();}
+function togOf(id){if(!can("aOff"))return;var o=D.offers.find(function(x){return x.id===id;});if(o)o.active=!o.active;rOffers();dirty();}
 function editOf(id){
   if(!can("eOff"))return;
-  var o=(D.offers||[]).find(function(x){return x.id===id;});if(!o)return;
+  var o=D.offers.find(function(x){return x.id===id;});if(!o)return;
   // Populate product dropdown first
-  var sp=el("ofp");if(sp)sp.innerHTML="<option>All products</option>"+(D.stock||[]).map(function(x){return "<option"+(o.prod===x.name?" selected":"")+">"+ x.name+"</option>";}).join("");
+  var sp=el("ofp");if(sp)sp.innerHTML="<option>All products</option>"+D.stock.map(function(x){return "<option"+(o.prod===x.name?" selected":"")+">"+ x.name+"</option>";}).join("");
   if(el("m-of-title"))el("m-of-title").innerHTML="<i class=\"ti ti-edit\" style=\"color:var(--gd);margin-right:7px\"></i>Edit Promotion";
   el("of-edit-id").value=id;
   el("oft").value=o.title||"";
@@ -4808,13 +4514,13 @@ function editOf(id){
   el("m-of-save").innerHTML="<i class=\"ti ti-check\"></i> Update";
   om("m-of");
 }
-function delOf(id){if(!can("dOff"))return;var of=(D.offers||[]).find(function(x){return x.id===id;});if(!of)return;var msg="Delete offer: \""+of.prod+" — "+of.disc+"% off\"?\n\nThis cannot be undone.";if(!confirm(msg))return;D.offers=(D.offers||[]).filter(function(o){return o.id!==id;});auditLog("DATA_EXPORTED","Offer deleted by "+CU.name+" ("+CU.role+"): "+of.prod+" "+of.disc+"%");rOffers();dirty();toast("Offer removed");}
+function delOf(id){if(!can("dOff"))return;if(!confirm("Delete?"))return;D.offers=D.offers.filter(function(o){return o.id!==id;});rOffers();dirty();}
 
 var RPT_FROM="";var RPT_TO="";
 function exportReportXL(){
   if(!can("exp")){toast("Director only","err");return;}
   var from=RPT_FROM||"";var to2=RPT_TO||tday();
-  var delivered=(D.orders||[]).filter(function(o){
+  var delivered=D.orders.filter(function(o){
     var dd=o.deliveredAt||o.date;if(o.status!=="Delivered")return false;
     if(from&&dd<from)return false;if(to2&&dd>to2)return false;return true;
   });
@@ -4822,19 +4528,19 @@ function exportReportXL(){
     if(!byProd[o.prod])byProd[o.prod]={Product:o.prod,Units:0,Revenue:0};
     byProd[o.prod].Units+=o.qty;byProd[o.prod].Revenue+=o.qty*o.price;});
   var byCust={};delivered.forEach(function(o){
-    var cu=(D.customers||[]).find(function(x){return x.id===o.cId;});var n=cu?cu.name:"Unknown";
+    var cu=D.customers.find(function(x){return x.id===o.cId;});var n=cu?cu.name:"Unknown";
     if(!byCust[n])byCust[n]={Customer:n,Orders:0,Revenue:0};
     byCust[n].Orders++;byCust[n].Revenue+=o.qty*o.price;});
   var wb=XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(Object.values(byProd)),"By Product");
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(Object.values(byCust).sort(function(a,b){return b.Revenue-a.Revenue;})),"By Customer");
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(delivered.map(function(o){var cu=(D.customers||[]).find(function(x){return x.id===o.cId;});return{Date:o.deliveredAt||o.date,Order:o.id,Customer:cu?cu.name:"",Product:o.prod,Qty:o.qty,Price:o.price,Revenue:o.qty*o.price,Driver:o.driver||"",Payment:o.paid};})),"Orders Detail");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(delivered.map(function(o){var cu=D.customers.find(function(x){return x.id===o.cId;});return{Date:o.deliveredAt||o.date,Order:o.id,Customer:cu?cu.name:"",Product:o.prod,Qty:o.qty,Price:o.price,Revenue:o.qty*o.price,Driver:o.driver||"",Payment:o.paid};})),"Orders Detail");
   // Driver performance sheet
   var drvMap2={};delivered.forEach(function(o){var d=o.completedBy||o.driver||"Unassigned";var asgn=o.driver||"Unassigned";if(!drvMap2[d])drvMap2[d]={"Completed By":d,"Assigned Driver":asgn===d?"(same)":asgn,Deliveries:0,Units:0,Revenue:0};drvMap2[d].Deliveries++;drvMap2[d].Units+=o.qty;drvMap2[d].Revenue+=o.qty*o.price;});
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(Object.values(drvMap2).sort(function(a,b){return b.Deliveries-a.Deliveries;})),"Driver Performance");
   // Audit log sheet (last 100 events)
-  if(D.auditLog&&(D.auditLog||[]).length){
-    var auditRows=(D.auditLog||[]).slice().reverse().map(function(e){return{Timestamp:e.ts,User:e.user,Role:e.role,Action:e.action,Details:e.details||""};});
+  if(D.auditLog&&D.auditLog.length){
+    var auditRows=(D.auditLog||[]).slice(-100).reverse().map(function(e){return{Timestamp:e.ts,User:e.user,Role:e.role,Action:e.action,Details:e.details||""};});
     XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(auditRows),"Audit Log");
   }
   XLSX.writeFile(wb,"NewDawn_Report_"+new Date().toISOString().slice(0,10)+".xlsx");
@@ -4842,7 +4548,7 @@ function exportReportXL(){
 }
 function rReports(){
   var pg=el("pg-reports");if(!pg)return;
-  var del=(D.orders||[]).filter(function(o){
+  var del=D.orders.filter(function(o){
     if(o.status!=="Delivered")return false;
     if(RPT_FROM||RPT_TO){
       // Date range selected: use deliveredAt for accuracy
@@ -4856,9 +4562,9 @@ function rReports(){
   });
   var rev=del.reduce(function(a,o){return a+o.qty*o.price;},0);
   var cost=del.reduce(function(a,o){return a+o.qty*(o.cost||0);},0);
-  var totD=(D.customers||[]).reduce(function(a,c){return a+custDebt(c.id);},0);
-  var totCredit=(D.customers||[]).reduce(function(a,cu){return a+(cu.credit||0);},0);
-  var btlIss=(D.orders||[]).filter(function(o){return o.bottle_after&&o.bottle_after!=="Good";}).length;
+  var totD=D.customers.reduce(function(a,c){return a+custDebt(c.id);},0);
+  var totCredit=D.customers.reduce(function(a,cu){return a+(cu.credit||0);},0);
+  var btlIss=D.orders.filter(function(o){return o.bottle_after&&o.bottle_after!=="Good";}).length;
   // Driver performance
   // Driver performance: group by who COMPLETED the delivery (completedBy)
   // Fall back to assigned driver if completedBy not set (legacy orders)
@@ -4876,12 +4582,12 @@ function rReports(){
   var today=tday();
   var aging={d7:0,d14:0,d30:0,d60:0,d60p:0};
   // Aging respects the selected date period
-  (D.invoices||[]).filter(function(i){
+  D.invoices.filter(function(i){
     if(i.paid>=i.amount||i.voided)return false;
     if(!RPT_FROM&&!RPT_TO)return true;
     var ordMatch=i.notes&&i.notes.match(/#(\d+)/);
     if(ordMatch){
-      var _ao=(D.orders||[]).find(function(x){return String(x.id)===ordMatch[1];});
+      var _ao=D.orders.find(function(x){return String(x.id)===ordMatch[1];});
       if(_ao&&_ao.date){
         if(RPT_FROM&&_ao.date<RPT_FROM)return false;
         if(RPT_TO&&_ao.date>RPT_TO)return false;
@@ -4897,9 +4603,9 @@ function rReports(){
     else aging.d60p+=(inv.amount-inv.paid);
   });
   var cRevMap={};del.forEach(function(o){if(!cRevMap[o.cId])cRevMap[o.cId]={rev:0,ords:0};cRevMap[o.cId].rev+=o.qty*o.price;cRevMap[o.cId].ords++;});
-  var cRevs=(D.customers||[]).map(function(c){var cm=cRevMap[c.id]||{rev:0,ords:0};return{c:c,rev:cm.rev,ords:cm.ords,debt:custDebt(c.id)};}).sort(function(a,b){return b.rev-a.rev;});
+  var cRevs=D.customers.map(function(c){var cm=cRevMap[c.id]||{rev:0,ords:0};return{c:c,rev:cm.rev,ords:cm.ords,debt:custDebt(c.id)};}).sort(function(a,b){return b.rev-a.rev;});
   var pRevs={};del.forEach(function(o){if(!pRevs[o.prod])pRevs[o.prod]={qty:0,rev:0};pRevs[o.prod].qty+=o.qty;pRevs[o.prod].rev+=o.qty*o.price;});
-  var zones=[].concat([],(D.customers||[]).map(function(c){return c.estate||c.zone||"";})).filter(function(z,i,a){return z&&a.indexOf(z)===i;});
+  var zones=[].concat([],D.customers.map(function(c){return c.estate||c.zone||"";})).filter(function(z,i,a){return z&&a.indexOf(z)===i;});
   var _rptLabel="";if(RPT_FROM&&RPT_TO)_rptLabel=RPT_FROM+" to "+RPT_TO;else if(RPT_FROM)_rptLabel="From "+RPT_FROM;else if(RPT_TO)_rptLabel="Up to "+RPT_TO;
   pg.innerHTML=
     "<div class=\"ph\"><h1>Business Reports</h1>"+
@@ -4909,7 +4615,7 @@ function rReports(){
       var mS=y2+"-"+String(m2+1).padStart(2,"0")+"-01";
       var lmD=new Date(y2,m2-1,1);
       var lmS=lmD.getFullYear()+"-"+String(lmD.getMonth()+1).padStart(2,"0")+"-01";
-      var lmE=_ymd(new Date(y2,m2,0)); // local-safe
+      var lmE=new Date(y2,m2,0).toISOString().slice(0,10);
       var qS=y2+"-"+String(Math.floor(m2/3)*3+1).padStart(2,"0")+"-01";
       var yS=y2+"-01-01";
       var ps="padding:4px 10px;border-radius:99px;border:1.5px solid ";
@@ -4938,7 +4644,7 @@ function rReports(){
       "<div class=\"stat sn\"><div class=\"sl\">Gross profit</div><div class=\"sv\">"+(can("vProfit")?"KSh "+(rev-cost).toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>")+"</div><div class=\"ss\">"+(can("vProfit")&&rev>0?Math.round((rev-cost)/rev*100)+"% margin":"&mdash;&mdash;")+"</div></div>"+
       "<div class=\"stat sr\"><div class=\"sl\">Total debt</div><div class=\"sv\">"+(can("vDebt")?"KSh "+totD.toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>")+"</div>"+(totCredit>0&&can("vDebt")?"<div class=\"ss\" style=\"color:#3498db;cursor:pointer\" onclick=\"nav('debts');setTimeout(function(){rDebts('__credit__',0);},200)\" title=\"See customers with credit\"><i class=\"ti ti-gift\"></i> KSh "+totCredit.toLocaleString()+" credit held &rarr;</div>":"<div class=\"ss\">net of credits</div>")+"</div>"+
       "<div class=\"stat sa\"><div class=\"sl\">Bottle issues</div><div class=\"sv\">"+btlIss+"</div><div class=\"ss\">damaged/cracked/missing</div></div>"+
-      "<div class=\"stat sb\"><div class=\"sl\">Open complaints</div><div class=\"sv\">"+(D.complaints||[]).filter(function(c){return c.status!=="Resolved";}).length+"</div></div>"+
+      "<div class=\"stat sb\"><div class=\"sl\">Open complaints</div><div class=\"sv\">"+D.complaints.filter(function(c){return c.status!=="Resolved";}).length+"</div></div>"+
     "</div>"+
     "<div class=\"g2\">"+
       "<div class=\"card\"><div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-trophy\"></i>Top customers</div></div>"+
@@ -4962,8 +4668,8 @@ function rReports(){
       "<div class=\"card\"><div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-map-pin\"></i>Sales by area</div></div>"+(_rptLabel?"<p style=\"font-size:10px;color:var(--tx2);margin:-8px 0 8px\">"+_rptLabel+"</p>":"")+
         "<div class=\"tw\"><table><thead><tr><th>Area</th><th>Customers</th><th>Orders</th></tr></thead><tbody>"+
         (zones.length?zones.map(function(z){
-          var cu=(D.customers||[]).filter(function(c){return c.estate===z||c.zone===z;}).length;
-          var or=del.filter(function(o){var cu2=(D.customers||[]).find(function(x){return x.id===o.cId;});return cu2&&(cu2.estate===z||cu2.zone===z);}).length;
+          var cu=D.customers.filter(function(c){return c.estate===z||c.zone===z;}).length;
+          var or=del.filter(function(o){var cu2=D.customers.find(function(x){return x.id===o.cId;});return cu2&&(cu2.estate===z||cu2.zone===z);}).length;
           return "<tr><td>"+z+"</td><td>"+cu+"</td><td>"+or+"</td></tr>";
         }).join(""):"<tr><td colspan=\"3\" style=\"text-align:center;padding:18px;color:var(--tx2)\">No area data yet</td></tr>")+
         "</tbody></table></div>"+
@@ -5000,8 +4706,8 @@ function rReports(){
       "<div class=\"card\"><div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-droplet\"></i>Bottle condition</div></div>"+
         "<div class=\"tw\"><table><thead><tr><th>Condition</th><th>Count</th><th>%</th></tr></thead><tbody>"+
         ["Good","Cracked","Damaged","Missing"].map(function(cond){
-          var cnt=(D.orders||[]).filter(function(o){return o.bottle_after===cond||(cond==="Good"&&!o.bottle_after&&o.status==="Delivered");}).length;
-          var tot=Math.max((D.orders||[]).filter(function(o){return o.status==="Delivered";}).length,1);
+          var cnt=D.orders.filter(function(o){return o.bottle_after===cond||(cond==="Good"&&!o.bottle_after&&o.status==="Delivered");}).length;
+          var tot=Math.max(D.orders.filter(function(o){return o.status==="Delivered";}).length,1);
           return "<tr><td>"+btl(cond)+"</td><td style=\"font-weight:700\">"+cnt+"</td><td>"+Math.round(cnt/tot*100)+"%</td></tr>";
         }).join("")+
         "</tbody></table></div>"+
@@ -5263,7 +4969,7 @@ function rExcel(){
     "<div style=\"display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap\">"+
       "<div style=\"background:#f0fdf4;border:1px solid #27ae60;border-radius:8px;padding:10px 14px;flex:1;min-width:160px\">"+
         "<div style=\"font-size:11px;color:#155724;font-weight:700;margin-bottom:3px\">HOT LOG (live)</div>"+
-        "<div style=\"font-size:20px;font-weight:900;color:#27ae60\">"+(D.auditLog?(D.auditLog||[]).length:0)+"</div>"+
+        "<div style=\"font-size:20px;font-weight:900;color:#27ae60\">"+(D.auditLog?D.auditLog.length:0)+"</div>"+
         "<div style=\"font-size:10px;color:#666\">Max "+AUDIT_HOT_MAX+" &middot; Live via newdawn_events</div>"+
       "</div>"+
       "<div style=\"background:#faf5ff;border:1px solid #7c3aed;border-radius:8px;padding:10px 14px;flex:1;min-width:160px\">"+
@@ -5375,10 +5081,10 @@ function rUsers(){
   if(!can("mUsers")){pg.innerHTML="<div style=\"padding:60px;text-align:center\"><i class=\"ti ti-lock\" style=\"font-size:38px;color:var(--bd);display:block;margin-bottom:12px\"></i><p style=\"font-size:14px;font-weight:700;color:var(--tx2)\">Director access required</p></div>";return;}
   var perms=[["View revenue","vRev"],["View profit/costs","vProfit"],["View debts","vDebt"],["View invoice amounts","vInv"],["Add orders","aOrd"],["Edit orders","eOrd"],["Delete orders","dOrd"],["Add customers","aCust"],["Edit customers","eCust"],["Delete customers","dCust"],["Add products","aSt"],["Edit products","eSt"],["Manage offers","aOff"],["Edit offers","eOff"],["Add invoices","aInv"],["Edit invoices","eInv"],["Mark invoices paid","mPaid"],["Log complaints","aCmp"],["Export/backup","exp"],["Restore backup","rest"],["Manage team","mUsers"]];
   pg.innerHTML=
-    "<div class=\"ph\"><h1>Team Management</h1><p>"+(USERS||[]).length+" members</p></div>"+
+    "<div class=\"ph\"><h1>Team Management</h1><p>"+USERS.length+" members</p></div>"+
     "<div class=\"toolbar\"><button class=\"btn btn-gold\" onclick=\"om('m-u')\"><i class=\"ti ti-plus\"></i> Add team member</button></div>"+
     "<div style=\"display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:13px;margin-bottom:18px\">"+
-    (USERS||[]).map(function(u){
+    USERS.map(function(u){
       var rl=R[u.role]||{label:u.role,bg:"#eee",c:"#333"};
       return "<div style=\"background:"+(u.id===CU.id?"var(--nv)":"#fff")+";border:"+(u.id===CU.id?"2px solid var(--gd)":"1px solid var(--bd)")+";border-radius:14px;padding:17px;box-shadow:var(--sh)\">"+
         "<div style=\"display:flex;align-items:center;gap:10px;margin-bottom:11px\">"+
@@ -5419,8 +5125,8 @@ function saveU(){
   if(!ini){var w=n.split(" ");ini=(w[0][0]+(w[1]?w[1][0]:w[0][1]||"X")).toUpperCase();}
   var cols=["#1a1560","#185FA5","#856404","#534AB7","#c0392b","#8e44ad","#16a085","#e67e22"];
   // Check PIN not already used
-  if((USERS||[]).find(function(u){return u.pin===p;})){toast("That PIN is already used by another team member","err");return;}
-  (USERS||[]).push({id:uid(),name:n,role:role,pin:p,ini:ini.slice(0,2),col:cols[(USERS||[]).length%cols.length]});
+  if(USERS.find(function(u){return u.pin===p;})){toast("That PIN is already used by another team member","err");return;}
+  USERS.push({id:uid(),name:n,role:role,pin:p,ini:ini.slice(0,2),col:cols[USERS.length%cols.length]});
   el("un").value="";el("upin").value="";el("uini").value="";
   cm("m-u");rUsers();
   auditLog("USER_CREATED","New user: "+n+" as "+(R[role]?R[role].label:role)+" — added by "+CU.name+" ("+CU.role+")");
@@ -5428,7 +5134,7 @@ function saveU(){
 }
 function prepChangePin(uid2){
   if(!can("mUsers"))return;
-  var u=(USERS||[]).find(function(x){return x.id===uid2;});if(!u)return;
+  var u=USERS.find(function(x){return x.id===uid2;});if(!u)return;
   // Director can only change: their own PIN, or Staff/Manager PINs
   // Director cannot change another Director's PIN
   if(u.role==="director"&&u.id!==CU.id){
@@ -5446,7 +5152,7 @@ function prepChangePin(uid2){
 function savePin(){
   if(!can("mUsers"))return;
   var uid2=parseInt(el("pin-uid").value);
-  var u=(USERS||[]).find(function(x){return x.id===uid2;});
+  var u=USERS.find(function(x){return x.id===uid2;});
   if(!u){toast("User not found","err");return;}
   // Security: double-check director cannot change another director's PIN
   if(u.role==="director"&&u.id!==CU.id){toast("Cannot change another Director's PIN","err");return;}
@@ -5456,7 +5162,7 @@ function savePin(){
   if(p1.length!==4){errEl.textContent="PIN must be exactly 4 digits";return;}
   if(p1!==p2){errEl.textContent="PINs do not match — try again";return;}
   // Check not already used by someone else
-  var conflict=(USERS||[]).find(function(x){return x.pin===p1&&x.id!==uid2;});
+  var conflict=USERS.find(function(x){return x.pin===p1&&x.id!==uid2;});
   if(conflict){errEl.textContent="That PIN is already used by "+conflict.name+" — choose a different one";return;}
   u.pin=p1;
   // If changing own PIN, update CU too
@@ -5466,19 +5172,19 @@ function savePin(){
   dirty();
   toast(u.id===CU.id?"Your PIN updated — use it from next login":"PIN updated for "+u.name);
 }
-function delU(id){if(!can("mUsers"))return;var toDel=(USERS||[]).find(function(u){return u.id===id;});if(!toDel)return;var msg="Remove team member: "+toDel.name+" ("+toDel.role+")?\n\nThey will lose all system access immediately.\n\nThis cannot be undone.";if(!confirm(msg))return;auditLog("USER_DELETED","Team member removed by "+CU.name+" ("+CU.role+"): "+(toDel?toDel.name:"unknown"));USERS=(USERS||[]).filter(function(u){return u.id!==id;});rUsers();dirty();}
+function delU(id){if(!can("mUsers"))return;var toDel=USERS.find(function(u){return u.id===id;});if(!confirm("Remove this team member?"))return;auditLog("USER_DELETED","Team member removed by "+CU.name+" ("+CU.role+"): "+(toDel?toDel.name:"unknown"));USERS=USERS.filter(function(u){return u.id!==id;});rUsers();dirty();}
 
 function buildBackupWB(){
   if(!can("exp"))return null;
   var wb=XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.customers||[]).map(function(c){return{ID:c.id,Name:c.name,Phone:c.phone,Phone2:c.phone2||"",IDNo:c.idno||"",Estate:c.estate||"",Court:c.court||"",HouseNo:c.house||"",HouseType:c.htype||"",Road:c.road||"",Zone:c.zone||"",Type:c.ctype,CreditLimit:c.credit||0,Notes:c.notes||"",Created:c.created||""};})),"Customers");
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.orders||[]).map(function(o){var c=(D.customers||[]).find(function(x){return x.id===o.cId;});return{ID:o.id,CustomerID:o.cId,CustomerName:c?c.name:"",Product:o.prod,Qty:o.qty,UnitPrice:o.price,Total:o.qty*o.price,Date:o.date,Status:o.status,Payment:o.paid,AmtPaid:o.amtPaid||0,Driver:o.driver||"",DeliveryAddr:o.deliver||"",BottleBefore:o.bottle_before||"",BottleAfter:o.bottle_after||"",Notes:o.notes||""};})),"Orders");
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.stock||[]).map(function(s){return{ID:s.id,Name:s.name,Size:s.size,SalePrice:s.price,CostPrice:s.cost,InStock:s.qty,MinLevel:s.min};})),"Stock");
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.offers||[]).map(function(o){return{ID:o.id,Title:o.title,Discount:o.disc,MinQty:o.minqty,Product:o.prod,StartDate:o.start,EndDate:o.end,Description:o.desc||"",Active:o.active?"Yes":"No"};})),"Offers");
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.invoices||[]).map(function(i){var c=(D.customers||[]).find(function(x){return x.id===i.cId;});var lp=(i.payments||[]).slice().sort(function(a,b){return b.date>a.date?1:-1;})[0];return{ID:i.id,CustomerID:i.cId,CustomerName:c?c.name:"",Amount:i.amount,Paid:i.paid,Balance:i.amount-i.paid,DueDate:i.due,IssueDate:i.date,Notes:i.notes||"",LastPayDate:lp?lp.date:"",LastPayAmt:lp?lp.amt:0,LastPayMethod:lp?lp.method:""};})),"Invoices");
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.complaints||[]).map(function(c){var cu=(D.customers||[]).find(function(x){return x.id===c.cId;});return{ID:c.id,CustomerID:c.cId,CustomerName:cu?cu.name:"",Type:c.type,Details:c.details,ActionTaken:c.action||"",Status:c.status,Date:c.date};})),"Complaints");
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.routes||[]).map(function(r){return{Name:r.name,Driver:r.driver,Vehicle:r.vehicle,Zone:r.zone,Days:r.days};})),"DeliveryRoutes");
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((USERS||[]).map(function(u){return{ID:u.id,Name:u.name,Role:u.role,Initials:u.ini};})),"Team");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(D.customers.map(function(c){return{ID:c.id,Name:c.name,Phone:c.phone,Phone2:c.phone2||"",IDNo:c.idno||"",Estate:c.estate||"",Court:c.court||"",HouseNo:c.house||"",HouseType:c.htype||"",Road:c.road||"",Zone:c.zone||"",Type:c.ctype,CreditLimit:c.credit||0,Notes:c.notes||"",Created:c.created||""};})),"Customers");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(D.orders.map(function(o){var c=D.customers.find(function(x){return x.id===o.cId;});return{ID:o.id,CustomerID:o.cId,CustomerName:c?c.name:"",Product:o.prod,Qty:o.qty,UnitPrice:o.price,Total:o.qty*o.price,Date:o.date,Status:o.status,Payment:o.paid,AmtPaid:o.amtPaid||0,Driver:o.driver||"",DeliveryAddr:o.deliver||"",BottleBefore:o.bottle_before||"",BottleAfter:o.bottle_after||"",Notes:o.notes||""};})),"Orders");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(D.stock.map(function(s){return{ID:s.id,Name:s.name,Size:s.size,SalePrice:s.price,CostPrice:s.cost,InStock:s.qty,MinLevel:s.min};})),"Stock");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(D.offers.map(function(o){return{ID:o.id,Title:o.title,Discount:o.disc,MinQty:o.minqty,Product:o.prod,StartDate:o.start,EndDate:o.end,Description:o.desc||"",Active:o.active?"Yes":"No"};})),"Offers");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(D.invoices.map(function(i){var c=D.customers.find(function(x){return x.id===i.cId;});var lp=(i.payments||[]).slice().sort(function(a,b){return b.date>a.date?1:-1;})[0];return{ID:i.id,CustomerID:i.cId,CustomerName:c?c.name:"",Amount:i.amount,Paid:i.paid,Balance:i.amount-i.paid,DueDate:i.due,IssueDate:i.date,Notes:i.notes||"",LastPayDate:lp?lp.date:"",LastPayAmt:lp?lp.amt:0,LastPayMethod:lp?lp.method:""};})),"Invoices");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(D.complaints.map(function(c){var cu=D.customers.find(function(x){return x.id===c.cId;});return{ID:c.id,CustomerID:c.cId,CustomerName:cu?cu.name:"",Type:c.type,Details:c.details,ActionTaken:c.action||"",Status:c.status,Date:c.date};})),"Complaints");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(D.routes.map(function(r){return{Name:r.name,Driver:r.driver,Vehicle:r.vehicle,Zone:r.zone,Days:r.days};})),"DeliveryRoutes");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(USERS.map(function(u){return{ID:u.id,Name:u.name,Role:u.role,Initials:u.ini};})),"Team");
   return wb;
 }
 function saveXL(){
@@ -5493,8 +5199,8 @@ function saveXL(){
   toast("Backup saved — keep this file safe!");
 }
 function printInvoice(invId){
-  var i=(D.invoices||[]).find(function(x){return x.id===invId;});if(!i)return;
-  var cu=(D.customers||[]).find(function(x){return x.id===i.cId;});if(!cu)cu={name:"Unknown",address:""};
+  var i=D.invoices.find(function(x){return x.id===invId;});if(!i)return;
+  var cu=D.customers.find(function(x){return x.id===i.cId;});
   var pays=(i.payments||[]).map(function(p){
     return "<tr><td>"+fmt(p.date)+"</td><td>"+p.method+"</td><td>"+( p.ref||"")+"</td><td style='text-align:right'>KSh "+p.amt.toLocaleString()+"</td></tr>";
   }).join("");
@@ -5538,8 +5244,8 @@ function printInvoice(invId){
   w.document.close();
 }
 function printStatement(cId){
-  var cu=(D.customers||[]).find(function(x){return x.id===cId;});if(!cu){toast("Customer not found","err");return;}
-  var invs=(D.invoices||[]).filter(function(i){return i.cId===cId;}).sort(function(a,b){return a.date>b.date?1:-1;});
+  var cu=D.customers.find(function(x){return x.id===cId;});if(!cu)return;
+  var invs=D.invoices.filter(function(i){return i.cId===cId;}).sort(function(a,b){return a.date>b.date?1:-1;});
   var totalAmt=invs.reduce(function(s,i){return s+i.amount;},0);
   var totalPaid=invs.reduce(function(s,i){return s+i.paid;},0);
   var rows=invs.map(function(i){
@@ -5706,13 +5412,13 @@ function sendEmailBackup(manual){
   var wbout=XLSX.write(wb,{bookType:"xlsx",type:"base64"});
   var filename="NewDawn_Backup_"+today+".xlsx";
   var summary={
-    customers:(D.customers||[]).length,
-    orders:(D.orders||[]).length,
-    pending:(D.orders||[]).filter(function(o){return o.status==="Pending"||o.status==="Processing";}).length,
-    revenue:"KSh "+((D.orders||[]).filter(function(o){return o.status==="Delivered";}).reduce(function(s,o){return s+o.qty*o.price;},0)).toLocaleString(),
-    debt:"KSh "+((D.invoices||[]).reduce(function(s,i){return s+Math.max(0,i.amount-i.paid);},0)).toLocaleString(),
-    stock:(D.stock||[]).length,
-    complaints:(D.complaints||[]).filter(function(c){return c.status!=="Resolved";}).length
+    customers:D.customers.length,
+    orders:D.orders.length,
+    pending:D.orders.filter(function(o){return o.status==="Pending"||o.status==="Processing";}).length,
+    revenue:"KSh "+(D.orders.filter(function(o){return o.status==="Delivered";}).reduce(function(s,o){return s+o.qty*o.price;},0)).toLocaleString(),
+    debt:"KSh "+(D.invoices.reduce(function(s,i){return s+Math.max(0,i.amount-i.paid);},0)).toLocaleString(),
+    stock:D.stock.length,
+    complaints:D.complaints.filter(function(c){return c.status!=="Resolved";}).length
   };
   emailjs.send(EJ_SERVICE_ID,EJ_TEMPLATE_ID,{
     backup_date:today,
@@ -5732,7 +5438,7 @@ function sendEmailBackup(manual){
     var el2=el("ej-last");if(el2)el2.textContent="Last sent: "+today+" at "+new Date().toLocaleTimeString();
   }).catch(function(err){
     var msg=err.text||err.message||JSON.stringify(err)||"unknown error";
-    toast("Backup email failed (unrelated to order sync — check EmailJS settings): "+msg,"err");
+    toast("Email failed: "+msg,"err");
     // EmailJS error — Service:"+EJ_SERVICE_ID+" Template:"+EJ_TEMPLATE_ID);
   });
 }
@@ -5862,12 +5568,12 @@ function xSheet(name){
   var wb=XLSX.utils.book_new();
   var td=tday();
   var sheets={
-    "Customers":(D.customers||[]).map(function(c){return{Name:c.name,Phone:c.phone,Estate:c.estate||"",Court:c.court||"",HouseNo:c.house||"",Type:c.ctype,Debt:"KSh "+(custDebt(c.id)||0).toLocaleString()};}),
-    "Orders":(D.orders||[]).map(function(o){var c=(D.customers||[]).find(function(x){return x.id===o.cId;});return{OrderID:o.id,Customer:c?c.name:"",Product:o.prod,Qty:o.qty,Total:o.qty*o.price,Date:o.date,Status:o.status,Payment:o.paid,Bottle:o.bottle_after||o.bottle_before||""};}),
-    "Stock":(D.stock||[]).map(function(s){return{Product:s.name,Size:s.size,Price:s.price,InStock:s.qty,MinLevel:s.min,Status:s.qty<=s.min?"Low":"OK"};}),
-    "Invoices":(D.invoices||[]).map(function(i){var c=(D.customers||[]).find(function(x){return x.id===i.cId;});return{Invoice:i.id,Customer:c?c.name:"",Amount:i.amount,Paid:i.paid,Balance:i.amount-i.paid,Due:i.due,Status:i.paid>=i.amount?"Paid":i.due<td?"Overdue":"Unpaid"};}),
-    "Complaints":(D.complaints||[]).map(function(c){var cu=(D.customers||[]).find(function(x){return x.id===c.cId;});return{Customer:cu?cu.name:"",Type:c.type,Details:c.details,Status:c.status,Date:c.date};}),
-    "Offers":(D.offers||[]).map(function(o){return{Title:o.title,Discount:o.disc+"%",Active:o.active?"Yes":"No",Expires:o.end};})
+    "Customers":D.customers.map(function(c){return{Name:c.name,Phone:c.phone,Estate:c.estate||"",Court:c.court||"",HouseNo:c.house||"",Type:c.ctype,Debt:"KSh "+(custDebt(c.id)||0).toLocaleString()};}),
+    "Orders":D.orders.map(function(o){var c=D.customers.find(function(x){return x.id===o.cId;});return{OrderID:o.id,Customer:c?c.name:"",Product:o.prod,Qty:o.qty,Total:o.qty*o.price,Date:o.date,Status:o.status,Payment:o.paid,Bottle:o.bottle_after||o.bottle_before||""};}),
+    "Stock":D.stock.map(function(s){return{Product:s.name,Size:s.size,Price:s.price,InStock:s.qty,MinLevel:s.min,Status:s.qty<=s.min?"Low":"OK"};}),
+    "Invoices":D.invoices.map(function(i){var c=D.customers.find(function(x){return x.id===i.cId;});return{Invoice:i.id,Customer:c?c.name:"",Amount:i.amount,Paid:i.paid,Balance:i.amount-i.paid,Due:i.due,Status:i.paid>=i.amount?"Paid":i.due<td?"Overdue":"Unpaid"};}),
+    "Complaints":D.complaints.map(function(c){var cu=D.customers.find(function(x){return x.id===c.cId;});return{Customer:cu?cu.name:"",Type:c.type,Details:c.details,Status:c.status,Date:c.date};}),
+    "Offers":D.offers.map(function(o){return{Title:o.title,Discount:o.disc+"%",Active:o.active?"Yes":"No",Expires:o.end};})
   };
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(sheets[name]||[]),name);
   XLSX.writeFile(wb,"NewDawn_"+name+"_"+td+".xlsx");
@@ -5907,7 +5613,7 @@ function restoreXL(input){
 
       var tm=get("Team");if(tm&&tm.length){
         var restoredUsers=tm.map(function(r){
-          var existing=(USERS||[]).find(function(u){return u.id===r.ID;});
+          var existing=USERS.find(function(u){return u.id===r.ID;});
           return existing||{id:r.ID||Date.now(),name:r.Name||"User",role:(R[r.Role]?r.Role:"staff"),pin:"1234",ini:r.Initials||"US",col:"#1a1560"};
         });
         if(restoredUsers.length)USERS=restoredUsers;
@@ -5921,7 +5627,7 @@ function restoreXL(input){
       if(FB_READY){FB_LAST_LOCAL_WRITE=Date.now();pushToCloud();}
       nav("excel",null);
       refreshCurrentPage();
-      saved();toast("Data restored — "+( (D.customers||[]).length)+" customers, "+((D.orders||[]).length)+" orders loaded");
+      saved();toast("Data restored — "+( D.customers.length)+" customers, "+(D.orders.length)+" orders loaded");
     }catch(err){
       var rm=el("rmsg");if(rm)rm.innerHTML="<span style=\"color:#c0392b\"><i class=\"ti ti-x\"></i> Failed: "+err.message+"</span>";
       toast("Restore failed - "+err.message,"err");
@@ -5933,41 +5639,6 @@ function restoreXL(input){
   };
   reader.readAsArrayBuffer(file);input.value="";
 }
-function syncWaterCycles(){
-  // Lightweight water-only resync — no credit migration, no stock fixes
-  // Safe to call after stock edit without racing the main dirty() write
-  if(!CU||CU.role!=="director"||!FB_READY)return;
-  var changed=0;
-  (D.customers||[]).forEach(function(cu){
-    var waterOrds=(D.orders||[]).filter(function(o){
-      return o.cId===cu.id&&o.status==="Delivered"&&is20ltr(o.prod);
-    }).sort(function(a,b){
-      var da=a.deliveredAt||a.date||"";var db=b.deliveredAt||b.date||"";
-      return da>db?1:da<db?-1:0;
-    });
-    var totalBottles=waterOrds.reduce(function(s,o){return s+(o.qty||1);},0);
-    var correct=totalBottles%8;
-    if(cu.waterCycle!==correct){
-      cu.waterCycle=correct;
-      // Rebuild history
-      var newH=[];var cum=0;var cyc=0;
-      for(var oi=0;oi<waterOrds.length;oi++){
-        var ord=waterOrds[oi];var prev=cum;
-        cum+=(ord.qty||1);
-        if(prev<4&&cum>=4&&cum<8)newH.push({ts:ord.deliveredAt||ord.date||tday(),bottles:cum,event:"milestone_4",ordId:ord.id,qty:ord.qty,by:"System (sync)"});
-        while(cum>=8){cyc++;newH.push({ts:ord.deliveredAt||ord.date||tday(),bottles:8,event:"cycle_complete",cycleNum:cyc,ordId:ord.id,qty:ord.qty,by:"System (sync)"});cum-=8;}
-      }
-      var manual=(cu.cycleHistory||[]).filter(function(h){return h.by&&h.by!=="System (bootstrap)"&&h.by!=="System (sync)";});
-      cu.cycleHistory=newH.concat(manual);
-      changed++;
-    }
-  });
-  if(changed>0){
-    dirty();
-    toast("Water cycles updated for "+changed+" customer(s)","ok");
-    if(el("pg-customers")&&el("pg-customers").classList.contains("act"))rCusts();
-  }
-}
 function runIntegrityCheck(){
   if(!CU||CU.role!=="director"||!FB_READY)return;
   var issues=[];
@@ -5975,7 +5646,7 @@ function runIntegrityCheck(){
   // If c.credit > 0 but creditLog is empty or missing, it was set via the form
   // (old behaviour before the split) — move it to creditLimit and zero credit
   var migrated=0;
-  (D.customers||[]).forEach(function(cu){
+  D.customers.forEach(function(cu){
     if((cu.credit>0)&&(!cu.creditLog||!cu.creditLog.length)){
       // No payment history means this was set via the form as creditLimit
       if(!cu.creditLimit||cu.creditLimit===0){cu.creditLimit=cu.credit;}
@@ -5988,13 +5659,13 @@ function runIntegrityCheck(){
   // Source of truth: sum of o.qty for all delivered 20ltr orders per customer
   // Runs every director login to auto-correct any drift
   var bootstrapped=0;
-  (D.customers||[]).forEach(function(cu){
+  D.customers.forEach(function(cu){
     // Find ALL delivered 20ltr water orders for this customer, sorted by date
-    var waterOrds=(D.orders||[]).filter(function(o){
+    var waterOrds=D.orders.filter(function(o){
       return o.cId===cu.id&&o.status==="Delivered"&&is20ltr(o.prod);
     }).sort(function(a,b){
-      var da=a.deliveredAt||a.date||"";
-      var db=b.deliveredAt||b.date||"";
+      var da=o&&o.deliveredAt||a.date||"";
+      var db=o&&o.deliveredAt||b.date||"";
       return da>db?1:da<db?-1:0;
     });
     // Sum total bottles from quantities
@@ -6031,26 +5702,22 @@ function runIntegrityCheck(){
     cu.cycleHistory=newHistory.concat(manualEntries);
     if(changed)bootstrapped++;
   });
-  if(bootstrapped>0){
-    dirty();
-    issues.push("Water cycle synced for "+bootstrapped+" customer(s) — quantities recomputed from delivered orders");
-    if(el("pg-customers")&&el("pg-customers").classList.contains("act"))rCusts();
-  }
+  if(bootstrapped>0){dirty();issues.push("Water cycle synced for "+bootstrapped+" customer(s) — quantities recomputed from delivered orders");}
   // Check 1: negative stock
-  (D.stock||[]).forEach(function(s){
+  D.stock.forEach(function(s){
     if(s.qty<0){s.qty=0;issues.push("Stock: "+s.name+" had negative qty — reset to 0");}
   });
   // Check 2: orders referencing missing customers
-  var custIds=(D.customers||[]).reduce(function(m,c){m[c.id]=true;return m;},{});
-  (D.orders||[]).forEach(function(o){
+  var custIds=D.customers.reduce(function(m,c){m[c.id]=true;return m;},{});
+  D.orders.forEach(function(o){
     if(!custIds[o.cId])issues.push("Order #"+o.id+" references missing customer ID "+o.cId);
   });
   // Check 3: orphaned invoices (no matching order, amount unpaid)
-  (D.invoices||[]).forEach(function(inv){
+  D.invoices.forEach(function(inv){
     if(inv.paid>=inv.amount||inv.voided)return; // paid or voided — ignore
     var ordMatch=inv.notes&&inv.notes.match(/#(\d+)/);
     if(ordMatch){
-      var o=(D.orders||[]).find(function(x){return String(x.id)===ordMatch[1];});
+      var o=D.orders.find(function(x){return String(x.id)===ordMatch[1];});
       if(!o)issues.push("Invoice #"+inv.id+" references deleted order #"+ordMatch[1]+" — KSh "+(inv.amount-inv.paid)+" outstanding");
     }
   });
@@ -6059,7 +5726,7 @@ function runIntegrityCheck(){
   // Check 5: payment status sync
   syncPaymentStatuses();
   if(issues.length>0){
-    if((D.stock||[]).some(function(s){return s.qty===0&&issues.some(function(i){return i.indexOf(s.name)>-1});}))dirty();
+    if(D.stock.some(function(s){return s.qty===0&&issues.some(function(i){return i.indexOf(s.name)>-1});}))dirty();
     auditLog("CUSTOMER_UPDATED","Data integrity check: "+issues.length+" issue(s) — "+issues.slice(0,3).join("; "));
     // Show director what was fixed
     toast("✓ Data check: "+issues.length+" item(s) corrected — see audit log","ok");
@@ -6070,16 +5737,16 @@ function runIntegrityCheck(){
   }
 }
 function syncIdCounters(){
-  var maxO=(D.orders||[]).reduce(function(m,o){return Math.max(m,Number(o.id)||0);},1000);
-  var maxI=(D.invoices||[]).reduce(function(m,i){return Math.max(m,Number(i.id)||0);},2000);
-  var maxCust=(D.customers||[]).reduce(function(m,cu){return Math.max(m,Number(cu.id)||0);},3000);
-  var maxCmp=(D.complaints||[]).reduce(function(m,x){return Math.max(m,Number(x.id)||0);},4000);
+  var maxO=D.orders.reduce(function(m,o){return Math.max(m,Number(o.id)||0);},1000);
+  var maxI=D.invoices.reduce(function(m,i){return Math.max(m,Number(i.id)||0);},2000);
+  var maxCust=D.customers.reduce(function(m,cu){return Math.max(m,Number(cu.id)||0);},3000);
+  var maxCmp=D.complaints.reduce(function(m,x){return Math.max(m,Number(x.id)||0);},4000);
   nOId=maxO+1;nIId=maxI+1;nCId=maxCust+1;nCmpId=maxCmp+1;
 }
 function syncPaymentStatuses(){
   // Fix any order whose payment badge doesn't match its invoice reality
-  (D.orders||[]).forEach(function(o){
-    var inv=(D.invoices||[]).find(function(i){
+  D.orders.forEach(function(o){
+    var inv=D.invoices.find(function(i){
       return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+o.id)!==-1;
     });
     if(inv){
@@ -6110,41 +5777,41 @@ function mergeXL(input){
 
       get("Customers").forEach(function(r){
         if(!hasId(r.ID)||!r.Name)return;
-        if((D.customers||[]).find(function(x){return x.id===r.ID;})){rep.customers.skipped++;return;}
-        (D.customers||[]).push({id:r.ID,name:r.Name||"",phone:r.Phone||"",phone2:r.Phone2||"",idno:r.IDNo||"",estate:r.Estate||"",court:r.Court||"",house:r.HouseNo||"",htype:r.HouseType||"House",road:r.Road||"",zone:r.Zone||"",ctype:r.Type||"Residential",credit:r.CreditLimit||0,notes:r.Notes||"",created:r.Created||""});
+        if(D.customers.find(function(x){return x.id===r.ID;})){rep.customers.skipped++;return;}
+        D.customers.push({id:r.ID,name:r.Name||"",phone:r.Phone||"",phone2:r.Phone2||"",idno:r.IDNo||"",estate:r.Estate||"",court:r.Court||"",house:r.HouseNo||"",htype:r.HouseType||"House",road:r.Road||"",zone:r.Zone||"",ctype:r.Type||"Residential",credit:r.CreditLimit||0,notes:r.Notes||"",created:r.Created||""});
         rep.customers.added++;
       });
       get("Orders").forEach(function(r){
         if(!hasId(r.ID))return;
-        if((D.orders||[]).find(function(x){return x.id===r.ID;})){rep.orders.skipped++;return;}
-        (D.orders||[]).push({id:r.ID,cId:r.CustomerID||0,prod:r.Product||"",qty:r.Qty||0,price:r.UnitPrice||0,date:r.Date||"",status:r.Status||"Pending",paid:r.Payment||"Unpaid",amtPaid:r.AmtPaid||0,driver:r.Driver||"",deliver:r.DeliveryAddr||"",bottle_before:r.BottleBefore||"Good",bottle_after:r.BottleAfter||null,notes:r.Notes||""});
+        if(D.orders.find(function(x){return x.id===r.ID;})){rep.orders.skipped++;return;}
+        D.orders.push({id:r.ID,cId:r.CustomerID||0,prod:r.Product||"",qty:r.Qty||0,price:r.UnitPrice||0,date:r.Date||"",status:r.Status||"Pending",paid:r.Payment||"Unpaid",amtPaid:r.AmtPaid||0,driver:r.Driver||"",deliver:r.DeliveryAddr||"",bottle_before:r.BottleBefore||"Good",bottle_after:r.BottleAfter||null,notes:r.Notes||""});
         rep.orders.added++;
       });
       get("Invoices").forEach(function(r){
         if(!hasId(r.ID))return;
-        var ex=(D.invoices||[]).find(function(x){return x.id===r.ID;});
+        var ex=D.invoices.find(function(x){return x.id===r.ID;});
         if(ex){
           if(r.Paid>ex.paid){var diff=r.Paid-ex.paid;if(!ex.payments)ex.payments=[];ex.payments.push({date:r.LastPayDate||tday(),amt:diff,method:r.LastPayMethod||"Cash",ref:"Merged"});ex.paid=r.Paid;}
           rep.invoices.skipped++;return;
         }
-        (D.invoices||[]).push({id:r.ID,cId:r.CustomerID||0,amount:r.Amount||0,paid:r.Paid||0,due:r.DueDate||"",notes:r.Notes||"",date:r.IssueDate||tday(),payments:r.Paid>0?[{date:r.LastPayDate||tday(),amt:r.Paid,method:r.LastPayMethod||"Cash",ref:"Merged"}]:[]});
+        D.invoices.push({id:r.ID,cId:r.CustomerID||0,amount:r.Amount||0,paid:r.Paid||0,due:r.DueDate||"",notes:r.Notes||"",date:r.IssueDate||tday(),payments:r.Paid>0?[{date:r.LastPayDate||tday(),amt:r.Paid,method:r.LastPayMethod||"Cash",ref:"Merged"}]:[]});
         rep.invoices.added++;
       });
       get("Complaints").forEach(function(r){
         if(!hasId(r.ID))return;
-        if((D.complaints||[]).find(function(x){return x.id===r.ID;})){rep.complaints.skipped++;return;}
-        (D.complaints||[]).push({id:r.ID,cId:r.CustomerID||0,type:r.Type||"Other",details:r.Details||"",action:r.ActionTaken||"",status:r.Status||"Open",date:r.Date||tday()});
+        if(D.complaints.find(function(x){return x.id===r.ID;})){rep.complaints.skipped++;return;}
+        D.complaints.push({id:r.ID,cId:r.CustomerID||0,type:r.Type||"Other",details:r.Details||"",action:r.ActionTaken||"",status:r.Status||"Open",date:r.Date||tday()});
         rep.complaints.added++;
       });
       get("Stock").forEach(function(r){
         if(!hasId(r.ID)||!r.Name)return;
-        var ex=(D.stock||[]).find(function(x){return x.id===r.ID;});
+        var ex=D.stock.find(function(x){return x.id===r.ID;});
         if(ex){if(ex.qty!==r.InStock)rep.stock.conflicts.push({name:r.Name,master:ex.qty,incoming:r.InStock});return;}
-        (D.stock||[]).push({id:r.ID,name:r.Name||"",size:r.Size||"",price:r.SalePrice||0,cost:r.CostPrice||0,qty:r.InStock||0,min:r.MinLevel||10});
+        D.stock.push({id:r.ID,name:r.Name||"",size:r.Size||"",price:r.SalePrice||0,cost:r.CostPrice||0,qty:r.InStock||0,min:r.MinLevel||10});
       });
       get("Offers").forEach(function(r){
         if(!hasId(r.ID))return;
-        if(!(D.offers||[]).find(function(x){return x.id===r.ID;}))(D.offers||[]).push({id:r.ID,title:r.Title||"",disc:r.Discount||0,minqty:r.MinQty||1,prod:r.Product||"",start:r.StartDate||"",end:r.EndDate||"",desc:r.Description||"",active:r.Active==="Yes"});
+        if(!D.offers.find(function(x){return x.id===r.ID;}))D.offers.push({id:r.ID,title:r.Title||"",disc:r.Discount||0,minqty:r.MinQty||1,prod:r.Product||"",start:r.StartDate||"",end:r.EndDate||"",desc:r.Description||"",active:r.Active==="Yes"});
       });
 
       syncIdCounters();
@@ -6188,7 +5855,7 @@ function mergeXL(input){
   reader.readAsArrayBuffer(file);input.value="";
 }
 function resStock(name,qty){
-  var s=(D.stock||[]).find(function(x){return x.name===name;});
+  var s=D.stock.find(function(x){return x.name===name;});
   if(s){s.qty=qty;dirty();toast(name+" qty set to "+qty);}
 }
 
