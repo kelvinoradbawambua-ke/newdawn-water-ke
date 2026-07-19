@@ -1306,7 +1306,10 @@ function checkAutoSaveRecovery(){
     var snapOrds=(snap.D.orders||[]).length;
     var currCusts=D.customers?(D.customers||[]).length:0;
     var currOrds=D.orders?(D.orders||[]).length:0;
-    var snapIsBetter=!hasCurrentData||(snapCusts>currCusts+5)||(snapOrds>currOrds+10);
+    // NEVER consider a snapshot "better" if it has FEWER customers than live data —
+    // customers are the foundational record; a higher order count in a stale local
+    // snapshot must never be allowed to justify losing real customers added elsewhere.
+    var snapIsBetter=!hasCurrentData||(snapCusts>=currCusts&&(snapCusts>currCusts+5||snapOrds>currOrds+10));
     // Check if local snapshot is more recent than Firestore
     var snapTs=snap.ts?new Date(snap.ts).getTime():0;
     var snapIsNewer=snapTs>0&&snapTs>Date.now()-30*60*1000; // within 30 min
@@ -1331,7 +1334,8 @@ function checkAutoSaveRecovery(){
         // Ask director to confirm (older local data or smaller difference)
         var snapTime=snap.ts?new Date(snap.ts).toLocaleString():"earlier session";
         var msg="Found an auto-saved session from "+snapTime+" on this device with "+snapCusts+" customers and "+snapOrds+" orders.";
-        if(hasCurrentData)msg+="\n\nCloud has "+currCusts+" customers. The local save has more data.";
+        if(hasCurrentData)msg+="\n\nLive cloud data currently has "+currCusts+" customers and "+currOrds+" orders.";
+        msg+="\n\n\u26a0\ufe0f Restoring will REPLACE the live cloud data with this local snapshot.";
         msg+="\n\nRestore this data now?";
         if(confirm(msg)){
           D=snap.D;
