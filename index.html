@@ -1518,8 +1518,16 @@ function buildApp(){
   }
   startIdleWatcher();
   setTimeout(runIntegrityCheck,3500);
-  if(!FB_SETUP_DONE&&CU&&CU.role==="director"){
+  // Only ever show the setup wizard on a genuinely blank system — never trust
+  // FB_SETUP_DONE alone, since a stale/corrupted flag must never be allowed to
+  // block access to a system that clearly already has real data.
+  var _trulyBlank=(D.customers||[]).length===0&&(D.orders||[]).length===0&&(USERS||[]).length<=1;
+  if(!FB_SETUP_DONE&&_trulyBlank&&CU&&CU.role==="director"){
     setTimeout(showSetupWizard,600);
+  }else if(!FB_SETUP_DONE&&!_trulyBlank){
+    // Flag was stale/wrong — silently correct it now that we can see real data exists
+    FB_SETUP_DONE=true;
+    if(FB_DOC_REF)FB_DOC_REF.set({setupDone:true},{merge:true});
   }
 }
 function toggleUM(){el("um").classList.toggle("open");}
