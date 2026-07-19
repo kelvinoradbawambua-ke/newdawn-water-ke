@@ -10,6 +10,9 @@
 <meta name="theme-color" content="#0f0f3d">
 <title>New Dawn Pure Drinking Water</title>
 <link rel="dns-prefetch" href="https://www.gstatic.com">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <link rel="dns-prefetch" href="https://firestore.googleapis.com">
 <link rel="dns-prefetch" href="https://cdnjs.cloudflare.com">
 <link rel="dns-prefetch" href="https://cdn.jsdelivr.net">
@@ -208,7 +211,7 @@ var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-10";
+var APP_VERSION="2026-07-19-sync-v2";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -1396,6 +1399,7 @@ function buildApp(){
       "</div>"+
       "<div class=\"topright\">"+
         "<div class=\"sts ready\" id=\"sts\"><i class=\"ti ti-circle\"></i> Ready</div>"+
+        "<div style=\"font-size:9px;color:#999;padding:2px 8px\" title=\"Build version — check this after every update to confirm the latest fixes actually loaded\">v"+APP_VERSION+"</div>"+
         "<div class=\"sts ready\" id=\"as-indicator\" style=\"font-size:10px\"><i class=\"ti ti-refresh\"></i> Auto-save on</div>"+
         (can("exp")?"<button class=\"bsv\" onclick=\"saveXL()\"><i class=\"ti ti-device-floppy\"></i> Save</button>":"")+
         "<div class=\"upill\" onclick=\"toggleUM()\">"+
