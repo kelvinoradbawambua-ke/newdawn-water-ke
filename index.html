@@ -956,7 +956,7 @@ function _startHeartbeat(){
     // the listener LOOKS healthy — this is the only reliable way to recover
     // from a silent stall, and costs nothing but one extra read.
     var silentFor=Date.now()-FB_LAST_SNAPSHOT;
-    if(silentFor>180000){
+    if(silentFor>45000){
       startCloudListener(); // tears down old listener internally, re-subscribes fresh
     }
   },20000);
