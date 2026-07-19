@@ -1207,6 +1207,10 @@ function renderUG(){
       "<div class=\"urole\">"+rl.label+"</div>"+
       "</div>";
   }).join("")+(isDefault?"<div style=\"text-align:center;padding:12px;font-size:11px;color:var(--tx2)\"><i class=\"ti ti-loader\" style=\"animation:spin 1s linear infinite\"></i> Loading accounts...</div>":"");
+  // Self-heal: if still showing the placeholder because real data hasn't
+  // arrived yet, keep re-checking every 500ms until it does — never rely on
+  // a manual reload happening to have better timing.
+  if(isDefault)setTimeout(renderUG,500);
 }
 function selU(id){
   SU=(USERS||[]).find(function(u){return u.id===id;});
