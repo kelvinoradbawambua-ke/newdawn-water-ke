@@ -240,7 +240,14 @@ var CU=null,SU=null,PE="";
 
 function can(p){return !!(CU&&R[CU.role]&&R[CU.role].p[p]);}
 function el(id){return document.getElementById(id);}
-function tday(){return new Date().toISOString().split("T")[0];}
+function _ymd(d){
+  // Local-timezone-safe YYYY-MM-DD — NEVER use toISOString() for this,
+  // it converts to UTC and silently shifts the date near midnight in
+  // any timezone ahead of UTC (e.g. East Africa Time, UTC+3).
+  var y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,"0"),dd=String(d.getDate()).padStart(2,"0");
+  return y+"-"+m+"-"+dd;
+}
+function tday(){return _ymd(new Date());}
 function maskPhone(p){if(!p)return"";var s=String(p).replace(/\s/g,"");if(s.length<5)return"•••••";return s.slice(0,2)+"•".repeat(Math.max(0,s.length-4))+s.slice(-2);}
 function maskName(n){if(!n)return"Customer";var parts=n.trim().split(" ");return parts[0].slice(0,1)+"••• "+(parts[1]?parts[1].slice(0,1)+"•••":"");}
 function vName(){return can("vPhone");}
@@ -2039,15 +2046,15 @@ function rDash(){
   var now=new Date();
   var yr=now.getFullYear();
   var mo=now.getMonth(); // 0-based
-  var td=now.toISOString().slice(0,10);
+  var td=_ymd(now); // local-timezone-safe — matches tday() used for order/delivery dates
   var qStart=Math.floor(mo/3)*3; // quarter start month (0-based)
   var qEnd=qStart+2; // quarter end month (0-based)
   // ── Week bounds ───────────────────────────────────────────────────
   var dow=now.getDay(); // 0=Sun
   var weekStart=new Date(now); weekStart.setDate(now.getDate()-(dow===0?6:dow-1)); // Mon
   var weekEnd=new Date(weekStart); weekEnd.setDate(weekStart.getDate()+6); // Sun
-  var wkS=weekStart.toISOString().slice(0,10);
-  var wkE=weekEnd.toISOString().slice(0,10);
+  var wkS=_ymd(weekStart);
+  var wkE=_ymd(weekEnd);
   var periodDel=del.filter(function(o){
     var dd=(o.deliveredAt||o.date)||"";
     if(!dd)return DASH_PERIOD==="all";
@@ -2068,7 +2075,7 @@ function rDash(){
   var wkDays=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
   var wkRevs=wkDays.map(function(_,i){
     var d=new Date(weekStart);d.setDate(weekStart.getDate()+i);
-    var ds=d.toISOString().slice(0,10);
+    var ds=_ymd(d); // local-safe — must match order dates for chart bars to populate correctly
     return del.filter(function(o){var dd=o.deliveredAt||o.date;return dd===ds;}).reduce(function(a,o){return a+o.qty*o.price;},0);
   });
   var wkMax=Math.max.apply(null,wkRevs.concat([1]));
@@ -2092,7 +2099,7 @@ function rDash(){
   var thisRev=del.filter(function(o){var dd=o.deliveredAt||o.date;return dd&&dd.startsWith(thisMonth);}).reduce(function(s,o){return s+o.qty*o.price;},0);
   var lastRev=del.filter(function(o){var dd=o.deliveredAt||o.date;return dd&&dd.startsWith(lastMonth);}).reduce(function(s,o){return s+o.qty*o.price;},0);
   if(can("vRev")&&lastRev>0){var tp=Math.round((thisRev-lastRev)/lastRev*100);if(Math.abs(tp)>=10){var tc=tp>0?"#27ae60":"#c0392b";alerts.push({t:"ni",i:(tp>0?"ti-trending-up":"ti-trending-down"),m:"Revenue "+(tp>0?"+":"")+tp+"% vs last month — KSh "+thisRev.toLocaleString()+" this month",dest:"reports"});}}
-  var churnDate=new Date(Date.now()-30*86400000).toISOString().slice(0,10);
+  var churnDate=_ymd(new Date(Date.now()-30*86400000)); // local-safe
   var churned=(D.customers||[]).filter(function(cu){var lo=(D.orders||[]).filter(function(o){return o.cId===cu.id&&o.status==="Delivered";}).sort(function(a,b){return b.date>a.date?1:-1;})[0];return lo&&lo.date<churnDate;}).length;
   if(churned>0)alerts.push({t:"nw",i:"ti-user-exclamation",m:churned+" customer(s) have not ordered in 30+ days",dest:"customers"});
 
@@ -3815,7 +3822,7 @@ function rDel(q){
   var _dlvTd=tday();
   var _dlvDow=_dlvNow.getDay();
   var _dlvWkStart=new Date(_dlvNow);_dlvWkStart.setDate(_dlvNow.getDate()-(_dlvDow===0?6:_dlvDow-1));
-  var _dlvWkS=_dlvWkStart.toISOString().slice(0,10);
+  var _dlvWkS=_ymd(_dlvWkStart); // local-safe
   var _dlvMo=_dlvNow.getFullYear()+"-"+String(_dlvNow.getMonth()+1).padStart(2,"0");
   var todayDel=(D.orders||[]).filter(function(o){return o.status==="Delivered"&&(o.deliveredAt===_dlvTd||(!o.deliveredAt&&o.date===_dlvTd));}).length;
   // Use deliveredAt (set by completeDlv) for accuracy; fall back to o.date
@@ -4344,7 +4351,7 @@ function rDebts(q,pg){
   var _dnow=new Date();
   var _ddow=_dnow.getDay();
   var _dwkStart=new Date(_dnow);_dwkStart.setDate(_dnow.getDate()-(_ddow===0?6:_ddow-1));
-  var _dwkS=_dwkStart.toISOString().slice(0,10);
+  var _dwkS=_ymd(_dwkStart); // local-safe
   var _dmo=_dnow.getFullYear()+"-"+String(_dnow.getMonth()+1).padStart(2,"0");
   var debtors=(D.customers||[]).map(function(c){
     // Period-scoped debt: find orders in this period and their unpaid invoices
@@ -4846,7 +4853,7 @@ function rReports(){
       var mS=y2+"-"+String(m2+1).padStart(2,"0")+"-01";
       var lmD=new Date(y2,m2-1,1);
       var lmS=lmD.getFullYear()+"-"+String(lmD.getMonth()+1).padStart(2,"0")+"-01";
-      var lmE=new Date(y2,m2,0).toISOString().slice(0,10);
+      var lmE=_ymd(new Date(y2,m2,0)); // local-safe
       var qS=y2+"-"+String(Math.floor(m2/3)*3+1).padStart(2,"0")+"-01";
       var yS=y2+"-01-01";
       var ps="padding:4px 10px;border-radius:99px;border:1.5px solid ";
