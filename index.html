@@ -199,6 +199,12 @@ var FB_BACKUP_COL=null; // backup collection reference
 var FB_EVENTS_COL=null; // audit events subcollection — 1 doc per event
 var FB_READY=false;
 var _APP_READY=false; // true after first Firestore snapshot received
+var FB_RECONNECT_ATTEMPTS=0; // for exponential backoff
+var _idleWarnTimer=null;
+var _idleWarnEl=null;
+var FB_RECONNECT_TIMER=null;
+var FB_LAST_SNAPSHOT=0; // timestamp of last successful snapshot — for heartbeat
+var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
@@ -696,6 +702,7 @@ function startCloudListener(){
   if(!FB_DOC_REF)return;
   if(FB_UNSUB)FB_UNSUB();
   FB_UNSUB=FB_DOC_REF.onSnapshot(function(doc){
+    FB_LAST_SNAPSHOT=Date.now();FB_RECONNECT_ATTEMPTS=0; // reset backoff on success
     if(!doc.exists){
       // SAFETY GUARD: Check all recovery sources before writing clean slate
       var snap=autoSaveCheckLocal();
@@ -899,8 +906,42 @@ function startCloudListener(){
       renderUG();
     }
   },function(err){
-    var c=el("cloud-status");if(c)c.innerHTML="<i class=\"ti ti-cloud-off\"></i> Offline - changes saved locally";
+    var c=el("cloud-status");if(c)c.innerHTML="<i class=\"ti ti-cloud-off\"></i> Reconnecting\u2026";
+    FB_UNSUB=null;
+    _reconnectCloudListener();
   });
+}
+function _reconnectCloudListener(){
+  // Exponential backoff: 2s, 4s, 8s, 16s, capped at 30s — auto-heals without
+  // ever requiring a manual page refresh
+  if(FB_RECONNECT_TIMER)clearTimeout(FB_RECONNECT_TIMER);
+  FB_RECONNECT_ATTEMPTS++;
+  var delay=Math.min(30000,2000*Math.pow(2,FB_RECONNECT_ATTEMPTS-1));
+  FB_RECONNECT_TIMER=setTimeout(function(){
+    if(!fbAuth||!fbAuth.currentUser){
+      // Auth session lost too — re-authenticate then reconnect
+      fbAuth&&fbAuth.signInAnonymously().then(function(){startCloudListener();}).catch(function(){_reconnectCloudListener();});
+    }else{
+      startCloudListener();
+    }
+  },delay);
+}
+function _startHeartbeat(){
+  // Every 20s, verify the listener is still actually alive.
+  // A backgrounded/throttled tab can silently stall onSnapshot without
+  // ever firing an error — heartbeat catches this case the error handler misses.
+  if(FB_HEARTBEAT_TIMER)clearInterval(FB_HEARTBEAT_TIMER);
+  FB_HEARTBEAT_TIMER=setInterval(function(){
+    if(!FB_DOC_REF)return;
+    var silentFor=Date.now()-FB_LAST_SNAPSHOT;
+    // Firestore listeners normally receive a snapshot within seconds of subscribing,
+    // and stay silent only while nothing changes — 90s of total silence with no
+    // confirmed listener is a strong signal the connection stalled.
+    if(!FB_UNSUB&&silentFor>15000){
+      // Listener is confirmed dead (nulled by error handler) — reconnect now
+      _reconnectCloudListener();
+    }
+  },20000);
 }
 function refreshCurrentPage(){
   var activePg=document.querySelector(".pg.act");
@@ -1351,6 +1392,7 @@ function buildApp(){
   setTimeout(updateStockBadge,2000); // low stock badge on nav
   // Restart audit listener after login — ensures live connection with auth established
   setTimeout(startAuditListener,1000);
+  _startHeartbeat();
   // Restart cloud listener if killed by logout
   if(!FB_UNSUB){
     if(FB_DOC_REF){startCloudListener();}
@@ -1643,6 +1685,9 @@ function logout(){
       FB_DOC_REF.set(snap,{merge:true});
     }
   }catch(e){}
+  if(FB_HEARTBEAT_TIMER){clearInterval(FB_HEARTBEAT_TIMER);FB_HEARTBEAT_TIMER=null;}
+  if(FB_RECONNECT_TIMER){clearTimeout(FB_RECONNECT_TIMER);FB_RECONNECT_TIMER=null;}
+  FB_RECONNECT_ATTEMPTS=0;
   if(FB_UNSUB){try{FB_UNSUB();}catch(e){}FB_UNSUB=null;}
   if(FB_AUDIT_UNSUB){try{FB_AUDIT_UNSUB();}catch(e){}FB_AUDIT_UNSUB=null;}
   FB_READY=false;FB_DOC_REF=null;_APP_READY=false;
@@ -3131,13 +3176,46 @@ var _idleLast=Date.now();
 function resetIdleTimer(){
   _idleLast=Date.now();
   if(_idleTimer)clearTimeout(_idleTimer);
+  if(_idleWarnTimer)clearTimeout(_idleWarnTimer);
+  _dismissIdleWarning();
   if(!CU)return;
   var limit=CU.role==="staff"?60000:CU.role==="manager"?300000:600000;
+  var warnWindow=CU.role==="staff"?10000:20000; // show warning 10s (staff) or 20s (mgr/dir) before logout
+  _idleWarnTimer=setTimeout(function(){
+    if(CU)_showIdleWarning(warnWindow/1000);
+  },limit-warnWindow);
   _idleTimer=setTimeout(function(){
     if(!CU)return;
+    _dismissIdleWarning();
     toast("Session expired due to inactivity — logging out","err");
     setTimeout(logout,1500);
   },limit);
+}
+function _showIdleWarning(seconds){
+  _dismissIdleWarning();
+  var d=document.createElement("div");
+  d.id="idle-warn-banner";
+  d.style.cssText="position:fixed;top:0;left:0;right:0;z-index:99999;background:#c0392b;color:#fff;padding:12px 16px;text-align:center;font-size:14px;font-weight:600;box-shadow:0 2px 8px rgba(0,0,0,.2);display:flex;align-items:center;justify-content:center;gap:14px;flex-wrap:wrap";
+  var span=document.createElement("span");
+  span.id="idle-warn-count";
+  span.textContent="You will be logged out in "+seconds+"s due to inactivity";
+  var btn=document.createElement("button");
+  btn.textContent="Stay logged in";
+  btn.style.cssText="background:#fff;color:#c0392b;border:none;border-radius:6px;padding:6px 16px;font-weight:700;font-size:13px;cursor:pointer";
+  btn.onclick=function(){resetIdleTimer();};
+  d.appendChild(span);d.appendChild(btn);
+  document.body.appendChild(d);
+  _idleWarnEl=d;
+  var remaining=seconds;
+  var tick=setInterval(function(){
+    remaining--;
+    if(!_idleWarnEl){clearInterval(tick);return;}
+    if(remaining<=0){clearInterval(tick);return;}
+    span.textContent="You will be logged out in "+remaining+"s due to inactivity";
+  },1000);
+}
+function _dismissIdleWarning(){
+  if(_idleWarnEl){try{_idleWarnEl.remove();}catch(e){}_idleWarnEl=null;}
 }
 function startIdleWatcher(){
   ["click","keydown","touchstart","mousemove"].forEach(function(ev){
@@ -3147,6 +3225,8 @@ function startIdleWatcher(){
 }
 function stopIdleWatcher(){
   if(_idleTimer){clearTimeout(_idleTimer);_idleTimer=null;}
+  if(_idleWarnTimer){clearTimeout(_idleWarnTimer);_idleWarnTimer=null;}
+  _dismissIdleWarning();
 }
 function is20ltr(prodName){
   if(!prodName)return false;
