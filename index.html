@@ -726,7 +726,7 @@ function startCloudListener(){
         }
         /* Main doc missing — restoring from local data and pushing to cloud */
         setTimeout(function(){FB_LAST_LOCAL_WRITE=Date.now();pushToCloud();},1000);
-        FB_READY=true;_APP_READY=true;
+        FB_READY=true;_APP_READY=true;scheduleCloudSync(); // flush any changes made while disconnected
         if(CU){refreshCurrentPage();}else{renderUG();}
         return;
       }
@@ -754,7 +754,7 @@ function startCloudListener(){
             setupDone:false,
             updatedAt:Date.now()
           };
-          FB_DOC_REF.set(cleanSlate).then(function(){FB_READY=true;});
+          FB_DOC_REF.set(cleanSlate).then(function(){FB_READY=true;scheduleCloudSync();});
         });
         return;
       }
@@ -766,7 +766,7 @@ function startCloudListener(){
         setupDone:false,
         updatedAt:Date.now()
       };
-      FB_DOC_REF.set(cleanSlate).then(function(){FB_READY=true;});
+      FB_DOC_REF.set(cleanSlate).then(function(){FB_READY=true;scheduleCloudSync();});
       return;
     }
     var data=doc.data();
@@ -889,7 +889,7 @@ function startCloudListener(){
     else if(data._lastDailyBackup)D._lastDailyBackup=data._lastDailyBackup;
     syncIdCounters();
     syncPaymentStatuses();
-    FB_READY=true;
+    FB_READY=true;scheduleCloudSync(); // flush any changes made while disconnected
     // Flush any audit events queued before Firestore was ready
     if(window._auditQueue&&window._auditQueue.length&&FB_EVENTS_COL){
       var q=window._auditQueue.splice(0);
@@ -996,14 +996,14 @@ function initCloudConnection(cb){
   var done=false;
   function finish(){if(!done){done=true;if(cb)cb();}}
   var timeout=setTimeout(function(){
-    FB_READY=true;finish();
+    FB_READY=true;scheduleCloudSync();finish();
   },8000);
   var authRetries=0;
   function tryAuth(){
     fbAuth.signInAnonymously().then(function(){
       startCloudListener();
       startAuditListener();
-      setTimeout(function(){clearTimeout(timeout);FB_READY=true;finish();},1500);
+      setTimeout(function(){clearTimeout(timeout);FB_READY=true;scheduleCloudSync();finish();},1500);
     }).catch(function(err){
       authRetries++;
       if(authRetries<3){
@@ -1032,7 +1032,7 @@ function initCloudConnection(cb){
   tryAuth();
 }
 function skipCloud(){
-  FB_READY=true;renderLogin();
+  FB_READY=true;scheduleCloudSync();renderLogin();
   var c=el("cloud-status");if(c)c.innerHTML="<i class=\"ti ti-cloud-off\"></i> Offline mode";
 }
 
@@ -1409,7 +1409,7 @@ function buildApp(){
     else if(typeof fbDb!=="undefined"){
       // Restore FB_DOC_REF (was nulled on logout) then restart
       FB_DOC_REF=fbDb.collection("newdawn").doc("main");
-      FB_READY=true;
+      FB_READY=true;scheduleCloudSync();
       startCloudListener();
     }
   }
