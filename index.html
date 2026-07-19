@@ -813,10 +813,15 @@ function startCloudListener(){
         (D.orders||[]).forEach(function(o){localOrdMap[o.id]=o;});
         data.D.orders.forEach(function(ro){
           var lo=localOrdMap[ro.id];
-          var _delAt=_recentlyDeletedOrderIds[ro.id];
-          if(_delAt&&Date.now()-_delAt<60000){
-            // Was explicitly deleted here in the last 60s — respect that,
-            // ignore this stale/in-flight remote copy instead of resurrecting it
+          // Check BOTH the shared (synced, cross-device) deletion marker and
+          // the local-only one — the shared one is authoritative and works
+          // regardless of which device performed the deletion; the local one
+          // remains as a fast first-line guard on the deleting device itself.
+          var _sharedDelAt=(data.D.deletedOrderIds&&data.D.deletedOrderIds[ro.id])||(D.deletedOrderIds&&D.deletedOrderIds[ro.id]);
+          var _delAt=_recentlyDeletedOrderIds[ro.id]||_sharedDelAt;
+          if(_delAt){
+            // Was explicitly deleted (by any device, at any time this was
+            // recorded) — respect that, never resurrect it
           }else if(!lo){(D.orders||[]).push(ro);} // genuinely new order from remote
           else if(ro.status==="Delivered"&&lo.status!=="Delivered"){
             // Remote shows delivered — always accept (staff completed it)
@@ -843,6 +848,14 @@ function startCloudListener(){
             return remoteOrdIds[o.id]||o.status==="Delivered"||(o._ts&&o._ts>fiveMinAgo);
           });
         }
+      }
+      // Merge shared deletion markers — union of local and remote, so any
+      // device's deletion is remembered regardless of who deletes or who syncs
+      if(data.D.deletedOrderIds){
+        if(!D.deletedOrderIds)D.deletedOrderIds={};
+        Object.keys(data.D.deletedOrderIds).forEach(function(k){
+          if(!D.deletedOrderIds[k])D.deletedOrderIds[k]=data.D.deletedOrderIds[k];
+        });
       }
       // Invoices: take remote (payments recorded on any device) — but respect
       // any recently-voided invoice here for 60s, and never blindly overwrite
@@ -3780,7 +3793,7 @@ function completeDlv(){
           if(dlvCu){
             dlvCu.credit=(dlvCu.credit||0)+dlvOver;
             if(!dlvCu.creditLog)dlvCu.creditLog=[];
-            dlvCu.creditLog.push({date:tday(),amt:dlvOver,type:"overpayment",ordId:oid,method:dlvMethod,by:CU.name,role:CU.role,note:"Overpayment at delivery of Order #"+oid});
+            dlvCu.creditLog.push({date:tday(),amt:dlvOver,type:"overpayment",ordId:o.id,method:dlvMethod,by:CU.name,role:CU.role,note:"Overpayment at delivery of Order #"+o.id});
           }
         }
       }
@@ -3852,11 +3865,16 @@ function delO(id){
   if(st&&o.status!=="Delivered"&&o.status!=="Cancelled"&&wasStockDeducted){
     st.qty+=o.qty;
     if(!st.history)st.history=[];
-    st.history.push({ts:tday(),type:"restore",qty:+o.qty,by:CU.name,ordId:oid,bal:st.qty});
+    st.history.push({ts:tday(),type:"restore",qty:+o.qty,by:CU.name,ordId:id,bal:st.qty});
     if(st.history.length>50)st.history=st.history.slice(-50);
     updateStockBadge();
   }
-  // Remove order — tombstone it so an in-flight/stale sync snapshot can't resurrect it
+  // Remove order — tombstone it INSIDE the synced document itself (not just
+  // local memory), so EVERY device — not only this one — knows the order
+  // was intentionally deleted and will never push it back via an unrelated
+  // save from stale local state.
+  if(!D.deletedOrderIds)D.deletedOrderIds={};
+  D.deletedOrderIds[id]=Date.now();
   _recentlyDeletedOrderIds[id]=Date.now();
   D.orders=(D.orders||[]).filter(function(x){return x.id!==id;});
   // Remove unpaid invoices only — keep paid ones for records
