@@ -1245,6 +1245,25 @@ function renderLogin(){
   var _ll=el("ll");if(_ll)_ll.innerHTML=makeLogoHTML(180);
   renderUG();
 }
+function _checkSetupWizardEligibility(){
+  // Never judge "is this a blank system" before real data has actually had a
+  // chance to arrive from Firestore — buildApp() runs synchronously in
+  // milliseconds, long before any async snapshot response. Wait for _APP_READY
+  // (set the moment the first real snapshot lands, whether empty or not) and
+  // retry until then, exactly like the rDash/renderUG self-heal pattern.
+  if(!CU||CU.role!=="director")return;
+  if(!_APP_READY){setTimeout(_checkSetupWizardEligibility,500);return;}
+  var _trulyBlank=(D.customers||[]).length===0&&(D.orders||[]).length===0&&(USERS||[]).length<=1;
+  if(!FB_SETUP_DONE&&_trulyBlank){
+    setTimeout(showSetupWizard,600);
+  }else if(!FB_SETUP_DONE&&!_trulyBlank){
+    // Flag was stale/wrong — silently correct it now that real data is confirmed present
+    FB_SETUP_DONE=true;
+    if(FB_DOC_REF)FB_DOC_REF.set({setupDone:true},{merge:true});
+  }
+}
+
+
 function renderUG(){
   if(!el("usg"))return; // login screen not active — ignore
   var isDefault=(USERS||[]).length===1&&USERS[0].name==="Director"&&!FB_READY;
@@ -1518,17 +1537,7 @@ function buildApp(){
   }
   startIdleWatcher();
   setTimeout(runIntegrityCheck,3500);
-  // Only ever show the setup wizard on a genuinely blank system — never trust
-  // FB_SETUP_DONE alone, since a stale/corrupted flag must never be allowed to
-  // block access to a system that clearly already has real data.
-  var _trulyBlank=(D.customers||[]).length===0&&(D.orders||[]).length===0&&(USERS||[]).length<=1;
-  if(!FB_SETUP_DONE&&_trulyBlank&&CU&&CU.role==="director"){
-    setTimeout(showSetupWizard,600);
-  }else if(!FB_SETUP_DONE&&!_trulyBlank){
-    // Flag was stale/wrong — silently correct it now that we can see real data exists
-    FB_SETUP_DONE=true;
-    if(FB_DOC_REF)FB_DOC_REF.set({setupDone:true},{merge:true});
-  }
+  _checkSetupWizardEligibility();
 }
 function toggleUM(){el("um").classList.toggle("open");}
 // ── KEYBOARD SHORTCUTS ──
