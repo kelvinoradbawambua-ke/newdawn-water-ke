@@ -533,7 +533,8 @@ function getBackupPayload(){
       customers:(D.customers||[]).length,
       orders:(D.orders||[]).length,
       stock:(D.stock||[]).length,
-      invoices:(D.invoices||[]).length
+      invoices:(D.invoices||[]).length,
+      users:(USERS||[]).length
     }
   };
 }
@@ -613,7 +614,7 @@ function restoreFromLatestBackup(onSuccess,onFail){
     FB_BACKUP_COL
       .orderBy(firebase.firestore.FieldPath.documentId(),"desc")
       .limit(1)
-      .get().then(function(snap){
+      .get({source:"server"}).then(function(snap){
         if(snap.empty){tryNext();return;}
         var best=null;
         snap.forEach(function(d){
@@ -1021,29 +1022,32 @@ function forceRefreshNow(){
   startCloudListener(); // tears down and re-subscribes fresh, pulls current state immediately
 }
 function _startHeartbeat(){
-  // A backgrounded/throttled/sleeping tab can silently stall onSnapshot
-  // WITHOUT ever nulling FB_UNSUB or firing an error — a listener reference
-  // can look "alive" while delivering nothing. Detecting that reliably from
-  // JS alone is not possible, so instead of guessing, we force a full
-  // teardown-and-resubscribe on a fixed schedule regardless of apparent
-  // health. This guarantees no device can ever drift more than a few
-  // minutes out of sync, no matter the failure mode.
+  // COST-CRITICAL: a quiet period with no changes is NORMAL, healthy
+  // onSnapshot behavior — it must NEVER be treated as "the connection is
+  // broken." A previous version of this function forced a full
+  // teardown-and-resubscribe (= a fresh Firestore read) any time 45s
+  // passed without a change, which silently burned through tens of
+  // thousands of reads per day across multiple open devices and put the
+  // free-tier quota at real risk. That approach is removed entirely.
+  //
+  // Recovery now relies ONLY on two mechanisms that cost nothing when
+  // everything is healthy:
+  //  1. An explicit onSnapshot error nulls FB_UNSUB -> reconnect immediately
+  //     (rare, and only happens when something is actually wrong)
+  //  2. The Page Visibility API (_initVisibilityRecovery) forces a fresh
+  //     subscribe the instant a backgrounded tab regains focus — this is
+  //     the real fix for the "silently stalled while backgrounded" case,
+  //     and only fires when a human actually looks at the screen again,
+  //     not on a fixed timer.
   if(FB_HEARTBEAT_TIMER)clearInterval(FB_HEARTBEAT_TIMER);
   if(window._syncAgeTicker)clearInterval(window._syncAgeTicker);
-  window._syncAgeTicker=setInterval(_updateSyncAge,1000); // lightweight DOM text update only
+  window._syncAgeTicker=setInterval(_updateSyncAge,1000); // local DOM text only — zero Firestore cost
   FB_HEARTBEAT_TIMER=setInterval(function(){
     if(!FB_DOC_REF||!CU)return;
-    // Explicit-death case: FB_UNSUB already nulled by the error handler —
-    // reconnect immediately rather than waiting for the next cycle.
+    // Only ever reconnect on CONFIRMED death (FB_UNSUB nulled by an actual
+    // error) — never based on quiet time alone.
     if(!FB_UNSUB){_reconnectCloudListener();return;}
-    // Proactive safety net: force a fresh subscribe every 3 minutes even if
-    // the listener LOOKS healthy — this is the only reliable way to recover
-    // from a silent stall, and costs nothing but one extra read.
-    var silentFor=Date.now()-FB_LAST_SNAPSHOT;
-    if(silentFor>45000){
-      startCloudListener(); // tears down old listener internally, re-subscribes fresh
-    }
-  },20000);
+  },60000); // checked once a minute — this branch only ever fires on genuine failure
 }
 function refreshCurrentPage(){
   var activePg=document.querySelector(".pg.act");
@@ -5752,7 +5756,7 @@ function showBackupHistory(){
   if(!can("rest")){toast("Only directors can view backup history","err");return;}
   var el2=el("backup-history");if(!el2||!FB_BACKUP_COL)return;
   el2.innerHTML="<div style=\"font-size:12px;color:var(--tx2)\">Loading backup history...</div>";
-  FB_BACKUP_COL.orderBy(firebase.firestore.FieldPath.documentId(),"desc").limit(10).get().then(function(snap){
+  FB_BACKUP_COL.orderBy(firebase.firestore.FieldPath.documentId(),"desc").limit(20).get({source:"server"}).then(function(snap){
     if(snap.empty){el2.innerHTML="<div style=\"font-size:12px;color:var(--tx2)\">No backups yet — they start automatically after 10 minutes of use.</div>";return;}
     var rows="";
     snap.forEach(function(d){
@@ -5762,8 +5766,10 @@ function showBackupHistory(){
       var custs=(data.stats&&data.stats.customers)||0;
       var ords=(data.stats&&data.stats.orders)||0;
       var stk=(data.stats&&data.stats.stock)||0;
+      var usrs=(data.stats&&data.stats.users)!=null?data.stats.users:"?";
       var stkWarn=stk===0?" <span style=\"color:#c0392b;font-weight:700\">(0 products!)</span>":"";
-      rows+="<tr><td style=\"font-weight:700\">"+type+"</td><td>"+d.id.split("-").slice(1).join("-")+"</td><td>"+t+"</td><td>"+custs+" customers, "+ords+" orders, "+stk+" products"+stkWarn+"</td>"+
+      var usrWarn=usrs===1?" <span style=\"color:#c0392b;font-weight:700\">(only 1 user!)</span>":(usrs==="?"?" <span style=\"color:#999\">(user count unknown — check manually)</span>":"");
+      rows+="<tr><td style=\"font-weight:700\">"+type+"</td><td>"+d.id.split("-").slice(1).join("-")+"</td><td>"+t+"</td><td>"+custs+" customers, "+ords+" orders, "+stk+" products, "+usrs+" users"+stkWarn+usrWarn+"</td>"+
         "<td><button class=\"btn btn-xs btn-navy\" onclick=\"restoreSpecificBackup('"+d.id+"')\" title=\"Restore to this point\"><i class=\"ti ti-history\" style=\"margin-right:3px\"></i>Restore</button></td></tr>";
     });
     el2.innerHTML="<table style=\"width:100%;font-size:11px;border-collapse:collapse;margin-top:8px\">"+
@@ -6240,11 +6246,21 @@ function runIntegrityCheck(){
   }
 }
 function syncIdCounters(){
+  // ID counters must be a ratchet — only ever move forward, never backward.
+  // A restore from an older backup can load D.orders/etc that lack any IDs
+  // created after that backup was taken; recalculating purely from what is
+  // currently loaded would roll the counter back and let a brand-new order
+  // collide with an ID already in use elsewhere (Firestore, another device's
+  // cache) — which looks exactly like "deleting an order doesn't work,"
+  // since a colliding duplicate can reappear on the same ID.
   var maxO=(D.orders||[]).reduce(function(m,o){return Math.max(m,Number(o.id)||0);},1000);
   var maxI=(D.invoices||[]).reduce(function(m,i){return Math.max(m,Number(i.id)||0);},2000);
   var maxCust=(D.customers||[]).reduce(function(m,cu){return Math.max(m,Number(cu.id)||0);},3000);
   var maxCmp=(D.complaints||[]).reduce(function(m,x){return Math.max(m,Number(x.id)||0);},4000);
-  nOId=maxO+1;nIId=maxI+1;nCId=maxCust+1;nCmpId=maxCmp+1;
+  nOId=Math.max(nOId||1001,maxO+1);
+  nIId=Math.max(nIId||2001,maxI+1);
+  nCId=Math.max(nCId||3001,maxCust+1);
+  nCmpId=Math.max(nCmpId||4001,maxCmp+1);
 }
 function syncPaymentStatuses(){
   // Fix any order whose payment badge doesn't match its invoice reality
