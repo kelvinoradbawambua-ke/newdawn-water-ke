@@ -811,12 +811,15 @@ function startCloudListener(){
             Object.assign(lo,ro);
           }
         });
-        // Remove orders deleted remotely — but protect orders placed in last 60s
+        // Remove orders deleted remotely — but NEVER infer deletion for a Delivered
+        // order (financial record — only explicit delO() may remove it) or for an
+        // order placed in the last 5 minutes (protects against a lost/delayed/raced
+        // write being misread as "deleted" and permanently wiping real data).
         var remoteOrdIds={};
         data.D.orders.forEach(function(o){remoteOrdIds[o.id]=true;});
-        var sixtyAgo=Date.now()-60000;
+        var fiveMinAgo=Date.now()-300000;
         D.orders=(D.orders||[]).filter(function(o){
-          return remoteOrdIds[o.id]||(o._ts&&o._ts>sixtyAgo); // keep recent local orders
+          return remoteOrdIds[o.id]||o.status==="Delivered"||(o._ts&&o._ts>fiveMinAgo);
         });
       }
       // Invoices: take remote (payments recorded on any device)
