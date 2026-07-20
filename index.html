@@ -201,6 +201,19 @@ var FB_DOC_REF=null;
 var FB_BACKUP_COL=null; // backup collection reference
 var FB_EVENTS_COL=null; // audit events subcollection — 1 doc per event
 var FB_READY=false;
+// DATA SAFETY: FB_READY drives the UI (login can proceed, spinners can stop)
+// and used to ALSO gate whether it's safe to write to Firestore — but those
+// are different questions. FB_READY gets set true on a flat timer after auth
+// succeeds, regardless of whether the actual document snapshot has arrived
+// yet. On a slow connection (exactly what mobile staff devices see), that
+// timer can fire before the real data comes back — at which point D and
+// USERS are still sitting at their untouched startup defaults (a single
+// bootstrap director, empty everything else). If a write were allowed to go
+// out at that moment, it would silently overwrite the real shared data for
+// the whole business. This flag is the actual write-safety gate: it is only
+// ever set true inside the real onSnapshot callback, i.e. only once the app
+// has genuine, authoritative knowledge of what's really in the cloud.
+var _cloudDataConfirmed=false;
 var _APP_READY=false; // true after first Firestore snapshot received
 var FB_RECONNECT_ATTEMPTS=0; // for exponential backoff
 var _idleWarnTimer=null;
@@ -214,7 +227,7 @@ var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-20-live-sync-audit-v8";
+var APP_VERSION="2026-07-20-init-race-condition-fix-v9";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -454,6 +467,13 @@ var FB_WRITE_RETRY_TIMER=null; // QUOTA GUARD: only one pending write-retry may 
 var FB_WRITE_RETRY_ATTEMPTS=0; // QUOTA GUARD: drives backoff instead of a fixed 5s-forever hammer
 function pushToCloud(){
   if(!FB_READY||!FB_DOC_REF)return;
+  // DATA SAFETY GATE: never write until we've genuinely heard back from
+  // Firestore at least once (see _cloudDataConfirmed above). Without this,
+  // a slow connection could let FB_READY flip true from a flat timer before
+  // the real snapshot arrives, and this function would then happily push
+  // whatever D/USERS still look like at startup (empty data, a single
+  // bootstrap director) straight over the real shared data for everyone.
+  if(!_cloudDataConfirmed)return;
   var isEmpty=(!D.customers||(D.customers||[]).length===0)&&(!D.orders||(D.orders||[]).length===0)&&(!D.stock||(D.stock||[]).length===0);
   if(isEmpty&&FB_SETUP_DONE)return; // empty data guard — silently skip
   // QUOTA GUARD: a manual/scheduled push supersedes any pending retry — cancel it,
@@ -786,8 +806,12 @@ function startAuditListener(){
 function startCloudListener(){
   if(!FB_DOC_REF)return;
   if(FB_UNSUB)FB_UNSUB();
+  // Re-arm on every fresh subscribe, including reconnects — a reconnect must
+  // never be treated as "confirmed" until ITS OWN snapshot actually arrives.
+  _cloudDataConfirmed=false;
   FB_UNSUB=FB_DOC_REF.onSnapshot(function(doc){
     FB_LAST_SNAPSHOT=Date.now();FB_RECONNECT_ATTEMPTS=0; // reset backoff on success
+    _cloudDataConfirmed=true; // we now have authoritative knowledge of real state — safe to write from here on
     if(!doc.exists){
       // SAFETY GUARD: Check all recovery sources before writing clean slate
       var snap=autoSaveCheckLocal();
@@ -3716,13 +3740,13 @@ function saveOrd(){
       if(netChange>0&&newStock&&newStock.qty<netChange){
         if(!confirm("⚠️ Stock Alert\n\nOnly "+newStock.qty+" more unit(s) available for "+pn+".\n\nOrder will be updated but stock is insufficient. Please restock.\n\nContinue?"))return;
       }
-      if(newStock)newStock.qty-=netChange;
+      if(newStock)newStock.qty=Math.max(0,newStock.qty-netChange);
     }else{
       if(newStock&&newStock.qty<qty){
         if(!confirm("⚠️ Stock Alert\n\nOnly "+newStock.qty+" unit(s) in stock for "+pn+".\n\nOrder will be updated. Please restock soon.\n\nContinue?"))return;
       }
       if(oldStock)oldStock.qty+=o.qty;
-      if(newStock)newStock.qty-=qty;
+      if(newStock)newStock.qty=Math.max(0,newStock.qty-qty);
     }
     var stCostE=(D.stock||[]).find(function(s){return s.name===pn;});
     o.cId=cId;o.prod=pn;o.qty=qty;o.price=price;o.cost=stCostE?stCostE.cost:0;o.date=el("od").value;
