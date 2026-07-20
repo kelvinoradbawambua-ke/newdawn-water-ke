@@ -229,7 +229,7 @@ var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-20-critical-write-loss-fix-v11";
+var APP_VERSION="2026-07-20-diagnostic-logging-v12";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -469,7 +469,7 @@ var FB_WRITE_RETRY_TIMER=null; // QUOTA GUARD: only one pending write-retry may 
 var FB_WRITE_RETRY_ATTEMPTS=0; // QUOTA GUARD: drives backoff instead of a fixed 5s-forever hammer
 var FB_PENDING_CONFIRM_RETRY=null; // ensures a write attempted before confirmation is never silently lost
 function pushToCloud(){
-  if(!FB_READY||!FB_DOC_REF)return;
+  if(!FB_READY||!FB_DOC_REF){console.log("[NDSYNC] pushToCloud BLOCKED: FB_READY="+FB_READY+" FB_DOC_REF="+(!!FB_DOC_REF));return;}
   // DATA SAFETY GATE: never write until we've genuinely heard back from
   // Firestore at least once (see _cloudDataConfirmed above). Without this,
   // a slow connection could let FB_READY flip true from a flat timer before
@@ -491,17 +491,19 @@ function pushToCloud(){
   // GUARANTEE a retry of this exact call in 1 second, repeating until
   // confirmation arrives — the write is delayed, never dropped.
   if(!_cloudDataConfirmed){
+    console.log("[NDSYNC] pushToCloud WAITING on _cloudDataConfirmed — will retry in 1s");
     if(!FB_PENDING_CONFIRM_RETRY){
       FB_PENDING_CONFIRM_RETRY=setTimeout(function(){FB_PENDING_CONFIRM_RETRY=null;pushToCloud();},1000);
     }
     return;
   }
   var isEmpty=(!D.customers||(D.customers||[]).length===0)&&(!D.orders||(D.orders||[]).length===0)&&(!D.stock||(D.stock||[]).length===0);
-  if(isEmpty&&FB_SETUP_DONE)return; // empty data guard — silently skip
+  if(isEmpty&&FB_SETUP_DONE){console.log("[NDSYNC] pushToCloud BLOCKED: isEmpty guard triggered (D looks empty)");return;} // empty data guard — silently skip
   // QUOTA GUARD: a manual/scheduled push supersedes any pending retry — cancel it,
   // the queue-and-process below will cover it.
   if(FB_WRITE_RETRY_TIMER){clearTimeout(FB_WRITE_RETRY_TIMER);FB_WRITE_RETRY_TIMER=null;}
   // Queue the write — process one at a time to prevent race conditions
+  console.log("[NDSYNC] pushToCloud PROCEEDING — queuing write, D.orders.length="+(D.orders||[]).length);
   FB_WRITE_QUEUE.push(Date.now());
   if(!FB_WRITING)processWriteQueue();
 }
@@ -550,7 +552,9 @@ function processWriteQueue(){
     var _sizeKB=Math.round(_payloadStr.length/1024);
     if(_sizeKB>800){toast("⚠️ Data near Firestore limit ("+_sizeKB+"KB/1000KB). Export a backup and ask your tech team to archive old orders.","warn");}
   }catch(e){}
+  console.log("[NDSYNC] processWriteQueue SENDING to Firestore — orders="+(DforSync.orders?DforSync.orders.length:0)+" customers="+(DforSync.customers?DforSync.customers.length:0)+" sizeKB="+_sizeKB);
   FB_DOC_REF.set(JSON.parse(JSON.stringify(payload)),{merge:true}).then(function(){
+    console.log("[NDSYNC] processWriteQueue SUCCESS — write confirmed by Firestore at "+new Date().toISOString());
     FB_WRITING=false;
     FB_WRITE_RETRY_ATTEMPTS=0; // a successful write means the connection/quota is healthy again
     _hideCloudOfflineBanner();
@@ -561,6 +565,7 @@ function processWriteQueue(){
     // Process any writes that came in while we were writing
     if(FB_WRITE_QUEUE.length)processWriteQueue();
   }).catch(function(err){
+    console.log("[NDSYNC] processWriteQueue FAILED — code="+(err&&err.code)+" message="+(err&&err.message));
     FB_WRITING=false;
     var errMsg=err&&err.message?err.message:(err&&err.code?err.code:"unknown");
     var isQuota=err&&(err.code==="resource-exhausted"||/quota/i.test(errMsg));
@@ -830,10 +835,12 @@ function startCloudListener(){
   if(FB_UNSUB)FB_UNSUB();
   // Re-arm on every fresh subscribe, including reconnects — a reconnect must
   // never be treated as "confirmed" until ITS OWN snapshot actually arrives.
+  console.log("[NDSYNC] startCloudListener called — _cloudDataConfirmed reset to false");
   _cloudDataConfirmed=false;
   FB_UNSUB=FB_DOC_REF.onSnapshot(function(doc){
     FB_LAST_SNAPSHOT=Date.now();FB_RECONNECT_ATTEMPTS=0; // reset backoff on success
     _cloudDataConfirmed=true; // we now have authoritative knowledge of real state — safe to write from here on
+    console.log("[NDSYNC] snapshot arrived — _cloudDataConfirmed=true, doc.exists="+doc.exists+", doc.metadata.fromCache="+(doc.metadata&&doc.metadata.fromCache));
     if(!doc.exists){
       // SAFETY GUARD: Check all recovery sources before writing clean slate
       var snap=autoSaveCheckLocal();
@@ -898,6 +905,7 @@ function startCloudListener(){
     var isOwnWrite=Date.now()-FB_LAST_LOCAL_WRITE<5000;
     var serverTime=data.updatedAt||0;
     var weAreNewer=FB_LAST_LOCAL_WRITE>serverTime+1000;
+    console.log("[NDSYNC] snapshot received — isOwnWrite="+isOwnWrite+" weAreNewer="+weAreNewer+" remoteOrders="+(data.D.orders?data.D.orders.length:0)+" localOrders="+(D.orders?D.orders.length:0)+" FB_LAST_LOCAL_WRITE="+FB_LAST_LOCAL_WRITE+" serverTime="+serverTime);
 
     // ── FIELD-LEVEL SMART MERGE ─────────────────────────────────────────
     // Orders, invoices, stock, payments: ALWAYS accept remote
@@ -970,11 +978,10 @@ function startCloudListener(){
             if(remoteOrdIds[o.id])return true; // still present remotely — keep
             var _sharedDelAt=(data.D.deletedOrderIds&&data.D.deletedOrderIds[o.id])||(D.deletedOrderIds&&D.deletedOrderIds[o.id]);
             var _delAt=_recentlyDeletedOrderIds[o.id]||_sharedDelAt;
-            if(_delAt)return false; // explicit, intentional deletion — always honor it
-            // No tombstone — fall back to the original conservative guard:
-            // never infer deletion for a Delivered order or a brand-new local
-            // order just because it's momentarily missing from one snapshot.
-            return o.status==="Delivered"||(o._ts&&o._ts>fiveMinAgo);
+            if(_delAt){console.log("[NDSYNC] order id="+o.id+" REMOVED — explicit tombstone found");return false;}
+            var keep=o.status==="Delivered"||(o._ts&&o._ts>fiveMinAgo);
+            if(!keep)console.log("[NDSYNC] order id="+o.id+" REMOVED — not in remote, no tombstone, status="+o.status+" _ts age(ms)="+(o._ts?Date.now()-o._ts:"none"));
+            return keep;
           });
         }
       }
@@ -3863,6 +3870,7 @@ auditLog("ORDER_UPDATED","Order #"+o.id+" edited by "+CU.name+" ("+CU.role+")");
   else if(amtPaid>0){payStatus="Partial";}
   else{payStatus="Unpaid";}
   (D.orders||[]).push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:price,cost:costAtSale,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?el("onotes").value:"",_ts:Date.now(),prodConfirmed:true});
+  console.log("[NDSYNC] order created id="+newOrdId+" D.orders.length="+(D.orders||[]).length+" FB_READY="+FB_READY+" _cloudDataConfirmed="+_cloudDataConfirmed+" FB_WRITING="+FB_WRITING);
   // Always create invoice for exact orders — provides full financial trail
   (D.invoices||[]).push({id:nIId++,cId:cId,amount:total,paid:amtPaid,due:(function(){var dd=new Date((el("od").value||tday())+"T12:00:00");dd.setDate(dd.getDate()+7);return dd.toISOString().split("T")[0];})(),notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
   auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty);
