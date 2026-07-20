@@ -214,7 +214,7 @@ var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-20-customer-sync-integrity-v5";
+var APP_VERSION="2026-07-20-live-sync-audit-v8";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -903,19 +903,32 @@ function startCloudListener(){
             Object.assign(lo,ro);
           }
         });
-        // Remove orders deleted remotely — but NEVER infer deletion for a Delivered
-        // order (financial record — only explicit delO() may remove it), for an
-        // order placed in the last 5 minutes, or for ANY local order at all if this
-        // device itself wrote something in the last 5 seconds (isOwnWrite). A brand
-        // new local order can legitimately be briefly absent from an incoming remote
-        // snapshot simply because Firestore hasn't finished propagating our own write
-        // yet — that must never be misread as "someone deleted it".
+        // Remove orders deleted remotely. IMPORTANT: an explicit deletion
+        // tombstone (set only by delO() after its own confirmations) must
+        // always be honored, even for a Delivered order — that's a genuine,
+        // intentional deletion, not sync staleness. The "never infer deletion
+        // for a Delivered order" rule below only protects against a DIFFERENT
+        // problem: a delivered order being briefly, innocently absent from one
+        // snapshot for reasons that have nothing to do with deletion. Without
+        // checking the tombstone first, that protection also silently blocked
+        // every genuine delivered-order deletion from ever reaching any other
+        // device — the deleting device removed it locally and in the cloud
+        // document, but every other device's own merge logic refused to apply
+        // the removal, so it looked "synced" while quietly not syncing this
+        // one thing.
         if(!isOwnWrite){
           var remoteOrdIds={};
           data.D.orders.forEach(function(o){remoteOrdIds[o.id]=true;});
           var fiveMinAgo=Date.now()-300000;
           D.orders=(D.orders||[]).filter(function(o){
-            return remoteOrdIds[o.id]||o.status==="Delivered"||(o._ts&&o._ts>fiveMinAgo);
+            if(remoteOrdIds[o.id])return true; // still present remotely — keep
+            var _sharedDelAt=(data.D.deletedOrderIds&&data.D.deletedOrderIds[o.id])||(D.deletedOrderIds&&D.deletedOrderIds[o.id]);
+            var _delAt=_recentlyDeletedOrderIds[o.id]||_sharedDelAt;
+            if(_delAt)return false; // explicit, intentional deletion — always honor it
+            // No tombstone — fall back to the original conservative guard:
+            // never infer deletion for a Delivered order or a brand-new local
+            // order just because it's momentarily missing from one snapshot.
+            return o.status==="Delivered"||(o._ts&&o._ts>fiveMinAgo);
           });
         }
       }
@@ -951,14 +964,17 @@ function startCloudListener(){
       }
       // Stock: take remote (restocks on any device)
       if(data.D.stock)D.stock=data.D.stock;
-      // Pending payments: merge (staff collections from multiple devices)
-      if(data.D.pendingPayments){
-        var localPP={};
-        (D.pendingPayments||[]).forEach(function(p){if(p.id)localPP[p.id]=true;});
-        (data.D.pendingPayments||[]).forEach(function(p){
-          if(p.id&&!localPP[p.id])(D.pendingPayments=D.pendingPayments||[]).push(p);
-        });
-      }
+      // Pending payments: take remote wholesale, same as stock/invoices/routes
+      // below — NOT an add-only merge. The old add-only approach ("only push
+      // entries this device has never seen") meant that once a device had
+      // cached a pending-payment record, it would NEVER see it change again —
+      // e.g. a director acknowledging a staff cash collection on the iPad
+      // would never update that same record on the staff phone that created
+      // it, since the phone already "knew" that id and the merge skipped it.
+      // The phone would keep showing "pending approval" forever, until logout
+      // forced a full fresh load. A live OLTP system can't require a logout
+      // to see a field change on a record it already has.
+      if(data.D.pendingPayments)D.pendingPayments=data.D.pendingPayments;
       // Routes, offers, complaints: take remote
       if(data.D.routes)D.routes=data.D.routes;
       if(data.D.offers)D.offers=data.D.offers;
@@ -6075,31 +6091,57 @@ function printStatement(cId){
     "</body></html>");
   w.document.close();
 }
+function _renderBackupHistoryRows(el2,snap){
+  if(snap.empty){el2.innerHTML="<div style=\"font-size:12px;color:var(--tx2)\">No backups yet — they start automatically after 10 minutes of use.</div>";return;}
+  var docs=[];
+  snap.forEach(function(d){docs.push(d);});
+  // Sort newest-first client-side — needed for the fallback path (which can't
+  // use orderBy), and harmless/no-op for the primary path (already sorted).
+  docs.sort(function(a,b){return a.id<b.id?1:a.id>b.id?-1:0;});
+  var rows="";
+  docs.forEach(function(d){
+    var data=d.data();
+    var t=data.backedUpAt?new Date(data.backedUpAt).toLocaleString():"?";
+    var type=d.id.startsWith("daily-")?"Daily":"Hourly";
+    var custs=(data.stats&&data.stats.customers)||0;
+    var ords=(data.stats&&data.stats.orders)||0;
+    var stk=(data.stats&&data.stats.stock)||0;
+    var usrs=(data.stats&&data.stats.users)!=null?data.stats.users:"?";
+    var stkWarn=stk===0?" <span style=\"color:#c0392b;font-weight:700\">(0 products!)</span>":"";
+    var usrWarn=usrs===1?" <span style=\"color:#c0392b;font-weight:700\">(only 1 user!)</span>":(usrs==="?"?" <span style=\"color:#999\">(user count unknown — check manually)</span>":"");
+    rows+="<tr><td style=\"font-weight:700\">"+type+"</td><td>"+d.id.split("-").slice(1).join("-")+"</td><td>"+t+"</td><td>"+custs+" customers, "+ords+" orders, "+stk+" products, "+usrs+" users"+stkWarn+usrWarn+"</td>"+
+      "<td><button class=\"btn btn-xs btn-navy\" onclick=\"restoreSpecificBackup('"+d.id+"')\" title=\"Restore to this point\"><i class=\"ti ti-history\" style=\"margin-right:3px\"></i>Restore</button></td></tr>";
+  });
+  el2.innerHTML="<table style=\"width:100%;font-size:11px;border-collapse:collapse;margin-top:8px\">"+
+    "<thead><tr style=\"background:var(--nv);color:#fff\"><th style=\"padding:5px 8px\">Type</th><th style=\"padding:5px 8px\">Date</th><th style=\"padding:5px 8px\">Time</th><th style=\"padding:5px 8px\">Contents</th><th style=\"padding:5px 8px\">Action</th></tr></thead>"+
+    "<tbody>"+rows+"</tbody></table>";
+}
 function showBackupHistory(){
   if(!can("rest")){toast("Only directors can view backup history","err");return;}
   var el2=el("backup-history");if(!el2||!FB_BACKUP_COL)return;
   el2.innerHTML="<div style=\"font-size:12px;color:var(--tx2)\">Loading backup history...</div>";
   FB_BACKUP_COL.orderBy(firebase.firestore.FieldPath.documentId(),"desc").limit(20).get({source:"server"}).then(function(snap){
-    if(snap.empty){el2.innerHTML="<div style=\"font-size:12px;color:var(--tx2)\">No backups yet — they start automatically after 10 minutes of use.</div>";return;}
-    var rows="";
-    snap.forEach(function(d){
-      var data=d.data();
-      var t=data.backedUpAt?new Date(data.backedUpAt).toLocaleString():"?";
-      var type=d.id.startsWith("daily-")?"Daily":"Hourly";
-      var custs=(data.stats&&data.stats.customers)||0;
-      var ords=(data.stats&&data.stats.orders)||0;
-      var stk=(data.stats&&data.stats.stock)||0;
-      var usrs=(data.stats&&data.stats.users)!=null?data.stats.users:"?";
-      var stkWarn=stk===0?" <span style=\"color:#c0392b;font-weight:700\">(0 products!)</span>":"";
-      var usrWarn=usrs===1?" <span style=\"color:#c0392b;font-weight:700\">(only 1 user!)</span>":(usrs==="?"?" <span style=\"color:#999\">(user count unknown — check manually)</span>":"");
-      rows+="<tr><td style=\"font-weight:700\">"+type+"</td><td>"+d.id.split("-").slice(1).join("-")+"</td><td>"+t+"</td><td>"+custs+" customers, "+ords+" orders, "+stk+" products, "+usrs+" users"+stkWarn+usrWarn+"</td>"+
-        "<td><button class=\"btn btn-xs btn-navy\" onclick=\"restoreSpecificBackup('"+d.id+"')\" title=\"Restore to this point\"><i class=\"ti ti-history\" style=\"margin-right:3px\"></i>Restore</button></td></tr>";
-    });
-    el2.innerHTML="<table style=\"width:100%;font-size:11px;border-collapse:collapse;margin-top:8px\">"+
-      "<thead><tr style=\"background:var(--nv);color:#fff\"><th style=\"padding:5px 8px\">Type</th><th style=\"padding:5px 8px\">Date</th><th style=\"padding:5px 8px\">Time</th><th style=\"padding:5px 8px\">Contents</th><th style=\"padding:5px 8px\">Action</th></tr></thead>"+
-      "<tbody>"+rows+"</tbody></table>";
+    _renderBackupHistoryRows(el2,snap);
   }).catch(function(e){
-    el2.innerHTML="<div style=\"font-size:12px;color:#c0392b\">Could not load backup history: "+e.message+"</div>";
+    // RESILIENCE: an ordered query can fail for reasons that have nothing to
+    // do with whether backups actually exist — e.g. a missing composite
+    // index (exactly what happened here: this project needed one created for
+    // "order by document ID" on this collection). Rather than dead-ending on
+    // a red error message with no way to see or restore a backup until
+    // someone notices and fixes the index, fall back to an unordered read
+    // (which needs no index at all) and sort client-side instead. Same
+    // resilience pattern already used for the audit log listener.
+    var isIndexErr=e&&(e.code==="failed-precondition"||/index/i.test(e.message||""));
+    FB_BACKUP_COL.limit(20).get({source:"server"}).then(function(snap2){
+      _renderBackupHistoryRows(el2,snap2);
+      if(isIndexErr){
+        el2.innerHTML+="<div style=\"font-size:11px;color:#856404;background:#fff8e1;padding:6px 10px;border-radius:6px;margin-top:8px\">"+
+          "<i class=\"ti ti-alert-triangle\"></i> Showing backups via a fallback query — the normal sorted query needs a one-time Firestore index. "+
+          "<a href=\""+(e.message.match(/https?:\/\/\S+/)?e.message.match(/https?:\/\/\S+/)[0]:"#")+"\" target=\"_blank\" style=\"color:#7c3aed;font-weight:700\">Create it here</a> to remove this notice.</div>";
+      }
+    }).catch(function(e2){
+      el2.innerHTML="<div style=\"font-size:12px;color:#c0392b\">Could not load backup history: "+e2.message+"</div>";
+    });
   });
 }
 function restoreSpecificBackup(docId){
