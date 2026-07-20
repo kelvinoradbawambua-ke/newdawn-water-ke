@@ -229,7 +229,7 @@ var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-20-stale-connection-detection-v10";
+var APP_VERSION="2026-07-20-critical-write-loss-fix-v11";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -467,6 +467,7 @@ function scheduleCloudSync(){
 }
 var FB_WRITE_RETRY_TIMER=null; // QUOTA GUARD: only one pending write-retry may exist at a time
 var FB_WRITE_RETRY_ATTEMPTS=0; // QUOTA GUARD: drives backoff instead of a fixed 5s-forever hammer
+var FB_PENDING_CONFIRM_RETRY=null; // ensures a write attempted before confirmation is never silently lost
 function pushToCloud(){
   if(!FB_READY||!FB_DOC_REF)return;
   // DATA SAFETY GATE: never write until we've genuinely heard back from
@@ -475,7 +476,26 @@ function pushToCloud(){
   // the real snapshot arrives, and this function would then happily push
   // whatever D/USERS still look like at startup (empty data, a single
   // bootstrap director) straight over the real shared data for everyone.
-  if(!_cloudDataConfirmed)return;
+  //
+  // CRITICAL FIX: this used to just "return" here when not yet confirmed —
+  // silently dropping whatever change triggered this call, with NOTHING
+  // scheduled to ever retry it. It relied entirely on some UNRELATED later
+  // event coincidentally calling scheduleCloudSync() again. On a phone, where
+  // _cloudDataConfirmed gets re-armed to false every time the tab is
+  // backgrounded and resumed (switching apps, screen lock — very frequent for
+  // staff on delivery rounds), that reliance can simply fail: an order gets
+  // created, the write silently no-ops, and nothing ever tries again. The
+  // order stays real in this device's memory but is NEVER durably written to
+  // Firestore — which is exactly indistinguishable from data loss the moment
+  // anyone reloads or logs in fresh. Now: still refuse to write yet, but
+  // GUARANTEE a retry of this exact call in 1 second, repeating until
+  // confirmation arrives — the write is delayed, never dropped.
+  if(!_cloudDataConfirmed){
+    if(!FB_PENDING_CONFIRM_RETRY){
+      FB_PENDING_CONFIRM_RETRY=setTimeout(function(){FB_PENDING_CONFIRM_RETRY=null;pushToCloud();},1000);
+    }
+    return;
+  }
   var isEmpty=(!D.customers||(D.customers||[]).length===0)&&(!D.orders||(D.orders||[]).length===0)&&(!D.stock||(D.stock||[]).length===0);
   if(isEmpty&&FB_SETUP_DONE)return; // empty data guard — silently skip
   // QUOTA GUARD: a manual/scheduled push supersedes any pending retry — cancel it,
