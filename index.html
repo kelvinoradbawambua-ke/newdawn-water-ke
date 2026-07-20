@@ -206,6 +206,7 @@ var FB_RECONNECT_ATTEMPTS=0; // for exponential backoff
 var _idleWarnTimer=null;
 var _recentlyDeletedOrderIds={}; // id->timestamp, prevents sync from resurrecting a just-deleted order
 var _recentlyVoidedInvoiceIds={}; // id->timestamp, prevents sync from silently un-voiding an invoice
+var _recentlyDeletedCustomerIds={}; // id->timestamp, prevents sync from resurrecting a just-deleted customer
 var _idleWarnEl=null;
 var FB_RECONNECT_TIMER=null;
 var FB_LAST_SNAPSHOT=0; // timestamp of last successful snapshot — for heartbeat
@@ -213,7 +214,7 @@ var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-19-sync-v2";
+var APP_VERSION="2026-07-20-customer-sync-integrity-v5";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -449,10 +450,15 @@ function scheduleCloudSync(){
   if(FB_SYNC_TIMER)clearTimeout(FB_SYNC_TIMER);
   FB_SYNC_TIMER=setTimeout(pushToCloud,800);
 }
+var FB_WRITE_RETRY_TIMER=null; // QUOTA GUARD: only one pending write-retry may exist at a time
+var FB_WRITE_RETRY_ATTEMPTS=0; // QUOTA GUARD: drives backoff instead of a fixed 5s-forever hammer
 function pushToCloud(){
   if(!FB_READY||!FB_DOC_REF)return;
   var isEmpty=(!D.customers||(D.customers||[]).length===0)&&(!D.orders||(D.orders||[]).length===0)&&(!D.stock||(D.stock||[]).length===0);
   if(isEmpty&&FB_SETUP_DONE)return; // empty data guard — silently skip
+  // QUOTA GUARD: a manual/scheduled push supersedes any pending retry — cancel it,
+  // the queue-and-process below will cover it.
+  if(FB_WRITE_RETRY_TIMER){clearTimeout(FB_WRITE_RETRY_TIMER);FB_WRITE_RETRY_TIMER=null;}
   // Queue the write — process one at a time to prevent race conditions
   FB_WRITE_QUEUE.push(Date.now());
   if(!FB_WRITING)processWriteQueue();
@@ -504,6 +510,8 @@ function processWriteQueue(){
   }catch(e){}
   FB_DOC_REF.set(JSON.parse(JSON.stringify(payload)),{merge:true}).then(function(){
     FB_WRITING=false;
+    FB_WRITE_RETRY_ATTEMPTS=0; // a successful write means the connection/quota is healthy again
+    _hideCloudOfflineBanner();
     var e=el("sts");if(e){e.className="sts saved";e.innerHTML="<i class=\"ti ti-cloud-check\"></i> Synced "+new Date().toLocaleTimeString();}
     var cs=el("cloud-status");
     var custN=(D&&D.customers&&(D.customers||[]).length)||0;
@@ -512,9 +520,42 @@ function processWriteQueue(){
     if(FB_WRITE_QUEUE.length)processWriteQueue();
   }).catch(function(err){
     FB_WRITING=false;
-    var e=el("sts");if(e){e.className="sts dirty";e.innerHTML="<i class=\"ti ti-cloud-off\"></i> Sync failed - retrying";}
-    setTimeout(pushToCloud,5000);
+    var errMsg=err&&err.message?err.message:(err&&err.code?err.code:"unknown");
+    var isQuota=err&&(err.code==="resource-exhausted"||/quota/i.test(errMsg));
+    var e=el("sts");
+    if(e){e.className="sts dirty";e.innerHTML="<i class=\"ti ti-cloud-off\"></i> "+(isQuota?"Daily limit reached - will retry":"Sync failed - retrying");}
+    // QUOTA GUARD: this used to retry every 5 seconds forever, unconditionally, on
+    // ANY failure — including a genuinely-exceeded daily quota, where every one of
+    // those retries fails and gets attempted again 5s later, all day, from every
+    // open device. That is a self-inflicted quota hammer, not a fix. Now: capped
+    // exponential backoff (5s, 10s, 20s... capped at 5 min), and only ONE retry is
+    // ever pending at a time — a fresh call to pushToCloud() (from real user action)
+    // cancels the old retry rather than stacking a second one alongside it.
+    FB_WRITE_RETRY_ATTEMPTS++;
+    var delay=Math.min(5*60*1000,5000*Math.pow(2,FB_WRITE_RETRY_ATTEMPTS-1));
+    if(FB_WRITE_RETRY_TIMER)clearTimeout(FB_WRITE_RETRY_TIMER);
+    FB_WRITE_RETRY_TIMER=setTimeout(function(){FB_WRITE_RETRY_TIMER=null;pushToCloud();},delay);
+    // After a few consecutive failures this is not a blip — tell the team plainly
+    // so they don't keep working assuming other devices see their changes.
+    if(FB_WRITE_RETRY_ATTEMPTS>=3)_showCloudOfflineBanner(isQuota);
   });
+}
+var _cloudOfflineBannerShown=false;
+function _showCloudOfflineBanner(isQuota){
+  if(_cloudOfflineBannerShown)return;
+  _cloudOfflineBannerShown=true;
+  var b=document.createElement("div");
+  b.id="cloud-offline-banner";
+  b.style.cssText="position:fixed;top:0;left:0;right:0;z-index:99999;background:#c0392b;color:#fff;text-align:center;padding:9px 14px;font-size:12.5px;font-weight:600;font-family:inherit";
+  b.innerHTML=isQuota?
+    "⚠️ Firebase daily free limit reached — changes are saved on THIS device only until it resets (usually ~10am EAT). Other devices will not see new orders/edits until then.":
+    "⚠️ Cloud sync is down — changes are saved on THIS device only. Other devices will not see new orders/edits until sync recovers.";
+  document.body.insertBefore(b,document.body.firstChild);
+}
+function _hideCloudOfflineBanner(){
+  _cloudOfflineBannerShown=false;
+  var b=el("cloud-offline-banner");
+  if(b&&b.parentNode)b.parentNode.removeChild(b);
 }
 /* ══════════════════════════════════════════════════════════
    AUTOMATIC BACKUP ENGINE
@@ -671,8 +712,22 @@ function _mergeAuditEvents(remote){
     if(pg&&pg.classList.contains("act"))rAuditLog();
   }
 }
+var AUDIT_RETRY_TIMER=null;   // QUOTA GUARD: tracks the single pending retry, if any
+var AUDIT_RETRY_ATTEMPTS=0;   // QUOTA GUARD: drives exponential backoff instead of a fixed fast interval
+var AUDIT_FALLBACK_DONE=false;// QUOTA GUARD: the 200-doc safety-net read may only ever fire once per session
 function startAuditListener(){
   if(!FB_EVENTS_COL)return;
+  // QUOTA GUARD: cancel any retry that's already in flight before doing
+  // anything else. Without this, calling startAuditListener() again (page
+  // nav, re-login, initCloudConnection) while an error-triggered retry is
+  // still pending left the OLD retry chain running in parallel forever —
+  // each stacked chain independently retrying every 120s and each retry
+  // costing up to 200 document reads via the fallback .get() below. A
+  // handful of idle background tabs open during a rules-propagation error
+  // window was enough to silently burn through the entire daily read quota
+  // with nobody touching the app. This flag makes "one listener attempt in
+  // flight at a time, ever" an invariant instead of a hope.
+  if(AUDIT_RETRY_TIMER){clearTimeout(AUDIT_RETRY_TIMER);AUDIT_RETRY_TIMER=null;}
   // Tear down previous listener
   if(FB_AUDIT_UNSUB){try{FB_AUDIT_UNSUB();}catch(e){}FB_AUDIT_UNSUB=null;}
   // 30-day rolling window — new events always have ts > cutoff
@@ -686,11 +741,16 @@ function startAuditListener(){
     .orderBy("ts","asc")
     .startAfter(cutoffTs)
     .onSnapshot(function(snap){
+      AUDIT_RETRY_ATTEMPTS=0; // a good snapshot means the connection is healthy again
       var remote=[];
       snap.forEach(function(d){remote.push(d.data());});
       _mergeAuditEvents(remote);
-      // If listener returned empty but we expect data, also do unordered get as safety
-      if(remote.length===0&&(!D.auditLog||(D.auditLog||[]).length===0)){
+      // If listener returned empty but we expect data, also do unordered get as safety.
+      // QUOTA GUARD: this used to be able to refire on every snapshot as long as the
+      // condition stayed true, which on a genuinely-empty collection meant repeated
+      // 200-doc reads. It's now capped to fire at most once per session.
+      if(remote.length===0&&!AUDIT_FALLBACK_DONE&&(!D.auditLog||(D.auditLog||[]).length===0)){
+        AUDIT_FALLBACK_DONE=true;
         FB_EVENTS_COL.limit(200).get().then(function(s2){
           var r2=[];s2.forEach(function(d){r2.push(d.data());});_mergeAuditEvents(r2);
         }).catch(function(){});
@@ -702,15 +762,25 @@ function startAuditListener(){
       var errMsg=err&&err.message?err.message:(err&&err.code?err.code:"unknown");
       var s=document.getElementById("audit-sync-status");
       if(s)s.innerHTML="<span style=\"color:#e74c3c\">Audit error: "+errMsg+"</span>";
-      // Fallback: get without orderBy
-      FB_EVENTS_COL.limit(200).get().then(function(snap){
-        var remote=[];
-        snap.forEach(function(d){remote.push(d.data());});
-        _mergeAuditEvents(remote);
-      }).catch(function(e2){
-        if(s)s.innerHTML="<span style=\"color:#e74c3c\">Audit read failed: "+(e2&&e2.code?e2.code:"")+"</span>";
-      });
-      setTimeout(startAuditListener,120000);
+      // Fallback: get without orderBy. QUOTA GUARD: only ever once per session —
+      // see AUDIT_FALLBACK_DONE note above. Repeated errors no longer mean
+      // repeated 200-doc reads.
+      if(!AUDIT_FALLBACK_DONE){
+        AUDIT_FALLBACK_DONE=true;
+        FB_EVENTS_COL.limit(200).get().then(function(snap){
+          var remote=[];
+          snap.forEach(function(d){remote.push(d.data());});
+          _mergeAuditEvents(remote);
+        }).catch(function(e2){
+          if(s)s.innerHTML="<span style=\"color:#e74c3c\">Audit read failed: "+(e2&&e2.code?e2.code:"")+"</span>";
+        });
+      }
+      // QUOTA GUARD: exponential backoff (2min, 4min, 8min... capped at 30min)
+      // instead of a fixed 120s-forever retry, AND only ever one retry timer
+      // alive at once (enforced at the top of this function).
+      AUDIT_RETRY_ATTEMPTS++;
+      var delay=Math.min(30*60*1000,120000*Math.pow(2,AUDIT_RETRY_ATTEMPTS-1));
+      AUDIT_RETRY_TIMER=setTimeout(startAuditListener,delay);
     });
 }
 function startCloudListener(){
@@ -895,36 +965,70 @@ function startCloudListener(){
       if(data.D.complaints)D.complaints=data.D.complaints;
     }
 
-    // 3. Customers: only take remote if they have MORE (prevent reduction)
+    // 3. Customers: proper ID-level merge with deletion tombstones — NOT a
+    // length comparison. The old logic ("remote has fewer than local? then
+    // merge missing local ones back in") looks safe but is exactly the bug
+    // that hit order deletion before it was fixed: if Device A deletes a
+    // customer and Device B still has it in memory from a moment ago, B's
+    // very next sync would see "remote is shorter" and push the deleted
+    // customer straight back into the shared document — resurrecting it for
+    // everyone, silently, on a system used by 6 people across 6 devices. This
+    // now uses the same id-map + tombstone + grace-period approach already
+    // proven for orders.
+    Object.keys(_recentlyDeletedCustomerIds).forEach(function(k){
+      if(Date.now()-_recentlyDeletedCustomerIds[k]>60000)delete _recentlyDeletedCustomerIds[k];
+    });
     var remoteCustomers=data.D.customers||[];
     var localCustomers=D.customers||[];
-    if(remoteCustomers.length>localCustomers.length){
-      // Log silently-added customers from sync
-      var added=remoteCustomers.length-localCustomers.length;
-      if(added>0&&CU)auditLog("CUSTOMER_UPDATED","Sync: "+added+" customer(s) added from another session");
-    }
-    if(remoteCustomers.length>=localCustomers.length){
-      // Remote has same or more customers — safe to take
-      // BUT: preserve local waterCycle/cycleHistory if local is higher
-      // (prevents slow cloud roundtrip overwriting just-completed delivery)
+    var addedCount=0;
+    if(remoteCustomers.length||localCustomers.length){
       var localCustMap={};
       localCustomers.forEach(function(lc){localCustMap[lc.id]=lc;});
+      var mergedCustomers=[];
+      var seenIds={};
       remoteCustomers.forEach(function(rc){
+        var _sharedDelAt=(data.D.deletedCustomerIds&&data.D.deletedCustomerIds[rc.id])||(D.deletedCustomerIds&&D.deletedCustomerIds[rc.id]);
+        var _delAt=_recentlyDeletedCustomerIds[rc.id]||_sharedDelAt;
+        if(_delAt){return;} // explicitly deleted by any device — never resurrect
         var lc=localCustMap[rc.id];
         if(lc&&(lc.waterCycle||0)>(rc.waterCycle||0)){
+          // Preserve local water-cycle progress if it's ahead — prevents a
+          // slow cloud round-trip from overwriting a just-completed delivery.
           rc.waterCycle=lc.waterCycle;
           rc.cycleHistory=lc.cycleHistory;
         }
+        if(!lc)addedCount++;
+        mergedCustomers.push(rc);
+        seenIds[rc.id]=true;
       });
-      D.customers=remoteCustomers;
-      // Refresh customer page if visible (badge update after sync)
+      // Keep any local-only customer that's either genuinely new (within the
+      // last 5 minutes — hasn't propagated to this snapshot yet, same grace
+      // window used for orders) or simply wasn't in this particular remote
+      // snapshot for some other reason — but never if it's tombstoned.
+      var fiveMinAgo=Date.now()-300000;
+      localCustomers.forEach(function(lc){
+        if(seenIds[lc.id])return;
+        var _sharedDelAt=(data.D.deletedCustomerIds&&data.D.deletedCustomerIds[lc.id])||(D.deletedCustomerIds&&D.deletedCustomerIds[lc.id]);
+        var _delAt=_recentlyDeletedCustomerIds[lc.id]||_sharedDelAt;
+        if(_delAt)return; // this device (or another) intentionally deleted it
+        if(lc._ts&&lc._ts>fiveMinAgo){mergedCustomers.push(lc);return;} // too new to trust its absence
+        // Older local-only customer genuinely missing from remote and not
+        // tombstoned — extremely unlikely in normal operation, but keep it
+        // rather than silently drop a real customer record; a stray extra
+        // record is far cheaper to notice and clean up than a silently lost one.
+        mergedCustomers.push(lc);
+      });
+      if(addedCount>0&&CU)auditLog("CUSTOMER_UPDATED","Sync: "+addedCount+" customer(s) added from another session");
+      D.customers=mergedCustomers;
       if(el("pg-customers")&&el("pg-customers").classList.contains("act"))rCusts();
-    } else if(!isOwnWrite&&remoteCustomers.length>0){
-      // Remote has fewer but it's not our write — merge (add missing local)
-      var remCustIds={};
-      remoteCustomers.forEach(function(cu){remCustIds[cu.id]=true;});
-      var onlyLocal=localCustomers.filter(function(cu){return !remCustIds[cu.id];});
-      D.customers=remoteCustomers.concat(onlyLocal);
+    }
+    // Merge shared customer-deletion tombstones — union of local and remote,
+    // so any device's deletion is remembered regardless of who deletes or syncs.
+    if(data.D.deletedCustomerIds){
+      if(!D.deletedCustomerIds)D.deletedCustomerIds={};
+      Object.keys(data.D.deletedCustomerIds).forEach(function(k){
+        if(!D.deletedCustomerIds[k])D.deletedCustomerIds[k]=data.D.deletedCustomerIds[k];
+      });
     }
     // Always ensure required arrays exist
     if(!D.routes)D.routes=[];
@@ -2529,7 +2633,7 @@ cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer updated");
         +(can("vPhone")?dupAddr.name:maskName(dupAddr.name))+"\n\nContinue adding a new customer?"))return;
     }
   }
-  (D.customers||[]).push({id:uid(),name:n,phone:ph,phone2:el("cph2").value,idno:el("cid").value,estate:el("cestate").value,court:el("ccourt").value,house:el("chouse").value,htype:el("chtype").value,road:el("croad").value,zone:el("czone").value,ctype:el("ctype").value,creditLimit:parseFloat(el("ccl").value)||0,notes:el("cnotes").value,created:tday()});
+  (D.customers||[]).push({id:uid(),name:n,phone:ph,phone2:el("cph2").value,idno:el("cid").value,estate:el("cestate").value,court:el("ccourt").value,house:el("chouse").value,htype:el("chtype").value,road:el("croad").value,zone:el("czone").value,ctype:el("ctype").value,creditLimit:parseFloat(el("ccl").value)||0,notes:el("cnotes").value,created:tday(),_ts:Date.now()});
   ["cn","cph","cph2","cid","cestate","ccourt","chouse","croad","czone","cnotes"].forEach(function(id){el(id).value="";});el("ccl").value="0";
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
 cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer added");
@@ -2551,24 +2655,59 @@ function editCust(id){
 function delC(id){
   if(!can("dCust"))return;
   var c=(D.customers||[]).find(function(x){return x.id===id;});if(!c)return;
+  // ENTERPRISE RULE 1: never let a customer disappear while they still owe
+  // the business money. Debt must be explicitly written off — with a reason
+  // and an audit trail — before deletion, exactly like Order deletion now
+  // requires. This used to silently discard every unpaid invoice with no
+  // reason logged and no way to see it happened later.
+  var outstandingInvs=(D.invoices||[]).filter(function(i){return i.cId===id&&!i.voided&&i.paid<i.amount;});
+  if(outstandingInvs.length){
+    var totalOwed=outstandingInvs.reduce(function(s,i){return s+(i.amount-i.paid);},0);
+    toast("This customer has KSh "+totalOwed.toLocaleString()+" outstanding across "+outstandingInvs.length+" invoice(s). Void "+(outstandingInvs.length>1?"each one":"it")+" first (reason required) — then delete.","warn");
+    voidInvoice(outstandingInvs[0].id);
+    return;
+  }
+  // ENTERPRISE RULE 2: the mirror image of Rule 1 — if the BUSINESS owes the
+  // customer money (a credit balance from an overpayment), that liability
+  // can't just vanish with the customer record either. Require an explicit,
+  // logged decision on what happened to it.
+  if(c.credit>0){
+    if(!confirm("This customer has KSh "+c.credit.toLocaleString()+" in store credit — money the business owes them.\n\nConfirm this has been refunded or otherwise settled outside the system. This will be logged.\n\nContinue deleting?"))return;
+    auditLog("CUSTOMER_UPDATED","KSh "+c.credit+" store credit for "+(can("vPhone")?c.name:"[masked]")+" cleared on deletion by "+CU.name+" ("+CU.role+") — confirmed settled outside the system.");
+  }
   var paidInvs=(D.invoices||[]).filter(function(i){return i.cId===id&&i.paid>0;});
-  var debt=custDebt(id);
+  var deliveredOrds=(D.orders||[]).filter(function(o){return o.cId===id&&o.status==="Delivered";});
   var msg="Remove "+(can("vPhone")?c.name:"this customer")+"?\n\n";
-  if(debt>0)msg+="They have KSh "+debt.toLocaleString()+" outstanding debt — this will be written off.\n\n";
+  if(deliveredOrds.length)msg+=deliveredOrds.length+" delivered order(s) will be KEPT for revenue/history records (customer will show as removed on them).\n\n";
   if(paidInvs.length)msg+=paidInvs.length+" paid invoice(s) will be kept for financial records.\n\n";
-  msg+="Their orders and unpaid invoices will be removed. Cannot be undone.";
+  msg+="Their pending/unfulfilled orders will be removed and any deducted stock restored. Cannot be undone.";
   if(!confirm(msg))return;
-  // Restore stock for any pending orders before removing customer
+  // Restore stock for pending/unfulfilled orders before removing them
   (D.orders||[]).filter(function(o){return o.cId===id&&o.status!=="Delivered"&&o.status!=="Cancelled"&&o.prodConfirmed!==false;}).forEach(function(o){
     var st=(D.stock||[]).find(function(s){return s.name===o.prod;});
     if(st)st.qty+=o.qty;
   });
-  D.customers=(D.customers||[]).filter(function(x){return x.id!==id;});
-  var _deletedOrdCount=(D.orders||[]).filter(function(o){return o.cId===id;}).length;
-  D.orders=(D.orders||[]).filter(function(o){return o.cId!==id;});
+  // ENTERPRISE RULE 3: a Delivered order is recognized revenue — deleting the
+  // customer must never silently delete their delivery/revenue history along
+  // with them. Only pre-fulfillment orders (Pending/Processing) are removed;
+  // Delivered and Cancelled orders stay exactly as they are, still queryable
+  // in reports. customName()/cAddr() already render a graceful "—" for an
+  // order whose customer no longer exists, so nothing else breaks.
+  var _removedOrdCount=(D.orders||[]).filter(function(o){return o.cId===id&&o.status!=="Delivered"&&o.status!=="Cancelled";}).length;
+  D.orders=(D.orders||[]).filter(function(o){return !(o.cId===id&&o.status!=="Delivered"&&o.status!=="Cancelled");});
+  // At this point every invoice for this customer either has zero balance
+  // (fully paid) or was just explicitly voided above — safe to drop any that
+  // never had a single payment (nothing lost), keep the rest for the books.
   D.invoices=(D.invoices||[]).filter(function(i){if(i.cId!==id)return true;return i.paid>0;});
   D.complaints=(D.complaints||[]).filter(function(x){return x.cId!==id;});
-  auditLog("CUSTOMER_DELETED","Customer deleted by "+CU.name+" ("+CU.role+"): "+(can("vPhone")?c.name:"[masked]")+". "+_deletedOrdCount+" orders removed, "+paidInvs.length+" paid invoices retained.");
+  D.customers=(D.customers||[]).filter(function(x){return x.id!==id;});
+  // Tombstone the deletion so it can never be silently resurrected by another
+  // device's next sync — this mechanism previously existed for orders and
+  // invoices but was missing entirely for customers.
+  if(!D.deletedCustomerIds)D.deletedCustomerIds={};
+  D.deletedCustomerIds[id]=Date.now();
+  _recentlyDeletedCustomerIds[id]=Date.now();
+  auditLog("CUSTOMER_DELETED","Customer deleted by "+CU.name+" ("+CU.role+"): "+(can("vPhone")?c.name:"[masked]")+". "+_removedOrdCount+" unfulfilled order(s) removed, "+deliveredOrds.length+" delivered order(s) kept for history, "+paidInvs.length+" paid invoice(s) retained.");
   rCusts(undefined,CUST_PAGE);
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   dirty();toast("Customer removed"+(paidInvs.length?" — "+paidInvs.length+" paid invoice(s) retained":""));
@@ -3471,7 +3610,13 @@ function saveOrd(){
   if(window._savingOrder)return;
   window._savingOrder=true;
   setTimeout(function(){window._savingOrder=false;},1000);
-  if(!can("aOrd")&&!can("eOrd"))return;
+  // PERMISSION HARDENING: the old check was `!can("aOrd")&&!can("eOrd")`, which
+  // meant a role with aOrd:1 but eOrd:0 (e.g. staff) could pass this gate even
+  // while editing an existing order — the UI already hides the Edit button from
+  // such roles, but this function itself did not actually enforce the distinction.
+  // Now the correct permission is required for the specific action being taken.
+  var _isEditingOrder=!!el("o-edit-id").value;
+  if(_isEditingOrder){if(!can("eOrd"))return;}else{if(!can("aOrd"))return;}
   if(!(D.customers||[]).length){toast("Add a customer first","err");return;}
   var cId=parseInt(el("oc")&&el("oc").value)||0;
   if(!cId){toast("Please select a customer","err");if(el("oc-search"))el("oc-search").focus();return;}
@@ -3770,16 +3915,26 @@ function completeDlv(){
   o.completedRole=CU.role;
   o.bottle_after=el("dlv-btl").value;
 
+  // FINANCIAL ACCURACY FIX: invoice creation must happen regardless of who
+  // completes the delivery — establishing what's owed is bookkeeping, not
+  // payment-taking. This used to live entirely inside "if(can('mPaid'))"
+  // below, which meant a category-order delivery (price only known at
+  // delivery time) completed by staff/drivers — who do the large majority
+  // of deliveries, from their phones — never got an invoice created at all.
+  // The order correctly showed Delivered with stock correctly deducted, but
+  // nothing was ever recorded as owed for it: a silent revenue gap on
+  // exactly the workflow this business runs most often. Fixed: invoice
+  // existence/creation is now unconditional; only *applying a new payment*
+  // stays gated by mPaid — staff still route cash through the
+  // pendingPayments/director-acknowledgement flow exactly as before.
+  var total=o.qty*o.price;
+  var inv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+oid)!==-1;});
+  if(isCat&&!inv&&total>0){
+    inv={id:nIId++,cId:o.cId,amount:total,paid:0,due:tday(),notes:"Order #"+oid,date:tday(),payments:[]};
+    (D.invoices||[]).push(inv);
+  }
   if(can("mPaid")){
     var amt=parseFloat(el("dlv-amt").value)||0;
-    var total=o.qty*o.price;
-    // Find or create invoice
-    var inv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+oid)!==-1;});
-    if(isCat&&!inv&&total>0){
-      // Create invoice now for category orders (was deferred until delivery)
-      inv={id:nIId++,cId:o.cId,amount:total,paid:0,due:tday(),notes:"Order #"+oid,date:tday(),payments:[]};
-      (D.invoices||[]).push(inv);
-    }
     if(amt>0&&inv){
       if(!inv.payments)inv.payments=[];
       var dlvMethod=el("dlv-method")?el("dlv-method").value:"Cash";
@@ -3808,7 +3963,16 @@ function completeDlv(){
       else{o.paid="Partial";o.amtPaid=amt;}
     }
   }else{
-    o.paid=o.paid||"Unpaid";
+    // Staff/driver: reflect whatever the invoice already shows (e.g. a prior
+    // director-recorded payment) — but never apply a NEW payment here; that
+    // still only ever happens via the pendingPayments/ack flow below.
+    if(inv){
+      if(inv.paid>=inv.amount){o.paid="Paid";o.amtPaid=inv.paid;}
+      else if(inv.paid>0){o.paid="Partial";o.amtPaid=inv.paid;}
+      else{o.paid=o.paid||"Unpaid";}
+    }else{
+      o.paid=o.paid||"Unpaid";
+    }
   }
 
   // Staff/driver cash collection: record as pending approval
@@ -3859,11 +4023,41 @@ function completeDlv(){
 function delO(id){
   if(!can("dOrd"))return;
   var o=(D.orders||[]).find(function(x){return x.id===id;});if(!o)return;
-  var hasPaid=(D.invoices||[]).some(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+id)!==-1&&i.paid>0;});
-  var msg=hasPaid?
-    "Delete order #"+id+"?\n\nThis order has payments on record. The invoice will be kept for your financial records, but the order will be removed.":
-    "Delete order #"+id+"? The linked invoice will also be removed.";
-  if(!confirm(msg))return;
+  var linkedInv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+id)!==-1;});
+  var outstandingBal=(linkedInv&&!linkedInv.voided)?Math.max(0,linkedInv.amount-linkedInv.paid):0;
+
+  // ENTERPRISE RULE 1: an order that hasn't been delivered yet and still has a
+  // balance should be CANCELLED, not deleted — Cancel already correctly
+  // restores stock and closes out the invoice for an unfulfilled order. Delete
+  // is for pure data-entry correction and for writing off delivered orders
+  // that genuinely went unpaid — not a shortcut around Cancel.
+  if(outstandingBal>0&&o.status!=="Delivered"){
+    toast("This order isn't delivered yet and still has a balance owed — use Cancel instead of Delete.","warn");
+    return;
+  }
+  // ENTERPRISE RULE 2: a DELIVERED order with an outstanding balance is real
+  // bad debt — goods already left the business, payment was never fully
+  // collected. Deleting the order must never make that debt silently vanish.
+  // It has to be written off explicitly, with a reason and an audit trail,
+  // exactly like any other bad-debt write-off — never left dangling on an
+  // invoice nobody can find in the debt totals anymore (which is exactly what
+  // used to happen: the invoice was "kept for records" but excluded from every
+  // debt calculation the moment its order disappeared, with no reason logged).
+  if(outstandingBal>0){
+    toast("Order #"+id+" has KSh "+outstandingBal.toLocaleString()+" still owed. Void the invoice first (reason required) — then delete.","warn");
+    voidInvoice(linkedInv.id);
+    return;
+  }
+  // ENTERPRISE RULE 3: a DELIVERED order is a recognized revenue transaction —
+  // deleting it changes historical financial reports after the fact. That's
+  // fundamentally different from deleting a Pending/Processing order (no
+  // revenue impact yet), so it gets its own explicit, informative warning
+  // instead of the same generic confirm() used for an ordinary delete.
+  if(o.status==="Delivered"){
+    if(!confirm("⚠️ REVENUE IMPACT\n\nOrder #"+id+" was DELIVERED — deleting it removes KSh "+(o.qty*o.price).toLocaleString()+" from historical revenue reports for "+(o.deliveredAt||o.date)+".\n\nThis changes past financial reports and cannot be undone.\n\nDelete anyway?"))return;
+  }else{
+    if(!confirm("Delete order #"+id+"?"+(linkedInv?" The linked invoice will also be removed.":"")))return;
+  }
   // Restore stock — skip for category orders (prodConfirmed===false means no stock was deducted)
   var st=(D.stock||[]).find(function(s){return s.name===o.prod;});
   var wasStockDeducted=(o.prodConfirmed!==false);
@@ -3882,15 +4076,27 @@ function delO(id){
   D.deletedOrderIds[id]=Date.now();
   _recentlyDeletedOrderIds[id]=Date.now();
   D.orders=(D.orders||[]).filter(function(x){return x.id!==id;});
-  // Remove unpaid invoices only — keep paid ones for records
+  // At this point any outstanding balance was already resolved above (either
+  // there never was one, or it was explicitly voided) — so it's now safe to
+  // remove an invoice with zero payment history, and keep one with real
+  // payment history for the books, exactly as before.
   D.invoices=(D.invoices||[]).filter(function(i){
     var linked=i.notes&&i.notes.indexOf("#"+id)!==-1;
     if(linked&&i.paid<=0)return false;
     return true;
   });
-  auditLog("ORDER_DELETED","Order #"+id+" deleted by "+CU.name+" ("+CU.role+"). Product: "+o.prod+", Qty: "+o.qty+", Status was: "+o.status);
+  auditLog("ORDER_DELETED","Order #"+id+" deleted by "+CU.name+" ("+CU.role+"). Product: "+o.prod+", Qty: "+o.qty+", Status was: "+o.status+(o.status==="Delivered"?" \u2014 REVENUE IMPACT: KSh "+(o.qty*o.price).toLocaleString()+" removed from historical reports":""));
   rOrds(undefined,ORD_PAGE);
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
+  // WATER CYCLE INTEGRITY: completeDlv() adds this order's qty to the
+  // customer's cycle count at the moment of delivery. Deleting a delivered
+  // water order after the fact used to leave that count permanently stale —
+  // nothing ever reversed it, and this could silently push a customer's
+  // "next cycle" milestone/free-bottle trigger further than their real
+  // delivery history supports. syncWaterCycles() already exists as a correct
+  // full recalculation from actual order history — it just needed to be
+  // called here, not only when a stock item's water flag is toggled.
+  if(o.status==="Delivered"&&is20ltr(o.prod))syncWaterCycles();
   dirty();toast("Order #"+id+" deleted");
 }
 
@@ -3901,13 +4107,62 @@ function cancelO(id){
   if(o.status==="Delivered"){toast("Cannot cancel a delivered order — delete it if needed","err");return;}
   var inv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+id)!==-1;});
   var hasPaid=inv&&inv.paid>0;
+  // ENTERPRISE RULE: cancelling an order that already has money paid against
+  // it must not leave the fate of that money ambiguous. It used to just zero
+  // the invoice balance and stop — no record of whether the cash was ever
+  // actually handed back, or should instead sit as credit for a future order.
+  // Now the business explicitly decides, and that decision is logged.
+  if(hasPaid){
+    _openCancelDisposition(id);
+    return;
+  }
+  _finishCancelO(id,null);
+}
+function _openCancelDisposition(id){
+  var o=(D.orders||[]).find(function(x){return x.id===id;});if(!o)return;
+  var inv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+id)!==-1;});
+  if(!inv)return;
+  var cu=(D.customers||[]).find(function(x){return x.id===o.cId;});
   var isCatOrder=(o.prodConfirmed===false);
-  var msg=hasPaid?
-    "Cancel order #"+id+"?\n\nKSh "+inv.paid.toLocaleString()+" has already been paid. The invoice will stay with the paid amount recorded."+(isCatOrder?" No stock to restore.":"\ Stock will be restored."):
-    "Cancel order #"+id+"?"+(isCatOrder?" Category order — no stock to restore. Invoice will be removed.":" Stock will be restored and the invoice removed.");
-  if(!confirm(msg))return;
-  // Restore stock
-  var skipStockRestore=(o.prodConfirmed===false);
+  var tt=el("m-generic-title");
+  if(tt)tt.innerHTML="<i class=\"ti ti-x\" style=\"color:#e74c3c;margin-right:8px\"></i>Cancel Order #"+id;
+  var gb=el("m-generic-body");if(!gb)return;
+  gb.innerHTML="<div class=\"mbdy\">"
+    +"<div class=\"notif nr\" style=\"margin-bottom:16px\">"
+    +"<i class=\"ti ti-alert-circle\"></i>"
+    +"<div><strong>KSh "+inv.paid.toLocaleString()+" was already paid on this order.</strong>"
+    +"<div style=\"margin-top:3px;font-size:12px\">Customer: "+(cu?(can("vPhone")?cu.name:maskName(cu.name)):"?")
+    +"<br>"+(isCatOrder?"Category order — no stock to restore.":"Stock will be restored.")
+    +" What should happen to the KSh "+inv.paid.toLocaleString()+" already paid?</div>"
+    +"</div></div>"
+    +"<div class=\"fg\" style=\"margin-bottom:0\">"
+    +"<label class=\"flabel\">Disposition <span style=\"color:#c0392b\">*</span></label>"
+    +"<select class=\"fi\" id=\"cxl-disp-sel\">"
+    +"<option value=\"\">— Select —</option>"
+    +"<option value=\"credit\">Convert to store credit (customer uses it on a future order)</option>"
+    +"<option value=\"refund\">Refunded in cash to customer (outside the system)</option>"
+    +"</select>"
+    +"</div>"
+    +"<div class=\"mft\">"
+    +"<button class=\"btn\" onclick=\"cm('m-generic')\">Back</button>"
+    +"<button class=\"btn btn-red\" onclick=\"_confirmCancelDisposition("+id+")\">"
+    +"<i class=\"ti ti-x\"></i> Cancel Order</button>"
+    +"</div></div>";
+  om("m-generic");
+}
+function _confirmCancelDisposition(id){
+  var sel=el("cxl-disp-sel");
+  var disp=sel?sel.value:"";
+  if(!disp){toast("Please choose what happens to the amount paid","err");return;}
+  cm("m-generic");
+  _finishCancelO(id,disp);
+}
+function _finishCancelO(id,disposition){
+  var o=(D.orders||[]).find(function(x){return x.id===id;});if(!o)return;
+  var inv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+id)!==-1;});
+  var hasPaid=inv&&inv.paid>0;
+  var isCatOrder=(o.prodConfirmed===false);
+  var skipStockRestore=isCatOrder;
   var st=(D.stock||[]).find(function(s){return s.name===o.prod;});
   if(st&&!skipStockRestore){
     st.qty+=o.qty;
@@ -3916,22 +4171,33 @@ function cancelO(id){
     if(st.history.length>50)st.history=st.history.slice(-50);
     updateStockBadge();
   }
-  // Update order status
   o.status="Cancelled";
   o.paid=hasPaid?"Partial":"Cancelled";
-  // Handle invoice
+  var dispNote="";
   if(inv){
     if(hasPaid){
-      // Keep invoice but zero the balance — only owed what was paid
+      // Nothing further owed — goods were never delivered.
       inv.amount=inv.paid;
+      o.cancelDisposition=disposition; // internal record only — doesn't affect any badge/status logic elsewhere
+      if(disposition==="credit"){
+        var cu=(D.customers||[]).find(function(x){return x.id===o.cId;});
+        if(cu){
+          cu.credit=(cu.credit||0)+inv.paid;
+          if(!cu.creditLog)cu.creditLog=[];
+          cu.creditLog.push({date:tday(),amt:inv.paid,type:"overpayment",ordId:id,by:CU.name,role:CU.role,note:"Order #"+id+" cancelled — KSh "+inv.paid+" converted to store credit"});
+        }
+        dispNote=" \u2014 KSh "+inv.paid+" converted to customer credit";
+      }else if(disposition==="refund"){
+        dispNote=" \u2014 KSh "+inv.paid+" recorded as refunded in cash (paid outside the system)";
+      }
     }else{
-      // Remove fully unpaid invoice
       D.invoices=(D.invoices||[]).filter(function(i){return i.id!==inv.id;});
     }
   }
-  auditLog("ORDER_CANCELLED","Order #"+id+" cancelled by "+CU.name+" ("+CU.role+"). Product: "+o.prod+", Qty: "+o.qty+(hasPaid?", KSh "+inv.paid+" already paid — invoice kept":""));
+  auditLog("ORDER_CANCELLED","Order #"+id+" cancelled by "+CU.name+" ("+CU.role+"). Product: "+o.prod+", Qty: "+o.qty+dispNote);
   rOrds(undefined,ORD_PAGE);rDel();
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
+  if(el("pg-customers")&&el("pg-customers").classList.contains("act"))rCusts();
   dirty();toast("Order #"+id+" cancelled"+(skipStockRestore?" — category order":" — stock restored"));
 }
 var _assignOid=0;
@@ -4476,17 +4742,51 @@ function ackPendingPay(id){
   if(!D.pendingPayments)return;
   var pp=(D.pendingPayments||[]).find(function(x){return x.id===id;});
   if(!pp||pp.ack){toast("Already acknowledged","warn");return;}
-  // Apply payment to linked invoice
-  var inv=(D.invoices||[]).find(function(i){return i.cId===pp.cId&&i.paid<i.amount;});
+  // FINANCIAL ACCURACY FIX: this used to grab the customer's FIRST unpaid
+  // invoice found in the array — not necessarily the invoice for the order
+  // this cash was actually collected against. A customer carrying more than
+  // one outstanding invoice is routine on a credit-based water business, so
+  // cash collected for Order A could get silently applied to Order B's
+  // invoice instead. It also discarded any amount beyond that invoice's
+  // balance instead of crediting the customer — real cash the business
+  // received could vanish from the books entirely. Fixed: match the
+  // order-specific invoice first (same "#"+ordId linkage used everywhere
+  // else in this app), fall back to the customer's oldest outstanding
+  // invoice only if no order-specific invoice exists, and route any leftover
+  // to customer credit — exactly like recPay()/completeDlv() already do for
+  // director-recorded payments.
+  var inv=(D.invoices||[]).find(function(i){return i.cId===pp.cId&&i.notes&&i.notes.indexOf("#"+pp.ordId)!==-1;});
+  if(!inv){
+    inv=(D.invoices||[]).filter(function(i){return i.cId===pp.cId&&i.paid<i.amount&&!i.voided;})
+      .sort(function(a,b){return a.date>b.date?1:-1;})[0];
+  }
+  var remaining=pp.amt;
   if(inv){
-    var apply=Math.min(pp.amt,inv.amount-inv.paid);
-    inv.paid+=apply;
-    if(!inv.payments)inv.payments=[];
-    inv.payments.push({date:tday(),amt:apply,method:pp.method,ref:"Staff collection by "+pp.collectedBy+" — ack by "+CU.name});
-    if(inv.paid>=inv.amount){var o=(D.orders||[]).find(function(x){return x.id===pp.ordId;});if(o)o.paid="Paid";}
+    var apply=Math.min(remaining,inv.amount-inv.paid);
+    if(apply>0){
+      if(!inv.payments)inv.payments=[];
+      inv.payments.push({date:tday(),amt:apply,method:pp.method,ref:"Staff collection by "+pp.collectedBy+" — ack by "+CU.name});
+      inv.paid=inv.payments.reduce(function(s,p){return s+(p.amt||0);},0);
+      remaining-=apply;
+      var o=(D.orders||[]).find(function(x){return x.id===pp.ordId;});
+      if(o){
+        if(inv.paid>=inv.amount){o.paid="Paid";}else if(inv.paid>0){o.paid="Partial";}
+        o.amtPaid=inv.paid;
+      }
+    }
+  }
+  // Leftover (invoice fully settled, or none found at all) becomes customer
+  // credit rather than being silently lost.
+  if(remaining>0){
+    var cu=(D.customers||[]).find(function(x){return x.id===pp.cId;});
+    if(cu){
+      cu.credit=(cu.credit||0)+remaining;
+      if(!cu.creditLog)cu.creditLog=[];
+      cu.creditLog.push({date:tday(),amt:remaining,type:"overpayment",ordId:pp.ordId,method:pp.method,by:CU.name,role:CU.role,note:"Overpayment acknowledging "+pp.collectedBy+"'s collection for Order #"+pp.ordId});
+    }
   }
   pp.ack=true;pp.ackedBy=CU.name;pp.ackedDate=tday();
-  auditLog("CASH_ACKNOWLEDGED","Director "+CU.name+" acknowledged KSh "+pp.amt+" cash collected by "+pp.collectedBy+" for Order #"+pp.ordId);
+  auditLog("CASH_ACKNOWLEDGED","Director "+CU.name+" acknowledged KSh "+pp.amt+" cash collected by "+pp.collectedBy+" for Order #"+pp.ordId+(remaining>0?" (KSh "+remaining+" over invoice balance \u2192 customer credit)":""));
   dirty();
   toast("Payment of KSh "+pp.amt.toLocaleString()+" acknowledged and applied");
   // Refresh ALL affected views so changes appear immediately
@@ -6288,6 +6588,13 @@ function syncIdCounters(){
 function syncPaymentStatuses(){
   // Fix any order whose payment badge doesn't match its invoice reality
   (D.orders||[]).forEach(function(o){
+    // A Cancelled order's label ("Partial" if something was paid, "Cancelled"
+    // if not) is set deliberately by _finishCancelO() and must not be
+    // recalculated here — a cancelled order's linked invoice has its `amount`
+    // capped to exactly what was paid (nothing further is owed), which would
+    // otherwise make this function see "fully paid" and silently relabel a
+    // cancelled order as "Paid", masking the fact that it was cancelled.
+    if(o.status==="Cancelled")return;
     var inv=(D.invoices||[]).find(function(i){
       return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+o.id)!==-1;
     });
@@ -6297,9 +6604,8 @@ function syncPaymentStatuses(){
       else{o.paid="Unpaid";}
     }else{
       // No invoice: if order was explicitly set Paid at creation, keep it
-      // If order is Cancelled, keep as Cancelled
       // Don't change Unpaid orders that just don't have invoices (shouldn't happen but be safe)
-      if(o.status!=="Cancelled"&&o.paid!=="Paid"&&o.paid!=="Unpaid"&&o.paid!=="Partial"){
+      if(o.paid!=="Paid"&&o.paid!=="Unpaid"&&o.paid!=="Partial"){
         o.paid="Paid"; // fix any corrupted status
       }
     }
