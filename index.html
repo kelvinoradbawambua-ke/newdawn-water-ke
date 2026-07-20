@@ -229,7 +229,7 @@ var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-20-orders-filter-visibility-v24";
+var APP_VERSION="2026-07-20-write-race-mitigation-v25";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -569,15 +569,63 @@ function processWriteQueue(){
       return i.paid<i.amount||i.date>=cutoffDate;
     });
   }
+  // RACE-CONDITION MITIGATION (2026-07-20): before writing, check the
+  // server's CURRENT state and merge in any order/customer that exists
+  // there but isn't yet in our local payload. Without this, if two devices
+  // place orders within a similar few-second window and neither device
+  // does anything else for 5+ minutes afterward (so the existing isOwnWrite
+  // and grace-period protections have both expired), one device's write
+  // could silently drop the other's very recent addition — a genuine,
+  // different race from the ID-collision bug fixed earlier in this file
+  // (that one was deterministic; this one is a timing-probability race).
+  // Cost: one extra Firestore read per write — negligible at this
+  // business's scale (a few hundred extra reads/day at most, against a
+  // 50,000/day free quota), and far cheaper than the alternative of
+  // silently losing a real order.
+  console.log("[NDSYNC] processWriteQueue checking server freshness before writing...");
+  FB_DOC_REF.get({source:"server"}).then(function(freshDoc){
+    if(freshDoc.exists){
+      var freshData=freshDoc.data();
+      var freshD=freshData.D||{};
+      if(freshD.orders&&DforSync.orders){
+        var localOrdIds={};DforSync.orders.forEach(function(o){localOrdIds[o.id]=true;});
+        freshD.orders.forEach(function(fo){
+          if(localOrdIds[fo.id])return;
+          var tombstoned=(DforSync.deletedOrderIds&&DforSync.deletedOrderIds[fo.id])||(freshD.deletedOrderIds&&freshD.deletedOrderIds[fo.id]);
+          if(tombstoned)return; // intentionally deleted elsewhere — never resurrect
+          DforSync.orders.push(fo);
+          console.log("[NDSYNC] freshness check RESCUED order id="+fo.id+" that would otherwise have been dropped by this write");
+        });
+      }
+      if(freshD.customers&&DforSync.customers){
+        var localCustIds={};DforSync.customers.forEach(function(c){localCustIds[c.id]=true;});
+        freshD.customers.forEach(function(fc){
+          if(localCustIds[fc.id])return;
+          var tombstoned=(DforSync.deletedCustomerIds&&DforSync.deletedCustomerIds[fc.id])||(freshD.deletedCustomerIds&&freshD.deletedCustomerIds[fc.id]);
+          if(tombstoned)return;
+          DforSync.customers.push(fc);
+          console.log("[NDSYNC] freshness check RESCUED customer id="+fc.id+" that would otherwise have been dropped by this write");
+        });
+      }
+    }
+    _sendWritePayload();
+  }).catch(function(){
+    // Freshness check itself failed (e.g. momentarily offline) — don't block
+    // the write entirely on this extra safety step; proceed with local data
+    // as-is, same as before this mitigation existed.
+    _sendWritePayload();
+  });
+  function _sendWritePayload(){
   var payload={
     D:DforSync,USERS:USERS,nOId:nOId,nIId:nIId,nCId:nCId,
     setupDone:FB_SETUP_DONE,
     updatedAt:FB_LAST_LOCAL_WRITE
   };
   // Estimate document size — warn director before hitting 1MB Firestore limit
+  var _sizeKB=0;
   try{
     var _payloadStr=JSON.stringify(payload);
-    var _sizeKB=Math.round(_payloadStr.length/1024);
+    _sizeKB=Math.round(_payloadStr.length/1024);
     if(_sizeKB>800){toast("⚠️ Data near Firestore limit ("+_sizeKB+"KB/1000KB). Export a backup and ask your tech team to archive old orders.","warn");}
   }catch(e){}
   console.log("[NDSYNC] processWriteQueue SENDING to Firestore — orders="+(DforSync.orders?DforSync.orders.length:0)+" customers="+(DforSync.customers?DforSync.customers.length:0)+" sizeKB="+_sizeKB);
@@ -614,6 +662,7 @@ function processWriteQueue(){
     // so they don't keep working assuming other devices see their changes.
     if(FB_WRITE_RETRY_ATTEMPTS>=3)_showCloudOfflineBanner(isQuota);
   });
+  }
 }
 var _cloudOfflineBannerShown=false;
 function _showCloudOfflineBanner(isQuota){
