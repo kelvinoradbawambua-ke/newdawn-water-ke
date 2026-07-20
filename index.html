@@ -230,7 +230,7 @@ var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-20-atomic-order-id-v29";
+var APP_VERSION="2026-07-20-order-save-feedback-v30";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -4105,17 +4105,19 @@ function reserveNextOrderId(){
 }
 function saveOrd(){
   // Prevent duplicate orders from rapid double-tap on slow devices/networks.
-  // FIX (2026-07-20): this used to reset on a blind 1-second timer regardless
-  // of whether the save had actually finished — now that order creation
-  // involves a real Firestore transaction (see reserveNextOrderId), which can
-  // genuinely take longer than 1s on a poor connection (the exact scenario
-  // that caused the original bug), the guard is now reset explicitly when
-  // the save actually completes. This safety-net timeout is just a fallback
-  // in case something truly unexpected hangs and never resolves at all.
+  // FIX (2026-07-20): the guard now uses a SHORT safety net (2.5s) by
+  // default — long enough to cover any purely synchronous validation
+  // (missing customer, missing product, etc., none of which involve a
+  // network call), so a simple validation error doesn't lock the button for
+  // an unnecessarily long time. It only gets EXTENDED to a longer window
+  // once the function is genuinely committed to the async, transaction-based
+  // save below — that's the one case that can legitimately take several
+  // seconds under poor connectivity (confirmed live: a real save took ~6.5s
+  // while its transaction retried before falling back).
   if(window._savingOrder)return;
   window._savingOrder=true;
   if(window._savingOrderSafetyNet)clearTimeout(window._savingOrderSafetyNet);
-  window._savingOrderSafetyNet=setTimeout(function(){window._savingOrder=false;},8000);
+  window._savingOrderSafetyNet=setTimeout(function(){window._savingOrder=false;},2500);
   // PERMISSION HARDENING: the old check was `!can("aOrd")&&!can("eOrd")`, which
   // meant a role with aOrd:1 but eOrd:0 (e.g. staff) could pass this gate even
   // while editing an existing order — the UI already hides the Edit button from
@@ -4251,6 +4253,15 @@ auditLog("ORDER_UPDATED","Order #"+o.id+" edited by "+CU.name+" ("+CU.role+")");
 
   if(isCat){
     // Category order: no stock deduction, no invoice yet, payment at delivery
+    // UX FIX (2026-07-20): give visible feedback the moment the save is
+    // genuinely underway — this is what was missing when a real save took
+    // ~6.5s (transaction retry before falling back) with zero visual change
+    // on the button, which is exactly why a second click felt necessary
+    // even though the guard was already correctly blocking it underneath.
+    var _saveBtnC=el("m-o-save");
+    if(_saveBtnC){_saveBtnC.disabled=true;_saveBtnC.innerHTML="<i class=\"ti ti-loader-2\"></i> Placing order...";}
+    if(window._savingOrderSafetyNet)clearTimeout(window._savingOrderSafetyNet);
+    window._savingOrderSafetyNet=setTimeout(function(){window._savingOrder=false;if(_saveBtnC){_saveBtnC.disabled=false;_saveBtnC.innerHTML="<i class=\"ti ti-check\"></i> Place order";}},15000);
     reserveNextOrderId().then(function(newOrdId){
       (D.orders||[]).push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:0,cost:0,date:el("od").value,status:"Pending",paid:"Unpaid",amtPaid:0,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?sanitizeInput(el("onotes").value):"",prodConfirmed:false,_ts:Date.now()});
       auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty+" (category/TBC)");
@@ -4259,7 +4270,12 @@ auditLog("ORDER_UPDATED","Order #"+o.id+" edited by "+CU.name+" ("+CU.role+")");
       cm("m-o");rOrds(undefined,ORD_PAGE);dirty();
       toast("Order #"+newOrdId+" placed — driver confirms brand & collects payment at delivery");
       window._savingOrder=false;
-    }).catch(function(){window._savingOrder=false;toast("Something went wrong placing the order — please try again","err");});
+      if(_saveBtnC){_saveBtnC.disabled=false;_saveBtnC.innerHTML="<i class=\"ti ti-check\"></i> Place order";}
+    }).catch(function(){
+      window._savingOrder=false;
+      if(_saveBtnC){_saveBtnC.disabled=false;_saveBtnC.innerHTML="<i class=\"ti ti-check\"></i> Place order";}
+      toast("Something went wrong placing the order — please try again","err");
+    });
     return;
   }
 
@@ -4279,6 +4295,10 @@ auditLog("ORDER_UPDATED","Order #"+o.id+" edited by "+CU.name+" ("+CU.role+")");
   if(amtPaid>=total){payStatus="Paid";}
   else if(amtPaid>0){payStatus="Partial";}
   else{payStatus="Unpaid";}
+  var _saveBtn=el("m-o-save");
+  if(_saveBtn){_saveBtn.disabled=true;_saveBtn.innerHTML="<i class=\"ti ti-loader-2\"></i> Placing order...";}
+  if(window._savingOrderSafetyNet)clearTimeout(window._savingOrderSafetyNet);
+  window._savingOrderSafetyNet=setTimeout(function(){window._savingOrder=false;if(_saveBtn){_saveBtn.disabled=false;_saveBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}},15000);
   reserveNextOrderId().then(function(newOrdId){
     if(st){
       st.qty=Math.max(0,st.qty-qty);
@@ -4296,7 +4316,12 @@ auditLog("ORDER_UPDATED","Order #"+o.id+" edited by "+CU.name+" ("+CU.role+")");
     rDel();
     cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+newOrdId+" placed");
     window._savingOrder=false;
-  }).catch(function(){window._savingOrder=false;toast("Something went wrong placing the order — please try again","err");});
+    if(_saveBtn){_saveBtn.disabled=false;_saveBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}
+  }).catch(function(){
+    window._savingOrder=false;
+    if(_saveBtn){_saveBtn.disabled=false;_saveBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}
+    toast("Something went wrong placing the order — please try again","err");
+  });
 }
 function openDlv(oid){
   var o=(D.orders||[]).find(function(x){return x.id===oid;});if(!o)return;
