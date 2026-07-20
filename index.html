@@ -229,7 +229,7 @@ var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-20-diagnostic-logging-v12";
+var APP_VERSION="2026-07-20-infinite-write-loop-fix-v13";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -1128,7 +1128,22 @@ function startCloudListener(){
     else if(data._lastDailyBackup)D._lastDailyBackup=data._lastDailyBackup;
     syncIdCounters();
     syncPaymentStatuses();
-    FB_READY=true;scheduleCloudSync(); // flush any changes made while disconnected
+    // CRITICAL FIX: this used to unconditionally call scheduleCloudSync() here,
+    // every single time ANY snapshot arrived — not just when genuinely
+    // recovering from a disconnect. That created a perfect self-feeding loop:
+    // a write completes -> the resulting snapshot echoes back -> this line
+    // fires again -> schedules another write -> which echoes again ->
+    // forever, roughly every 5-6 seconds, all day, with zero actual data
+    // changes each cycle. This is very likely the dominant cause of both the
+    // Firestore write-quota consumption and the general data confusion,
+    // since a constant stream of redundant writes gives far more
+    // opportunities for a genuinely new change (like a just-placed order) to
+    // race against one of these no-op echo-writes. It's also simply no
+    // longer needed: the retry-until-confirmed mechanism in pushToCloud()
+    // (see FB_PENDING_CONFIRM_RETRY) already guarantees any write attempted
+    // before confirmation gets flushed automatically once confirmed — this
+    // line's original purpose is already covered, safely, without looping.
+    FB_READY=true;
     // Flush any audit events queued before Firestore was ready
     if(window._auditQueue&&window._auditQueue.length&&FB_EVENTS_COL){
       var q=window._auditQueue.splice(0);
