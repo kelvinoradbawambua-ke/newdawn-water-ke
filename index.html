@@ -229,7 +229,7 @@ var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-20-invoice-voided-display-v22";
+var APP_VERSION="2026-07-20-orders-filter-visibility-v24";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -2686,7 +2686,17 @@ function rDash(){
       "<div class=\"stat sn\" style=\"cursor:pointer\" onclick=\"nav('reports',null)\" title=\"View profit report\">"
       +"<div class=\"sic\" style=\"background:#eef2ff;color:#534AB7\"><i class=\"ti ti-chart-pie\"></i></div>"
       +"<div class=\"sl\">Profit &mdash; "+periodLabel+"</div>"
-      +"<div class=\"sv\">"+(can("vProfit")?"KSh "+(rev-cost).toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>")+"</div><div class=\"ss\">"+(can("vProfit")&&rev>0?Math.round((rev-cost)/rev*100)+"% margin &rarr;":(periodDel.length===0?"No deliveries yet":"No cost data"))+"</div></div>"+
+      +(function(){
+        var _profit=rev-cost;
+        if(!can("vProfit"))return "<div class=\"sv\"><span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span></div><div class=\"ss\">&mdash;&mdash;</div>";
+        var _valStyle=_profit<0?" style=\"color:#c0392b\"":"";
+        var _sub;
+        if(periodDel.length===0)_sub="No deliveries yet";
+        else if(_profit<0)_sub="<span style=\"color:#c0392b;font-weight:700\"><i class=\"ti ti-alert-triangle\"></i> Loss — costs exceeded (net) revenue</span>";
+        else if(rev>0)_sub=Math.round(_profit/rev*100)+"% margin &rarr;";
+        else _sub="No cost data";
+        return "<div class=\"sv\""+_valStyle+">KSh "+_profit.toLocaleString()+"</div><div class=\"ss\">"+_sub+"</div>";
+      })()+"</div>"+
       "<div class=\"stat sb\" style=\"cursor:pointer\" onclick=\"nav('customers',null)\" title=\"View all customers\"><div class=\"sic\" style=\"background:#eaf0ff;color:#185FA5\"><i class=\"ti ti-users\"></i></div><div class=\"sl\">Customers</div><div class=\"sv\">"+(D.customers||[]).length+"</div><div class=\"ss\">"+(D.customers||[]).filter(function(c){return c.ctype==="Distributor";}).length+" distributors &rarr;</div></div>"+
       "<div class=\"stat sa\" style=\"cursor:pointer\" onclick=\"nav('orders',null);setTimeout(function(){filterOrds('Pending');},100)\" title=\"View pending orders\"><div class=\"sic\" style=\"background:#fff8e1;color:#f39c12\"><i class=\"ti ti-clipboard-list\"></i></div><div class=\"sl\">Active orders</div><div class=\"sv\">"+pend+"</div><div class=\"ss\">pending / processing &rarr;</div></div>"+
       "<div class=\"stat sr\" style=\"cursor:pointer\" onclick=\"nav('debts',null)\" title=\"View debts\"><div class=\"sic\" style=\"background:#fff0f0;color:#c0392b\"><i class=\"ti ti-alert-circle\"></i></div><div class=\"sl\">Outstanding debt</div><div class=\"sv\">"+(can("vDebt")?"KSh "+totD.toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>")+"</div><div class=\"ss\">"+(can("vDebt")?debts.length+" customers &rarr;":"&mdash;&mdash;")+"</div></div>"+
@@ -3453,6 +3463,10 @@ function rOrds(q,pg,sort){
   if(!el("ords-srch")){
     pgEl.innerHTML=
     "<div class=\"ph\"><h1>Orders</h1><p>"+(D.orders||[]).length+" total &middot; "+(D.orders||[]).filter(function(o){return o.status==="Pending"||o.status==="Processing";}).length+" active</p></div>"+
+    (df?"<div style=\"background:#fff8e1;border:1.5px solid #f39c12;border-radius:8px;padding:8px 14px;margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px\">"+
+      "<span style=\"font-size:12px;font-weight:700;color:#856404\"><i class=\"ti ti-filter\"></i> Showing only: "+fmt(df)+(sf?" &middot; "+sf:"")+" — this is NOT your full order list</span>"+
+      "<button class=\"btn btn-xs\" style=\"background:#856404;color:#fff\" onclick=\"ORD_STATUS_F='';ORD_DATE_F='';rOrds(undefined,0);\"><i class=\"ti ti-x\"></i> Clear filter — show all "+(D.orders||[]).length+"</button>"+
+    "</div>":"")+
     "<div class=\"toolbar\">"+
       "<div class=\"srch\"><i class=\"ti ti-search\"></i><input id=\"ords-srch\" type=\"text\" autocomplete=\"off\" autocorrect=\"off\" autocapitalize=\"off\" spellcheck=\"false\" inputmode=\"search\" placeholder=\"Search by order #, product, address, driver...\" oninput=\"rOrds(this.value,0)\" value=\""+q2+"\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
       "<select class=\"fsel\" onchange=\"filterOrds(this.value)\">"+
