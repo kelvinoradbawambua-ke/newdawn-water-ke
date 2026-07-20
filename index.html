@@ -229,7 +229,7 @@ var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-20-director-login-race-fix-v14";
+var APP_VERSION="2026-07-20-root-cause-fixes-v16";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -678,6 +678,47 @@ function runAutoBackup(){
     FB_LAST_DAILY=nowMs;
     writeBackup("daily-"+dateStr);
     pruneOldBackups("daily-",14); // 14 daily backups = 2 weeks coverage
+    pruneOldTombstones(); // see function below — zero extra Firestore cost, piggybacks on this existing daily cycle
+  }
+}
+function pruneOldTombstones(){
+  // STRUCTURAL/COST AUDIT FIX (2026-07-20): D.deletedOrderIds and
+  // D.deletedCustomerIds previously grew forever with no pruning, and both
+  // are included in every single sync payload — a genuine, if slow,
+  // contributor to the document-size ceiling this file already warns about
+  // elsewhere. Now that syncIdCounters() makes ID reuse structurally
+  // impossible (see the 2026-07-20 fix there), a tombstone entry lingering
+  // forever is merely wasteful, not a correctness risk — so pruning is now
+  // purely a size optimization, safe to do.
+  //
+  // Size estimate (verified by construction, not measured on a live doc):
+  // each entry is `"<id>":<13-digit ms timestamp>` — roughly 20-25 bytes in
+  // JSON. Even at a (generously high) 50 deletions/month, that's under 15KB
+  // per year — negligible against the ~800KB-1MB ceiling. This pruning is a
+  // hygiene improvement, not a fix for an urgent size problem.
+  //
+  // Prune window: 90 days. This must comfortably exceed the longest
+  // plausible time a real device could stay disconnected/stale before
+  // reconnecting and still needing the tombstone to protect against
+  // resurrecting something it deleted right before going offline. 90 days
+  // is far beyond any realistic "phone left in a drawer" scenario for an
+  // actively-used business tool — a device unsynced that long has almost
+  // certainly been decommissioned, re-logged-in fresh, or replaced.
+  var cutoff=Date.now()-90*24*60*60*1000;
+  var prunedO=0,prunedC=0;
+  if(D.deletedOrderIds){
+    Object.keys(D.deletedOrderIds).forEach(function(k){
+      if(D.deletedOrderIds[k]<cutoff){delete D.deletedOrderIds[k];prunedO++;}
+    });
+  }
+  if(D.deletedCustomerIds){
+    Object.keys(D.deletedCustomerIds).forEach(function(k){
+      if(D.deletedCustomerIds[k]<cutoff){delete D.deletedCustomerIds[k];prunedC++;}
+    });
+  }
+  if(prunedO>0||prunedC>0){
+    console.log("[NDSYNC] pruneOldTombstones — removed "+prunedO+" order tombstone(s), "+prunedC+" customer tombstone(s) older than 90 days");
+    dirty(); // goes through the normal, already-safe debounced write path
   }
 }
 function startAutoBackup(){
@@ -830,13 +871,32 @@ function startAuditListener(){
       AUDIT_RETRY_TIMER=setTimeout(startAuditListener,delay);
     });
 }
-function startCloudListener(){
+function startCloudListener(isWarmRefresh){
   if(!FB_DOC_REF)return;
   if(FB_UNSUB)FB_UNSUB();
-  // Re-arm on every fresh subscribe, including reconnects — a reconnect must
-  // never be treated as "confirmed" until ITS OWN snapshot actually arrives.
-  console.log("[NDSYNC] startCloudListener called — _cloudDataConfirmed reset to false");
-  _cloudDataConfirmed=false;
+  // STRUCTURAL FIX for reconnect-driven write starvation: a COLD reconnect
+  // (initial connect, or recovering from a genuinely confirmed connection
+  // error) means we have real uncertainty about current state and must
+  // re-arm the write-safety gate — any write must wait for a fresh,
+  // confirmed snapshot before proceeding, exactly as before.
+  //
+  // A WARM refresh (the tab/app merely regained visibility — screen
+  // unlocked, app switched back to) is different: this session was ALREADY
+  // confirmed a moment ago. There is no genuine reason to distrust the data
+  // this device already has. Previously, EVERY visibility change reset the
+  // gate to false regardless of which case this was — on a device where
+  // visibility changes happen faster than a round-trip confirmation can
+  // complete (rapid app-switching, or simply alt-tabbing during testing),
+  // this could re-arm the gate over and over, so the queued write's
+  // retry-every-1-second loop kept finding "not confirmed yet" and never
+  // actually got a chance to fire — a real, previously-unrecognized write
+  // starvation risk, not merely a theoretical one.
+  if(!isWarmRefresh){
+    console.log("[NDSYNC] startCloudListener called (cold) — _cloudDataConfirmed reset to false");
+    _cloudDataConfirmed=false;
+  }else{
+    console.log("[NDSYNC] startCloudListener called (warm refresh) — _cloudDataConfirmed left as-is ("+_cloudDataConfirmed+")");
+  }
   FB_UNSUB=FB_DOC_REF.onSnapshot(function(doc){
     FB_LAST_SNAPSHOT=Date.now();FB_RECONNECT_ATTEMPTS=0; // reset backoff on success
     _cloudDataConfirmed=true; // we now have authoritative knowledge of real state — safe to write from here on
@@ -1050,6 +1110,16 @@ function startCloudListener(){
     var remoteCustomers=data.D.customers||[];
     var localCustomers=D.customers||[];
     var addedCount=0;
+    // COSMETIC FIX: a fresh page load always starts with zero customers
+    // locally, so the very first snapshot naturally looks like "412 new
+    // customers just arrived" — that's not a real cross-device event, it's
+    // just the normal initial load. This used to log a false "X customer(s)
+    // added from another session" audit entry on every single login,
+    // regardless of role, making the audit trail far noisier than reality —
+    // which made real sync issues much harder to spot. Now: this message is
+    // only logged once this device already had a real local customer list to
+    // compare against.
+    var _isFirstCustomerMerge=localCustomers.length===0&&remoteCustomers.length>0;
     if(remoteCustomers.length||localCustomers.length){
       var localCustMap={};
       localCustomers.forEach(function(lc){localCustMap[lc.id]=lc;});
@@ -1087,7 +1157,7 @@ function startCloudListener(){
         // record is far cheaper to notice and clean up than a silently lost one.
         mergedCustomers.push(lc);
       });
-      if(addedCount>0&&CU)auditLog("CUSTOMER_UPDATED","Sync: "+addedCount+" customer(s) added from another session");
+      if(addedCount>0&&CU&&!_isFirstCustomerMerge)auditLog("CUSTOMER_UPDATED","Sync: "+addedCount+" customer(s) added from another session");
       D.customers=mergedCustomers;
       if(el("pg-customers")&&el("pg-customers").classList.contains("act"))rCusts();
     }
@@ -1206,8 +1276,11 @@ function _initVisibilityRecovery(){
   document.addEventListener("visibilitychange",function(){
     if(document.visibilityState==="visible"&&CU&&FB_DOC_REF){
       // Force a completely fresh subscribe — guarantees current state is
-      // pulled immediately regardless of what happened while backgrounded
-      startCloudListener();
+      // pulled immediately regardless of what happened while backgrounded.
+      // WARM refresh: this session was already confirmed before backgrounding;
+      // don't re-arm the write-safety gate on every tab-switch (see
+      // startCloudListener's isWarmRefresh comment for why that mattered).
+      startCloudListener(true);
       var c=el("cloud-status");if(c)c.innerHTML="<i class=\"ti ti-refresh\"></i> Refreshing\u2026";
     }
   });
@@ -1614,6 +1687,26 @@ function checkAutoSaveRecovery(){
   // Non-director/manager roles: skip localStorage restore — trust Firestore
   if(!CU||( CU.role!=="director"&&CU.role!=="manager")){
     buildApp();
+    return;
+  }
+  // ROOT-CAUSE FIX (2026-07-20): everything below this line compares a local
+  // browser snapshot against "current live data" (D.customers.length etc.) to
+  // decide whether to auto-restore and PUSH that snapshot to Firestore. This
+  // function used to run synchronously the instant a PIN was entered —
+  // before initCloudConnection() has had any chance whatsoever to hear back
+  // from Firestore. At that moment D is still the empty startup skeleton, so
+  // "current data" always looks like zero customers, which made the
+  // comparison meaningless and made the "fast path" auto-restore-and-push
+  // fire on essentially every director/manager login where any recent local
+  // autosave existed — silently overwriting live cloud data with a stale
+  // browser cache, structurally guaranteed by timing, not a rare race. This
+  // is the same class of problem _checkSetupWizardEligibility() already
+  // solves correctly elsewhere in this file: never judge "what does live
+  // data look like" before live data has actually had a chance to arrive.
+  // Applying that exact same, already-proven pattern here.
+  if(!_cloudDataConfirmed){
+    console.log("[NDSYNC] checkAutoSaveRecovery WAITING on _cloudDataConfirmed before comparing snapshots");
+    setTimeout(checkAutoSaveRecovery,500);
     return;
   }
   var snap=autoSaveCheckLocal();
@@ -2048,11 +2141,33 @@ function logout(){
     try{runAutoBackup();}catch(e){}
   }
   // Final sync push before disconnecting
+  // ROOT-CAUSE FIX (2026-07-20): this used to fire unconditionally whenever
+  // FB_READY was true, with zero check on whether this device's own view of
+  // D was actually current. Firestore's {merge:true} replaces array fields
+  // wholesale, not item-by-item — a device whose listener had silently
+  // stalled (backgrounded tab, phone lock, brief network drop — none of
+  // which throw a visible error) would, on logout, overwrite the server's
+  // fresher order/customer/invoice/stock arrays with its own stale, shorter
+  // ones. This is the uniform rule now applied to every risky write in this
+  // file: never write array data without a recent, confirmed view of real
+  // state. "Recent" here means both genuinely confirmed at least once
+  // (_cloudDataConfirmed) AND that confirmation isn't stale (FB_LAST_SNAPSHOT
+  // within the last 15s — comfortably longer than a normal round-trip, short
+  // enough to actually mean something). If this device can't currently prove
+  // its view is fresh, it skips this extra push rather than risk clobbering
+  // other devices' data — any genuine pending local change was already
+  // handled by the normal dirty()/pushToCloud() debounce that runs on every
+  // action, long before a user gets around to explicitly logging out; this
+  // final push was only ever a "just in case" safety net, and a safety net
+  // that can silently destroy other people's work is worse than no net.
+  var _snapshotIsFresh=_cloudDataConfirmed&&FB_LAST_SNAPSHOT&&(Date.now()-FB_LAST_SNAPSHOT<15000);
   try{
-    if(FB_READY&&FB_DOC_REF&&typeof D==="object"){
+    if(FB_READY&&FB_DOC_REF&&typeof D==="object"&&_snapshotIsFresh){
       var snap=JSON.parse(JSON.stringify({D:D}));
       delete snap.D.auditLog;
       FB_DOC_REF.set(snap,{merge:true});
+    }else if(FB_READY&&FB_DOC_REF){
+      console.log("[NDSYNC] logout SKIPPED final push — snapshot not confirmed fresh (avoids clobbering other devices' data)");
     }
   }catch(e){}
   if(FB_HEARTBEAT_TIMER){clearInterval(FB_HEARTBEAT_TIMER);FB_HEARTBEAT_TIMER=null;}
@@ -2812,7 +2927,21 @@ function delC(id){
   // Delivered and Cancelled orders stay exactly as they are, still queryable
   // in reports. customName()/cAddr() already render a graceful "—" for an
   // order whose customer no longer exists, so nothing else breaks.
-  var _removedOrdCount=(D.orders||[]).filter(function(o){return o.cId===id&&o.status!=="Delivered"&&o.status!=="Cancelled";}).length;
+  var _ordersToRemove=(D.orders||[]).filter(function(o){return o.cId===id&&o.status!=="Delivered"&&o.status!=="Cancelled";});
+  var _removedOrdCount=_ordersToRemove.length;
+  // SIBLING-BUG FIX (2026-07-20): this cascade used to remove these orders
+  // from D.orders with no corresponding entry in D.deletedOrderIds — the
+  // exact same tombstone mechanism that protects a standalone delO() call
+  // was simply never applied here. Any other device that still had one of
+  // these orders cached locally (created recently enough to fall under the
+  // "don't infer deletion from one missing snapshot" grace window) could
+  // resurrect it right back into the shared document on its next write,
+  // since nothing told it this removal was real and intentional.
+  if(!D.deletedOrderIds)D.deletedOrderIds={};
+  _ordersToRemove.forEach(function(o){
+    D.deletedOrderIds[o.id]=Date.now();
+    _recentlyDeletedOrderIds[o.id]=Date.now();
+  });
   D.orders=(D.orders||[]).filter(function(o){return !(o.cId===id&&o.status!=="Delivered"&&o.status!=="Cancelled");});
   // At this point every invoice for this customer either has zero balance
   // (fully paid) or was just explicitly voided above — safe to drop any that
@@ -4629,7 +4758,7 @@ function findMissingOrders(){
 function showMissingOrders(){
   var missing=findMissingOrders();
   var body=el("m-recon-body");if(!body)return;
-  if(!missing.length){body.innerHTML="<div style=\'padding:20px;text-align:center;color:var(--tx2)\'>No missing orders found — audit log matches live orders.</div>";cm("m-recon");return;}
+  if(!missing.length){body.innerHTML="<div style=\'padding:20px;text-align:center;color:var(--tx2)\'>No missing orders found — audit log matches live orders.</div>";om("m-recon");return;}
   var rows=missing.map(function(m,i){
     var custOpts=(D.customers||[]).map(function(c){return "<option value=\'"+c.id+"\'"+(c.id===m.cId?" selected":"")+">"+c.name+"</option>";}).join("");
     var srcColor=m.source==="invoice"?"#27ae60":m.source.indexOf("cycle")===0?"#e67e22":"#c0392b";
@@ -4648,7 +4777,7 @@ function showMissingOrders(){
     "<thead><tr style=\'background:var(--nv);color:#fff\'><th style=\'padding:5px 8px\'>Orig #</th><th style=\'padding:5px 8px\'>Customer</th><th style=\'padding:5px 8px\'>Product</th><th style=\'padding:5px 8px\'>Qty</th><th style=\'padding:5px 8px\'>Price</th><th style=\'padding:5px 8px\'>Source</th><th style=\'padding:5px 8px\'>Action</th></tr></thead>"+
     "<tbody>"+rows+"</tbody></table>";
   window._reconMissing=missing;
-  cm("m-recon");
+  om("m-recon");
 }
 function recreateOrder(idx){
   var row=document.querySelector("tr[data-idx=\'"+idx+"\']");if(!row)return;
@@ -5313,9 +5442,8 @@ function editCmp(id){
   var ct=el("cmp-t");if(ct)ct.value=cmp.type||"Water quality";
   om("m-cmp");
 }
-function resolveCmp(id){if(!can("mCmp")){toast("Only managers can resolve complaints","err");return;}var c=(D.complaints||[]).find(function(x){return x.id===id;});if(c)c.status="Resolved";rCmps(undefined,CMP_PAGE);dirty();toast("Complaint resolved");}
-  if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
-function delCmp(id){if(!can("dCmp")){toast("Only managers can delete complaints","err");return;}var cmp=(D.complaints||[]).find(function(x){return x.id===id;});if(!cmp)return;var cu=(D.customers||[]).find(function(x){return x.id===cmp.cId;});var cmpText=cmp.details||"";var msg="Delete complaint from "+(cu?(can("vPhone")?cu.name:"this customer"):"unknown")+"?\n\n\""+cmpText.slice(0,80)+(cmpText.length>80?"…":"")+"\"\n\nThis cannot be undone.";if(!confirm(msg))return;D.complaints=(D.complaints||[]).filter(function(c){return c.id!==id;});rCmps(undefined,CMP_PAGE);dirty();}
+function resolveCmp(id){if(!can("mCmp")){toast("Only managers can resolve complaints","err");return;}var c=(D.complaints||[]).find(function(x){return x.id===id;});if(c)c.status="Resolved";rCmps(undefined,CMP_PAGE);if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();dirty();toast("Complaint resolved");}
+function delCmp(id){if(!can("dCmp")){toast("Only managers can delete complaints","err");return;}var cmp=(D.complaints||[]).find(function(x){return x.id===id;});if(!cmp)return;var cu=(D.customers||[]).find(function(x){return x.id===cmp.cId;});var cmpText=cmp.details||"";var msg="Delete complaint from "+(cu?(can("vPhone")?cu.name:"this customer"):"unknown")+"?\n\n\""+cmpText.slice(0,80)+(cmpText.length>80?"…":"")+"\"\n\nThis cannot be undone.";if(!confirm(msg))return;D.complaints=(D.complaints||[]).filter(function(c){return c.id!==id;});rCmps(undefined,CMP_PAGE);if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();dirty();}
 
 function addRoute(){
   if(!can("eOrd")){toast("Managers only","err");return;}
@@ -6717,16 +6845,47 @@ function runIntegrityCheck(){
 }
 function syncIdCounters(){
   // ID counters must be a ratchet — only ever move forward, never backward.
-  // A restore from an older backup can load D.orders/etc that lack any IDs
-  // created after that backup was taken; recalculating purely from what is
-  // currently loaded would roll the counter back and let a brand-new order
-  // collide with an ID already in use elsewhere (Firestore, another device's
-  // cache) — which looks exactly like "deleting an order doesn't work,"
-  // since a colliding duplicate can reappear on the same ID.
+  //
+  // ROOT-CAUSE FIX (2026-07-20): the ratchet previously computed its floor
+  // ONLY from IDs currently present in D.orders/D.customers/etc. — it had
+  // zero awareness of D.deletedOrderIds / D.deletedCustomerIds (the
+  // tombstone maps). This is a genuine, deterministic bug, not a timing
+  // issue: the moment the highest-ever-used order ID gets deleted, the next
+  // recalculation (on ANY device, at ANY future login) sees a smaller
+  // maximum and reissues that exact same ID to a brand-new order. Since
+  // D.deletedOrderIds never expires, every device's merge logic then
+  // permanently treats that brand-new order as "deleted," because it shares
+  // an ID with an old, unrelated, genuinely-deleted order. This is not a
+  // rare edge case — it reproduces on the very next order placed after any
+  // deletion of the highest-numbered record, and once a rolled-back counter
+  // is pushed to Firestore's own nOId/nCId field, EVERY device inherits the
+  // corruption from then on, since the ratchet formula trusts whatever is
+  // stored in the cloud as a valid floor.
+  //
+  // FIX: the floor must include the max of every ID that has EVER existed —
+  // present or deleted — never just what's currently visible. This makes ID
+  // reuse structurally impossible, which is what actually needs to be true
+  // for the tombstone mechanism to be safe, rather than requiring tombstones
+  // to somehow know "this ID now refers to a different record."
   var maxO=(D.orders||[]).reduce(function(m,o){return Math.max(m,Number(o.id)||0);},1000);
+  if(D.deletedOrderIds){
+    Object.keys(D.deletedOrderIds).forEach(function(k){maxO=Math.max(maxO,Number(k)||0);});
+  }
   var maxI=(D.invoices||[]).reduce(function(m,i){return Math.max(m,Number(i.id)||0);},2000);
+  // Invoices are never hard-deleted from the array (void keeps them, marked
+  // voided:true) so no tombstone map exists for them and none is needed —
+  // maxI computed from the array alone is already always correct.
   var maxCust=(D.customers||[]).reduce(function(m,cu){return Math.max(m,Number(cu.id)||0);},3000);
+  if(D.deletedCustomerIds){
+    Object.keys(D.deletedCustomerIds).forEach(function(k){maxCust=Math.max(maxCust,Number(k)||0);});
+  }
   var maxCmp=(D.complaints||[]).reduce(function(m,x){return Math.max(m,Number(x.id)||0);},4000);
+  // VERIFIED BY READING: delCmp() (see below) simply filters D.complaints
+  // with no tombstone map at all — so there is no deleted-complaint-id
+  // history to fold in here. This is fine ONLY because complaints sync via
+  // full-replace (see step 5 below), which has no "resurrection" failure
+  // mode to protect against in the first place — see the complaint-deletion
+  // note further down for why a tombstone isn't needed there.
   nOId=Math.max(nOId||1001,maxO+1);
   nIId=Math.max(nIId||2001,maxI+1);
   nCId=Math.max(nCId||3001,maxCust+1);
