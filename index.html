@@ -229,7 +229,7 @@ var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-20-execution-test-suite-v26";
+var APP_VERSION="2026-07-20-quota-hardening-v27";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -496,6 +496,7 @@ function scheduleCloudSync(){
 var FB_WRITE_RETRY_TIMER=null; // QUOTA GUARD: only one pending write-retry may exist at a time
 var FB_WRITE_RETRY_ATTEMPTS=0; // QUOTA GUARD: drives backoff instead of a fixed 5s-forever hammer
 var FB_PENDING_CONFIRM_RETRY=null; // ensures a write attempted before confirmation is never silently lost
+var _lastFreshnessCheckTime=0; // Tier 2: tracks the last REAL server-freshness check, to safely skip redundant ones during a rapid burst of writes
 function pushToCloud(){
   if(!FB_READY||!FB_DOC_REF){console.log("[NDSYNC] pushToCloud BLOCKED: FB_READY="+FB_READY+" FB_DOC_REF="+(!!FB_DOC_REF));return;}
   // DATA SAFETY GATE: never write until we've genuinely heard back from
@@ -582,8 +583,25 @@ function processWriteQueue(){
   // business's scale (a few hundred extra reads/day at most, against a
   // 50,000/day free quota), and far cheaper than the alternative of
   // silently losing a real order.
+  // TIER 2 OPTIMIZATION (2026-07-20): if we genuinely checked the server's
+  // fresh state within the last 15 seconds, skip doing it again right now.
+  // During a burst of several saves in quick succession (e.g. placing a few
+  // orders back to back), every single one of those writes was paying for
+  // its own extra read even though nothing meaningful could have changed
+  // remotely in that tiny window. This is safe specifically because the
+  // business has explicitly confirmed up to ~30s of staleness is acceptable
+  // — this skip can only ever shorten how "fresh" a write's view is by a few
+  // seconds, well within that tolerance. The very first write of any burst
+  // still checks properly, and a sustained burst re-checks every 15s.
+  var _skipFreshnessCheck=(Date.now()-_lastFreshnessCheckTime<15000);
+  if(_skipFreshnessCheck){
+    console.log("[NDSYNC] processWriteQueue SKIPPING freshness check — checked "+(Date.now()-_lastFreshnessCheckTime)+"ms ago, within 15s window");
+    _sendWritePayload();
+    return;
+  }
   console.log("[NDSYNC] processWriteQueue checking server freshness before writing...");
   FB_DOC_REF.get({source:"server"}).then(function(freshDoc){
+    _lastFreshnessCheckTime=Date.now(); // only update on a REAL check, not a skip
     if(freshDoc.exists){
       var freshData=freshDoc.data();
       var freshD=freshData.D||{};
@@ -1341,6 +1359,9 @@ function _reconnectCloudListener(){
   },delay);
 }
 var _visRecoveryAttached=false;
+var _backgroundPauseTimer=null;
+var _pausedForBackground=false;
+var BACKGROUND_PAUSE_MS=2*60*1000; // 2 minutes — long enough that a brief app-switch (checking a message, glancing away) never triggers a teardown, short enough to meaningfully reduce peak concurrent connections from tabs genuinely left in the background
 function _initVisibilityRecovery(){
   if(_visRecoveryAttached)return; // never attach twice across multiple logins in one tab
   _visRecoveryAttached=true;
@@ -1351,14 +1372,46 @@ function _initVisibilityRecovery(){
   // This is the standard pattern real-time enterprise apps (Gmail, Slack, etc.)
   // use to guarantee instant freshness on return, instead of waiting on a timer.
   document.addEventListener("visibilitychange",function(){
-    if(document.visibilityState==="visible"&&CU&&FB_DOC_REF){
-      // Force a completely fresh subscribe — guarantees current state is
-      // pulled immediately regardless of what happened while backgrounded.
-      // WARM refresh: this session was already confirmed before backgrounding;
-      // don't re-arm the write-safety gate on every tab-switch (see
-      // startCloudListener's isWarmRefresh comment for why that mattered).
-      startCloudListener(true);
+    if(document.visibilityState==="visible"){
+      if(_backgroundPauseTimer){clearTimeout(_backgroundPauseTimer);_backgroundPauseTimer=null;}
+      if(!CU||!FB_DOC_REF)return;
+      if(_pausedForBackground){
+        // TIER 3 (2026-07-20): the listener was genuinely torn down while
+        // backgrounded — this must be a COLD reconnect (real uncertainty
+        // about current state, same as any other reconnect-from-disconnect),
+        // not the lighter warm refresh used for a brief tab-switch.
+        _pausedForBackground=false;
+        console.log("[NDSYNC] resuming after background pause — cold reconnect");
+        startCloudListener(false);
+      }else{
+        // Force a completely fresh subscribe — guarantees current state is
+        // pulled immediately regardless of what happened while backgrounded.
+        // WARM refresh: this session was already confirmed before backgrounding;
+        // don't re-arm the write-safety gate on every tab-switch (see
+        // startCloudListener's isWarmRefresh comment for why that mattered).
+        startCloudListener(true);
+      }
       var c=el("cloud-status");if(c)c.innerHTML="<i class=\"ti ti-refresh\"></i> Refreshing\u2026";
+    }else if(document.visibilityState==="hidden"){
+      // TIER 3 (2026-07-20): don't tear down immediately on every brief
+      // switch-away — only pause the connection if it stays hidden for the
+      // full threshold. This is the change with the most direct effect on
+      // Firestore's "peak concurrent connections" figure: a device left
+      // backgrounded (screen locked, app switched away and forgotten) no
+      // longer holds a live listener open indefinitely — it cleanly
+      // disconnects after 2 minutes and reconnects the moment it's actually
+      // looked at again. Nothing about login state is touched by this at all.
+      if(_backgroundPauseTimer)clearTimeout(_backgroundPauseTimer);
+      _backgroundPauseTimer=setTimeout(function(){
+        _backgroundPauseTimer=null;
+        if(document.visibilityState==="hidden"&&FB_UNSUB){
+          console.log("[NDSYNC] backgrounded for "+(BACKGROUND_PAUSE_MS/1000)+"s — pausing listener to free the connection");
+          try{FB_UNSUB();}catch(e){}
+          FB_UNSUB=null;
+          _pausedForBackground=true;
+          var c=el("cloud-status");if(c)c.innerHTML="<i class=\"ti ti-moon\"></i> Paused (backgrounded)";
+        }
+      },BACKGROUND_PAUSE_MS);
     }
   });
 }
@@ -3848,7 +3901,9 @@ function resetIdleTimer(){
   if(_idleWarnTimer)clearTimeout(_idleWarnTimer);
   _dismissIdleWarning();
   if(!CU)return;
-  var limit=CU.role==="staff"?60000:CU.role==="manager"?300000:600000;
+  // TIER 1a (2026-07-20): director idle timeout reduced from 600s to 180s —
+  // a genuinely forgotten/unattended director session now re-locks sooner.
+  var limit=CU.role==="staff"?60000:CU.role==="manager"?300000:180000;
   var warnWindow=CU.role==="staff"?10000:20000; // show warning 10s (staff) or 20s (mgr/dir) before logout
   _idleWarnTimer=setTimeout(function(){
     if(CU)_showIdleWarning(warnWindow/1000);
@@ -3886,15 +3941,32 @@ function _showIdleWarning(seconds){
 function _dismissIdleWarning(){
   if(_idleWarnEl){try{_idleWarnEl.remove();}catch(e){}_idleWarnEl=null;}
 }
+var MAX_SESSION_AGE_MS=8*60*60*1000; // 8 hours — a full work shift, then a fresh login is required regardless of activity
+var _maxSessionTimer=null;
 function startIdleWatcher(){
   ["click","keydown","touchstart","mousemove"].forEach(function(ev){
     document.addEventListener(ev,resetIdleTimer,{passive:true});
   });
   resetIdleTimer();
+  // TIER 1b (2026-07-20): a genuinely different mechanism from the idle
+  // timeout above. The idle timer only ever fires after a CONTINUOUS stretch
+  // of zero interaction — a session where someone taps something every
+  // couple of minutes can legitimately stay open all day and never once
+  // trigger it. This timer is set ONCE at login and is never reset by
+  // activity, so it directly addresses "logged in too long" (a real security
+  // and monitoring-clarity concern) rather than "forgotten and untouched,"
+  // which is what the idle timer already covers.
+  if(_maxSessionTimer)clearTimeout(_maxSessionTimer);
+  _maxSessionTimer=setTimeout(function(){
+    if(!CU)return;
+    toast("Session reached its maximum length — please log in again","warn");
+    setTimeout(logout,2000);
+  },MAX_SESSION_AGE_MS);
 }
 function stopIdleWatcher(){
   if(_idleTimer){clearTimeout(_idleTimer);_idleTimer=null;}
   if(_idleWarnTimer){clearTimeout(_idleWarnTimer);_idleWarnTimer=null;}
+  if(_maxSessionTimer){clearTimeout(_maxSessionTimer);_maxSessionTimer=null;}
   _dismissIdleWarning();
 }
 function is20ltr(prodName){
