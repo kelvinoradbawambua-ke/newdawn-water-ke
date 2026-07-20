@@ -199,6 +199,7 @@ var fbAuth=null;
 var fbDb=null;
 var FB_DOC_REF=null;
 var FB_BACKUP_COL=null; // backup collection reference
+var FB_COUNTERS_REF=null; // dedicated small doc for atomic ID counters — kept separate from the main document so reserving an ID never contends with normal data writes
 var FB_EVENTS_COL=null; // audit events subcollection — 1 doc per event
 var FB_READY=false;
 // DATA SAFETY: FB_READY drives the UI (login can proceed, spinners can stop)
@@ -229,7 +230,7 @@ var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-20-final-deploy-v28";
+var APP_VERSION="2026-07-20-atomic-order-id-v29";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -4060,11 +4061,61 @@ function checkCycleWarn(){
     +"<div style=\"font-size:10px;color:var(--tx2);margin-top:4px;text-align:right\">"+(next>=8?"Cycle resets after delivery":""+(8-next)+" more bottle"+(8-next===1?"":"s")+" to complete cycle")+"</div>"
     +"</div>";
 }
+function reserveNextOrderId(){
+  // ROOT-CAUSE FIX (2026-07-20): two devices could each read the same
+  // locally-cached "next order number" and both create an order with the
+  // same ID — whichever device's write landed last silently overwrote the
+  // other's order (confirmed live: Order #1204 created independently by two
+  // staff members, one lost). A Firestore transaction is the correct,
+  // guaranteed fix — not a smaller odds-reduction — because Firestore
+  // itself detects the conflict and automatically retries the losing
+  // transaction with the now-current value, so two simultaneous requests
+  // can never receive the same number, no matter how bad the connection is.
+  //
+  // This lives in its OWN small, dedicated document (newdawn_counters/main),
+  // deliberately separate from the main data document — a transaction only
+  // needs to retry if something else touches the SAME document between its
+  // read and write, so isolating the counter keeps this transaction fast
+  // and prevents it from ever contending with normal order/customer saves.
+  //
+  // Cost: one read + one write per order created — negligible at this
+  // business's scale (10-20 orders/day = 10-20 extra read+write pairs/day).
+  if(!FB_COUNTERS_REF||!fbDb){
+    // Offline / not yet connected: fall back to the previous best-effort
+    // local increment rather than blocking order creation entirely. This is
+    // weaker (the original race is possible again in this specific case)
+    // but availability matters — a device with no connection must still be
+    // able to record an order locally, to sync once reconnected.
+    return Promise.resolve(nOId++);
+  }
+  return fbDb.runTransaction(function(transaction){
+    return transaction.get(FB_COUNTERS_REF).then(function(doc){
+      var current=doc.exists&&doc.data().nOId?doc.data().nOId:Math.max(nOId-1,1000);
+      var next=current+1;
+      transaction.set(FB_COUNTERS_REF,{nOId:next},{merge:true});
+      return next;
+    });
+  }).then(function(reservedId){
+    nOId=Math.max(nOId,reservedId+1); // keep local counter ratcheted forward too
+    return reservedId;
+  }).catch(function(err){
+    console.log("[NDSYNC] reserveNextOrderId transaction FAILED ("+(err&&err.message)+") — falling back to local counter");
+    return nOId++; // still create the order rather than block the user on a transient error
+  });
+}
 function saveOrd(){
-  // Prevent duplicate orders from rapid double-tap on slow devices/networks
+  // Prevent duplicate orders from rapid double-tap on slow devices/networks.
+  // FIX (2026-07-20): this used to reset on a blind 1-second timer regardless
+  // of whether the save had actually finished — now that order creation
+  // involves a real Firestore transaction (see reserveNextOrderId), which can
+  // genuinely take longer than 1s on a poor connection (the exact scenario
+  // that caused the original bug), the guard is now reset explicitly when
+  // the save actually completes. This safety-net timeout is just a fallback
+  // in case something truly unexpected hangs and never resolves at all.
   if(window._savingOrder)return;
   window._savingOrder=true;
-  setTimeout(function(){window._savingOrder=false;},1000);
+  if(window._savingOrderSafetyNet)clearTimeout(window._savingOrderSafetyNet);
+  window._savingOrderSafetyNet=setTimeout(function(){window._savingOrder=false;},8000);
   // PERMISSION HARDENING: the old check was `!can("aOrd")&&!can("eOrd")`, which
   // meant a role with aOrd:1 but eOrd:0 (e.g. staff) could pass this gate even
   // while editing an existing order — the UI already hides the Edit button from
@@ -4196,33 +4247,31 @@ auditLog("ORDER_UPDATED","Order #"+o.id+" edited by "+CU.name+" ("+CU.role+")");
     return;
   }
 
-  var newOrdId=nOId++;
   var stCost=(D.stock||[]).find(function(s){return s.name===pn;});var costAtSale=stCost?stCost.cost:0;
 
   if(isCat){
     // Category order: no stock deduction, no invoice yet, payment at delivery
-    (D.orders||[]).push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:0,cost:0,date:el("od").value,status:"Pending",paid:"Unpaid",amtPaid:0,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?sanitizeInput(el("onotes").value):"",prodConfirmed:false,_ts:Date.now()});
-    auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty+" (category/TBC)");
-    if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
-  rDel();
-  cm("m-o");rOrds(undefined,ORD_PAGE);dirty();
-    toast("Order #"+newOrdId+" placed — driver confirms brand & collects payment at delivery");
+    reserveNextOrderId().then(function(newOrdId){
+      (D.orders||[]).push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:0,cost:0,date:el("od").value,status:"Pending",paid:"Unpaid",amtPaid:0,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?sanitizeInput(el("onotes").value):"",prodConfirmed:false,_ts:Date.now()});
+      auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty+" (category/TBC)");
+      if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
+      rDel();
+      cm("m-o");rOrds(undefined,ORD_PAGE);dirty();
+      toast("Order #"+newOrdId+" placed — driver confirms brand & collects payment at delivery");
+      window._savingOrder=false;
+    }).catch(function(){window._savingOrder=false;toast("Something went wrong placing the order — please try again","err");});
     return;
   }
 
   // Exact product order — normal flow
+  // Stock-alert confirmations stay synchronous here (they don't need the
+  // reserved ID) — only the actual commit (stock deduction, order/invoice
+  // creation) waits for a guaranteed-unique ID below.
   var st=(D.stock||[]).find(function(s){return s.name===pn;});
   if(st&&st.qty<=0){
-    if(!confirm("⚠️ Stock Alert\n\n"+pn+" is OUT OF STOCK (0 units).\n\nThe order will be recorded but cannot be fulfilled until restocked.\n\nContinue placing this order?"))return;
+    if(!confirm("⚠️ Stock Alert\n\n"+pn+" is OUT OF STOCK (0 units).\n\nThe order will be recorded but cannot be fulfilled until restocked.\n\nContinue placing this order?")){window._savingOrder=false;return;}
   }else if(st&&st.qty<qty){
-    if(!confirm("⚠️ Stock Alert\n\n"+pn+" has only "+st.qty+" unit(s) in stock but you are ordering "+qty+".\n\nThe order will be recorded. Please restock soon.\n\nContinue?"))return;
-  }
-  if(st){
-    st.qty=Math.max(0,st.qty-qty);
-    if(!st.history)st.history=[];
-    st.history.push({ts:tday(),type:"sale",qty:-qty,by:CU.name,ordId:newOrdId,bal:st.qty});
-    if(st.history.length>50)st.history=st.history.slice(-50);
-    updateStockBadge();
+    if(!confirm("⚠️ Stock Alert\n\n"+pn+" has only "+st.qty+" unit(s) in stock but you are ordering "+qty+".\n\nThe order will be recorded. Please restock soon.\n\nContinue?")){window._savingOrder=false;return;}
   }
   var total=price*qty;
   var amtPaid=can("mPaid")?(parseFloat(el("oamt").value)||0):0;
@@ -4230,14 +4279,24 @@ auditLog("ORDER_UPDATED","Order #"+o.id+" edited by "+CU.name+" ("+CU.role+")");
   if(amtPaid>=total){payStatus="Paid";}
   else if(amtPaid>0){payStatus="Partial";}
   else{payStatus="Unpaid";}
-  (D.orders||[]).push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:price,cost:costAtSale,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?sanitizeInput(el("onotes").value):"",_ts:Date.now(),prodConfirmed:true});
-  console.log("[NDSYNC] order created id="+newOrdId+" D.orders.length="+(D.orders||[]).length+" FB_READY="+FB_READY+" _cloudDataConfirmed="+_cloudDataConfirmed+" FB_WRITING="+FB_WRITING);
-  // Always create invoice for exact orders — provides full financial trail
-  (D.invoices||[]).push({id:nIId++,cId:cId,amount:total,paid:amtPaid,due:(function(){var dd=new Date((el("od").value||tday())+"T12:00:00");dd.setDate(dd.getDate()+7);return dd.toISOString().split("T")[0];})(),notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
-  auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty);
-  if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
-  rDel();
-cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+newOrdId+" placed");
+  reserveNextOrderId().then(function(newOrdId){
+    if(st){
+      st.qty=Math.max(0,st.qty-qty);
+      if(!st.history)st.history=[];
+      st.history.push({ts:tday(),type:"sale",qty:-qty,by:CU.name,ordId:newOrdId,bal:st.qty});
+      if(st.history.length>50)st.history=st.history.slice(-50);
+      updateStockBadge();
+    }
+    (D.orders||[]).push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:price,cost:costAtSale,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?sanitizeInput(el("onotes").value):"",_ts:Date.now(),prodConfirmed:true});
+    console.log("[NDSYNC] order created id="+newOrdId+" D.orders.length="+(D.orders||[]).length+" FB_READY="+FB_READY+" _cloudDataConfirmed="+_cloudDataConfirmed+" FB_WRITING="+FB_WRITING);
+    // Always create invoice for exact orders — provides full financial trail
+    (D.invoices||[]).push({id:nIId++,cId:cId,amount:total,paid:amtPaid,due:(function(){var dd=new Date((el("od").value||tday())+"T12:00:00");dd.setDate(dd.getDate()+7);return dd.toISOString().split("T")[0];})(),notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
+    auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty);
+    if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
+    rDel();
+    cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+newOrdId+" placed");
+    window._savingOrder=false;
+  }).catch(function(){window._savingOrder=false;toast("Something went wrong placing the order — please try again","err");});
 }
 function openDlv(oid){
   var o=(D.orders||[]).find(function(x){return x.id===oid;});if(!o)return;
@@ -7321,6 +7380,7 @@ window.addEventListener("load",function(){
       FB_DOC_REF=fbDb.collection("newdawn").doc("main");
       FB_BACKUP_COL=fbDb.collection("newdawn_backups");
       FB_EVENTS_COL=fbDb.collection("newdawn_events");
+      FB_COUNTERS_REF=fbDb.collection("newdawn_counters").doc("main");
     }catch(e){
       var r=document.getElementById("root");
       if(r)r.innerHTML="<div class=\"lscreen\"><div class=\"lbox\" style=\"text-align:center\">"+
