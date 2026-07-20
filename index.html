@@ -229,7 +229,7 @@ var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-20-quota-hardening-v27";
+var APP_VERSION="2026-07-20-final-deploy-v28";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -3061,7 +3061,7 @@ function delC(id){
   if(outstandingInvs.length){
     var totalOwed=outstandingInvs.reduce(function(s,i){return s+(i.amount-i.paid);},0);
     toast("This customer has KSh "+totalOwed.toLocaleString()+" outstanding across "+outstandingInvs.length+" invoice(s). Void "+(outstandingInvs.length>1?"each one":"it")+" first (reason required) — then delete.","warn");
-    voidInvoice(outstandingInvs[0].id);
+    voidInvoice(outstandingInvs[0].id,function(){delC(id);});
     return;
   }
   // ENTERPRISE RULE 2: the mirror image of Rule 1 — if the BUSINESS owes the
@@ -3359,10 +3359,12 @@ function reversePayment(invId,payIdx){
   if(el("pg-debts")&&el("pg-debts").classList.contains("act"))rDebts();
   toast("Payment reversed — Invoice #"+invId+" updated","ok");
 }
-function voidInvoice(invId){
+var _voidOnComplete=null;
+function voidInvoice(invId,onComplete){
   if(!can("rest")){toast("Director only","err");return;}
   var inv=(D.invoices||[]).find(function(x){return x.id===invId;});if(!inv){toast("Invoice not found","err");return;}
   if(inv.voided){toast("Already voided","err");return;}
+  _voidOnComplete=onComplete||null;
   var cu=(D.customers||[]).find(function(x){return x.id===inv.cId;});
   var bal=inv.amount-inv.paid;
   var tt=el("m-generic-title");
@@ -3413,6 +3415,13 @@ dirty();cm("m-generic");
   if(el("pg-invoices")&&el("pg-invoices").classList.contains("act"))rInvs(undefined,INV_PAGE);
   if(el("pg-debts")&&el("pg-debts").classList.contains("act"))rDebts();
   toast("Invoice #"+invId+" voided — KSh "+bal.toLocaleString()+" written off","ok");
+  // CHAINED FLOW (2026-07-20): if this void was triggered as part of a
+  // delete-order/delete-customer redirect, automatically continue into the
+  // original delete action now — same one reason, same one decision, just
+  // without requiring a second manual click on Delete afterward. A small
+  // delay lets the toast/modal-close render first so the flow feels
+  // sequential rather than instantaneous and jarring.
+  if(_voidOnComplete){var _cb=_voidOnComplete;_voidOnComplete=null;setTimeout(_cb,400);}
 }
 function recPay(){
   if(!can("mPaid")){toast("No permission to record payments","err");return;}
@@ -4492,7 +4501,7 @@ function delO(id){
   // debt calculation the moment its order disappeared, with no reason logged).
   if(outstandingBal>0){
     toast("Order #"+id+" has KSh "+outstandingBal.toLocaleString()+" still owed. Void the invoice first (reason required) — then delete.","warn");
-    voidInvoice(linkedInv.id);
+    voidInvoice(linkedInv.id,function(){delO(id);});
     return;
   }
   // ENTERPRISE RULE 3: a DELIVERED order is a recognized revenue transaction —
@@ -4880,7 +4889,7 @@ function prepStAdd(){
 }
 function saveSt(){
   if(!can("aSt")&&!can("eSt"))return;
-  var n=el("sn").value.trim();if(!n){toast("Name required","err");return;}
+  var n=sanitizeInput(el("sn").value.trim());if(!n){toast("Name required","err");return;}
   var editId=el("s-edit-id").value;
   if(editId){
     var s=(D.stock||[]).find(function(x){return String(x.id)===String(editId);});
@@ -4905,7 +4914,7 @@ function editSt(id){
   var s=(D.stock||[]).find(function(x){return x.id===id;});
   if(!s)return;
   el("s-edit-id").value=s.id;
-  el("sn").value=s.name||"";el("ss").value=s.size||"";el("sp").value=s.price||0;
+  el("sn").value=unescapeForEdit(s.name)||"";el("ss").value=s.size||"";el("sp").value=s.price||0;
   el("sc").value=s.cost||0;el("sq").value=s.qty||0;el("sm").value=s.min||10;
   if(el("sw"))el("sw").checked=!!s.isWater;
   el("m-s-title").innerHTML="<i class=\"ti ti-edit\" style=\"color:var(--gd);margin-right:7px\"></i>Edit Product";
@@ -5717,18 +5726,18 @@ function prepOf(){
 function editOff(id){editOf(id);}
 function saveOff(){
   if(!can("aOff")&&!can("eOff"))return;
-  var t=el("oft").value.trim();if(!t){toast("Title required","err");return;}
+  var t=sanitizeInput(el("oft").value.trim());if(!t){toast("Title required","err");return;}
   var editId=el("of-edit-id").value;
   if(editId){
     var o=(D.offers||[]).find(function(x){return String(x.id)===String(editId);});
     if(o){
       o.title=t;o.disc=parseInt(el("ofd").value)||0;o.minqty=parseInt(el("ofmq").value)||1;
-      o.prod=el("ofp").value;o.start=el("ofs").value;o.end=el("ofe").value;o.desc=el("ofdesc").value;
+      o.prod=el("ofp").value;o.start=el("ofs").value;o.end=el("ofe").value;o.desc=sanitizeInput(el("ofdesc").value);
       cm("m-of");rOffers();dirty();toast("Offer updated");
       return;
     }
   }
-  (D.offers||[]).push({id:uid(),title:t,disc:parseInt(el("ofd").value)||0,minqty:parseInt(el("ofmq").value)||1,prod:el("ofp").value,start:el("ofs").value,end:el("ofe").value,desc:el("ofdesc").value,active:true});
+  (D.offers||[]).push({id:uid(),title:t,disc:parseInt(el("ofd").value)||0,minqty:parseInt(el("ofmq").value)||1,prod:el("ofp").value,start:el("ofs").value,end:el("ofe").value,desc:sanitizeInput(el("ofdesc").value),active:true});
   el("oft").value="";el("ofd").value="";el("ofmq").value="1";el("ofdesc").value="";cm("m-of");rOffers();dirty();toast("Offer created");
 }
 function togOf(id){if(!can("aOff"))return;var o=(D.offers||[]).find(function(x){return x.id===id;});if(o)o.active=!o.active;rOffers();dirty();}
@@ -5739,12 +5748,12 @@ function editOf(id){
   var sp=el("ofp");if(sp)sp.innerHTML="<option>All products</option>"+(D.stock||[]).map(function(x){return "<option"+(o.prod===x.name?" selected":"")+">"+ x.name+"</option>";}).join("");
   if(el("m-of-title"))el("m-of-title").innerHTML="<i class=\"ti ti-edit\" style=\"color:var(--gd);margin-right:7px\"></i>Edit Promotion";
   el("of-edit-id").value=id;
-  el("oft").value=o.title||"";
+  el("oft").value=unescapeForEdit(o.title)||"";
   el("ofd").value=o.disc||0;
   el("ofmq").value=o.minqty||1;
   el("ofs").value=o.start||"";
   el("ofe").value=o.end||"";
-  el("ofdesc").value=o.desc||"";
+  el("ofdesc").value=unescapeForEdit(o.desc)||"";
   el("m-of-save").innerHTML="<i class=\"ti ti-check\"></i> Update";
   om("m-of");
 }
@@ -6369,7 +6378,7 @@ function rUsers(){
 }
 function saveU(){
   if(!can("mUsers"))return;
-  var n=el("un").value.trim();if(!n){toast("Name required","err");return;}
+  var n=sanitizeInput(el("un").value.trim());if(!n){toast("Name required","err");return;}
   var p=String(el("upin").value||"").replace(/[^0-9]/g,"").slice(0,4);
   if(p.length!==4){toast("PIN must be 4 digits e.g. 1234","err");return;}
   var role=el("ur").value;if(!R[role]){toast("Invalid role","err");return;}
@@ -6542,9 +6551,18 @@ function _renderBackupHistoryRows(el2,snap){
   if(snap.empty){el2.innerHTML="<div style=\"font-size:12px;color:var(--tx2)\">No backups yet — they start automatically after 10 minutes of use.</div>";return;}
   var docs=[];
   snap.forEach(function(d){docs.push(d);});
-  // Sort newest-first client-side — needed for the fallback path (which can't
-  // use orderBy), and harmless/no-op for the primary path (already sorted).
-  docs.sort(function(a,b){return a.id<b.id?1:a.id>b.id?-1:0;});
+  // FIX (2026-07-20): sorting by the raw document ID string put every
+  // "hourly-*" backup before every "daily-*" backup, REGARDLESS of actual
+  // date — because 'h' sorts after 'd' alphabetically, the type prefix
+  // dominated the comparison instead of the date. Within one type this
+  // looked fine; mixed together it was genuinely out of order. Sorting by
+  // the real timestamp stored in each backup's own payload instead gives
+  // true chronological order regardless of type.
+  docs.sort(function(a,b){
+    var ta=(a.data()&&a.data().backedUpAt)||0;
+    var tb=(b.data()&&b.data().backedUpAt)||0;
+    return tb-ta; // newest first
+  });
   var rows="";
   docs.forEach(function(d){
     var data=d.data();
