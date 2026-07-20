@@ -229,7 +229,7 @@ var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-20-root-cause-fixes-v16";
+var APP_VERSION="2026-07-20-voided-order-visibility-v17";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -3243,7 +3243,7 @@ voidInvoice._confirm=function(invId){
   inv.voided=true;inv.voidedBy=CU.name;inv.voidedAt=tday();inv.voidReason=reason;
   _recentlyVoidedInvoiceIds[invId]=Date.now();
   var ordMatch=inv.notes&&inv.notes.match(/#(\d+)/);
-  if(ordMatch){var o=D.orders.find(function(x){return String(x.id)===ordMatch[1];});if(o&&o.status!=="Delivered")o.paid="Voided";}
+  if(ordMatch){var o=D.orders.find(function(x){return String(x.id)===ordMatch[1];});if(o)o.paid="Voided";}
   auditLog("PAYMENT_RECORDED","VOID: Invoice #"+invId+" voided by "+CU.name+". Reason: "+reason+". Amount written off: KSh "+bal);
     if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
 dirty();cm("m-generic");
@@ -5600,6 +5600,23 @@ function rReports(){
   var cost=del.reduce(function(a,o){return a+o.qty*(o.cost||0);},0);
   var totD=(D.customers||[]).reduce(function(a,c){return a+custDebt(c.id);},0);
   var totCredit=(D.customers||[]).reduce(function(a,cu){return a+(cu.credit||0);},0);
+  // ENTERPRISE TRANSPARENCY FIX (2026-07-20): voiding an invoice correctly
+  // leaves "Revenue" untouched — revenue is recognized at delivery, and a
+  // later failure to collect payment is a separate bad-debt event, not a
+  // retroactive rewrite of history. But that write-off amount previously had
+  // NO visibility anywhere on Dashboard or Reports — a director had no way to
+  // see, at a glance, how much recognized revenue was ultimately never
+  // collected. This is the fix: a distinct, clearly-labeled figure, exactly
+  // how real accounting systems handle it — never hidden, never blended into
+  // Revenue itself.
+  var writtenOff=(D.invoices||[]).filter(function(i){
+    if(!i.voided)return false;
+    if(!RPT_FROM&&!RPT_TO)return true;
+    var vd=i.voidedAt||i.date;
+    if(RPT_FROM&&vd<RPT_FROM)return false;
+    if(RPT_TO&&vd>RPT_TO)return false;
+    return true;
+  }).reduce(function(a,i){return a+(i.amount-i.paid);},0);
   var btlIss=(D.orders||[]).filter(function(o){return o.bottle_after&&o.bottle_after!=="Good";}).length;
   // Driver performance
   // Driver performance: group by who COMPLETED the delivery (completedBy)
@@ -5679,6 +5696,7 @@ function rReports(){
       "<div class=\"stat sg\"><div class=\"sl\">Total revenue</div><div class=\"sv\">"+ksh(rev)+"</div><div class=\"ss\">"+del.length+" orders</div></div>"+
       "<div class=\"stat sn\"><div class=\"sl\">Gross profit</div><div class=\"sv\">"+(can("vProfit")?"KSh "+(rev-cost).toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>")+"</div><div class=\"ss\">"+(can("vProfit")&&rev>0?Math.round((rev-cost)/rev*100)+"% margin":"&mdash;&mdash;")+"</div></div>"+
       "<div class=\"stat sr\"><div class=\"sl\">Total debt</div><div class=\"sv\">"+(can("vDebt")?"KSh "+totD.toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>")+"</div>"+(totCredit>0&&can("vDebt")?"<div class=\"ss\" style=\"color:#3498db;cursor:pointer\" onclick=\"nav('debts');setTimeout(function(){rDebts('__credit__',0);},200)\" title=\"See customers with credit\"><i class=\"ti ti-gift\"></i> KSh "+totCredit.toLocaleString()+" credit held &rarr;</div>":"<div class=\"ss\">net of credits</div>")+"</div>"+
+      "<div class=\"stat sr\" title=\"Revenue was still earned at delivery — this is money that was ultimately never collected and formally written off, shown separately rather than hidden inside Revenue.\"><div class=\"sl\">Written off (bad debt)</div><div class=\"sv\">"+(can("vDebt")?"KSh "+writtenOff.toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>")+"</div><div class=\"ss\">"+(RPT_FROM||RPT_TO?"in selected period":"all time")+"</div></div>"+
       "<div class=\"stat sa\"><div class=\"sl\">Bottle issues</div><div class=\"sv\">"+btlIss+"</div><div class=\"ss\">damaged/cracked/missing</div></div>"+
       "<div class=\"stat sb\"><div class=\"sl\">Open complaints</div><div class=\"sv\">"+(D.complaints||[]).filter(function(c){return c.status!=="Resolved";}).length+"</div></div>"+
     "</div>"+
@@ -6904,6 +6922,14 @@ function syncPaymentStatuses(){
     var inv=(D.invoices||[]).find(function(i){
       return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+o.id)!==-1;
     });
+    // Same principle applies to a voided invoice — voidInvoice._confirm()
+    // deliberately sets o.paid="Voided" so the write-off is visible on the
+    // Orders page, not just buried in the Invoices list. This function used
+    // to ignore inv.voided completely and would recompute "Unpaid"/"Partial"
+    // straight from paid/amount, silently erasing the "Voided" label on the
+    // very next sync after it was set — a real bug that would have made the
+    // 2026-07-20 Voided-order-visibility fix look like it never worked.
+    if(inv&&inv.voided){if(o.paid!=="Voided")o.paid="Voided";return;}
     if(inv){
       if(inv.paid>=inv.amount){o.paid="Paid";o.amtPaid=inv.paid;}
       else if(inv.paid>0){o.paid="Partial";o.amtPaid=inv.paid;}
