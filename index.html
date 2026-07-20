@@ -229,7 +229,7 @@ var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-20-write-race-mitigation-v25";
+var APP_VERSION="2026-07-20-execution-test-suite-v26";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -5986,7 +5986,7 @@ function rAuditLog(pg){
           allTypes.map(function(t){return"<option value=\""+t+"\">"+(typeMap[t].label)+"</option>";}).join("")+
         "</select>"+
         "<button class=\"btn btn-xs\" onclick=\"AUDIT_Q='';AUDIT_TYPE='';AUDIT_PAGE=0;rAuditLog()\" style=\"white-space:nowrap\"><i class=\"ti ti-x\"></i> Clear</button>"+
-        "<button class=\"btn btn-xs\" onclick=\"rAuditLogWithArchives()\" style=\"background:#7c3aed;color:#fff;white-space:nowrap\"><i class=\"ti ti-archive\"></i> Archives</button>"+
+        "<button class=\"btn btn-xs\" onclick=\"rAuditLogWithArchives(event)\" style=\"background:#7c3aed;color:#fff;white-space:nowrap\"><i class=\"ti ti-archive\"></i> Archives</button>"+
         "<button class=\"btn btn-xs\" onclick=\"exportAuditCSV()\" style=\"background:#27ae60;color:#fff;white-space:nowrap\"><i class=\"ti ti-download\"></i> CSV</button>"+
         "<button class=\"btn btn-xs\" onclick=\"if(confirm('Purge entries older than 30 days?'))manualPurgeAuditLog(30)\" style=\"background:#e67e22;color:#fff;white-space:nowrap\"><i class=\"ti ti-trash\"></i> Purge 30d</button>"+
       "</div>"+
@@ -6050,7 +6050,7 @@ function rAuditLog(pg){
 }
 
 
-function rAuditLogWithArchives(){
+function rAuditLogWithArchives(event){
   var btn=event&&event.target;
   if(btn){btn.innerHTML="<i class=\"ti ti-loader\"></i> Loading...";btn.disabled=true;}
   loadAuditArchives(function(archived){
