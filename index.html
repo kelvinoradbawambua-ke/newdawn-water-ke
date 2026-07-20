@@ -229,7 +229,7 @@ var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-20-voided-order-visibility-v17";
+var APP_VERSION="2026-07-20-invoice-voided-display-v22";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -258,6 +258,34 @@ var D={customers:[],stock:[],orders:[],offers:[],invoices:[],routes:[],complaint
 };
 var nOId=1001,nIId=2001,nCId=3001,nCmpId=4001;
 var CU=null,SU=null,PE="";
+// SECURITY FIX (2026-07-20): this codebase renders user-entered free text
+// (customer names, complaint details, notes) directly into innerHTML in
+// many places, with zero HTML-escaping anywhere in the file. A customer name
+// or note containing something like an <img onerror=...> tag would silently
+// execute in every user's browser that later views that record — a genuine
+// stored XSS vulnerability on a system handling real customer data and real
+// money. Fixing every one of the many display sites correctly would be a
+// large, error-prone undertaking; sanitizing at the point of ENTRY instead
+// protects every downstream render automatically, since the dangerous
+// content never enters the data model at all. This neutralizes angle
+// brackets (the only characters that can turn text into markup/script)
+// while leaving all normal text, including special characters like & and
+// quotes, fully readable and unaffected.
+function sanitizeInput(s){
+  if(!s)return s;
+  return String(s).replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+// UX FIX (2026-07-20): the mirror image of sanitizeInput(). Setting an
+// <input>'s .value property does NOT decode HTML entities — it's a raw
+// string assignment. So a stored name/note containing "&lt;" (from the
+// sanitization above) would show the literal text "&lt;" in the edit form
+// instead of "<", which is confusing to re-edit even though it's not a
+// security or data problem. Used everywhere a sanitized field gets loaded
+// back into an editable form field.
+function unescapeForEdit(s){
+  if(!s)return s;
+  return String(s).replace(/&lt;/g,"<").replace(/&gt;/g,">");
+}
 
 function can(p){return !!(CU&&R[CU.role]&&R[CU.role].p[p]);}
 function el(id){return document.getElementById(id);}
@@ -2558,14 +2586,33 @@ function rDash(){
     DASH_PERIOD==="quarter"?"Q"+(Math.floor(mo/3)+1)+" "+yr:"All time";
   // ── Week daily breakdown (for weekly chart) ───────────────────────
   var wkDays=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+  // BUSINESS-LOGIC FIX (2026-07-20): "Revenue" on the dashboard previously
+  // counted the full qty*price of every delivered order, even ones whose
+  // invoice was later voided (formally written off as uncollectible). Gross
+  // accrual revenue not changing is technically correct accounting — but for
+  // a number directors check daily to gauge how the business is doing,
+  // counting money that's been explicitly declared "we will never collect
+  // this" is misleading in practice. Netting it out here. Only the
+  // UNPAID remainder at the time of voiding is subtracted — if part of the
+  // invoice was genuinely paid before being voided, that portion was real
+  // money collected and must still count.
+  function _writtenOffFor(orders){
+    var ids={};orders.forEach(function(o){ids[o.id]=true;});
+    return (D.invoices||[]).filter(function(i){
+      if(!i.voided)return false;
+      var m=i.notes&&i.notes.match(/#(\d+)/);
+      return m&&ids[parseInt(m[1])];
+    }).reduce(function(a,i){return a+(i.amount-i.paid);},0);
+  }
   var wkRevs=wkDays.map(function(_,i){
     var d=new Date(weekStart);d.setDate(weekStart.getDate()+i);
     var ds=_ymd(d); // local-safe — must match order dates for chart bars to populate correctly
-    return del.filter(function(o){var dd=o.deliveredAt||o.date;return dd===ds;}).reduce(function(a,o){return a+o.qty*o.price;},0);
+    var dayOrds=del.filter(function(o){var dd=o.deliveredAt||o.date;return dd===ds;});
+    return dayOrds.reduce(function(a,o){return a+o.qty*o.price;},0)-_writtenOffFor(dayOrds);
   });
   var wkMax=Math.max.apply(null,wkRevs.concat([1]));
   var todayDow=dow===0?6:dow-1; // 0=Mon…6=Sun
-  var rev=periodDel.reduce(function(a,o){return a+o.qty*o.price;},0);
+  var rev=periodDel.reduce(function(a,o){return a+o.qty*o.price;},0)-_writtenOffFor(periodDel);
   var cost=periodDel.reduce(function(a,o){return a+o.qty*(o.cost||0);},0);
   var pend=(D.orders||[]).filter(function(o){return o.status==="Pending"||o.status==="Processing";}).length;
   var low=(D.stock||[]).filter(function(s){return s.qty<=s.min;}).length;
@@ -2574,7 +2621,11 @@ function rDash(){
   var totD=debts.reduce(function(a,c){return a+dashDebtMap[c.id];},0);
   var oCmp=(D.complaints||[]).filter(function(c){return c.status!=="Resolved";}).length;
   var mns=["J","F","M","A","M","J","J","A","S","O","N","D"];
-  var mRevs=mns.map(function(_,i){var m2=String(i+1).padStart(2,"0");return del.filter(function(o){var dd=o.deliveredAt||o.date;return dd&&dd.startsWith(yr+"-"+m2);}).reduce(function(a,o){return a+o.qty*o.price;},0);});
+  var mRevs=mns.map(function(_,i){
+    var m2=String(i+1).padStart(2,"0");
+    var mOrds=del.filter(function(o){var dd=o.deliveredAt||o.date;return dd&&dd.startsWith(yr+"-"+m2);});
+    return mOrds.reduce(function(a,o){return a+o.qty*o.price;},0)-_writtenOffFor(mOrds);
+  });
   var mMax=Math.max.apply(null,mRevs.concat([1]));
   var alerts=[];
   var now2=new Date();
@@ -2840,16 +2891,16 @@ function prepCustAdd(){
 }
 function saveCust(){
   if(!can("aCust")&&!can("eCust"))return;
-  var n=el("cn").value.trim(),ph=el("cph").value.trim();
+  var n=sanitizeInput(el("cn").value.trim()),ph=el("cph").value.trim();
   if(!n||!ph){toast("Name and phone required","err");return;}
   var editId=el("c-edit-id").value;
   if(editId){
     var c=(D.customers||[]).find(function(x){return String(x.id)===String(editId);});
     if(c){
       c.name=n;c.phone=ph;c.phone2=el("cph2").value;c.idno=el("cid").value;
-      c.estate=el("cestate").value;c.court=el("ccourt").value;c.house=el("chouse").value;
-      c.htype=el("chtype").value;c.road=el("croad").value;c.zone=el("czone").value;
-      c.ctype=el("ctype").value;c.creditLimit=parseFloat(el("ccl").value)||0;c.notes=el("cnotes").value;
+      c.estate=sanitizeInput(el("cestate").value);c.court=sanitizeInput(el("ccourt").value);c.house=el("chouse").value;
+      c.htype=el("chtype").value;c.road=sanitizeInput(el("croad").value);c.zone=sanitizeInput(el("czone").value);
+      c.ctype=el("ctype").value;c.creditLimit=parseFloat(el("ccl").value)||0;c.notes=sanitizeInput(el("cnotes").value);
       auditLog("CUSTOMER_UPDATED","Customer updated by "+CU.name+" ("+CU.role+"): "+n);
       if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
 cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer updated");
@@ -2867,7 +2918,7 @@ cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer updated");
         +(can("vPhone")?dupAddr.name:maskName(dupAddr.name))+"\n\nContinue adding a new customer?"))return;
     }
   }
-  (D.customers||[]).push({id:uid(),name:n,phone:ph,phone2:el("cph2").value,idno:el("cid").value,estate:el("cestate").value,court:el("ccourt").value,house:el("chouse").value,htype:el("chtype").value,road:el("croad").value,zone:el("czone").value,ctype:el("ctype").value,creditLimit:parseFloat(el("ccl").value)||0,notes:el("cnotes").value,created:tday(),_ts:Date.now()});
+  (D.customers||[]).push({id:uid(),name:n,phone:ph,phone2:el("cph2").value,idno:el("cid").value,estate:sanitizeInput(el("cestate").value),court:sanitizeInput(el("ccourt").value),house:el("chouse").value,htype:el("chtype").value,road:sanitizeInput(el("croad").value),zone:sanitizeInput(el("czone").value),ctype:el("ctype").value,creditLimit:parseFloat(el("ccl").value)||0,notes:sanitizeInput(el("cnotes").value),created:tday(),_ts:Date.now()});
   ["cn","cph","cph2","cid","cestate","ccourt","chouse","croad","czone","cnotes"].forEach(function(id){el(id).value="";});el("ccl").value="0";
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
 cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer added");
@@ -2877,11 +2928,11 @@ function editCust(id){
   var c=(D.customers||[]).find(function(x){return x.id===id;});
   if(!c)return;
   el("c-edit-id").value=c.id;
-  el("cn").value=c.name||"";el("cph").value=c.phone||"";el("cph2").value=c.phone2||"";
-  el("cid").value=c.idno||"";el("cestate").value=c.estate||"";el("ccourt").value=c.court||"";
-  el("chouse").value=c.house||"";el("chtype").value=c.htype||"House";el("croad").value=c.road||"";
-  el("czone").value=c.zone||"";el("ctype").value=c.ctype||"Residential";
-  el("ccl").value=c.creditLimit||0;el("cnotes").value=c.notes||"";
+  el("cn").value=unescapeForEdit(c.name)||"";el("cph").value=c.phone||"";el("cph2").value=c.phone2||"";
+  el("cid").value=c.idno||"";el("cestate").value=unescapeForEdit(c.estate)||"";el("ccourt").value=unescapeForEdit(c.court)||"";
+  el("chouse").value=c.house||"";el("chtype").value=c.htype||"House";el("croad").value=unescapeForEdit(c.road)||"";
+  el("czone").value=unescapeForEdit(c.zone)||"";el("ctype").value=c.ctype||"Residential";
+  el("ccl").value=c.creditLimit||0;el("cnotes").value=unescapeForEdit(c.notes)||"";
   el("m-c-title").innerHTML="<i class=\"ti ti-user-edit\" style=\"color:var(--gd);margin-right:7px\"></i>Edit Customer";
   el("m-c-save").innerHTML="<i class=\"ti ti-check\"></i> Update";
   om("m-c");
@@ -3263,6 +3314,18 @@ function recPay(){
   // ── INVOICE-SPECIFIC PAYMENT ──────────────────────────────────────────
   if(invId){
     var inv=(D.invoices||[]).find(function(x){return x.id===invId;});if(!inv){toast("Invoice not found","err");return;}
+    // GAP FIX (2026-07-20): this branch had no check for inv.voided at all.
+    // A voided invoice has already been formally written off with a reason
+    // and audit trail — recording a NEW payment against it afterward would
+    // create a real contradiction: money shows as collected, but the order
+    // still displays "Voided" (per syncPaymentStatuses' correct handling of
+    // voided invoices), and the invoice's own written-off status becomes
+    // misleading. This can genuinely happen cross-device: a director opens
+    // this payment form, another device voids the same invoice moments
+    // before this one submits. The customer-level payment branch below
+    // already correctly excludes voided invoices from its distribution —
+    // this was the one path missing the same protection.
+    if(inv.voided){toast("This invoice was voided/written off and cannot receive a new payment. If money was actually received, ask a director to review — voiding is not meant to be reversed casually.","err");return;}
     var bal=inv.amount-inv.paid;
     var credit=0;
     if(amt>bal){
@@ -3994,7 +4057,7 @@ auditLog("ORDER_UPDATED","Order #"+o.id+" edited by "+CU.name+" ("+CU.role+")");
 
   if(isCat){
     // Category order: no stock deduction, no invoice yet, payment at delivery
-    (D.orders||[]).push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:0,cost:0,date:el("od").value,status:"Pending",paid:"Unpaid",amtPaid:0,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?el("onotes").value:"",prodConfirmed:false,_ts:Date.now()});
+    (D.orders||[]).push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:0,cost:0,date:el("od").value,status:"Pending",paid:"Unpaid",amtPaid:0,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?sanitizeInput(el("onotes").value):"",prodConfirmed:false,_ts:Date.now()});
     auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty+" (category/TBC)");
     if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   rDel();
@@ -4023,7 +4086,7 @@ auditLog("ORDER_UPDATED","Order #"+o.id+" edited by "+CU.name+" ("+CU.role+")");
   if(amtPaid>=total){payStatus="Paid";}
   else if(amtPaid>0){payStatus="Partial";}
   else{payStatus="Unpaid";}
-  (D.orders||[]).push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:price,cost:costAtSale,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?el("onotes").value:"",_ts:Date.now(),prodConfirmed:true});
+  (D.orders||[]).push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:price,cost:costAtSale,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:el("odlvr").value,bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?sanitizeInput(el("onotes").value):"",_ts:Date.now(),prodConfirmed:true});
   console.log("[NDSYNC] order created id="+newOrdId+" D.orders.length="+(D.orders||[]).length+" FB_READY="+FB_READY+" _cloudDataConfirmed="+_cloudDataConfirmed+" FB_WRITING="+FB_WRITING);
   // Always create invoice for exact orders — provides full financial trail
   (D.invoices||[]).push({id:nIId++,cId:cId,amount:total,paid:amtPaid,due:(function(){var dd=new Date((el("od").value||tday())+"T12:00:00");dd.setDate(dd.getDate()+7);return dd.toISOString().split("T")[0];})(),notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
@@ -4872,7 +4935,7 @@ function rInvs(q,pg){
       "<div id=\"inv-results\"></div>";
   }
   var _is=el("inv-stats");
-  if(_is)_is.innerHTML=(D.invoices||[]).length+" total &middot; "+(D.invoices||[]).filter(function(i){return i.paid>=i.amount;}).length+" paid &middot; "+(D.invoices||[]).filter(function(i){return i.paid<i.amount&&i.due&&i.due<td;}).length+" overdue";
+  if(_is)_is.innerHTML=(D.invoices||[]).length+" total &middot; "+(D.invoices||[]).filter(function(i){return i.paid>=i.amount;}).length+" paid &middot; "+(D.invoices||[]).filter(function(i){return i.paid<i.amount&&i.due&&i.due<td&&!i.voided;}).length+" overdue"+((D.invoices||[]).filter(function(i){return i.voided;}).length?" &middot; "+(D.invoices||[]).filter(function(i){return i.voided;}).length+" voided":"");
   var _ip=el("inv-pending");if(_ip)_ip.innerHTML=pendingBanner;
   var _ir=el("inv-results");
   if(_ir)_ir.innerHTML=
@@ -4882,8 +4945,8 @@ function rInvs(q,pg){
 }function invRows(fil){
   var td=tday();if(!fil.length)return "<tr><td colspan=\"9\"><div class=\"te\"><i class=\"ti ti-receipt\"></i><p>No invoices found</p></div></td></tr>";
   return fil.map(function(i){
-    var c=(D.customers||[]).find(function(x){return x.id===i.cId;});var bal=i.amount-i.paid;var ov=bal>0&&i.due&&i.due<td;
-    var st=bal<=0?"<span class=\"badge bg\"><i class=\"ti ti-check\"></i>Paid</span>":ov?"<span class=\"badge br\"><i class=\"ti ti-alert-circle\"></i>Overdue</span>":"<span class=\"badge ba\">Unpaid</span>";
+    var c=(D.customers||[]).find(function(x){return x.id===i.cId;});var bal=i.amount-i.paid;var ov=bal>0&&i.due&&i.due<td&&!i.voided;
+    var st=i.voided?"<span class=\"badge\" style=\"background:#f0f0f0;color:#999;border:1px solid #ddd\"><i class=\"ti ti-ban\"></i>Voided</span>":bal<=0?"<span class=\"badge bg\"><i class=\"ti ti-check\"></i>Paid</span>":ov?"<span class=\"badge br\"><i class=\"ti ti-alert-circle\"></i>Overdue</span>":"<span class=\"badge ba\">Unpaid</span>";
     var lp=(i.payments||[]).slice().sort(function(a,b){return b.date>a.date?1:-1;})[0];
     var iph=c?(can("vPhone")?c.phone:maskPhone(c.phone)):"";
     return "<tr class=\""+(i.voided?"dr":ov&&bal>0?"dr":"")+"\">"+
@@ -5406,7 +5469,7 @@ function saveCmp(){
   if(!can("aCmp"))return;
   var cmpCustId=parseInt(el("cmp-c").value);
   if(!cmpCustId||isNaN(cmpCustId)){toast("Please select a customer","err");return;}
-  var det=el("cmp-det").value.trim();if(!det){toast("Details required","err");return;}
+  var det=sanitizeInput(el("cmp-det").value.trim());if(!det){toast("Details required","err");return;}
   var editIdEl=el("cmp-id");var editId=editIdEl?editIdEl.value:"";
   if(editId){
     // Editing existing complaint requires mCmp permission
@@ -5414,13 +5477,13 @@ function saveCmp(){
     var ex=(D.complaints||[]).find(function(x){return x.id===parseInt(editId);});
     if(ex){
       ex.cId=parseInt(el("cmp-c").value);ex.type=el("cmp-t").value;
-      ex.details=det;ex.action=el("cmp-act").value;ex.status=el("cmp-s").value;
+      ex.details=det;ex.action=sanitizeInput(el("cmp-act").value);ex.status=el("cmp-s").value;
       var cs2=el("cmp-c-search");if(cs2){cs2.disabled=false;cs2.value="";}
       if(el("cmp-c"))el("cmp-c").value="";
       if(editIdEl)editIdEl.value="";
       cm("m-cmp");rCmps(undefined,CMP_PAGE);dirty();toast("Complaint updated");return;
     }
-  }(D.complaints||[]).push({id:nCmpId++,cId:parseInt(el("cmp-c").value),type:el("cmp-t").value,details:det,action:el("cmp-act").value,status:el("cmp-s").value,date:el("cmp-d").value});el("cmp-det").value="";el("cmp-act").value="";auditLog("COMPLAINT_LOGGED","Complaint logged by "+CU.name+" ("+CU.role+"): "+el("cmp-t").value);
+  }(D.complaints||[]).push({id:nCmpId++,cId:parseInt(el("cmp-c").value),type:el("cmp-t").value,details:det,action:sanitizeInput(el("cmp-act").value),status:el("cmp-s").value,date:el("cmp-d").value});el("cmp-det").value="";el("cmp-act").value="";auditLog("COMPLAINT_LOGGED","Complaint logged by "+CU.name+" ("+CU.role+"): "+el("cmp-t").value);
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   cm("m-cmp");rCmps(undefined,CMP_PAGE);dirty();toast("Complaint logged");}
 function editCmp(id){
@@ -5436,8 +5499,8 @@ function editCmp(id){
   // Show all fields for manager
   var stEl=el("cmp-s");if(stEl)stEl.disabled=false;
   var actEl=el("cmp-act");if(actEl)actEl.disabled=false;
-  var cd=el("cmp-det");if(cd)cd.value=cmp.details||"";
-  var ca=el("cmp-act");if(ca)ca.value=cmp.action||"";
+  var cd=el("cmp-det");if(cd)cd.value=unescapeForEdit(cmp.details)||"";
+  var ca=el("cmp-act");if(ca)ca.value=unescapeForEdit(cmp.action)||"";
   var cs=el("cmp-s");if(cs)cs.value=cmp.status||"Open";
   var ct=el("cmp-t");if(ct)ct.value=cmp.type||"Water quality";
   om("m-cmp");
@@ -5596,19 +5659,16 @@ function rReports(){
     }
     return true;
   });
-  var rev=del.reduce(function(a,o){return a+o.qty*o.price;},0);
-  var cost=del.reduce(function(a,o){return a+o.qty*(o.cost||0);},0);
   var totD=(D.customers||[]).reduce(function(a,c){return a+custDebt(c.id);},0);
   var totCredit=(D.customers||[]).reduce(function(a,cu){return a+(cu.credit||0);},0);
-  // ENTERPRISE TRANSPARENCY FIX (2026-07-20): voiding an invoice correctly
-  // leaves "Revenue" untouched — revenue is recognized at delivery, and a
-  // later failure to collect payment is a separate bad-debt event, not a
-  // retroactive rewrite of history. But that write-off amount previously had
-  // NO visibility anywhere on Dashboard or Reports — a director had no way to
-  // see, at a glance, how much recognized revenue was ultimately never
-  // collected. This is the fix: a distinct, clearly-labeled figure, exactly
-  // how real accounting systems handle it — never hidden, never blended into
-  // Revenue itself.
+  // BUSINESS-LOGIC FIX (2026-07-20): owner's explicit decision — a written-off
+  // (voided) amount should NOT inflate the headline Revenue figure, even
+  // though gross accrual revenue not changing is technically correct
+  // accounting. Netting it out here for consistency with the Dashboard,
+  // which now does the same — otherwise the two pages would show two
+  // different "Revenue" numbers for the same period, a new confusion. The
+  // separate "Written off" card below still shows the figure on its own, so
+  // nothing is hidden — it's just no longer counted twice as if uncollected.
   var writtenOff=(D.invoices||[]).filter(function(i){
     if(!i.voided)return false;
     if(!RPT_FROM&&!RPT_TO)return true;
@@ -5617,6 +5677,8 @@ function rReports(){
     if(RPT_TO&&vd>RPT_TO)return false;
     return true;
   }).reduce(function(a,i){return a+(i.amount-i.paid);},0);
+  var rev=del.reduce(function(a,o){return a+o.qty*o.price;},0)-writtenOff;
+  var cost=del.reduce(function(a,o){return a+o.qty*(o.cost||0);},0);
   var btlIss=(D.orders||[]).filter(function(o){return o.bottle_after&&o.bottle_after!=="Good";}).length;
   // Driver performance
   // Driver performance: group by who COMPLETED the delivery (completedBy)
