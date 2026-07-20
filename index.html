@@ -229,7 +229,7 @@ var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-20-infinite-write-loop-fix-v13";
+var APP_VERSION="2026-07-20-director-login-race-fix-v14";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -1766,7 +1766,17 @@ function buildApp(){
     }
   }
   startIdleWatcher();
-  setTimeout(runIntegrityCheck,3500);
+  // CRITICAL FIX: this used to fire at a flat 3.5 seconds after login,
+  // regardless of whether this device had actually caught up with every
+  // other device's very recent changes yet. runIntegrityCheck() can silently
+  // auto-correct and SAVE (e.g. water-cycle recalculation) — if it ran before
+  // a just-placed order from another device had arrived and merged in, it
+  // would push this device's still-incomplete copy of the data, silently
+  // erasing that order. This was reproducing on every director login. Now:
+  // requires genuine cloud confirmation (not just the old FB_READY timer),
+  // and waits substantially longer to give other devices' concurrent writes
+  // a real chance to arrive first.
+  setTimeout(runIntegrityCheck,15000);
   _checkSetupWizardEligibility();
 }
 function toggleUM(){el("um").classList.toggle("open");}
@@ -6604,7 +6614,7 @@ function syncWaterCycles(){
   }
 }
 function runIntegrityCheck(){
-  if(!CU||CU.role!=="director"||!FB_READY)return;
+  if(!CU||CU.role!=="director"||!FB_READY||!_cloudDataConfirmed)return;
   var issues=[];
   // Fix: migrate old c.credit (used as creditLimit) to c.creditLimit
   // If c.credit > 0 but creditLog is empty or missing, it was set via the form
@@ -6667,6 +6677,7 @@ function runIntegrityCheck(){
     if(changed)bootstrapped++;
   });
   if(bootstrapped>0){
+    console.log("[NDSYNC] runIntegrityCheck AUTO-SAVING due to water cycle drift — bootstrapped="+bootstrapped+" D.orders.length="+(D.orders||[]).length);
     dirty();
     issues.push("Water cycle synced for "+bootstrapped+" customer(s) — quantities recomputed from delivered orders");
     if(el("pg-customers")&&el("pg-customers").classList.contains("act"))rCusts();
