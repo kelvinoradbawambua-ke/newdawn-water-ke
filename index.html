@@ -223,11 +223,13 @@ var _recentlyDeletedCustomerIds={}; // id->timestamp, prevents sync from resurre
 var _idleWarnEl=null;
 var FB_RECONNECT_TIMER=null;
 var FB_LAST_SNAPSHOT=0; // timestamp of last successful snapshot — for heartbeat
+var FB_LAST_APPLIED_UPDATED_AT=0; // the cloud doc's own updatedAt we last actually applied — used to detect a silently-stalled listener
+var FB_LAST_HEALTH_CHECK=0; // throttles the active health-check below
 var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-20-init-race-condition-fix-v9";
+var APP_VERSION="2026-07-20-stale-connection-detection-v10";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -1093,6 +1095,7 @@ function startCloudListener(){
       USERS=[{id:1,name:"Director",role:"director",pin:"1234",ini:"DR",col:"#1a1560"}];
     }
     FB_SETUP_DONE=data.setupDone===true;
+    FB_LAST_APPLIED_UPDATED_AT=data.updatedAt||0;
     // Carry backup stamp
     if(data.D._lastDailyBackup)D._lastDailyBackup=data.D._lastDailyBackup;
     else if(data._lastDailyBackup)D._lastDailyBackup=data._lastDailyBackup;
@@ -1204,7 +1207,31 @@ function _startHeartbeat(){
     // Only ever reconnect on CONFIRMED death (FB_UNSUB nulled by an actual
     // error) — never based on quiet time alone.
     if(!FB_UNSUB){_reconnectCloudListener();return;}
-  },60000); // checked once a minute — this branch only ever fires on genuine failure
+    // THIRD RECOVERY MECHANISM — rare, cheap, and PROOF-based (not a "quiet
+    // period = broken" guess, which was the original quota bug's mistake).
+    // Neither mechanism above catches one real failure mode: a tab that stays
+    // visible and foregrounded the whole time, whose underlying connection
+    // silently degrades without ever firing an explicit error (happens on
+    // flaky WiFi/mobile networks — the connection doesn't fully drop, it just
+    // stops delivering). The app would sit there showing "Live" while
+    // genuinely missing every update from every other device, indefinitely,
+    // with nothing to ever notice or recover from it. This check does a
+    // single forced server read, rarely, and only reconnects if that read
+    // PROVES a real update was missed — the server's own updatedAt is newer
+    // than what this device has actually applied. Cost: at most one extra
+    // document read roughly every 10 minutes per open device — negligible,
+    // nowhere near the frequency of the removed 45s heartbeat.
+    if(Date.now()-FB_LAST_HEALTH_CHECK>600000){
+      FB_LAST_HEALTH_CHECK=Date.now();
+      FB_DOC_REF.get({source:"server"}).then(function(doc){
+        if(!doc.exists)return;
+        var serverUpdatedAt=(doc.data()||{}).updatedAt||0;
+        if(serverUpdatedAt>FB_LAST_APPLIED_UPDATED_AT+2000){
+          forceRefreshNow(); // proven stale — reconnect once, not repeatedly
+        }
+      }).catch(function(){}); // a failed health-check read isn't itself worth acting on
+    }
+  },60000); // checked once a minute — the two heavier branches only fire rarely
 }
 function refreshCurrentPage(){
   var activePg=document.querySelector(".pg.act");
