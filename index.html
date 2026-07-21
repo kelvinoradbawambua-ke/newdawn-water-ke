@@ -791,6 +791,21 @@ function runAutoBackup(){
     D._lastPeriodicBackupAt=nowMs; // SOD also satisfies this cycle's periodic backup — avoids writing two backups back-to-back
     writeBackup("sod-"+dateStr);
     pruneOldBackups("sod-",14); // 2 weeks of start-of-day snapshots
+    // LEGACY CLEANUP (2026-07-21): the old "daily-"/"hourly-" naming scheme
+    // (pre-dating today's sod-/eod-/periodic- rework) left a real backlog of
+    // documents sitting in the collection — confirmed visually in the
+    // Firestore console, well beyond any keep-limit that should have
+    // applied. The new pruning above only ever looks at its own new
+    // prefixes, so it would never touch or clean up that old backlog on its
+    // own. This piggybacks on the same once-daily SOD cycle to gradually
+    // prune the legacy prefixes down too — deliberately a small, bounded
+    // nibble each day (pruneOldBackups only ever reads/deletes a handful
+    // beyond the keep count per call) rather than one large batch delete, to
+    // keep every individual operation cheap. A backlog of dozens will clear
+    // out gradually over the following days, not instantly — the safer,
+    // more quota-conscious way to do it.
+    pruneOldBackups("daily-",2);
+    pruneOldBackups("hourly-",2);
     FB_DOC_REF.set({_lastSodBackupDate:dateStr,_lastPeriodicBackupAt:nowMs},{merge:true}).catch(function(){});
     return; // one backup action per check — keeps each write small and simple
   }
