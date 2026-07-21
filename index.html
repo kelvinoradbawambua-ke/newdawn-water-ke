@@ -230,7 +230,7 @@ var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-21-v34";
+var APP_VERSION="2026-07-21-v35";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -1110,16 +1110,24 @@ function startAuditListener(){
   if(AUDIT_RETRY_TIMER){clearTimeout(AUDIT_RETRY_TIMER);AUDIT_RETRY_TIMER=null;}
   // Tear down previous listener
   if(FB_AUDIT_UNSUB){try{FB_AUDIT_UNSUB();}catch(e){}FB_AUDIT_UNSUB=null;}
-  // 30-day rolling window — new events always have ts > cutoff
-  var cutoff=new Date();
-  cutoff.setDate(cutoff.getDate()-30);
-  var cutoffTs=cutoff.toISOString();
-  // Real-time listener: MERGE incoming, never replace
-  // orderBy("ts","asc") on newdawn_events — Firestore auto-creates
-  // single-field ascending index for every collection automatically
+  // CRITICAL FIX (2026-07-21): this used to have NO limit at all — it read
+  // the ENTIRE 30-day rolling window of audit events, in full, every single
+  // time this listener was freshly subscribed (every page load, every
+  // navigation to the Data tab, every reconnect from background-pause
+  // resume or a connection error). With months of real activity and testing,
+  // this collection has accumulated hundreds to thousands of individual
+  // documents — meaning a single reconnect could cost hundreds or thousands
+  // of reads in one burst. This is very likely the actual explanation for
+  // the sharp, isolated read spikes observed live (extreme read-to-write
+  // ratio, recurring shape matching reconnect frequency, not steady
+  // activity). Bounded to the 200 most recent events, matching the same
+  // AUDIT_HOT_MAX=200 pattern already used elsewhere in this app for the
+  // hot log — still gives full real-time updates for new events (the newest
+  // event always sorts to the top and correctly triggers a live update),
+  // just without ever re-reading unbounded history on every reconnect.
   FB_AUDIT_UNSUB=FB_EVENTS_COL
-    .orderBy("ts","asc")
-    .startAfter(cutoffTs)
+    .orderBy("ts","desc")
+    .limit(200)
     .onSnapshot(function(snap){
       AUDIT_RETRY_ATTEMPTS=0; // a good snapshot means the connection is healthy again
       var remote=[];
