@@ -230,7 +230,7 @@ var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-21-v31";
+var APP_VERSION="2026-07-21-v32";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -624,6 +624,53 @@ function processWriteQueue(){
           if(tombstoned)return;
           DforSync.customers.push(fc);
           console.log("[NDSYNC] freshness check RESCUED customer id="+fc.id+" that would otherwise have been dropped by this write");
+        });
+      }
+      // ROOT-CAUSE FIX (2026-07-21): this rescue mechanism previously only
+      // covered orders and customers — invoices (where every payment lives)
+      // and pending cash acknowledgements were never protected. A device
+      // that had been doing OTHER tasks for a while, with a slightly stale
+      // local view of invoices, could write and silently overwrite a
+      // payment another device had just recorded — the exact "processing
+      // customer payments gets lost" pattern reported live. Fixed the same
+      // way as orders/customers: rescue anything genuinely new the server
+      // has that this write doesn't know about, AND — critically, since a
+      // payment updates an EXISTING invoice rather than creating a new one —
+      // prefer whichever version shows MORE progress (more paid, or voided)
+      // rather than blindly trusting whichever device happens to write last.
+      if(freshD.invoices&&DforSync.invoices){
+        var localInvMap={};DforSync.invoices.forEach(function(iv,idx){localInvMap[iv.id]=idx;});
+        freshD.invoices.forEach(function(fi){
+          var localIdx=localInvMap[fi.id];
+          if(localIdx===undefined){
+            DforSync.invoices.push(fi);
+            console.log("[NDSYNC] freshness check RESCUED invoice id="+fi.id+" that would otherwise have been dropped by this write");
+            return;
+          }
+          var li=DforSync.invoices[localIdx];
+          var serverPaid=fi.paid||0,localPaid=li.paid||0;
+          var serverMoreAdvanced=(fi.voided&&!li.voided)||(serverPaid>localPaid);
+          if(serverMoreAdvanced){
+            DforSync.invoices[localIdx]=fi;
+            console.log("[NDSYNC] freshness check PREFERRED server's more-advanced invoice id="+fi.id+" (paid "+localPaid+"->"+serverPaid+", voided="+(fi.voided||false)+")");
+          }
+        });
+      }
+      if(freshD.pendingPayments&&DforSync.pendingPayments){
+        var localPPMap={};DforSync.pendingPayments.forEach(function(pp,idx){if(pp.id)localPPMap[pp.id]=idx;});
+        freshD.pendingPayments.forEach(function(fp){
+          if(!fp.id)return;
+          var localIdx=localPPMap[fp.id];
+          if(localIdx===undefined){
+            DforSync.pendingPayments.push(fp);
+            console.log("[NDSYNC] freshness check RESCUED pending payment id="+fp.id+" that would otherwise have been dropped by this write");
+            return;
+          }
+          var lp=DforSync.pendingPayments[localIdx];
+          if(fp.ack&&!lp.ack){
+            DforSync.pendingPayments[localIdx]=fp;
+            console.log("[NDSYNC] freshness check PREFERRED server's acknowledged pending payment id="+fp.id);
+          }
         });
       }
     }
