@@ -230,7 +230,7 @@ var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-21-v33";
+var APP_VERSION="2026-07-21-v34";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -498,6 +498,11 @@ var FB_WRITE_RETRY_TIMER=null; // QUOTA GUARD: only one pending write-retry may 
 var FB_WRITE_RETRY_ATTEMPTS=0; // QUOTA GUARD: drives backoff instead of a fixed 5s-forever hammer
 var FB_PENDING_CONFIRM_RETRY=null; // ensures a write attempted before confirmation is never silently lost
 var _lastFreshnessCheckTime=0; // Tier 2: tracks the last REAL server-freshness check, to safely skip redundant ones during a rapid burst of writes
+var _stockQtyDeltas={}; // stock id -> net quantity change since last confirmed sync (e.g. -3 for a sale, +10 for a restock)
+function _recordStockDelta(stockId,delta){
+  if(!stockId||!delta)return;
+  _stockQtyDeltas[stockId]=(_stockQtyDeltas[stockId]||0)+delta;
+}
 function pushToCloud(){
   if(!FB_READY||!FB_DOC_REF){console.log("[NDSYNC] pushToCloud BLOCKED: FB_READY="+FB_READY+" FB_DOC_REF="+(!!FB_DOC_REF));return;}
   // DATA SAFETY GATE: never write until we've genuinely heard back from
@@ -680,18 +685,36 @@ function processWriteQueue(){
       if(freshD.stock&&DforSync.stock){
         var localStockIds={};DforSync.stock.forEach(function(s,idx){localStockIds[s.id]=idx;});
         freshD.stock.forEach(function(fs){
-          if(localStockIds[fs.id]===undefined){
+          var idx=localStockIds[fs.id];
+          if(idx===undefined){
             DforSync.stock.push(fs);
             console.log("[NDSYNC] freshness check RESCUED stock item id="+fs.id+" ("+fs.name+") that would otherwise have been dropped by this write");
+            return;
           }
-          // HONEST LIMITATION: this rescues a genuinely NEW product another
-          // device added that we don't know about yet — it does not resolve
-          // a QUANTITY conflict where two devices each deducted/restocked
-          // the SAME product independently (neither number is "more
-          // correct" than the other, unlike a payment's paid amount). That
-          // remains a low-probability residual risk at this team's scale,
-          // as already assessed — a full fix would need per-product atomic
-          // increments, a larger architectural change not warranted here.
+          // FIX (2026-07-21): previously this only rescued genuinely NEW
+          // products — a QUANTITY conflict (two devices each independently
+          // deducting/restocking the SAME product) was a known, documented
+          // limitation, not something actually resolved. Closed now by
+          // applying THIS device's own tracked net change (e.g. "-3" for a
+          // sale, "+10" for a restock) on top of whatever the server's
+          // quantity currently shows — the same principle Firestore's own
+          // atomic increment uses server-side, applied here client-side on
+          // the same already-scheduled freshness-check read, at zero extra
+          // Firestore cost. This correctly combines both devices' real
+          // changes instead of one silently overwriting the other.
+          var delta=_stockQtyDeltas[fs.id]||0;
+          if(delta!==0){
+            var merged=Math.max(0,(fs.qty||0)+delta);
+            console.log("[NDSYNC] freshness check MERGED stock id="+fs.id+" ("+fs.name+") — server="+fs.qty+" + our delta="+delta+" = "+merged);
+            var mergedItem=fs;
+            mergedItem.qty=merged;
+            if(DforSync.stock[idx].history)mergedItem.history=DforSync.stock[idx].history;
+            DforSync.stock[idx]=mergedItem;
+          }else{
+            // No local change to this item this cycle — trust the server's
+            // current value rather than our own possibly-stale one
+            DforSync.stock[idx]=fs;
+          }
         });
       }
       if(freshD.complaints&&DforSync.complaints){
@@ -750,6 +773,7 @@ function processWriteQueue(){
   FB_DOC_REF.set(JSON.parse(JSON.stringify(payload)),{merge:true}).then(function(){
     console.log("[NDSYNC] processWriteQueue SUCCESS — write confirmed by Firestore at "+new Date().toISOString());
     FB_WRITING=false;
+    _stockQtyDeltas={}; // deltas are now reflected in the confirmed write — must not be re-applied next cycle
     FB_WRITE_RETRY_ATTEMPTS=0; // a successful write means the connection/quota is healthy again
     _hideCloudOfflineBanner();
     var e=el("sts");if(e){e.className="sts saved";e.innerHTML="<i class=\"ti ti-cloud-check\"></i> Synced "+new Date().toLocaleTimeString();}
@@ -3266,7 +3290,7 @@ function delC(id){
   // Restore stock for pending/unfulfilled orders before removing them
   (D.orders||[]).filter(function(o){return o.cId===id&&o.status!=="Delivered"&&o.status!=="Cancelled"&&o.prodConfirmed!==false;}).forEach(function(o){
     var st=(D.stock||[]).find(function(s){return s.name===o.prod;});
-    if(st)st.qty+=o.qty;
+    if(st){st.qty+=o.qty;_recordStockDelta(st.id,o.qty);}
   });
   // ENTERPRISE RULE 3: a Delivered order is recognized revenue — deleting the
   // customer must never silently delete their delivery/revenue history along
@@ -4391,13 +4415,13 @@ function saveOrd(){
       if(netChange>0&&newStock&&newStock.qty<netChange){
         if(!confirm("⚠️ Stock Alert\n\nOnly "+newStock.qty+" more unit(s) available for "+pn+".\n\nOrder will be updated but stock is insufficient. Please restock.\n\nContinue?"))return;
       }
-      if(newStock)newStock.qty=Math.max(0,newStock.qty-netChange);
+      if(newStock){newStock.qty=Math.max(0,newStock.qty-netChange);_recordStockDelta(newStock.id,-netChange);}
     }else{
       if(newStock&&newStock.qty<qty){
         if(!confirm("⚠️ Stock Alert\n\nOnly "+newStock.qty+" unit(s) in stock for "+pn+".\n\nOrder will be updated. Please restock soon.\n\nContinue?"))return;
       }
-      if(oldStock)oldStock.qty+=o.qty;
-      if(newStock)newStock.qty=Math.max(0,newStock.qty-qty);
+      if(oldStock){oldStock.qty+=o.qty;_recordStockDelta(oldStock.id,o.qty);}
+      if(newStock){newStock.qty=Math.max(0,newStock.qty-qty);_recordStockDelta(newStock.id,-qty);}
     }
     var stCostE=(D.stock||[]).find(function(s){return s.name===pn;});
     o.cId=cId;o.prod=pn;o.qty=qty;o.price=price;o.cost=stCostE?stCostE.cost:0;o.date=el("od").value;
@@ -4484,7 +4508,7 @@ auditLog("ORDER_UPDATED","Order #"+o.id+" edited by "+CU.name+" ("+CU.role+")");
   window._savingOrderSafetyNet=setTimeout(function(){window._savingOrder=false;if(_saveBtn){_saveBtn.disabled=false;_saveBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}},15000);
   reserveNextOrderId().then(function(newOrdId){
     if(st){
-      st.qty=Math.max(0,st.qty-qty);
+      st.qty=Math.max(0,st.qty-qty);_recordStockDelta(st.id,-qty);
       if(!st.history)st.history=[];
       st.history.push({ts:tday(),type:"sale",qty:-qty,by:CU.name,ordId:newOrdId,bal:st.qty});
       if(st.history.length>50)st.history=st.history.slice(-50);
@@ -4620,7 +4644,7 @@ function completeDlv(){
       if(st.qty<o.qty){
         if(!confirm("⚠️ Only "+st.qty+" in stock but delivering "+o.qty+".\n\nStock will go to 0. Continue?"))return;
       }
-      st.qty=Math.max(0,st.qty-o.qty);
+      st.qty=Math.max(0,st.qty-o.qty);_recordStockDelta(st.id,-o.qty);
       if(!st.history)st.history=[];
       st.history.push({ts:tday(),type:"sale",qty:-o.qty,by:CU.name,ordId:o.id,bal:st.qty});
       if(st.history.length>50)st.history=st.history.slice(-50);
@@ -4785,7 +4809,7 @@ function delO(id){
   var st=(D.stock||[]).find(function(s){return s.name===o.prod;});
   var wasStockDeducted=(o.prodConfirmed!==false);
   if(st&&o.status!=="Delivered"&&o.status!=="Cancelled"&&wasStockDeducted){
-    st.qty+=o.qty;
+    st.qty+=o.qty;_recordStockDelta(st.id,o.qty);
     if(!st.history)st.history=[];
     st.history.push({ts:tday(),type:"restore",qty:+o.qty,by:CU.name,ordId:id,bal:st.qty});
     if(st.history.length>50)st.history=st.history.slice(-50);
@@ -4888,7 +4912,7 @@ function _finishCancelO(id,disposition){
   var skipStockRestore=isCatOrder;
   var st=(D.stock||[]).find(function(s){return s.name===o.prod;});
   if(st&&!skipStockRestore){
-    st.qty+=o.qty;
+    st.qty+=o.qty;_recordStockDelta(st.id,o.qty);
     if(!st.history)st.history=[];
     st.history.push({ts:tday(),type:"restore",qty:+o.qty,by:CU.name,ordId:id,bal:st.qty});
     if(st.history.length>50)st.history=st.history.slice(-50);
@@ -5276,7 +5300,7 @@ function recreateOrder(idx){
 }
 
 
-function doRS(){if(!can("aSt")){toast("Permission denied","err");return;}var id=parseInt(el("rp").value);var q=parseInt(el("rq").value)||0;if(q<=0){toast("Enter quantity to add","err");return;}var p=(D.stock||[]).find(function(s){return s.id===id;});if(p){p.qty+=q;
+function doRS(){if(!can("aSt")){toast("Permission denied","err");return;}var id=parseInt(el("rp").value);var q=parseInt(el("rq").value)||0;if(q<=0){toast("Enter quantity to add","err");return;}var p=(D.stock||[]).find(function(s){return s.id===id;});if(p){p.qty+=q;_recordStockDelta(p.id,q);
   if(!p.history)p.history=[];p.history.push({ts:tday(),type:"restock",qty:q,by:CU.name,bal:p.qty});if(p.history.length>50)p.history=p.history.slice(-50);
   // Auto-fulfil pending orders for this product
   var _pending=(D.orders||[]).filter(function(o){
@@ -5285,7 +5309,7 @@ function doRS(){if(!can("aSt")){toast("Permission denied","err");return;}var id=
   var _fulfilled=0;
   _pending.forEach(function(o){
     if(p.qty>=o.qty){
-      p.qty-=o.qty;
+      p.qty-=o.qty;_recordStockDelta(p.id,-o.qty);
       p.history.push({ts:tday(),type:"sale",qty:-o.qty,by:"Auto (restock)",ordId:o.id,bal:p.qty});
       auditLog("STOCK_UPDATED","Auto-deducted "+o.qty+" "+p.name+" for Order #"+o.id+" (pending fulfilment after restock by "+CU.name+")");
       _fulfilled++;
