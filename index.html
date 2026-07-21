@@ -230,7 +230,7 @@ var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-20-order-save-feedback-v30";
+var APP_VERSION="2026-07-21-v30";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -584,19 +584,19 @@ function processWriteQueue(){
   // business's scale (a few hundred extra reads/day at most, against a
   // 50,000/day free quota), and far cheaper than the alternative of
   // silently losing a real order.
-  // TIER 2 OPTIMIZATION (2026-07-20): if we genuinely checked the server's
-  // fresh state within the last 15 seconds, skip doing it again right now.
-  // During a burst of several saves in quick succession (e.g. placing a few
-  // orders back to back), every single one of those writes was paying for
-  // its own extra read even though nothing meaningful could have changed
-  // remotely in that tiny window. This is safe specifically because the
-  // business has explicitly confirmed up to ~30s of staleness is acceptable
-  // — this skip can only ever shorten how "fresh" a write's view is by a few
-  // seconds, well within that tolerance. The very first write of any burst
-  // still checks properly, and a sustained burst re-checks every 15s.
-  var _skipFreshnessCheck=(Date.now()-_lastFreshnessCheckTime<15000);
+  // TIER 2 OPTIMIZATION (2026-07-20, extended per owner's confirmed 30s
+  // tolerance): if we genuinely checked the server's fresh state within the
+  // last 25 seconds, skip doing it again right now. During a burst of
+  // several saves in a row (e.g. processing a few deliveries back to back),
+  // every single one was paying for its own extra read even though nothing
+  // meaningful could have changed remotely in that window. Extended from
+  // 15s to 25s — still safely under the confirmed 30s staleness tolerance —
+  // to shave more redundant reads during ordinary moderately-paced activity,
+  // not just tight rapid-fire bursts. The very first write of any burst
+  // still checks properly, and a sustained burst re-checks every 25s.
+  var _skipFreshnessCheck=(Date.now()-_lastFreshnessCheckTime<25000);
   if(_skipFreshnessCheck){
-    console.log("[NDSYNC] processWriteQueue SKIPPING freshness check — checked "+(Date.now()-_lastFreshnessCheckTime)+"ms ago, within 15s window");
+    console.log("[NDSYNC] processWriteQueue SKIPPING freshness check — checked "+(Date.now()-_lastFreshnessCheckTime)+"ms ago, within 25s window");
     _sendWritePayload();
     return;
   }
@@ -760,16 +760,29 @@ function runAutoBackup(){
   var isEmpty=(!D.customers||(D.customers||[]).length===0)&&(!D.orders||(D.orders||[]).length===0);
   if(isEmpty)return;
   var now=new Date();
+  // COST-SHAVE (2026-07-20): backups previously ran on any hour, any day,
+  // any time a director's tab happened to be open — including genuinely
+  // idle overnight hours when the business isn't operating and nothing new
+  // has happened to back up. Restricting to business hours (8am-10pm) means
+  // a forgotten open tab overnight generates zero backup activity, and the
+  // periodic backups now happen every 3 hours instead of every hour —
+  // roughly a fifth of the previous write+prune volume for equivalent real
+  // coverage, since almost nothing changes minute-to-minute in this business
+  // anyway. 24 kept backups at this new cadence now represents ~3 days of
+  // history instead of 1 — MORE real coverage, not less, for lower cost.
+  var hr=now.getHours();
+  if(hr<8||hr>=22)return; // outside 8am-10pm business hours — skip entirely
   var dateStr=now.getFullYear()+"-"+String(now.getMonth()+1).padStart(2,"0")+"-"+String(now.getDate()).padStart(2,"0");
-  var hourStr=dateStr+"-"+String(now.getHours()).padStart(2,"0");
+  var hourStr=dateStr+"-"+String(hr).padStart(2,"0");
   var nowMs=Date.now();
-  // Hourly backup — every 60 minutes
-  if(nowMs-FB_LAST_HOURLY>60*60*1000){
+  // Periodic backup — every 3 hours (was hourly)
+  if(nowMs-FB_LAST_HOURLY>3*60*60*1000){
     FB_LAST_HOURLY=nowMs;
     writeBackup("hourly-"+hourStr);
-    pruneOldBackups("hourly-",24);
+    pruneOldBackups("hourly-",24); // now ~3 days of coverage at the new cadence, was ~1 day
   }
-  // Daily backup — once per day
+  // Daily (end-of-day) backup — once per day, naturally lands near the end
+  // of whichever business-hours session is active when 24h have elapsed
   if(nowMs-FB_LAST_DAILY>24*60*60*1000){
     FB_LAST_DAILY=nowMs;
     writeBackup("daily-"+dateStr);
