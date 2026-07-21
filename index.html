@@ -930,7 +930,7 @@ function _finishRestoreFromBackup(snap,onSuccess,onFail){
   if(!D.routes)D.routes=[];
   if(!D.complaints)D.complaints=[];
   if(!D.offers)D.offers=[];
-  if(best.USERS&&(best.USERS||[]).length)USERS=best.USERS;
+  if(best.USERS&&(best.USERS||[]).length>=USERS.length)USERS=best.USERS;
   nOId=Math.max(best.nOId||0,nOId);nIId=Math.max(best.nIId||0,nIId);nCId=Math.max(best.nCId||0,nCId);
   FB_SETUP_DONE=true;
   syncIdCounters();
@@ -1079,7 +1079,7 @@ function startCloudListener(isWarmRefresh){
         // Restore from local memory/autosave and push back up
         if(!hasLocalData&&hasSnapData){
           D=snap.D;
-          if(snap.USERS&&snap.USERS.length)USERS=snap.USERS;
+          if(snap.USERS&&snap.USERS.length>=USERS.length)USERS=snap.USERS;
           nOId=Math.max(snap.nOId||0,nOId);nIId=Math.max(snap.nIId||0,nIId);nCId=Math.max(snap.nCId||0,nCId);
           FB_SETUP_DONE=true;
           syncIdCounters();
@@ -1628,7 +1628,7 @@ function initCloudConnection(cb){
         var snap=autoSaveCheckLocal();
         if(snap&&snap.D){
           D=snap.D;
-          if(snap.USERS&&snap.USERS.length)USERS=snap.USERS;
+          if(snap.USERS&&snap.USERS.length>=USERS.length)USERS=snap.USERS;
           nOId=Math.max(snap.nOId||0,nOId);nIId=Math.max(snap.nIId||0,nIId);
           FB_SETUP_DONE=snap.setupDone===true;
           syncIdCounters();
@@ -1948,7 +1948,7 @@ function checkAutoSaveRecovery(){
         if(!D.offers)D.offers=[];
         if(!D.auditLog)D.auditLog=[];
         if(!D.pendingPayments)D.pendingPayments=[];
-        if(snap.USERS&&snap.USERS.length)USERS=snap.USERS;
+        if(snap.USERS&&snap.USERS.length>=USERS.length)USERS=snap.USERS;
         nOId=Math.max(snap.nOId||0,nOId);nIId=Math.max(snap.nIId||0,nIId);nCId=Math.max(snap.nCId||0,nCId);
         FB_SETUP_DONE=snap.setupDone===true||FB_SETUP_DONE;
         syncIdCounters();syncPaymentStatuses();
@@ -1970,7 +1970,7 @@ function checkAutoSaveRecovery(){
           if(!D.offers)D.offers=[];
           if(!D.auditLog)D.auditLog=[];
           if(!D.pendingPayments)D.pendingPayments=[];
-          if(snap.USERS&&snap.USERS.length)USERS=snap.USERS;
+          if(snap.USERS&&snap.USERS.length>=USERS.length)USERS=snap.USERS;
           nOId=Math.max(snap.nOId||0,nOId);nIId=Math.max(snap.nIId||0,nIId);nCId=Math.max(snap.nCId||0,nCId);
           FB_SETUP_DONE=snap.setupDone===true||FB_SETUP_DONE;
           syncIdCounters();syncPaymentStatuses();
@@ -6787,7 +6787,7 @@ function restoreSpecificBackup(docId){
     if(!data||!data.D){toast("Backup data invalid","err");return;}
     D=data.D;
     if(!D.routes)D.routes=[];if(!D.complaints)D.complaints=[];if(!D.offers)D.offers=[];if(!D.auditLog)D.auditLog=[];
-    if(data.USERS&&data.USERS.length)USERS=data.USERS;
+    if(data.USERS&&data.USERS.length>=USERS.length)USERS=data.USERS;
     // ROOT-CAUSE FIX (2026-07-21): confirmed live — restoring an older backup
     // used to blindly adopt that backup's own nOId value with zero
     // protection against going backward. A restore is legitimately meant to
