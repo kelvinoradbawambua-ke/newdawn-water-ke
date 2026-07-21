@@ -230,7 +230,7 @@ var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-21-v30";
+var APP_VERSION="2026-07-21-v31";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -931,7 +931,7 @@ function _finishRestoreFromBackup(snap,onSuccess,onFail){
   if(!D.complaints)D.complaints=[];
   if(!D.offers)D.offers=[];
   if(best.USERS&&(best.USERS||[]).length)USERS=best.USERS;
-  nOId=best.nOId||nOId;nIId=best.nIId||nIId;nCId=best.nCId||nCId;
+  nOId=Math.max(best.nOId||0,nOId);nIId=Math.max(best.nIId||0,nIId);nCId=Math.max(best.nCId||0,nCId);
   FB_SETUP_DONE=true;
   syncIdCounters();
   syncPaymentStatuses();
@@ -1080,7 +1080,7 @@ function startCloudListener(isWarmRefresh){
         if(!hasLocalData&&hasSnapData){
           D=snap.D;
           if(snap.USERS&&snap.USERS.length)USERS=snap.USERS;
-          nOId=snap.nOId||nOId;nIId=snap.nIId||nIId;nCId=snap.nCId||nCId;
+          nOId=Math.max(snap.nOId||0,nOId);nIId=Math.max(snap.nIId||0,nIId);nCId=Math.max(snap.nCId||0,nCId);
           FB_SETUP_DONE=true;
           syncIdCounters();
         }
@@ -1629,7 +1629,7 @@ function initCloudConnection(cb){
         if(snap&&snap.D){
           D=snap.D;
           if(snap.USERS&&snap.USERS.length)USERS=snap.USERS;
-          nOId=snap.nOId||nOId;nIId=snap.nIId||nIId;
+          nOId=Math.max(snap.nOId||0,nOId);nIId=Math.max(snap.nIId||0,nIId);
           FB_SETUP_DONE=snap.setupDone===true;
           syncIdCounters();
           _APP_READY=true;
@@ -1949,7 +1949,7 @@ function checkAutoSaveRecovery(){
         if(!D.auditLog)D.auditLog=[];
         if(!D.pendingPayments)D.pendingPayments=[];
         if(snap.USERS&&snap.USERS.length)USERS=snap.USERS;
-        nOId=snap.nOId||nOId;nIId=snap.nIId||nIId;nCId=snap.nCId||nCId;
+        nOId=Math.max(snap.nOId||0,nOId);nIId=Math.max(snap.nIId||0,nIId);nCId=Math.max(snap.nCId||0,nCId);
         FB_SETUP_DONE=snap.setupDone===true||FB_SETUP_DONE;
         syncIdCounters();syncPaymentStatuses();
         FB_LAST_LOCAL_WRITE=Date.now();
@@ -1971,7 +1971,7 @@ function checkAutoSaveRecovery(){
           if(!D.auditLog)D.auditLog=[];
           if(!D.pendingPayments)D.pendingPayments=[];
           if(snap.USERS&&snap.USERS.length)USERS=snap.USERS;
-          nOId=snap.nOId||nOId;nIId=snap.nIId||nIId;nCId=snap.nCId||nCId;
+          nOId=Math.max(snap.nOId||0,nOId);nIId=Math.max(snap.nIId||0,nIId);nCId=Math.max(snap.nCId||0,nCId);
           FB_SETUP_DONE=snap.setupDone===true||FB_SETUP_DONE;
           syncIdCounters();syncPaymentStatuses();
           FB_LAST_LOCAL_WRITE=Date.now();
@@ -6788,7 +6788,16 @@ function restoreSpecificBackup(docId){
     D=data.D;
     if(!D.routes)D.routes=[];if(!D.complaints)D.complaints=[];if(!D.offers)D.offers=[];if(!D.auditLog)D.auditLog=[];
     if(data.USERS&&data.USERS.length)USERS=data.USERS;
-    nOId=data.nOId||nOId;nIId=data.nIId||nIId;nCId=data.nCId||nCId;
+    // ROOT-CAUSE FIX (2026-07-21): confirmed live — restoring an older backup
+    // used to blindly adopt that backup's own nOId value with zero
+    // protection against going backward. A restore is legitimately meant to
+    // bring back OLDER DATA, but the order-number counter must never regress
+    // — any order numbers already issued before the restore may still be
+    // referenced elsewhere (another device's cache, the append-only audit
+    // log) and reusing them creates exactly the collision confirmed here:
+    // two real, different orders sharing the same number, with the earlier
+    // one silently overwritten. The counter can only ever move forward.
+    nOId=Math.max(data.nOId||0,nOId);nIId=Math.max(data.nIId||0,nIId);nCId=Math.max(data.nCId||0,nCId);
     FB_SETUP_DONE=true;
     syncIdCounters();syncPaymentStatuses();
     FB_LAST_LOCAL_WRITE=Date.now();
