@@ -730,7 +730,11 @@ function writeBackup(docId){
     var payload=JSON.parse(JSON.stringify(getBackupPayload()));
     FB_BACKUP_COL.doc(docId).set(payload).then(function(){
       // Stamp completion in main doc so all devices know a backup happened
-      if(docId.indexOf("daily-")===0&&FB_DOC_REF){
+      // today — triggers for the new sod-/eod- prefixes (either one counts
+      // as "backed up today" for the recovery-check logic below), plus the
+      // legacy "daily-" prefix for backward compatibility with any old
+      // documents from before this naming scheme changed.
+      if((docId.indexOf("daily-")===0||docId.indexOf("sod-")===0||docId.indexOf("eod-")===0)&&FB_DOC_REF){
         D._lastDailyBackup=tday();
         FB_DOC_REF.set({_lastDailyBackup:tday()},{merge:true}).catch(function(){});
       }
@@ -756,38 +760,58 @@ function pruneOldBackups(prefix,keepCount){
 }
 function runAutoBackup(){
   if(!CU||CU.role!=="director")return; // backups director-only
-  if(!FB_READY||!FB_BACKUP_COL)return;
+  if(!FB_READY||!FB_BACKUP_COL||!FB_DOC_REF)return;
   var isEmpty=(!D.customers||(D.customers||[]).length===0)&&(!D.orders||(D.orders||[]).length===0);
   if(isEmpty)return;
   var now=new Date();
-  // COST-SHAVE (2026-07-20): backups previously ran on any hour, any day,
-  // any time a director's tab happened to be open — including genuinely
-  // idle overnight hours when the business isn't operating and nothing new
-  // has happened to back up. Restricting to business hours (8am-10pm) means
-  // a forgotten open tab overnight generates zero backup activity, and the
-  // periodic backups now happen every 3 hours instead of every hour —
-  // roughly a fifth of the previous write+prune volume for equivalent real
-  // coverage, since almost nothing changes minute-to-minute in this business
-  // anyway. 24 kept backups at this new cadence now represents ~3 days of
-  // history instead of 1 — MORE real coverage, not less, for lower cost.
   var hr=now.getHours();
   if(hr<8||hr>=22)return; // outside 8am-10pm business hours — skip entirely
   var dateStr=now.getFullYear()+"-"+String(now.getMonth()+1).padStart(2,"0")+"-"+String(now.getDate()).padStart(2,"0");
   var hourStr=dateStr+"-"+String(hr).padStart(2,"0");
   var nowMs=Date.now();
-  // Periodic backup — every 3 hours (was hourly)
-  if(nowMs-FB_LAST_HOURLY>3*60*60*1000){
-    FB_LAST_HOURLY=nowMs;
-    writeBackup("hourly-"+hourStr);
-    pruneOldBackups("hourly-",24); // now ~3 days of coverage at the new cadence, was ~1 day
+
+  // ROOT-CAUSE FIX (2026-07-21): all three tracking timestamps below are now
+  // read from D — which is populated from the SHARED cloud document (see the
+  // pull-in fix in the merge handler) — instead of a local-only variable that
+  // reset to zero on every fresh login. Previously, ANY fresh login (idle
+  // timeout, the 8-hour session cap, a new device, a reconnect) saw "no
+  // record of a recent backup" and immediately wrote a new one — regardless
+  // of whether one had just been taken moments earlier by another device or
+  // this same director's prior session. With frequent logins (exactly the
+  // patterns discussed today), this could produce far more backup writes —
+  // and prune-triggered deletes — than intended, and is the most likely
+  // explanation for the unexplained delete burst seen earlier. Each write
+  // below is a small, targeted single-field update (not a full document
+  // write), matching the proven, already-working pattern used for
+  // _lastDailyBackup — cheap, and immediately visible to every other device.
+
+  // START OF DAY — first check of the day at/after 8am, once per day, shared
+  if(D._lastSodBackupDate!==dateStr){
+    D._lastSodBackupDate=dateStr;
+    D._lastPeriodicBackupAt=nowMs; // SOD also satisfies this cycle's periodic backup — avoids writing two backups back-to-back
+    writeBackup("sod-"+dateStr);
+    pruneOldBackups("sod-",14); // 2 weeks of start-of-day snapshots
+    FB_DOC_REF.set({_lastSodBackupDate:dateStr,_lastPeriodicBackupAt:nowMs},{merge:true}).catch(function(){});
+    return; // one backup action per check — keeps each write small and simple
   }
-  // Daily (end-of-day) backup — once per day, naturally lands near the end
-  // of whichever business-hours session is active when 24h have elapsed
-  if(nowMs-FB_LAST_DAILY>24*60*60*1000){
-    FB_LAST_DAILY=nowMs;
-    writeBackup("daily-"+dateStr);
-    pruneOldBackups("daily-",14); // 14 daily backups = 2 weeks coverage
-    pruneOldTombstones(); // see function below — zero extra Firestore cost, piggybacks on this existing daily cycle
+
+  // END OF DAY — during the final hour before close (9pm-10pm), once per day, shared
+  if(hr>=21&&D._lastEodBackupDate!==dateStr){
+    D._lastEodBackupDate=dateStr;
+    writeBackup("eod-"+dateStr);
+    pruneOldBackups("eod-",14);
+    pruneOldTombstones(); // piggyback the existing daily tombstone-prune cycle onto EOD instead of a separate "daily" type
+    FB_DOC_REF.set({_lastEodBackupDate:dateStr},{merge:true}).catch(function(){});
+    return;
+  }
+
+  // PERIODIC — every 3 hours during business hours, shared across all devices
+  // so simultaneous or repeated director logins never each trigger their own
+  if(nowMs-(D._lastPeriodicBackupAt||0)>3*60*60*1000){
+    D._lastPeriodicBackupAt=nowMs;
+    writeBackup("periodic-"+hourStr);
+    pruneOldBackups("periodic-",24); // ~3 days of coverage at this cadence
+    FB_DOC_REF.set({_lastPeriodicBackupAt:nowMs},{merge:true}).catch(function(){});
   }
 }
 function pruneOldTombstones(){
@@ -843,47 +867,68 @@ function startAutoBackup(){
 }
 function restoreFromLatestBackup(onSuccess,onFail){
   if(!FB_BACKUP_COL){if(onFail)onFail("No backup collection");return;}
-  // Try daily first, then hourly
-  var attempts=["daily-","hourly-"];
-  var ai=0;
-  function tryNext(){
-    if(ai>=attempts.length){if(onFail)onFail("No backups found");return;}
-    var prefix=attempts[ai++];
-    FB_BACKUP_COL
-      .orderBy(firebase.firestore.FieldPath.documentId(),"desc")
-      .limit(1)
-      .get({source:"server"}).then(function(snap){
-        if(snap.empty){tryNext();return;}
-        var best=null;
-        snap.forEach(function(d){
-          var data=d.data();
-          if(data&&data.D&&((data.D.customers&&data.D.customers.length>0)||(data.D.orders&&data.D.orders.length>0))){
-            if(!best||data.backedUpAt>(best.backedUpAt||0))best=data;
-          }
-        });
-        if(best){
-          D=best.D;
-          if(!D.routes)D.routes=[];
-          if(!D.complaints)D.complaints=[];
-          if(!D.offers)D.offers=[];
-          if(best.USERS&&(best.USERS||[]).length)USERS=best.USERS;
-          nOId=best.nOId||nOId;nIId=best.nIId||nIId;nCId=best.nCId||nCId;
-          FB_SETUP_DONE=true;
-          syncIdCounters();
-          syncPaymentStatuses();
-          // Merge hot audit log from localStorage (auditLog not in main doc)
-          var snap=autoSaveCheckLocal();
-          if(snap&&snap.D&&snap.D.auditLog&&(snap.D.auditLog||[]).length>0){
-            if(!D.auditLog)D.auditLog=[];
-            var existTs={};
-            (D.auditLog||[]).forEach(function(e){existTs[e.ts]=true;});
-            (snap.D.auditLog||[]).forEach(function(e){if(!existTs[e.ts])(D.auditLog||[]).push(e);});
-          }
-          if(onSuccess)onSuccess(best);
-        }else{tryNext();}
-      }).catch(function(){tryNext();});
+  // BUG FIX (2026-07-21): this used to order by raw document-ID TEXT
+  // (FieldPath.documentId()) and loop through a "daily-"/"hourly-" attempts
+  // list — but the extracted prefix was never actually used to filter the
+  // query, so both attempts ran the exact same unfiltered query. Ordering by
+  // ID text also doesn't reliably reflect true chronological order once
+  // multiple prefix types exist (e.g. "sod-" sorts alphabetically above
+  // "eod-" and "periodic-" regardless of actual date) — the same class of
+  // bug already found and fixed in the backup HISTORY display, except this
+  // one lives in the actual emergency data-RECOVERY path, which matters
+  // more. Fixed by ordering on the real backedUpAt timestamp field directly
+  // — this also means a single query now finds the true most recent backup
+  // of ANY type, so the attempts-loop is no longer needed at all.
+  FB_BACKUP_COL
+    .orderBy("backedUpAt","desc")
+    .limit(3) // small margin in case the very latest happens to be a legitimate empty/edge-case snapshot
+    .get({source:"server"}).then(function(snap){
+      _finishRestoreFromBackup(snap,onSuccess,onFail);
+    }).catch(function(err){
+      // DEFENSIVE FALLBACK: this is the emergency recovery path — the
+      // highest-stakes place in the app to have a single point of failure.
+      // If the ordered query fails for any reason (e.g. a missing Firestore
+      // index, same class of issue hit before on a different collection),
+      // fall back to an unordered fetch of the whole collection and sort
+      // client-side instead of giving up entirely.
+      console.log("[NDSYNC] restoreFromLatestBackup ordered query failed ("+(err&&err.message)+"), falling back to unordered fetch");
+      FB_BACKUP_COL.limit(50).get({source:"server"}).then(function(snap2){
+        _finishRestoreFromBackup(snap2,onSuccess,onFail);
+      }).catch(function(err2){
+        if(onFail)onFail(err2&&err2.message?err2.message:"Restore query failed");
+      });
+    });
+}
+function _finishRestoreFromBackup(snap,onSuccess,onFail){
+  if(snap.empty){if(onFail)onFail("No backups found");return;}
+  var docs=[];snap.forEach(function(d){docs.push(d);});
+  docs.sort(function(a,b){return (b.data().backedUpAt||0)-(a.data().backedUpAt||0);});
+  var best=null;
+  docs.forEach(function(d){
+    var data=d.data();
+    if(!best&&data&&data.D&&((data.D.customers&&data.D.customers.length>0)||(data.D.orders&&data.D.orders.length>0))){
+      best=data;
+    }
+  });
+  if(!best){if(onFail)onFail("No usable backups found");return;}
+  D=best.D;
+  if(!D.routes)D.routes=[];
+  if(!D.complaints)D.complaints=[];
+  if(!D.offers)D.offers=[];
+  if(best.USERS&&(best.USERS||[]).length)USERS=best.USERS;
+  nOId=best.nOId||nOId;nIId=best.nIId||nIId;nCId=best.nCId||nCId;
+  FB_SETUP_DONE=true;
+  syncIdCounters();
+  syncPaymentStatuses();
+  // Merge hot audit log from localStorage (auditLog not in main doc)
+  var localSnap=autoSaveCheckLocal();
+  if(localSnap&&localSnap.D&&localSnap.D.auditLog&&(localSnap.D.auditLog||[]).length>0){
+    if(!D.auditLog)D.auditLog=[];
+    var existTs={};
+    (D.auditLog||[]).forEach(function(e){existTs[e.ts]=true;});
+    (localSnap.D.auditLog||[]).forEach(function(e){if(!existTs[e.ts])(D.auditLog||[]).push(e);});
   }
-  tryNext();
+  if(onSuccess)onSuccess(best);
 }
 var FB_AUDIT_UNSUB=null;
 function _mergeAuditEvents(remote){
@@ -1302,9 +1347,20 @@ function startCloudListener(isWarmRefresh){
     }
     FB_SETUP_DONE=data.setupDone===true;
     FB_LAST_APPLIED_UPDATED_AT=data.updatedAt||0;
-    // Carry backup stamp
+    // Carry backup stamps — SHARED across every device/login, not local to one
+    // browser tab. This is the fix for a real gap: without pulling these in
+    // from the cloud on every device, each fresh login/reconnect saw "no
+    // record of a recent backup" in its own local memory and would trigger
+    // its own redundant one — multiplied across every director login,
+    // reconnect, or session-timeout re-entry throughout the day.
     if(data.D._lastDailyBackup)D._lastDailyBackup=data.D._lastDailyBackup;
     else if(data._lastDailyBackup)D._lastDailyBackup=data._lastDailyBackup;
+    if(data.D._lastSodBackupDate)D._lastSodBackupDate=data.D._lastSodBackupDate;
+    else if(data._lastSodBackupDate)D._lastSodBackupDate=data._lastSodBackupDate;
+    if(data.D._lastEodBackupDate)D._lastEodBackupDate=data.D._lastEodBackupDate;
+    else if(data._lastEodBackupDate)D._lastEodBackupDate=data._lastEodBackupDate;
+    if(data.D._lastPeriodicBackupAt)D._lastPeriodicBackupAt=data.D._lastPeriodicBackupAt;
+    else if(data._lastPeriodicBackupAt)D._lastPeriodicBackupAt=data._lastPeriodicBackupAt;
     syncIdCounters();
     syncPaymentStatuses();
     // CRITICAL FIX: this used to unconditionally call scheduleCloudSync() here,
@@ -6664,7 +6720,7 @@ function _renderBackupHistoryRows(el2,snap){
   docs.forEach(function(d){
     var data=d.data();
     var t=data.backedUpAt?new Date(data.backedUpAt).toLocaleString():"?";
-    var type=d.id.startsWith("daily-")?"Daily":"Hourly";
+    var type=d.id.startsWith("sod-")?"Start of day":d.id.startsWith("eod-")?"End of day":d.id.startsWith("periodic-")?"Periodic (3h)":d.id.startsWith("daily-")?"Daily (legacy)":"Hourly (legacy)";
     var custs=(data.stats&&data.stats.customers)||0;
     var ords=(data.stats&&data.stats.orders)||0;
     var stk=(data.stats&&data.stats.stock)||0;
