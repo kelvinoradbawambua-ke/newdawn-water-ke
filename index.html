@@ -1127,7 +1127,7 @@ function startAuditListener(){
   // just without ever re-reading unbounded history on every reconnect.
   FB_AUDIT_UNSUB=FB_EVENTS_COL
     .orderBy("ts","desc")
-    .limit(200)
+    .limit(50) // owner-chosen: small business, live view used for spot-checking recent errors, not archiving — deep history stays fully available via Archives
     .onSnapshot(function(snap){
       AUDIT_RETRY_ATTEMPTS=0; // a good snapshot means the connection is healthy again
       var remote=[];
@@ -1139,7 +1139,7 @@ function startAuditListener(){
       // 200-doc reads. It's now capped to fire at most once per session.
       if(remote.length===0&&!AUDIT_FALLBACK_DONE&&(!D.auditLog||(D.auditLog||[]).length===0)){
         AUDIT_FALLBACK_DONE=true;
-        FB_EVENTS_COL.limit(200).get().then(function(s2){
+        FB_EVENTS_COL.limit(50).get().then(function(s2){
           var r2=[];s2.forEach(function(d){r2.push(d.data());});_mergeAuditEvents(r2);
         }).catch(function(){});
       }
@@ -1155,7 +1155,7 @@ function startAuditListener(){
       // repeated 200-doc reads.
       if(!AUDIT_FALLBACK_DONE){
         AUDIT_FALLBACK_DONE=true;
-        FB_EVENTS_COL.limit(200).get().then(function(snap){
+        FB_EVENTS_COL.limit(50).get().then(function(snap){
           var remote=[];
           snap.forEach(function(d){remote.push(d.data());});
           _mergeAuditEvents(remote);
