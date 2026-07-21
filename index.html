@@ -230,7 +230,7 @@ var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-21-v32";
+var APP_VERSION="2026-07-21-v33";
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -670,6 +670,58 @@ function processWriteQueue(){
           if(fp.ack&&!lp.ack){
             DforSync.pendingPayments[localIdx]=fp;
             console.log("[NDSYNC] freshness check PREFERRED server's acknowledged pending payment id="+fp.id);
+          }
+        });
+      }
+      // COMPLETING COMPREHENSIVE COVERAGE (2026-07-21): extending the same
+      // check-before-write protection to the remaining collections, so no
+      // stale device can silently overwrite ANY data type with an outdated
+      // view — not just the highest-stakes ones above.
+      if(freshD.stock&&DforSync.stock){
+        var localStockIds={};DforSync.stock.forEach(function(s,idx){localStockIds[s.id]=idx;});
+        freshD.stock.forEach(function(fs){
+          if(localStockIds[fs.id]===undefined){
+            DforSync.stock.push(fs);
+            console.log("[NDSYNC] freshness check RESCUED stock item id="+fs.id+" ("+fs.name+") that would otherwise have been dropped by this write");
+          }
+          // HONEST LIMITATION: this rescues a genuinely NEW product another
+          // device added that we don't know about yet — it does not resolve
+          // a QUANTITY conflict where two devices each deducted/restocked
+          // the SAME product independently (neither number is "more
+          // correct" than the other, unlike a payment's paid amount). That
+          // remains a low-probability residual risk at this team's scale,
+          // as already assessed — a full fix would need per-product atomic
+          // increments, a larger architectural change not warranted here.
+        });
+      }
+      if(freshD.complaints&&DforSync.complaints){
+        var localCmpIds={};DforSync.complaints.forEach(function(c,idx){localCmpIds[c.id]=idx;});
+        freshD.complaints.forEach(function(fc){
+          var idx=localCmpIds[fc.id];
+          if(idx===undefined){
+            DforSync.complaints.push(fc);
+            console.log("[NDSYNC] freshness check RESCUED complaint id="+fc.id+" that would otherwise have been dropped by this write");
+          }else if(fc.status==="Resolved"&&DforSync.complaints[idx].status!=="Resolved"){
+            DforSync.complaints[idx]=fc;
+            console.log("[NDSYNC] freshness check PREFERRED server's resolved complaint id="+fc.id);
+          }
+        });
+      }
+      if(freshD.offers&&DforSync.offers){
+        var localOffIds={};DforSync.offers.forEach(function(o,idx){localOffIds[o.id]=idx;});
+        freshD.offers.forEach(function(fo2){
+          if(localOffIds[fo2.id]===undefined){
+            DforSync.offers.push(fo2);
+            console.log("[NDSYNC] freshness check RESCUED offer id="+fo2.id+" that would otherwise have been dropped by this write");
+          }
+        });
+      }
+      if(freshD.routes&&DforSync.routes){
+        var localRouteIds={};DforSync.routes.forEach(function(r,idx){localRouteIds[r.id]=idx;});
+        freshD.routes.forEach(function(fr){
+          if(localRouteIds[fr.id]===undefined){
+            DforSync.routes.push(fr);
+            console.log("[NDSYNC] freshness check RESCUED route id="+fr.id+" that would otherwise have been dropped by this write");
           }
         });
       }
