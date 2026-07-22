@@ -570,6 +570,19 @@ function processWriteQueue(){
       return o.status!=="Delivered"||(o.deliveredAt||o.date)>=cutoffDate;
     });
   }
+  // SAME GUARD APPLIED TO COMPLAINTS (2026-07-21): unlike stock (bounded by
+  // product count) and offers (bounded by promotion count, both naturally
+  // small), complaints accumulate one per real incident and had no size
+  // guard at all — genuinely unbounded growth over years of operation. Same
+  // pattern as orders: always keep anything still Open regardless of age,
+  // only trim old Resolved ones once the count grows large. Full history
+  // stays in D/localStorage/backups either way — only what gets re-sent on
+  // every write is trimmed.
+  if(DforSync.complaints&&DforSync.complaints.length>300){
+    DforSync.complaints=DforSync.complaints.filter(function(c){
+      return c.status!=="Resolved"||(c.date||"")>=cutoffDate;
+    });
+  }
   if(DforSync.invoices&&DforSync.invoices.length>500){
     // Keep unpaid + recent paid invoices
     DforSync.invoices=DforSync.invoices.filter(function(i){
@@ -3617,7 +3630,7 @@ function voidInvoice(invId,onComplete){
 voidInvoice._confirm=function(invId){
   var sel=el("void-reason-sel");var other=el("void-reason-other");
   var reason=(sel&&sel.value?sel.value:"");
-  if(reason==="Other")reason=(other&&other.value.trim())||"";
+  if(reason==="Other")reason=sanitizeInput((other&&other.value.trim())||"");
   if(!reason){toast("Please select a reason","err");return;}
   var inv=D.invoices.find(function(x){return x.id===invId;});if(!inv)return;
   var bal=inv.amount-inv.paid;
