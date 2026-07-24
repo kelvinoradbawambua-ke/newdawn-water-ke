@@ -5712,6 +5712,7 @@ function findMissingOrders(){
   var missing=[];
   Object.keys(placed).forEach(function(id){
     if(liveIds[id])return; // still exists — not missing
+    if((D.dismissedMissingOrders||[]).indexOf(parseInt(id))!==-1)return; // already reviewed and marked resolved
     var rec=placed[id];
     var inv=(D.invoices||[]).find(function(i){return i.notes&&i.notes.indexOf("#"+id)!==-1;});
     var cust=inv?(D.customers||[]).find(function(c){return c.id===inv.cId;}):null;
@@ -5743,16 +5744,19 @@ function showMissingOrders(){
   var body=el("m-recon-body");if(!body)return;
   if(!missing.length){body.innerHTML="<div style=\'padding:20px;text-align:center;color:var(--tx2)\'>No missing orders found — audit log matches live orders.</div>";om("m-recon");return;}
   var rows=missing.map(function(m,i){
-    var custOpts=(D.customers||[]).map(function(c){return "<option value=\'"+c.id+"\'"+(c.id===m.cId?" selected":"")+">"+c.name+"</option>";}).join("");
     var srcColor=m.source==="invoice"?"#27ae60":m.source.indexOf("cycle")===0?"#e67e22":"#c0392b";
     return "<tr data-idx=\'"+i+"\'>"+
       "<td>#"+m.origId+"</td>"+
-      "<td><select class=\'recon-cust\' style=\'width:140px\'>"+"<option value=\'\'>Select customer\u2026</option>"+custOpts+"</select></td>"+
+      "<td style=\'position:relative\'>"+
+        "<input class=\'recon-cust-search\' type=\'hidden\' value=\'"+(m.cId||"")+"\'>"+
+        "<input class=\'recon-cust-input\' type=\'text\' placeholder=\'Type name, phone or address\\u2026\' value=\'"+(m.cName&&m.cId?unescapeForEdit(m.cName):"")+"\' style=\'width:150px\' oninput=\'reconCustSearch("+i+",this.value)\' onblur=\'setTimeout(function(){var d=document.getElementById(\"recon-drop-"+i+"\");if(d)d.style.display=\"none\";},200)\'>"+
+        "<div id=\'recon-drop-"+i+"\' style=\'display:none;position:absolute;top:100%;left:0;z-index:50;background:#fff;border:1px solid var(--bd);border-radius:8px;box-shadow:0 4px 14px rgba(0,0,0,.12);max-height:220px;overflow-y:auto;width:260px\'></div>"+
+      "</td>"+
       "<td><input class=\'recon-prod\' value=\'"+m.prod+"\' style=\'width:110px\'></td>"+
       "<td><input class=\'recon-qty\' type=\'number\' value=\'"+m.qty+"\' style=\'width:50px\'></td>"+
       "<td><input class=\'recon-price\' type=\'number\' value=\'"+(m.price?Math.round(m.price):"")+"\' style=\'width:70px\' placeholder=\'KSh\'></td>"+
       "<td style=\'color:"+srcColor+";font-size:10px;font-weight:600\'>"+m.source+"</td>"+
-      "<td><button class=\'btn btn-xs btn-navy\' onclick=\'recreateOrder("+i+")\'>Recreate</button></td>"+
+      "<td style=\'white-space:nowrap\'><button class=\'btn btn-xs btn-navy\' onclick=\'recreateOrder("+i+")\'>Recreate</button> <button class=\'btn btn-xs\' style=\'background:#6b7280;color:#fff\' onclick=\'dismissMissingOrder("+m.origId+")\' title=\'Mark as resolved without recreating - e.g. if the customer genuinely cannot be identified\'>Dismiss</button></td>"+
       "</tr>";
   }).join("");
   body.innerHTML="<div style=\'font-size:12px;color:var(--tx2);margin-bottom:10px\'>Found "+missing.length+" order(s) in the audit log with no matching live order. Green source = recovered from invoice (most reliable). Orange = recovered from water-cycle history (price not available — enter manually). Red = no source found, verify manually before recreating.</div>"+
@@ -5762,9 +5766,53 @@ function showMissingOrders(){
   window._reconMissing=missing;
   om("m-recon");
 }
+function reconCustSearch(idx,q){
+  var drop=el("recon-drop-"+idx);if(!drop)return;
+  if(!q||q.length<2){drop.style.display="none";return;}
+  var lq=sanitizeInput(q).toLowerCase();
+  var matches=(D.customers||[]).filter(function(c){
+    return (c.name&&c.name.toLowerCase().indexOf(lq)!==-1)||
+      (c.phone&&c.phone.indexOf(q)!==-1)||
+      (c.phone2&&c.phone2.indexOf(q)!==-1)||
+      (c.court&&c.court.toLowerCase().indexOf(lq)!==-1)||
+      (c.house&&String(c.house).indexOf(q)!==-1)||
+      (c.estate&&c.estate.toLowerCase().indexOf(lq)!==-1)||
+      (c.road&&c.road.toLowerCase().indexOf(lq)!==-1);
+  }).slice(0,20);
+  if(!matches.length){
+    drop.innerHTML="<div style=\"padding:10px 14px;font-size:12px;color:var(--tx2)\">No customers found</div>";
+    drop.style.display="block";return;
+  }
+  drop.innerHTML=matches.map(function(c){
+    return "<div onmousedown=\"reconCustSelect("+idx+","+c.id+",event)\" "+
+      "style=\"padding:9px 14px;cursor:pointer;border-bottom:1px solid var(--bd);font-size:12px\">"+
+      "<div style=\"font-weight:700\">"+unescapeForEdit(c.name)+"</div>"+
+      "<div style=\"color:var(--tx2);font-size:11px\">"+cAddr(c)+(c.phone?" &middot; "+unescapeForEdit(c.phone):"")+"</div>"+
+    "</div>";
+  }).join("");
+  drop.style.display="block";
+}
+function reconCustSelect(idx,cId,e){
+  if(e)e.preventDefault();
+  var c=(D.customers||[]).find(function(x){return x.id===cId;});if(!c)return;
+  var row=document.querySelector("tr[data-idx=\'"+idx+"\']");if(!row)return;
+  row.querySelector(".recon-cust-search").value=cId;
+  row.querySelector(".recon-cust-input").value=unescapeForEdit(c.name);
+  var drop=el("recon-drop-"+idx);if(drop)drop.style.display="none";
+}
+function dismissMissingOrder(origId){
+  if(!can("rest")){toast("Only directors can resolve reconciliation items","err");return;}
+  if(!confirm("Mark order #"+origId+" as resolved without recreating it?\n\nUse this only if you're confident it genuinely cannot or shouldn't be recreated — e.g. the customer could not be identified after asking around. This will stop it appearing in future reconciliation checks.\n\nThis does not delete anything — it only stops flagging this specific gap."))return;
+  if(!D.dismissedMissingOrders)D.dismissedMissingOrders=[];
+  if(D.dismissedMissingOrders.indexOf(origId)===-1)D.dismissedMissingOrders.push(origId);
+  auditLog("ORDER_UPDATED","Missing order #"+origId+" marked resolved without recreating, by "+CU.name+" ("+CU.role+")");
+  dirty();
+  toast("Order #"+origId+" marked as resolved");
+  showMissingOrders(); // refresh the list, now excluding this one
+}
 function recreateOrder(idx){
   var row=document.querySelector("tr[data-idx=\'"+idx+"\']");if(!row)return;
-  var cId=parseInt(row.querySelector(".recon-cust").value)||0;
+  var cId=parseInt(row.querySelector(".recon-cust-search").value)||0;
   var prod=sanitizeInput(row.querySelector(".recon-prod").value.trim());
   var qty=parseInt(row.querySelector(".recon-qty").value)||0;
   var price=parseFloat(row.querySelector(".recon-price").value)||0;
