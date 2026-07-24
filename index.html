@@ -3317,16 +3317,24 @@ function rDash(){
   if(can("rest")){
     var _missingForAlert=_computeMissingOrders();
     if(_missingForAlert&&_missingForAlert.length){
-      alerts.push({t:"nr",i:"ti-file-alert",m:_missingForAlert.length+" order(s) in the audit log have no matching live order &mdash; needs your review",dest:"data"});
+      alerts.push({t:"nr",i:"ti-file-alert",m:_missingForAlert.length+" order(s) in the audit log have no matching live order &mdash; needs your review",act:"nav(\'data\',null);showMissingOrders()"});
     }
   }else if(CU){
     // Staff/driver/manager: only ever see this for an order THEY placed -
     // matched by user id from the audit entry itself, not name text, so it
     // can't misfire onto the wrong person even if two staff share a name.
+    // FIX (2026-07-21): the match required strict equality alone, which is
+    // vulnerable to a real edge case - if an older audit entry has no uid
+    // recorded at all, placedByUid comes back undefined, and undefined===
+    // undefined is true in JavaScript. That could match ANY logged-in user
+    // whose own id was somehow also unset, showing the alert to someone
+    // who never placed the order at all. Now requires both ids to actually
+    // be present, not just equal, closing that gap regardless of its exact
+    // cause.
     var _missingMine=_computeMissingOrders();
-    var _mineCount=(_missingMine||[]).filter(function(m){return m.placedByUid===CU.id;}).length;
-    if(_mineCount>0){
-      alerts.push({t:"nw",i:"ti-alert-circle",m:_mineCount+" order you placed needs director review &mdash; please check with "+(CU.role==="director"?"":"your director")});
+    var _mine=(_missingMine||[]).filter(function(m){return m.placedByUid&&CU.id&&m.placedByUid===CU.id;});
+    if(_mine.length>0){
+      alerts.push({t:"nw",i:"ti-alert-circle",m:"Order"+(_mine.length>1?"s":"")+" #"+_mine.map(function(m){return m.origId;}).join(", #")+" you placed need"+(_mine.length>1?"":"s")+" director review &mdash; please check with "+(CU.role==="director"?"":"your director")});
     }
   }
   var _urgency={nr:0,nw:1,ni:2,nok:3};alerts.sort(function(a,b){return(_urgency[a.t]||2)-(_urgency[b.t]||2);});
@@ -3417,7 +3425,7 @@ function rDash(){
       "</div>"+
       "<div>"+
         "<div class=\"card\"><div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-bell\"></i>Live alerts</div></div>"+
-          (alerts.length?alerts.map(function(a){var dest=a.dest||"";var style=dest?"cursor:pointer;\" onclick=\"nav('"+dest+"',null)\" title=\"Click to view\"":"\"";
+          (alerts.length?alerts.map(function(a){var dest=a.dest||"";var clickAction=a.act||(dest?"nav('"+dest+"',null)":"");var style=clickAction?"cursor:pointer;\" onclick=\""+clickAction+"\" title=\"Click to view\"":"\"";
 return "<div class=\"notif "+a.t+"\" style=\""+style+"\"><i class=\"ti "+a.i+"\"></i><span>"+a.m+"</span>"+(dest?"<i class=\"ti ti-arrow-right\" style=\"margin-left:auto;opacity:0.4;font-size:11px\"></i>":"")+"</div>";}).join(""):
             "<div class=\"notif nok\"><i class=\"ti ti-circle-check\"></i><span>All clear &mdash; no alerts</span></div>")+
         "</div>"+
