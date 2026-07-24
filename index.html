@@ -3014,7 +3014,7 @@ function buildMods(){
       "</div>"+
       "<div class=\"fg\"><label class=\"flabel\">Sale price (KSh)</label><input class=\"fi\" type=\"number\" id=\"sp\"></div>"+
       "<div class=\"fg\"><label class=\"flabel\">Cost price (KSh)</label><input class=\"fi\" type=\"number\" id=\"sc\"></div>"+
-      "<div class=\"fg\"><label class=\"flabel\">Opening stock</label><input class=\"fi\" type=\"number\" id=\"sq\"></div>"+
+      "<div class=\"fg\"><label class=\"flabel\" id=\"sq-label\">Opening stock</label><input class=\"fi\" type=\"number\" id=\"sq\"></div>"+
       "<div class=\"fg\"><label class=\"flabel\">Min stock level</label><input class=\"fi\" type=\"number\" id=\"sm\"></div>"+
       "<input type=\"hidden\" id=\"s-edit-id\" value=\"\">"+
     "</div></div>"+
@@ -5701,6 +5701,8 @@ function prepStAdd(){
   if(el("sw"))el("sw").checked=false;
   el("s-edit-id").value="";
   ["sn","ss","sp","sc","sq","sm"].forEach(function(id){el(id).value="";});
+  el("sq").disabled=false;
+  var _sqLbl=el("sq-label");if(_sqLbl)_sqLbl.innerHTML="Opening stock";
   el("m-s-title").innerHTML="<i class=\"ti ti-package\" style=\"color:var(--gd);margin-right:7px\"></i>Add Product";
   el("m-s-save").innerHTML="<i class=\"ti ti-check\"></i> Save";
   om("m-s");
@@ -5713,7 +5715,17 @@ function saveSt(){
     var s=(D.stock||[]).find(function(x){return String(x.id)===String(editId);});
     if(s){
       s.name=n;s.size=sanitizeInput(el("ss").value);s.price=parseFloat(el("sp").value)||0;
-      s.cost=parseFloat(el("sc").value)||0;s.qty=parseInt(el("sq").value)||0;s.min=parseInt(el("sm").value)||10;
+      s.cost=parseFloat(el("sc").value)||0;s.min=parseInt(el("sm").value)||10;
+      // FIX (2026-07-21): this used to also set s.qty=parseInt(el("sq").value)
+      // here - meaning editing a product's name, price, or any other detail
+      // would ALSO silently overwrite its quantity with whatever the form
+      // field happened to show at that moment. Since the dedicated Restock
+      // flow changes quantity by a delta (and is the only place that should),
+      // opening this edit form with a stale quantity on screen and saving it
+      // could clobber a more recent restock or order-driven change with an
+      // old, unrelated number - exactly the kind of silent stock drift this
+      // whole reconciliation effort has been about. Quantity is no longer
+      // touched by this form at all once a product already exists.
       s.isWater=el("sw")&&el("sw").checked?true:false;
       auditLog("STOCK_UPDATED","Product saved by "+CU.name+" ("+CU.role+"): "+n+(s.isWater?" [water cycle product]":""));
       if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
@@ -5734,6 +5746,12 @@ function editSt(id){
   el("s-edit-id").value=s.id;
   el("sn").value=unescapeForEdit(s.name)||"";el("ss").value=unescapeForEdit(s.size)||"";el("sp").value=s.price||0;
   el("sc").value=s.cost||0;el("sq").value=s.qty||0;el("sm").value=s.min||10;
+  // FIX (2026-07-21): quantity is shown for reference only when editing an
+  // existing product, not editable here - changing it now only ever happens
+  // through Restock (adds/removes a specific amount) or through orders
+  // themselves, never by overwriting the absolute number on this form.
+  el("sq").disabled=true;
+  var _sqLbl=el("sq-label");if(_sqLbl)_sqLbl.innerHTML="Current stock <span style=\"font-weight:400;color:var(--tx2)\">(use Restock to change)</span>";
   if(el("sw"))el("sw").checked=!!s.isWater;
   el("m-s-title").innerHTML="<i class=\"ti ti-edit\" style=\"color:var(--gd);margin-right:7px\"></i>Edit Product";
   el("m-s-save").innerHTML="<i class=\"ti ti-check\"></i> Update";
