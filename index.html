@@ -639,28 +639,22 @@ function _recordStockDelta(stockId,delta,orderId){
     if(!_stockDeltasByOrder[orderId])_stockDeltasByOrder[orderId]={};
     _stockDeltasByOrder[orderId][stockId]=(_stockDeltasByOrder[orderId][stockId]||0)+delta;
   }
-  // LAYER 2 (2026-07-21): untrimmed lifetime counters, alongside the
-  // existing display history (which is deliberately capped at 50 entries
-  // and not reliable for full reconciliation). Lets an ongoing check verify
-  // current qty against total deducted/restocked GOING FORWARD from when
-  // this shipped - honestly, this cannot retroactively audit history from
-  // before this existed, since no complete ledger was ever kept; it closes
-  // the gap permanently from this point on, which is the achievable and
-  // honest scope for the data this app actually has.
-  var s=(D.stock||[]).find(function(x){return x.id===stockId;});
-  if(s){
-    if(s.reconcileBaselineQty===undefined){
-      // First call for this item: the calling code always applies the qty
-      // change BEFORE calling this function, so s.qty here already reflects
-      // THIS delta. Fold it into the baseline rather than double-counting
-      // it in the lifetime counters too.
-      s.reconcileBaselineQty=s.qty;
-      s.lifetimeDeducted=0;s.lifetimeRestocked=0;
-    }else{
-      if(delta<0)s.lifetimeDeducted=(s.lifetimeDeducted||0)-delta;
-      else s.lifetimeRestocked=(s.lifetimeRestocked||0)+delta;
-    }
-  }
+  // REMOVED (2026-07-21): a Layer 2 reconciliation attempt (untrimmed
+  // lifetime counters + baseline, compared in runIntegrityCheck) was built
+  // and shipped here, but an independent review correctly found it cannot
+  // work as designed - the write-side delta-merge only explicitly carries
+  // over qty and history from the local copy, so these fields were silently
+  // dropped and reverted to the server's stale value on the very write path
+  // that runs on every stock action; the read-side snapshot handler then
+  // wholesale-replaces D.stock on every update, wiping them further. Net
+  // effect: the baseline re-derived itself from current reality almost
+  // every cycle, so the check could report "clean" while verifying nothing.
+  // A check that cannot fire is worse than no check - it manufactures
+  // confidence rather than providing it, the same principle already applied
+  // to the credit-balance check (report, never silently assume). Removed
+  // rather than patched in a rush; the real protection against this bug
+  // class is Bug 1's direct fix at the root cause, already shipped and
+  // proven with real execution.
 }
 function pushToCloud(){
   if(!FB_READY||!FB_DOC_REF){console.log("[NDSYNC] pushToCloud BLOCKED: FB_READY="+FB_READY+" FB_DOC_REF="+(!!FB_DOC_REF));return;}
@@ -3556,11 +3550,14 @@ function prepCustAdd(){
 }
 function saveCust(){
   if(!can("aCust")&&!can("eCust"))return;
-  // ITEM 3 (2026-07-21): same critical-edit flag as recPay - forces a real
-  // freshness check on this write even inside the normal skip window.
-  _hasPendingCriticalEdit=true;
   var n=sanitizeInput(el("cn").value.trim()),ph=el("cph").value.trim();
   if(!n||!ph){toast("Name and phone required","err");return;}
+  // ITEM 3 (2026-07-21): flag set here, after validation, not before - an
+  // earlier version set this at the top of the function, so a failed
+  // validation (and early return) left the flag set with nothing actually
+  // pending, forcing one unnecessary server read on the next unrelated
+  // write. Harmless but wasteful; fixed once flagged by review.
+  _hasPendingCriticalEdit=true;
   var editId=el("c-edit-id").value;
   if(editId){
     var c=(D.customers||[]).find(function(x){return String(x.id)===String(editId);});
@@ -3980,11 +3977,6 @@ dirty();cm("m-generic");
   if(_voidOnComplete){var _cb=_voidOnComplete;_voidOnComplete=null;setTimeout(_cb,400);}
 }
 function recPay(){
-  // ITEM 3 (2026-07-21): flag payment recording as a critical edit, forcing
-  // a real freshness check on its write even if it lands inside the normal
-  // 25s skip window - extra protection beyond the whole-record snapshot
-  // merge that already covers invoices on every incoming update regardless.
-  _hasPendingCriticalEdit=true;
   // FIX (2026-07-21): recPay had no double-submit protection, unlike saveOrd
   // which was given one specifically because a rapid double-tap on a slow
   // connection could create a duplicate. Payment recording is at least as
@@ -4005,6 +3997,10 @@ function recPay(){
   var cId=parseInt(el("pay-cid").value),amt=parseFloat(el("pay-amt").value)||0;
   if(!cId||isNaN(cId)){toast("Invalid customer","err");window._recordingPayment=false;if(_payBtn){_payBtn.disabled=false;_payBtn.innerHTML="<i class=\"ti ti-check\"></i> Record";}return;}
   if(!amt||amt<=0){toast("Enter a valid amount greater than zero","err");window._recordingPayment=false;if(_payBtn){_payBtn.disabled=false;_payBtn.innerHTML="<i class=\"ti ti-check\"></i> Record";}return;}
+  // ITEM 3 (2026-07-21): flag set here, after all three validation checks
+  // above, not before - avoids forcing an unnecessary server read on the
+  // next unrelated write if this payment fails validation and returns early.
+  _hasPendingCriticalEdit=true;
   var invId=el("pay-inv-id")&&el("pay-inv-id").value?parseInt(el("pay-inv-id").value):0;
   var payDate=el("pay-date")&&el("pay-date").value?el("pay-date").value:tday();
   var method=el("pay-method")?el("pay-method").value:"Cash";
@@ -5451,7 +5447,7 @@ function assignDriver(oid){
       var pend=(D.orders||[]).filter(function(x){return x.driver===d.name&&x.status!=="Delivered"&&x.status!=="Cancelled";}).length;
       var opt=document.createElement("option");
       opt.value=d.name;
-      opt.textContent=d.name+" ("+d.role+")"+(pend?" · "+pend+" pending":"· free");
+      opt.textContent=unescapeForEdit(d.name)+" ("+d.role+")"+(pend?" · "+pend+" pending":"· free");
       if(d.name===o.driver)opt.selected=true;
       sel.appendChild(opt);
     });
@@ -5923,7 +5919,7 @@ function editInv(id){
   }
   var s=el("ivc");if(s)s.innerHTML=(D.customers||[]).map(function(c){return "<option value=\""+c.id+"\""+(c.id===i.cId?" selected":"")+">"+c.name+"</option>";}).join("");
   el("iv-edit-id").value=i.id;
-  el("iva").value=i.amount;el("ivp").value=i.paid;el("ivd").value=i.due;el("ivn").value=i.notes||"";
+  el("iva").value=i.amount;el("ivp").value=i.paid;el("ivd").value=i.due;el("ivn").value=unescapeForEdit(i.notes)||"";
   // If invoice has payments, make paid field read-only — it's recalculated from payments
   var ivpEl=el("ivp");
   if(ivpEl){
@@ -7826,25 +7822,11 @@ function runIntegrityCheck(){
     }
   });
   if(_ambiguousCredit>0){issues.push(_ambiguousCredit+" customer(s) have a credit balance with no payment history logged — review manually before assuming it's a stale form-set value. Never auto-corrected.");}
-  // LAYER 2 (2026-07-21): ongoing stock reconciliation, the same
-  // detect-and-report-never-auto-fix principle as the credit check above.
-  // Verifies current qty against reconcileBaselineQty + lifetimeRestocked -
-  // lifetimeDeducted (all maintained in _recordStockDelta, the one function
-  // every stock-affecting action already goes through). This is deliberately
-  // NOT a claim of catching every possible historical discrepancy - there
-  // was never a complete ledger kept before this existed - it's an honest,
-  // ongoing check that starts holding true from the moment it shipped, and
-  // would catch this exact class of bug (and similar future ones) the
-  // moment it happens, rather than as silent, undetectable drift.
-  var _stockMismatches=[];
-  (D.stock||[]).forEach(function(s){
-    if(s.reconcileBaselineQty===undefined)return; // hasn't had any tracked movement yet since this shipped - nothing to check
-    var expected=s.reconcileBaselineQty+(s.lifetimeRestocked||0)-(s.lifetimeDeducted||0);
-    if(expected!==s.qty){
-      _stockMismatches.push(s.name+" (expected "+expected+", actual "+s.qty+")");
-    }
-  });
-  if(_stockMismatches.length>0){issues.push(_stockMismatches.length+" product(s) show a stock mismatch between recorded movements and actual quantity — review manually: "+_stockMismatches.join("; ")+". Never auto-corrected.");}
+  // REMOVED (2026-07-21): a stock reconciliation check was built here
+  // alongside the tracking in _recordStockDelta, but an independent review
+  // found the underlying tracking cannot survive sync - see the comment
+  // there for the full reasoning. Removed together rather than left as a
+  // check against data that no longer exists.
   // ── Water cycle sync — always recompute from delivered orders ────────
   // Source of truth: sum of o.qty for all delivered 20ltr orders per customer
   // Runs every director login to auto-correct any drift
