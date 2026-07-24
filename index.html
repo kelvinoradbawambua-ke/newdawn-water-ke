@@ -139,6 +139,9 @@ td{padding:9px 12px;vertical-align:middle}
 #oc-drop div:hover,#op-drop div:hover{background:var(--bg);}
 #oc-drop::-webkit-scrollbar,#op-drop::-webkit-scrollbar{width:4px}
 #oc-drop::-webkit-scrollbar-thumb,#op-drop::-webkit-scrollbar-thumb{background:var(--bd);border-radius:4px}
+.recon-drop-item:hover{background:var(--bg)}
+.recon-drop::-webkit-scrollbar{width:4px}
+.recon-drop::-webkit-scrollbar-thumb{background:var(--bd);border-radius:4px}
 .ftot span:first-child{font-size:12px;color:rgba(255,255,255,.65);font-weight:600}
 .ftot span:last-child{font-size:17px;font-weight:800;color:var(--gd)}
 .btn{display:inline-flex;align-items:center;gap:5px;padding:7px 14px;border-radius:8px;font-size:12px;border:1.5px solid var(--bd);background:#fff;color:var(--tx);cursor:pointer;font-weight:600;font-family:inherit;transition:all .15s;line-height:1;white-space:nowrap}
@@ -3304,6 +3307,28 @@ function rDash(){
   }
   (D.complaints||[]).filter(function(c){return c.status==="Open";}).slice(0,2).forEach(function(c){var cu=(D.customers||[]).find(function(x){return x.id===c.cId;});alerts.push({t:"nw",i:"ti-message-report",m:"Complaint: <strong>"+(cu?(can("vPhone")?cu.name:maskName(cu.name)):"?")+"</strong> &mdash; "+c.type,dest:"complaints"});});
   (D.orders||[]).filter(function(o){return o.status==="Pending";}).slice(0,3).forEach(function(o){alerts.push({t:"ni",i:"ti-truck",m:"Pending: <strong>#"+o.id+"</strong> &mdash; "+custName(o.cId)+": "+o.qty+"&times; "+o.prod,dest:"orders"});});
+  // ALERTS (2026-07-21): missing-order reconciliation, surfaced automatically
+  // rather than requiring the director to remember to run the check
+  // manually. Computed fresh from the same _computeMissingOrders() the
+  // reconciliation tool itself uses - not a separate stored alert, so it
+  // can never drift out of sync with reality: the moment an order is
+  // recreated or dismissed, this list stops including it and the alert(s)
+  // disappear on the next render, for every device, automatically.
+  if(can("rest")){
+    var _missingForAlert=_computeMissingOrders();
+    if(_missingForAlert&&_missingForAlert.length){
+      alerts.push({t:"nr",i:"ti-file-alert",m:_missingForAlert.length+" order(s) in the audit log have no matching live order &mdash; needs your review",dest:"data"});
+    }
+  }else if(CU){
+    // Staff/driver/manager: only ever see this for an order THEY placed -
+    // matched by user id from the audit entry itself, not name text, so it
+    // can't misfire onto the wrong person even if two staff share a name.
+    var _missingMine=_computeMissingOrders();
+    var _mineCount=(_missingMine||[]).filter(function(m){return m.placedByUid===CU.id;}).length;
+    if(_mineCount>0){
+      alerts.push({t:"nw",i:"ti-alert-circle",m:_mineCount+" order you placed needs director review &mdash; please check with "+(CU.role==="director"?"":"your director")});
+    }
+  }
   var _urgency={nr:0,nw:1,ni:2,nok:3};alerts.sort(function(a,b){return(_urgency[a.t]||2)-(_urgency[b.t]||2);});
   pg.innerHTML=
     "<div class=\"ph\"><h1>Dashboard</h1><p>Welcome back, "+CU.name+" &middot; "+new Date().toLocaleDateString("en-GB",{weekday:"long",day:"numeric",month:"long",year:"numeric"})+"</p></div>"+
@@ -4941,7 +4966,7 @@ function saveOrd(){
     window._savingOrderSafetyNet=setTimeout(function(){window._savingOrder=false;if(_saveBtnC){_saveBtnC.disabled=false;_saveBtnC.innerHTML="<i class=\"ti ti-check\"></i> Place order";}},15000);
     reserveNextOrderId().then(function(newOrdId){
       (D.orders||[]).push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:0,cost:0,date:el("od").value,status:"Pending",paid:"Unpaid",amtPaid:0,driver:el("odrv").value,deliver:sanitizeInput(el("odlvr").value),bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?sanitizeInput(el("onotes").value):"",prodConfirmed:false,_ts:Date.now()});
-      auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty+" (category/TBC)");
+      auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty+" (category/TBC) — customer #"+cId+" "+(function(){var _c=(D.customers||[]).find(function(x){return x.id===cId;});return _c?unescapeForEdit(_c.name):"unknown";})());
       if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
       rDel();
       cm("m-o");rOrds(undefined,ORD_PAGE);dirty();
@@ -4991,7 +5016,7 @@ function saveOrd(){
     // FIX (2026-07-21): both IDs now reserved together in ONE transaction -
     // see reserveNextOrderAndInvoiceIds - instead of two sequential ones.
     (D.invoices||[]).push({id:newInvId,cId:cId,amount:total,paid:amtPaid,due:(function(){var dd=new Date((el("od").value||tday())+"T12:00:00");dd.setDate(dd.getDate()+7);return dd.toISOString().split("T")[0];})(),notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
-    auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty);
+    auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty+" — customer #"+cId+" "+(function(){var _c=(D.customers||[]).find(function(x){return x.id===cId;});return _c?unescapeForEdit(_c.name):"unknown";})());
     if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
     rDel();
     cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+newOrdId+" placed");
@@ -5700,12 +5725,22 @@ function editSt(id){
 function prepRS(){var rp=el("rp");if(rp)rp.innerHTML=(D.stock||[]).map(function(x){return "<option value=\""+x.id+"\">"+x.name+" ("+x.qty+" in stock)</option>";}).join("");om("m-rs");}
 function findMissingOrders(){
   if(!can("rest")){toast("Only directors can run reconciliation","err");return;}
+  return _computeMissingOrders();
+}
+function _computeMissingOrders(){
   var placed={};
   (D.auditLog||[]).forEach(function(e){
     if(e.action!=="ORDER_PLACED")return;
     var m=e.details&&e.details.match(/^#(\d+) (.+?) x(\d+)/);
     if(!m)return;
-    placed[m[1]]={id:parseInt(m[1]),prod:m[2],qty:parseInt(m[3]),ts:e.ts};
+    // FIX (2026-07-21): the audit entry itself now carries the customer
+    // directly (added after the #1255 incident, where the order and its
+    // linked invoice were both lost together, leaving nothing to recover
+    // the customer from). Extracted here as the primary, most reliable
+    // source - it comes from the exact moment of order placement, not a
+    // separate record that can be lost in the same event as the order.
+    var cm=e.details.match(/customer #(\d+)/);
+    placed[m[1]]={id:parseInt(m[1]),prod:m[2],qty:parseInt(m[3]),ts:e.ts,auditCId:cm?parseInt(cm[1]):null,placedByUid:e.uid,placedByName:e.user};
   });
   var liveIds={};
   (D.orders||[]).forEach(function(o){liveIds[o.id]=true;});
@@ -5714,13 +5749,19 @@ function findMissingOrders(){
     if(liveIds[id])return; // still exists — not missing
     if((D.dismissedMissingOrders||[]).indexOf(parseInt(id))!==-1)return; // already reviewed and marked resolved
     var rec=placed[id];
+    var cust=null,priceSource=null;
+    if(rec.auditCId){
+      cust=(D.customers||[]).find(function(c){return c.id===rec.auditCId;});
+    }
     var inv=(D.invoices||[]).find(function(i){return i.notes&&i.notes.indexOf("#"+id)!==-1;});
-    var cust=inv?(D.customers||[]).find(function(c){return c.id===inv.cId;}):null;
+    if(!cust&&inv){
+      cust=(D.customers||[]).find(function(c){return c.id===inv.cId;});
+    }
     var viaCycle=false;
     if(!cust){
       // Fallback: check water-cycle history (20L milestone deliveries reference
       // ordId directly) — only covers a subset of orders but adds a second
-      // recovery source when the invoice is unavailable.
+      // recovery source when neither the audit entry nor the invoice has it.
       var found=null;
       (D.customers||[]).forEach(function(c){
         if(found)return;
@@ -5730,11 +5771,20 @@ function findMissingOrders(){
       });
       if(found){cust=found;viaCycle=true;}
     }
+    // Nearby orders (±3 IDs either side) — usually placed in the same
+    // delivery round by the same staff member, so they're a genuinely
+    // useful memory jog even when nothing else recovers the customer.
+    var nearby=(D.orders||[]).filter(function(o){
+      return Math.abs(o.id-rec.id)<=3&&o.id!==rec.id;
+    }).sort(function(a,b){return a.id-b.id;}).map(function(o){
+      var c=(D.customers||[]).find(function(x){return x.id===o.cId;});
+      return {id:o.id,cId:o.cId,cName:c?unescapeForEdit(c.name):"?",prod:unescapeForEdit(o.prod),qty:o.qty,driver:o.driver?unescapeForEdit(o.driver):""};
+    });
     missing.push({
-      origId:rec.id,prod:rec.prod,qty:rec.qty,ts:rec.ts,
+      origId:rec.id,prod:rec.prod,qty:rec.qty,ts:rec.ts,nearby:nearby,placedByUid:rec.placedByUid,placedByName:rec.placedByName,
       cId:cust?cust.id:null,cName:cust?cust.name:"Unknown — select manually",
       price:inv?(inv.amount/rec.qty):null,
-      source:inv?"invoice":(viaCycle?"cycle history (price unknown — enter manually)":"none found")
+      source:(rec.auditCId&&cust)?"audit trail (most reliable)":(inv?"invoice":(viaCycle?"cycle history (price unknown — enter manually)":"none found"))
     });
   });
   return missing;
@@ -5745,19 +5795,44 @@ function showMissingOrders(){
   if(!missing.length){body.innerHTML="<div style=\'padding:20px;text-align:center;color:var(--tx2)\'>No missing orders found — audit log matches live orders.</div>";om("m-recon");return;}
   var rows=missing.map(function(m,i){
     var srcColor=m.source==="invoice"?"#27ae60":m.source.indexOf("cycle")===0?"#e67e22":"#c0392b";
+    var nearbyHtml="";
+    var suggestHtml="";
+    if(m.nearby&&m.nearby.length){
+      // Active suggestion: if the customer isn't already known, and a nearby
+      // order (same delivery round) matches this one exactly on product AND
+      // quantity, that's a genuinely strong signal - not just "nearby," but
+      // "looks like the same kind of order." Surfaced as a direct question
+      // rather than left for the director to notice buried in the context
+      // strip below.
+      if(!m.cId){
+        var likelyMatch=m.nearby.find(function(n){return n.prod.trim().toLowerCase()===m.prod.trim().toLowerCase()&&n.qty===m.qty&&n.cId;});
+        if(likelyMatch){
+          suggestHtml="<tr id=\'recon-suggest-"+i+"\'><td></td><td colspan=\'6\' style=\'background:#fff8e1;padding:8px 10px;font-size:11px;border-left:3px solid var(--gd)\'>"+
+            "<i class=\\\"ti ti-bulb\\\" style=\\\"color:#856404;margin-right:4px\\\"></i>"+
+            "This looks similar to Order #"+likelyMatch.id+" ("+likelyMatch.cName+") — same product &amp; quantity ("+m.prod+" x"+m.qty+"). Use this customer? "+
+            "<button class=\\\"btn btn-xs btn-navy\\\" style=\\\"margin-left:6px\\\" onclick=\\\"reconCustSelect("+i+","+likelyMatch.cId+",null);el(\'recon-suggest-"+i+"\').style.display=\'none\'\\\">Yes, use "+likelyMatch.cName+"</button> "+
+            "<button class=\\\"btn btn-xs\\\" style=\\\"background:#fff;border:1px solid var(--bd)\\\" onclick=\\\"el(\'recon-suggest-"+i+"\').style.display=\'none\'\\\">No, let me search</button>"+
+            "</td></tr>";
+        }
+      }
+      nearbyHtml="<tr><td></td><td colspan=\'6\' style=\'background:var(--bg);padding:6px 10px;font-size:11px;color:var(--tx2)\'>"+
+        "<i class=\\\"ti ti-route\\\" style=\\\"color:var(--gd);margin-right:4px\\\"></i><strong>Nearby orders (same round):</strong> "+
+        m.nearby.map(function(n){return "#"+n.id+" "+n.cName+" ("+n.prod+" x"+n.qty+(n.driver?", "+n.driver:"")+")";}).join(" &nbsp;\\u2022&nbsp; ")+
+        "</td></tr>";
+    }
     return "<tr data-idx=\'"+i+"\'>"+
       "<td>#"+m.origId+"</td>"+
       "<td style=\'position:relative\'>"+
         "<input class=\'recon-cust-search\' type=\'hidden\' value=\'"+(m.cId||"")+"\'>"+
         "<input class=\'recon-cust-input\' type=\'text\' placeholder=\'Type name, phone or address\\u2026\' value=\'"+(m.cName&&m.cId?unescapeForEdit(m.cName):"")+"\' style=\'width:150px\' oninput=\'reconCustSearch("+i+",this.value)\' onblur=\'setTimeout(function(){var d=document.getElementById(\"recon-drop-"+i+"\");if(d)d.style.display=\"none\";},200)\'>"+
-        "<div id=\'recon-drop-"+i+"\' style=\'display:none;position:absolute;top:100%;left:0;z-index:50;background:#fff;border:1px solid var(--bd);border-radius:8px;box-shadow:0 4px 14px rgba(0,0,0,.12);max-height:220px;overflow-y:auto;width:260px\'></div>"+
+        "<div id=\'recon-drop-"+i+"\' class=\'recon-drop\' style=\'display:none;background:#fff;border:1.5px solid var(--gd);border-radius:8px;box-shadow:0 6px 20px rgba(0,0,0,.18);max-height:220px;overflow-y:auto\'></div>"+
       "</td>"+
       "<td><input class=\'recon-prod\' value=\'"+m.prod+"\' style=\'width:110px\'></td>"+
       "<td><input class=\'recon-qty\' type=\'number\' value=\'"+m.qty+"\' style=\'width:50px\'></td>"+
       "<td><input class=\'recon-price\' type=\'number\' value=\'"+(m.price?Math.round(m.price):"")+"\' style=\'width:70px\' placeholder=\'KSh\'></td>"+
       "<td style=\'color:"+srcColor+";font-size:10px;font-weight:600\'>"+m.source+"</td>"+
       "<td style=\'white-space:nowrap\'><button class=\'btn btn-xs btn-navy\' onclick=\'recreateOrder("+i+")\'>Recreate</button> <button class=\'btn btn-xs\' style=\'background:#6b7280;color:#fff\' onclick=\'dismissMissingOrder("+m.origId+")\' title=\'Mark as resolved without recreating - e.g. if the customer genuinely cannot be identified\'>Dismiss</button></td>"+
-      "</tr>";
+      "</tr>"+suggestHtml+nearbyHtml;
   }).join("");
   body.innerHTML="<div style=\'font-size:12px;color:var(--tx2);margin-bottom:10px\'>Found "+missing.length+" order(s) in the audit log with no matching live order. Green source = recovered from invoice (most reliable). Orange = recovered from water-cycle history (price not available — enter manually). Red = no source found, verify manually before recreating.</div>"+
     "<table style=\'width:100%;font-size:12px;border-collapse:collapse\'>"+
@@ -5769,6 +5844,25 @@ function showMissingOrders(){
 function reconCustSearch(idx,q){
   var drop=el("recon-drop-"+idx);if(!drop)return;
   if(!q||q.length<2){drop.style.display="none";return;}
+  // FIX (2026-07-21): this used to be position:absolute inside a narrow
+  // table cell in a 700px modal - a 260px-wide dropdown could easily spill
+  // past the modal's edge, or get visually clipped by any scrolling
+  // ancestor, since absolute positioning is relative to the nearest
+  // positioned parent, not the viewport. Fixed positioning calculated from
+  // the input's actual screen coordinates avoids both problems entirely -
+  // it renders relative to the viewport itself, immune to any container's
+  // overflow or width constraints, and flips to the left if it would
+  // otherwise overflow the right edge of the screen.
+  var inputEl=drop.previousElementSibling;
+  var rect=inputEl.getBoundingClientRect();
+  var dropWidth=280;
+  var left=rect.left;
+  if(left+dropWidth>window.innerWidth-12)left=window.innerWidth-dropWidth-12;
+  if(left<12)left=12;
+  drop.style.position="fixed";
+  drop.style.top=(rect.bottom+4)+"px";
+  drop.style.left=left+"px";
+  drop.style.width=dropWidth+"px";
   var lq=sanitizeInput(q).toLowerCase();
   var matches=(D.customers||[]).filter(function(c){
     return (c.name&&c.name.toLowerCase().indexOf(lq)!==-1)||
@@ -5780,14 +5874,14 @@ function reconCustSearch(idx,q){
       (c.road&&c.road.toLowerCase().indexOf(lq)!==-1);
   }).slice(0,20);
   if(!matches.length){
-    drop.innerHTML="<div style=\"padding:10px 14px;font-size:12px;color:var(--tx2)\">No customers found</div>";
+    drop.innerHTML="<div style=\"padding:12px 14px;font-size:12px;color:var(--tx2)\">No customers found</div>";
     drop.style.display="block";return;
   }
   drop.innerHTML=matches.map(function(c){
-    return "<div onmousedown=\"reconCustSelect("+idx+","+c.id+",event)\" "+
-      "style=\"padding:9px 14px;cursor:pointer;border-bottom:1px solid var(--bd);font-size:12px\">"+
-      "<div style=\"font-weight:700\">"+unescapeForEdit(c.name)+"</div>"+
-      "<div style=\"color:var(--tx2);font-size:11px\">"+cAddr(c)+(c.phone?" &middot; "+unescapeForEdit(c.phone):"")+"</div>"+
+    return "<div class=\"recon-drop-item\" onmousedown=\"reconCustSelect("+idx+","+c.id+",event)\" "+
+      "style=\"padding:9px 14px;cursor:pointer;border-bottom:1px solid var(--bd)\">"+
+      "<div style=\"font-weight:700;font-size:12px;color:var(--nv)\">"+unescapeForEdit(c.name)+"</div>"+
+      "<div style=\"color:var(--tx2);font-size:11px;margin-top:1px\">"+cAddr(c)+(c.phone?" &middot; "+unescapeForEdit(c.phone):"")+"</div>"+
     "</div>";
   }).join("");
   drop.style.display="block";
@@ -5829,7 +5923,7 @@ function recreateOrder(idx){
     var cust=(D.customers||[]).find(function(c){return c.id===cId;});
     D.orders.push({id:newId,cId:cId,prod:prod,qty:qty,price:price,status:"Pending",date:tday(),_ts:Date.now(),
       driver:"",paid:"Unpaid",notes:"Recovered via reconciliation — originally Order #"+orig});
-    auditLog("ORDER_PLACED","#"+newId+" "+prod+" x"+qty+" (recovered — originally #"+orig+") by "+CU.name);
+    auditLog("ORDER_PLACED","#"+newId+" "+prod+" x"+qty+" (recovered — originally #"+orig+") — customer #"+cId+" "+(function(){var _c=(D.customers||[]).find(function(x){return x.id===cId;});return _c?unescapeForEdit(_c.name):"unknown";})()+" by "+CU.name);
     toast("Order recreated as #"+newId);
     rOrds(undefined,ORD_PAGE);rDel();
     if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
