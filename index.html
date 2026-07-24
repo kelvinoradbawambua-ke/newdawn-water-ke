@@ -228,6 +228,13 @@ var _idleWarnEl=null;
 var FB_RECONNECT_TIMER=null;
 var FB_LAST_SNAPSHOT=0; // timestamp of last successful snapshot — for heartbeat
 var FB_LAST_APPLIED_UPDATED_AT=0; // the cloud doc's own updatedAt we last actually applied — used to detect a silently-stalled listener
+// FIX (2026-07-21): tracks the SERVER timestamp of this device's own last
+// confirmed write specifically - separate from FB_LAST_APPLIED_UPDATED_AT
+// above, which serves a different purpose (stall detection against ANY
+// snapshot, not specifically this device's own writes). Needed to make the
+// write-arbitration comparison (weAreNewer, below) fully server-clock-based
+// on both sides - see the fix at the comparison itself for the full reasoning.
+var FB_MY_LAST_WRITE_SERVER_TS=0;
 var FB_LAST_HEALTH_CHECK=0; // throttles the active health-check below
 var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
@@ -406,9 +413,41 @@ function tday(){return _ymd(new Date());}
 function maskPhone(p){if(!p)return"";var s=String(p).replace(/\s/g,"");if(s.length<5)return"•••••";return s.slice(0,2)+"•".repeat(Math.max(0,s.length-4))+s.slice(-2);}
 function maskName(n){if(!n)return"Customer";var parts=n.trim().split(" ");return parts[0].slice(0,1)+"••• "+(parts[1]?parts[1].slice(0,1)+"•••":"");}
 function vName(){return can("vPhone");}
-var _uidOffset=Math.floor(Math.random()*90000)+1000;
+// FIX (2026-07-21): uid() was second-precision with a session-wide random
+// offset - two devices creating a customer, stock item, or route in the
+// same wall-clock second could collide if their offsets landed close
+// together, and a device with its clock set backward could regenerate ids
+// in an already-used range entirely. Tested several designs against real
+// collision simulations before settling on this one - millisecond
+// precision (1000x finer than before) plus a genuine per-session random
+// salt and a same-millisecond counter, both occupying separate digit
+// ranges rather than being added together (an earlier version of this fix
+// added them directly, which silently allowed different salt+counter pairs
+// to sum to the same id - caught by testing, not assumed correct).
+// Honest limit: JavaScript's safe-integer ceiling caps how much extra
+// entropy can sit alongside a full millisecond timestamp, so this isn't a
+// mathematically perfect guarantee against every conceivable case - but it
+// is a substantial, tested improvement, not just a different-looking
+// formula.
+var _uidSalt=Math.floor(Math.random()*500);
 var _uidCounter=0;
-function uid(){_uidCounter=(_uidCounter+1)%1000;return Math.floor(Date.now()/1000)*100000+_uidOffset+_uidCounter;}
+function uid(){_uidCounter=(_uidCounter+1)%10;return Date.now()*5000+_uidSalt*10+_uidCounter;}
+// FIX (2026-07-21): no monetary value was ever rounded anywhere in the app -
+// every paid/amount figure ran on raw float sums. Mostly whole-shilling
+// usage has masked this so far, but the union-merge fixes built today
+// (payments, credit) added more summation points where float drift can
+// accumulate, not fewer - a genuine, previously-flagged gap made slightly
+// more relevant by today's own changes. Rounds to the nearest cent (2dp)
+// while staying a number, not a string, so downstream arithmetic and
+// comparisons continue to work exactly as before.
+function _round2(n){return Math.round((n||0)*100)/100;}
+// FIX (2026-07-21): found through adversarial testing before deploy - plain
+// Number() silently returns 0 for comma-formatted numbers like "5,000",
+// which is an extremely common way spreadsheets format currency amounts.
+// Using bare Number() for the XLSX import coercion fix would have quietly
+// replaced one silent-corruption bug (string concatenation) with another
+// (comma-formatted amounts zeroing out entirely). Strips separators first.
+function _numCoerce(v){return Number(String(v==null?"":v).replace(/,/g,""))||0;}
 function fmt(d){if(!d)return"-";var s=String(d);if(s.length===10)s+="T12:00:00";return new Date(s).toLocaleDateString("en-GB",{day:"2-digit",month:"short",year:"numeric"});}
 function ksh(v){return can("vRev")?"KSh "+Number(v).toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>";}
 function kshS(v){return can("vRev")?"KSh "+Number(v).toLocaleString():"KSh "+String.fromCharCode(8226,8226,8226,8226);}
@@ -449,7 +488,10 @@ function custDebt(id){
     if(i.paid>=i.amount)return false; // fully paid, no debt
     if(i.voided)return false; // voided/written-off — excluded from debt
     // Check if linked to a cancelled or deleted order
-    if(i.notes&&i.notes.indexOf("#")!==-1){
+    if(i.orderId){
+      var o=(D.orders||[]).find(function(x){return x.id===i.orderId;});
+      if(!o||o.status==="Cancelled")return false; // order gone or cancelled
+    }else if(i.notes&&i.notes.indexOf("#")!==-1){
       var match=i.notes.match(/#(\d+)/);
       if(match){
         var oid=parseInt(match[1]);
@@ -635,6 +677,70 @@ var _stockDeltasByOrder={};
 // (payments, customer records) still deserve the same "force a real check"
 // treatment as an extra layer, not just a lesser one.
 var _hasPendingCriticalEdit=false;
+function _mergeCustomerCredit(a,b){
+  // FIX (2026-07-21): same class of bug as invoice payments (Finding 1) -
+  // the customer merge only ever rescued brand-new customers or refused to
+  // shrink the team list; it never field-merged a credit change on an
+  // EXISTING customer. Two devices touching the same customer's credit at
+  // the same time - one recording an overpayment, another applying credit
+  // to a debt - meant one update silently overwrote the other. This unions
+  // both sides' creditLog entries by their unique id, dedupes, and
+  // recomputes the credit balance from the complete merged log - both
+  // changes survive regardless of which side's write lands last.
+  //
+  // FIX #2 (2026-07-21, same duplication risk caught on the payments merge
+  // above, applied here too): a creditLog entry from before today has no
+  // cid, so an already-synced old entry appearing on both sides of a merge
+  // had no way to be recognized as "the same one" and would be counted
+  // twice. Same composite-key fallback for existing entries.
+  function _logKey(l){return l.cid||(l.date+"|"+l.amt+"|"+l.type+"|"+(l.note||""));}
+  var mergedLog=(a&&a.creditLog)?a.creditLog.slice():[];
+  var seen={};
+  mergedLog.forEach(function(l){seen[_logKey(l)]=true;});
+  ((b&&b.creditLog)||[]).forEach(function(l){
+    var k=_logKey(l);
+    if(!seen[k]){mergedLog.push(l);seen[k]=true;}
+  });
+  var result=Object.assign({},b||a);
+  result.creditLog=mergedLog;
+  result.credit=_round2(mergedLog.reduce(function(s,l){return s+(l.amt||0);},0));
+  return result;
+}
+function _mergeInvoicePayments(a,b){
+  // FIX (2026-07-21): the merge used to pick ONE WHOLE invoice object -
+  // whichever side showed a higher paid total - discarding the other
+  // side's payments array entirely, record and all (date, method,
+  // reference). Two devices recording genuinely different payments on the
+  // same invoice within the sync window meant one payment silently
+  // vanished with no error - real cash collected, unaccounted for. This
+  // unions both sides' payments by their unique id (added specifically for
+  // this fix), dedupes, and recomputes paid from the complete merged set -
+  // so BOTH payments survive regardless of which side's write happens to
+  // land last.
+  //
+  // FIX #2 (2026-07-21, found by direct testing before deploy): every
+  // payment recorded before today has no pid at all. The dedup above only
+  // ever matched entries that HAD a pid - an old, already-synced payment
+  // appearing on both sides of a merge (the completely normal case for
+  // existing data) had no way to be recognized as "the same one," so it
+  // was pushed twice, silently doubling real recorded cash. A composite
+  // key (date+amount+method+reference) now stands in as identity for any
+  // entry that predates the pid field - two genuinely different payments
+  // sharing all four of those exactly is not a realistic risk.
+  function _payKey(p){return p.pid||(p.date+"|"+p.amt+"|"+p.method+"|"+p.ref);}
+  var merged=(a&&a.payments)?a.payments.slice():[];
+  var seen={};
+  merged.forEach(function(p){seen[_payKey(p)]=true;});
+  ((b&&b.payments)||[]).forEach(function(p){
+    var k=_payKey(p);
+    if(!seen[k]){merged.push(p);seen[k]=true;}
+  });
+  var result=Object.assign({},b||a);
+  result.payments=merged;
+  result.paid=_round2(merged.reduce(function(s,p){return s+(p.amt||0);},0));
+  result.voided=(a&&a.voided)||(b&&b.voided)||false; // voided is a one-way ratchet - either side voiding wins
+  return result;
+}
 function _recordStockDelta(stockId,delta,orderId){
   if(!stockId||!delta)return;
   _stockQtyDeltas[stockId]=(_stockQtyDeltas[stockId]||0)+delta;
@@ -815,13 +921,28 @@ function processWriteQueue(){
         });
       }
       if(freshD.customers&&DforSync.customers){
-        var localCustIds={};DforSync.customers.forEach(function(c){localCustIds[c.id]=true;});
+        var localCustMap={};DforSync.customers.forEach(function(c,idx){localCustMap[c.id]=idx;});
         freshD.customers.forEach(function(fc){
-          if(localCustIds[fc.id])return;
-          var tombstoned=(DforSync.deletedCustomerIds&&DforSync.deletedCustomerIds[fc.id])||(freshD.deletedCustomerIds&&freshD.deletedCustomerIds[fc.id]);
-          if(tombstoned)return;
-          DforSync.customers.push(fc);
-          console.log("[NDSYNC] freshness check RESCUED customer id="+fc.id+" that would otherwise have been dropped by this write");
+          var localIdx=localCustMap[fc.id];
+          if(localIdx===undefined){
+            var tombstoned=(DforSync.deletedCustomerIds&&DforSync.deletedCustomerIds[fc.id])||(freshD.deletedCustomerIds&&freshD.deletedCustomerIds[fc.id]);
+            if(tombstoned)return;
+            DforSync.customers.push(fc);
+            console.log("[NDSYNC] freshness check RESCUED customer id="+fc.id+" that would otherwise have been dropped by this write");
+            return;
+          }
+          // FIX (2026-07-21): this used to stop here for any customer that
+          // already existed locally - meaning a credit change recorded on
+          // the server (overpayment, or credit applied elsewhere) was
+          // completely ignored, and this write would overwrite it with
+          // whatever the local copy showed. Same class of silent money loss
+          // as invoice payments - now merges credit history the same way.
+          var lc=DforSync.customers[localIdx];
+          var serverCredit=fc.credit||0,localCredit=lc.credit||0;
+          if(serverCredit!==localCredit){
+            DforSync.customers[localIdx]=_mergeCustomerCredit(lc,fc);
+            console.log("[NDSYNC] freshness check MERGED customer id="+fc.id+" credit (local "+localCredit+", server "+serverCredit+", merged "+DforSync.customers[localIdx].credit+")");
+          }
         });
       }
       // ROOT-CAUSE FIX (2026-07-21): this rescue mechanism previously only
@@ -848,9 +969,15 @@ function processWriteQueue(){
           var li=DforSync.invoices[localIdx];
           var serverPaid=fi.paid||0,localPaid=li.paid||0;
           var serverMoreAdvanced=(fi.voided&&!li.voided)||(serverPaid>localPaid);
-          if(serverMoreAdvanced){
-            DforSync.invoices[localIdx]=fi;
-            console.log("[NDSYNC] freshness check PREFERRED server's more-advanced invoice id="+fi.id+" (paid "+localPaid+"->"+serverPaid+", voided="+(fi.voided||false)+")");
+          if(serverMoreAdvanced||serverPaid!==localPaid){
+            // FIX (2026-07-21): this used to fully replace the local invoice
+            // with the server's version whenever the server showed more
+            // progress - discarding this device's own payments entirely if
+            // they happened to differ from the server's. Now unions both
+            // sides' payments by id first, so a genuinely different payment
+            // recorded locally survives regardless of which side "wins."
+            DforSync.invoices[localIdx]=_mergeInvoicePayments(li,fi);
+            console.log("[NDSYNC] freshness check MERGED invoice id="+fi.id+" payments (local paid "+localPaid+", server paid "+serverPaid+", merged paid "+DforSync.invoices[localIdx].paid+")");
           }
         });
       }
@@ -1305,10 +1432,11 @@ function _mergeAuditEvents(remote){
   if(!remote||!remote.length)return;
   if(!D.auditLog)D.auditLog=[];
   var existing={};
-  (D.auditLog||[]).forEach(function(e){if(e.ts)existing[e.ts]=true;});
+  (D.auditLog||[]).forEach(function(e){var k=e._cid||e.ts;if(k)existing[k]=true;});
   var added=0;
   remote.forEach(function(e){
-    if(e.ts&&!existing[e.ts]){(D.auditLog||[]).push(e);existing[e.ts]=true;added++;}
+    var k=e._cid||e.ts;
+    if(k&&!existing[k]){(D.auditLog||[]).push(e);existing[k]=true;added++;}
   });
   if(added>0){
     (D.auditLog||[]).sort(function(a,b){return a.ts<b.ts?-1:a.ts>b.ts?1:0;});
@@ -1497,8 +1625,26 @@ function startCloudListener(isWarmRefresh){
     // moment, since isOwnWrite already correctly identifies it as our own
     // pending write regardless of what weAreNewer resolves to here.
     var serverTime=(data.updatedAt&&typeof data.updatedAt.toMillis==="function")?data.updatedAt.toMillis():0;
-    var weAreNewer=FB_LAST_LOCAL_WRITE>serverTime+1000;
-    console.log("[NDSYNC] snapshot received — isOwnWrite="+isOwnWrite+" weAreNewer="+weAreNewer+" remoteOrders="+(data.D.orders?data.D.orders.length:0)+" localOrders="+(D.orders?D.orders.length:0)+" FB_LAST_LOCAL_WRITE="+FB_LAST_LOCAL_WRITE+" serverTime="+serverTime);
+    // FIX (2026-07-21): this comparison used to be FB_LAST_LOCAL_WRITE (a
+    // LOCAL Date.now() value) compared directly against serverTime - even
+    // though serverTime itself had already been made correctly server-based,
+    // the comparison remained cross-clock on the other side. A phone with a
+    // clock running a few seconds fast would still have its writes
+    // perpetually judged "newer," silently overwriting correctly-clocked
+    // devices - the exact failure this whole fix was meant to close, just
+    // reopened by one variable left unconverted. Now: the moment a snapshot
+    // is recognized as this device's own write genuinely echoing back
+    // (isOwnWrite, which is a safe self-comparison regardless of clock
+    // accuracy), its SERVER timestamp is recorded as this device's own
+    // last-confirmed-write marker. All arbitration from then on compares
+    // that recorded server time against the incoming snapshot's server
+    // time - both sides server-based, no device's local clock involved at
+    // any point in the actual decision.
+    if(isOwnWrite&&serverTime>0){
+      FB_MY_LAST_WRITE_SERVER_TS=serverTime;
+    }
+    var weAreNewer=FB_MY_LAST_WRITE_SERVER_TS>=serverTime;
+    console.log("[NDSYNC] snapshot received — isOwnWrite="+isOwnWrite+" weAreNewer="+weAreNewer+" remoteOrders="+(data.D.orders?data.D.orders.length:0)+" localOrders="+(D.orders?D.orders.length:0)+" FB_MY_LAST_WRITE_SERVER_TS="+FB_MY_LAST_WRITE_SERVER_TS+" serverTime="+serverTime);
 
     // ── FIELD-LEVEL SMART MERGE ─────────────────────────────────────────
     // Orders, invoices, stock, payments: ALWAYS accept remote
@@ -1619,10 +1765,31 @@ function startCloudListener(isWarmRefresh){
           });
           var localInvMap={};
           (D.invoices||[]).forEach(function(i){localInvMap[i.id]=i;});
+          // FIX (2026-07-21): this used to trust the incoming remote invoice
+          // at face value for every case except a recent local void - meaning
+          // it had no protection against a remote write that was itself based
+          // on stale data (e.g. written during another device's 25s freshness-
+          // skip window) and so shows LESS progress than what this device
+          // already knows locally. The pre-write freshness check already
+          // guards this exact scenario in the other direction (preferring
+          // whichever side shows more paid, or voided) - this closes the gap
+          // by applying the identical principle here too, so both merge
+          // paths agree on the same rule regardless of which one a given
+          // moment happens to go through.
           D.invoices=data.D.invoices.map(function(ri){
             var tombAt=_recentlyVoidedInvoiceIds[ri.id];
             var li=localInvMap[ri.id];
             if(li&&li.voided&&tombAt&&Date.now()-tombAt<60000)return li; // respect our recent void
+            if(li&&(li.paid||0)!==(ri.paid||0)){
+              // FIX (2026-07-21): this used to pick whichever whole side
+              // showed more progress, discarding the other's payments
+              // entirely. Now unions both sides' payments by id, so a
+              // genuinely different payment recorded on either device
+              // survives regardless of which one this merge favors overall.
+              var merged=_mergeInvoicePayments(li,ri);
+              console.log("[NDSYNC] snapshot merge MERGED invoice id="+ri.id+" payments (local paid "+(li.paid||0)+", remote paid "+(ri.paid||0)+", merged paid "+merged.paid+")");
+              return merged;
+            }
             return ri;
           });
         }
@@ -1687,6 +1854,18 @@ function startCloudListener(isWarmRefresh){
           // slow cloud round-trip from overwriting a just-completed delivery.
           rc.waterCycle=lc.waterCycle;
           rc.cycleHistory=lc.cycleHistory;
+        }
+        // FIX (2026-07-21): same class of fix as the pre-write path above -
+        // this used to take the remote customer wholesale for every field
+        // except waterCycle, meaning a credit change known only locally
+        // (an overpayment or credit application this device made) was
+        // silently discarded the moment any other snapshot arrived. Merges
+        // credit history the same way, using the identical shared function,
+        // so both merge paths agree on the same outcome.
+        if(lc&&(lc.credit||0)!==(rc.credit||0)){
+          var _mergedCust=_mergeCustomerCredit(lc,rc);
+          rc.credit=_mergedCust.credit;
+          rc.creditLog=_mergedCust.creditLog;
         }
         if(!lc)addedCount++;
         mergedCustomers.push(rc);
@@ -2341,10 +2520,11 @@ function checkAutoSaveRecovery(){
   var _localSnap=autoSaveCheckLocal();
   if(_localSnap&&_localSnap.D&&_localSnap.D.auditLog&&(_localSnap.D.auditLog||[]).length){
     var _existing={};
-    (D.auditLog||[]).forEach(function(e){if(e.ts)_existing[e.ts]=true;});
+    (D.auditLog||[]).forEach(function(e){var k=e._cid||e.ts;if(k)_existing[k]=true;});
     if(!D.auditLog)D.auditLog=[];
     (_localSnap.D.auditLog||[]).forEach(function(e){
-      if(e.ts&&!_existing[e.ts])(D.auditLog||[]).push(e);
+      var k=e._cid||e.ts;
+      if(k&&!_existing[k])(D.auditLog||[]).push(e);
     });
     (D.auditLog||[]).sort(function(a,b){return a.ts>b.ts?1:-1;});
     if((D.auditLog||[]).length>AUDIT_HOT_MAX)D.auditLog=(D.auditLog||[]).slice(-AUDIT_HOT_MAX);
@@ -2713,24 +2893,44 @@ function wizSavePin(){
   wizStep(2);
 }
 function wizAddTeam(){
+  // FIX (2026-07-21): making the duplicate-PIN check async (the fix above)
+  // opened a narrow race: two rapid clicks on "Add to team" could both read
+  // WIZ_TEAM before either had pushed its entry, both concluding "no
+  // conflict" even with the same PIN. Same guard pattern already proven
+  // for order creation and payment recording.
+  if(window._wizAddingTeam)return;
+  window._wizAddingTeam=true;
+  if(window._wizAddingTeamTimer)clearTimeout(window._wizAddingTeamTimer);
+  window._wizAddingTeamTimer=setTimeout(function(){window._wizAddingTeam=false;},2500);
   var name=el("wiz-tname").value.trim();
   var role=el("wiz-trole").value;
   var pin=el("wiz-tpin").value.trim();
   var ini=el("wiz-tini").value.trim().toUpperCase();
-  if(!name||!pin||pin.length!==4||!/^\d{4}$/.test(pin)){toast("Name and 4-digit PIN required","err");return;}
-  if((USERS||[]).find(function(u){return u.pin===pin;})){toast("That PIN is already used by another team member","err");return;}
-  var cols=["#185FA5","#856404","#534AB7","#155724","#0c5460"];
-  if(!ini)ini=(name.split(" ").map(function(w){return w[0]||"";}).join("").toUpperCase()||"XX").slice(0,2);
-  WIZ_TEAM.push({id:uid(),name:sanitizeInput(name),role:role,pin:pin,ini:ini,col:cols[WIZ_TEAM.length%cols.length]});
-  el("wiz-tname").value="";el("wiz-tpin").value="";el("wiz-tini").value="";
-  wizStep(2);
+  if(!name||!pin||pin.length!==4||!/^\d{4}$/.test(pin)){toast("Name and 4-digit PIN required","err");window._wizAddingTeam=false;return;}
+  // FIX (2026-07-21): this only ever checked against USERS - never against
+  // WIZ_TEAM, the other team members already added in this same wizard
+  // session. Two people added back to back within the same setup could
+  // silently end up with the identical PIN, since neither was ever checked
+  // against the other. Now checks both lists together, using the same
+  // proper cross-format comparison used everywhere else PINs are set -
+  // safe regardless of whether USERS happens to contain an already-hashed
+  // entry or not.
+  findPinConflict(pin,(USERS||[]).concat(WIZ_TEAM||[]),null).then(function(conflict){
+    window._wizAddingTeam=false;
+    if(conflict){toast("That PIN is already used by another team member","err");return;}
+    var cols=["#185FA5","#856404","#534AB7","#155724","#0c5460"];
+    var _ini=ini;if(!_ini)_ini=(name.split(" ").map(function(w){return w[0]||"";}).join("").toUpperCase()||"XX").slice(0,2);
+    WIZ_TEAM.push({id:uid(),name:sanitizeInput(name),role:role,pin:pin,ini:_ini,col:cols[WIZ_TEAM.length%cols.length]});
+    el("wiz-tname").value="";el("wiz-tpin").value="";el("wiz-tini").value="";
+    wizStep(2);
+  });
 }
 function wizRemTeam(i){WIZ_TEAM.splice(i,1);wizStep(2);}
 function wizAddStock(){
   var name=el("wiz-sname").value.trim();
   var size=el("wiz-ssize").value.trim();
-  var price=parseFloat(el("wiz-sprice").value)||0;
-  var cost=parseFloat(el("wiz-scost").value)||0;
+  var price=_round2(parseFloat(el("wiz-sprice").value)||0);
+  var cost=_round2(parseFloat(el("wiz-scost").value)||0);
   var qty=parseInt(el("wiz-sqty").value)||0;
   var min=parseInt(el("wiz-smin").value)||10;
   if(!name||!price){toast("Product name and sale price required","err");return;}
@@ -3246,6 +3446,7 @@ function rDash(){
     var ids={};orders.forEach(function(o){ids[o.id]=true;});
     return (D.invoices||[]).filter(function(i){
       if(!i.voided)return false;
+      if(i.orderId)return ids[i.orderId];
       var m=i.notes&&i.notes.match(/#(\d+)/);
       return m&&ids[parseInt(m[1])];
     }).reduce(function(a,i){return a+(i.amount-i.paid);},0);
@@ -3607,7 +3808,7 @@ function saveCust(){
       c.name=n;c.phone=sanitizeInput(ph);c.phone2=sanitizeInput(el("cph2").value);c.idno=sanitizeInput(el("cid").value);
       c.estate=sanitizeInput(el("cestate").value);c.court=sanitizeInput(el("ccourt").value);c.house=sanitizeInput(el("chouse").value);
       c.htype=el("chtype").value;c.road=sanitizeInput(el("croad").value);c.zone=sanitizeInput(el("czone").value);
-      c.ctype=el("ctype").value;c.creditLimit=parseFloat(el("ccl").value)||0;c.notes=sanitizeInput(el("cnotes").value);
+      c.ctype=el("ctype").value;c.creditLimit=_round2(parseFloat(el("ccl").value)||0);c.notes=sanitizeInput(el("cnotes").value);
       auditLog("CUSTOMER_UPDATED","Customer updated by "+CU.name+" ("+CU.role+"): "+n);
       if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
 cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer updated");
@@ -3625,7 +3826,7 @@ cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer updated");
         +(can("vPhone")?unescapeForEdit(dupAddr.name):maskName(unescapeForEdit(dupAddr.name)))+"\n\nContinue adding a new customer?"))return;
     }
   }
-  (D.customers||[]).push({id:uid(),name:n,phone:sanitizeInput(ph),phone2:sanitizeInput(el("cph2").value),idno:sanitizeInput(el("cid").value),estate:sanitizeInput(el("cestate").value),court:sanitizeInput(el("ccourt").value),house:sanitizeInput(el("chouse").value),htype:el("chtype").value,road:sanitizeInput(el("croad").value),zone:sanitizeInput(el("czone").value),ctype:el("ctype").value,creditLimit:parseFloat(el("ccl").value)||0,notes:sanitizeInput(el("cnotes").value),created:tday(),_ts:Date.now()});
+  (D.customers||[]).push({id:uid(),name:n,phone:sanitizeInput(ph),phone2:sanitizeInput(el("cph2").value),idno:sanitizeInput(el("cid").value),estate:sanitizeInput(el("cestate").value),court:sanitizeInput(el("ccourt").value),house:sanitizeInput(el("chouse").value),htype:el("chtype").value,road:sanitizeInput(el("croad").value),zone:sanitizeInput(el("czone").value),ctype:el("ctype").value,creditLimit:_round2(parseFloat(el("ccl").value)||0),notes:sanitizeInput(el("cnotes").value),created:tday(),_ts:Date.now()});
   ["cn","cph","cph2","cid","cestate","ccourt","chouse","croad","czone","cnotes"].forEach(function(id){el(id).value="";});el("ccl").value="0";
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
 cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer added");
@@ -3676,7 +3877,7 @@ function delC(id){
   if(!confirm(msg))return;
   // Restore stock for pending/unfulfilled orders before removing them
   (D.orders||[]).filter(function(o){return o.cId===id&&o.status!=="Delivered"&&o.status!=="Cancelled"&&o.prodConfirmed!==false;}).forEach(function(o){
-    var st=(D.stock||[]).find(function(s){return s.name===o.prod;});
+    var st=(D.stock||[]).find(function(s){return (o.stockId&&s.id===o.stockId)||s.name===o.prod;});
     if(st){st.qty+=o.qty;_recordStockDelta(st.id,o.qty);}
   });
   // ENTERPRISE RULE 3: a Delivered order is recognized revenue — deleting the
@@ -3739,6 +3940,10 @@ function addFollowUp(cId){
   om("m-followup");
 }
 function saveFollowUp(){
+  // FIX (2026-07-21): found in a permission-gate sweep - this had no
+  // access check at all, anywhere. Every other customer-editing action
+  // requires eCust; this one was silently missed.
+  if(!can("eCust")){toast("No permission","err");return;}
   var cu=(D.customers||[]).find(function(x){return x.id===_fuCid;});if(!cu)return;
   if(!cu.followups)cu.followups=[];
   var entry={
@@ -3935,16 +4140,19 @@ function reversePayment(invId,payIdx){
   // Remove the payment entry
   pays.splice(payIdx,1);
   // Recalculate paid total from remaining payments — source of truth
-  inv.paid=pays.reduce(function(s,p){return s+(p.amt||0);},0);
+  inv.paid=_round2(pays.reduce(function(s,p){return s+(p.amt||0);},0));
   inv.payments=pays;
   // Sync linked order payment status
-  var ordMatch=inv.notes&&inv.notes.match(/#(\d+)/);
-  if(ordMatch){
-    var o=(D.orders||[]).find(function(x){return String(x.id)===ordMatch[1];});
-    if(o){
-      if(inv.paid>=inv.amount){o.paid="Paid";}else if(inv.paid>0){o.paid="Partial";}else{o.paid="Unpaid";}
-      o.amtPaid=inv.paid;
-    }
+  var o;
+  if(inv.orderId){
+    o=(D.orders||[]).find(function(x){return x.id===inv.orderId;});
+  }else{
+    var ordMatch=inv.notes&&inv.notes.match(/#(\d+)/);
+    if(ordMatch)o=(D.orders||[]).find(function(x){return String(x.id)===ordMatch[1];});
+  }
+  if(o){
+    if(inv.paid>=inv.amount){o.paid="Paid";}else if(inv.paid>0){o.paid="Partial";}else{o.paid="Unpaid";}
+    o.amtPaid=inv.paid;
   }
   auditLog("PAYMENT_RECORDED","REVERSAL: KSh "+pay.amt+" removed from Invoice #"+invId+" by "+CU.name+". Method: "+pay.method+". New paid total: KSh "+inv.paid);
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
@@ -3994,6 +4202,13 @@ function voidInvoice(invId,onComplete){
   om("m-generic");
 }
 voidInvoice._confirm=function(invId){
+  // FIX (2026-07-21): found in the same permission sweep as doAssignDriver,
+  // _finishCancelO, and addRoute._save - the opening function (voidInvoice)
+  // checks "rest" (director-only), but this, the actual mutation that
+  // writes off real money, never re-verified it. The most serious instance
+  // of this pattern found, since voiding an invoice is meant to be strictly
+  // director-only.
+  if(!can("rest")){toast("Director only","err");return;}
   var sel=el("void-reason-sel");var other=el("void-reason-other");
   var reason=(sel&&sel.value?sel.value:"");
   if(reason==="Other")reason=sanitizeInput((other&&other.value.trim())||"");
@@ -4003,7 +4218,8 @@ voidInvoice._confirm=function(invId){
   inv.voided=true;inv.voidedBy=CU.name;inv.voidedAt=tday();inv.voidReason=reason;
   _recentlyVoidedInvoiceIds[invId]=Date.now();
   var ordMatch=inv.notes&&inv.notes.match(/#(\d+)/);
-  if(ordMatch){var o=D.orders.find(function(x){return String(x.id)===ordMatch[1];});if(o)o.paid="Voided";}
+  var _voidO=inv.orderId?D.orders.find(function(x){return x.id===inv.orderId;}):(ordMatch?D.orders.find(function(x){return String(x.id)===ordMatch[1];}):null);
+  if(_voidO)_voidO.paid="Voided";
   auditLog("PAYMENT_RECORDED","VOID: Invoice #"+invId+" voided by "+CU.name+". Reason: "+reason+". Amount written off: KSh "+bal);
     if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
 dirty();cm("m-generic");
@@ -4036,7 +4252,7 @@ function recPay(){
     if(_payBtn){_payBtn.disabled=false;_payBtn.innerHTML="<i class=\"ti ti-check\"></i> Record";}
   },2500);
   if(!can("mPaid")){toast("No permission to record payments","err");window._recordingPayment=false;if(_payBtn){_payBtn.disabled=false;_payBtn.innerHTML="<i class=\"ti ti-check\"></i> Record";}return;}
-  var cId=parseInt(el("pay-cid").value),amt=parseFloat(el("pay-amt").value)||0;
+  var cId=parseInt(el("pay-cid").value),amt=_round2(parseFloat(el("pay-amt").value)||0);
   if(!cId||isNaN(cId)){toast("Invalid customer","err");window._recordingPayment=false;if(_payBtn){_payBtn.disabled=false;_payBtn.innerHTML="<i class=\"ti ti-check\"></i> Record";}return;}
   if(!amt||amt<=0){toast("Enter a valid amount greater than zero","err");window._recordingPayment=false;if(_payBtn){_payBtn.disabled=false;_payBtn.innerHTML="<i class=\"ti ti-check\"></i> Record";}return;}
   // ITEM 3 (2026-07-21): flag set here, after all three validation checks
@@ -4049,7 +4265,8 @@ function recPay(){
   var ref=el("pay-ref")?el("pay-ref").value:"";
   // ── INVOICE-SPECIFIC PAYMENT ──────────────────────────────────────────
   if(invId){
-    var inv=(D.invoices||[]).find(function(x){return x.id===invId;});if(!inv){toast("Invoice not found","err");return;}
+    var inv=(D.invoices||[]).find(function(x){return x.id===invId;});
+    if(!inv){toast("Invoice not found","err");_hasPendingCriticalEdit=false;window._recordingPayment=false;if(_payBtn){_payBtn.disabled=false;_payBtn.innerHTML="<i class=\"ti ti-check\"></i> Record";}return;}
     // GAP FIX (2026-07-20): this branch had no check for inv.voided at all.
     // A voided invoice has already been formally written off with a reason
     // and audit trail — recording a NEW payment against it afterward would
@@ -4061,7 +4278,7 @@ function recPay(){
     // before this one submits. The customer-level payment branch below
     // already correctly excludes voided invoices from its distribution —
     // this was the one path missing the same protection.
-    if(inv.voided){toast("This invoice was voided/written off and cannot receive a new payment. If money was actually received, ask a director to review — voiding is not meant to be reversed casually.","err");return;}
+    if(inv.voided){toast("This invoice was voided/written off and cannot receive a new payment. If money was actually received, ask a director to review — voiding is not meant to be reversed casually.","err");_hasPendingCriticalEdit=false;window._recordingPayment=false;if(_payBtn){_payBtn.disabled=false;_payBtn.innerHTML="<i class=\"ti ti-check\"></i> Record";}return;}
     var bal=inv.amount-inv.paid;
     var credit=0;
     if(amt>bal){
@@ -4069,26 +4286,24 @@ function recPay(){
       amt=bal;        // invoice gets exactly what it needs
     }
     if(!inv.payments)inv.payments=[];
-    inv.payments.push({date:payDate,amt:amt,method:method,ref:ref});
-    inv.paid=inv.payments.reduce(function(s,p){return s+(p.amt||0);},0);
+    inv.payments.push({pid:uid(),date:payDate,amt:amt,method:method,ref:ref});
+    inv.paid=_round2(inv.payments.reduce(function(s,p){return s+(p.amt||0);},0));
     // Store overpayment as customer credit balance
     if(credit>0){
       var cu=(D.customers||[]).find(function(x){return x.id===cId;});
       if(cu){
-        cu.credit=(cu.credit||0)+credit;
+        cu.credit=_round2((cu.credit||0)+credit);
         if(!cu.creditLog)cu.creditLog=[];
-        cu.creditLog.push({date:payDate,amt:credit,type:"overpayment",invId:invId,method:method,ref:ref,by:CU.name,role:CU.role,note:"Overpayment on Invoice #"+invId});
+        cu.creditLog.push({cid:uid(),date:payDate,amt:credit,type:"overpayment",invId:invId,method:method,ref:ref,by:CU.name,role:CU.role,note:"Overpayment on Invoice #"+invId});
         toast("KSh "+credit.toLocaleString()+" overpayment stored as credit for "+(can("vPhone")?cu.name:maskName(cu.name)),"ok");
       }
     }
     // Sync linked order
     var ordMatch=inv.notes&&inv.notes.match(/#(\d+)/);
-    if(ordMatch){
-      var o=(D.orders||[]).find(function(x){return String(x.id)===ordMatch[1];});
-      if(o){
-        if(inv.paid>=inv.amount){o.paid="Paid";}else if(inv.paid>0){o.paid="Partial";}else{o.paid="Unpaid";}
-        o.amtPaid=inv.paid;
-      }
+    var o=inv.orderId?(D.orders||[]).find(function(x){return x.id===inv.orderId;}):(ordMatch?(D.orders||[]).find(function(x){return String(x.id)===ordMatch[1];}):null);
+    if(o){
+      if(inv.paid>=inv.amount){o.paid="Paid";}else if(inv.paid>0){o.paid="Partial";}else{o.paid="Unpaid";}
+      o.amtPaid=inv.paid;
     }
     auditLog("PAYMENT_RECORDED","KSh "+amt.toLocaleString()+" on Invoice #"+invId+" by "+CU.name+" ("+CU.role+"). Method: "+method+(ref?" Ref: "+ref:"")+(credit>0?" | KSh "+credit.toLocaleString()+" overpayment added to credit":"")+". Balance: KSh "+(inv.amount-inv.paid).toLocaleString());
   }else{
@@ -4099,9 +4314,9 @@ function recPay(){
     // Apply any existing credit balance first
     if(existingCredit>0&&totalDebt>0){
       var useCredit=Math.min(existingCredit,totalDebt);
-      cu2.credit-=useCredit;
+      cu2.credit=_round2(cu2.credit-useCredit);
       if(!cu2.creditLog)cu2.creditLog=[];
-      cu2.creditLog.push({date:payDate,amt:-useCredit,type:"applied",by:CU.name,role:CU.role,method:method,note:"Credit applied to payment"});
+      cu2.creditLog.push({cid:uid(),date:payDate,amt:-useCredit,type:"applied",by:CU.name,role:CU.role,method:method,note:"Credit applied to payment"});
       amt+=useCredit; // add credit to the payment being allocated
       toast("KSh "+useCredit.toLocaleString()+" credit applied from balance","ok");
     }
@@ -4109,9 +4324,9 @@ function recPay(){
     if(amt>totalDebt&&totalDebt>0){
       credit2=amt-totalDebt;
       if(cu2){
-        cu2.credit=(cu2.credit||0)+credit2;
+        cu2.credit=_round2((cu2.credit||0)+credit2);
         if(!cu2.creditLog)cu2.creditLog=[];
-        cu2.creditLog.push({date:payDate,amt:credit2,type:"overpayment",method:method,ref:ref,by:CU.name,role:CU.role,note:"Overpayment on customer account"});
+        cu2.creditLog.push({cid:uid(),date:payDate,amt:credit2,type:"overpayment",method:method,ref:ref,by:CU.name,role:CU.role,note:"Overpayment on customer account"});
         toast("KSh "+credit2.toLocaleString()+" overpayment stored as credit","ok");
       }
       amt=totalDebt;
@@ -4123,17 +4338,15 @@ function recPay(){
         if(rem<=0)return;
         var tap=Math.min(rem,inv.amount-inv.paid);
         if(!inv.payments)inv.payments=[];
-        inv.payments.push({date:payDate,amt:tap,method:method,ref:ref});
-        inv.paid=inv.payments.reduce(function(s,p){return s+(p.amt||0);},0);
+        inv.payments.push({pid:uid(),date:payDate,amt:tap,method:method,ref:ref});
+        inv.paid=_round2(inv.payments.reduce(function(s,p){return s+(p.amt||0);},0));
         rem-=tap;
         var ordId=inv.notes&&inv.notes.match(/#(\d+)/);
-        if(ordId){
-          var o2=(D.orders||[]).find(function(x){return String(x.id)===ordId[1];});
-          if(o2){
+        var o2=inv.orderId?(D.orders||[]).find(function(x){return x.id===inv.orderId;}):(ordId?(D.orders||[]).find(function(x){return String(x.id)===ordId[1];}):null);
+        if(o2){
             if(inv.paid>=inv.amount){o2.paid="Paid";}else if(inv.paid>0){o2.paid="Partial";}else{o2.paid="Unpaid";}
             o2.amtPaid=inv.paid;
           }
-        }
       });
     auditLog("PAYMENT_RECORDED","KSh "+amt.toLocaleString()+" by "+CU.name+" ("+CU.role+") for customer #"+cId+". Method: "+method+(ref?" Ref: "+ref:"")+". Distributed oldest-first.");
   }
@@ -4645,7 +4858,7 @@ function checkCycleWarn(){
   if(!isWater){warn.style.display="none";return;}
   var cu=(D.customers||[]).find(function(x){return x.id===cId;});if(!cu){warn.style.display="none";return;}
   var cur=cu.waterCycle||0;
-  var qty=parseInt(el("oq")&&el("oq").value)||1; // bottles in this order
+  var qty=Math.max(1,parseInt(el("oq")&&el("oq").value)||1); // bottles in this order - floored at 1, a negative value here would invert stock deduction
   var next=cur+qty; // total after this order delivers
   var name=can("vPhone")?cu.name:maskName(cu.name);
   // Progress bar always shown
@@ -4717,8 +4930,8 @@ function reserveNextOrderId(){
     nOId=Math.max(nOId,reservedId+1); // keep local counter ratcheted forward too
     return reservedId;
   }).catch(function(err){
-    console.log("[NDSYNC] reserveNextOrderId transaction FAILED ("+(err&&err.message)+") — falling back to local counter");
-    return nOId++; // still create the order rather than block the user on a transient error
+    console.log("[NDSYNC] reserveNextOrderId transaction FAILED ("+(err&&err.message)+") — falling back to a collision-resistant id");
+    return Date.now()*1000+Math.floor(Math.random()*1000); // far outside the normal sequential range - can't collide with another device's own fallback
   });
 }
 function reserveNextInvoiceId(){
@@ -4742,8 +4955,8 @@ function reserveNextInvoiceId(){
     nIId=Math.max(nIId,reservedId+1);
     return reservedId;
   }).catch(function(err){
-    console.log("[NDSYNC] reserveNextInvoiceId transaction FAILED ("+(err&&err.message)+") — falling back to local counter");
-    return nIId++;
+    console.log("[NDSYNC] reserveNextInvoiceId transaction FAILED ("+(err&&err.message)+") — falling back to a collision-resistant id");
+    return Date.now()*1000+Math.floor(Math.random()*1000);
   });
 }
 function reserveNextOrderAndInvoiceIds(){
@@ -4759,7 +4972,7 @@ function reserveNextOrderAndInvoiceIds(){
   // halves both the round trips and the contention on the shared counters
   // document (previously up to 4 transactions on one document when two
   // devices created orders simultaneously; now 2).
-  if(!FB_COUNTERS_REF||!fbDb)return Promise.resolve({orderId:nOId++,invoiceId:nIId++});
+  if(!FB_COUNTERS_REF||!fbDb)return Promise.resolve({orderId:Date.now()*1000+Math.floor(Math.random()*1000),invoiceId:Date.now()*1000+Math.floor(Math.random()*1000)+1});
   return fbDb.runTransaction(function(transaction){
     return transaction.get(FB_COUNTERS_REF).then(function(doc){
       var data=doc.exists?doc.data():{};
@@ -4774,8 +4987,8 @@ function reserveNextOrderAndInvoiceIds(){
     nIId=Math.max(nIId,reserved.invoiceId+1);
     return reserved;
   }).catch(function(err){
-    console.log("[NDSYNC] reserveNextOrderAndInvoiceIds transaction FAILED ("+(err&&err.message)+") — falling back to local counters");
-    return {orderId:nOId++,invoiceId:nIId++};
+    console.log("[NDSYNC] reserveNextOrderAndInvoiceIds transaction FAILED ("+(err&&err.message)+") — falling back to collision-resistant ids");
+    return {orderId:Date.now()*1000+Math.floor(Math.random()*1000),invoiceId:Date.now()*1000+Math.floor(Math.random()*1000)+1};
   });
 }
 function reserveNextComplaintId(){
@@ -4792,8 +5005,8 @@ function reserveNextComplaintId(){
     nCmpId=Math.max(nCmpId,reservedId+1);
     return reservedId;
   }).catch(function(err){
-    console.log("[NDSYNC] reserveNextComplaintId transaction FAILED ("+(err&&err.message)+") — falling back to local counter");
-    return nCmpId++;
+    console.log("[NDSYNC] reserveNextComplaintId transaction FAILED ("+(err&&err.message)+") — falling back to a collision-resistant id");
+    return Date.now()*1000+Math.floor(Math.random()*1000);
   });
 }
 function saveOrd(){
@@ -4841,7 +5054,7 @@ function saveOrd(){
     if(price<=0&&!isCat){if(!confirm("⚠️ Price Warning\n\nThis product has no sale price set (KSh 0).\n\nContinue with a zero-value order?"))return;}
   }
 
-  var qty=parseInt(el("oq").value)||1;
+  var qty=Math.max(1,parseInt(el("oq").value)||1); // floored at 1 - a negative value here would invert stock deduction
   if(qty<1){toast("Quantity must be at least 1","err");return;}
   // Auto-apply active offer discount — qty now defined for minqty check
   if(price>0&&!isCat){
@@ -4894,7 +5107,7 @@ function saveOrd(){
     var o=(D.orders||[]).find(function(x){return String(x.id)===String(editId);});
     if(!o){toast("Order not found","err");return;}
     if(o.status==="Delivered"||o.status==="Cancelled"){toast("This order can no longer be fully edited","err");return;}
-    var oldStock=(D.stock||[]).find(function(s){return s.name===o.prod;});
+    var oldStock=(D.stock||[]).find(function(s){return (o.stockId&&s.id===o.stockId)||s.name===o.prod;});
     var newStock=(D.stock||[]).find(function(s){return s.name===pn;});
     if(oldStock===newStock){
       var netChange=qty-o.qty;
@@ -4910,7 +5123,7 @@ function saveOrd(){
       if(newStock){newStock.qty=Math.max(0,newStock.qty-qty);_recordStockDelta(newStock.id,-qty,o.id);}
     }
     var stCostE=(D.stock||[]).find(function(s){return s.name===pn;});
-    o.cId=cId;o.prod=pn;o.qty=qty;o.price=price;o.cost=stCostE?stCostE.cost:0;o.date=el("od").value;
+    o.cId=cId;o.prod=pn;o.stockId=stCostE?stCostE.id:null;o.qty=qty;o.price=_round2(price);o.cost=stCostE?_round2(stCostE.cost):0;o.date=el("od").value;
     // FIX (2026-07-21): prodConfirmed is the authoritative flag every
     // downstream path (delivery at 4981, delete at 5179, cancel at 5280)
     // trusts to decide whether stock was already deducted for this order.
@@ -4927,7 +5140,7 @@ function saveOrd(){
     // and leaving this flag false is already correct).
     o.prodConfirmed=!isCat;
     o.driver=el("odrv").value;o.deliver=sanitizeInput(el("odlvr").value);o.bottle_before=el("obtl").value;
-    var amtPaid=parseFloat(el("oamt").value)||0;
+    var amtPaid=_round2(parseFloat(el("oamt").value)||0);
     var total=price*qty;
     // Auto-correct payment status based on amount paid
     var payStatus;
@@ -4935,23 +5148,24 @@ function saveOrd(){
     else if(amtPaid>0){payStatus="Partial";}
     else{payStatus="Unpaid";}
     o.paid=payStatus;o.amtPaid=amtPaid;
-    var linkedInv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+o.id)!==-1;});
+    var linkedInv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&((o.invoiceId&&i.id===o.invoiceId)||(!o.invoiceId&&i.notes&&i.notes.match(new RegExp("#"+o.id+"(\\D|$)"))));});
     if(payStatus!=="Paid"){
       if(linkedInv){
-        linkedInv.amount=price*qty;
+        linkedInv.amount=_round2(price*qty);
         if(amtPaid>linkedInv.paid){
           var diff=amtPaid-linkedInv.paid;
           if(!linkedInv.payments)linkedInv.payments=[];
-          linkedInv.payments.push({date:tday(),amt:diff,method:"Cash",ref:"Order edit adjustment"});
+          linkedInv.payments.push({pid:uid(),date:tday(),amt:diff,method:"Cash",ref:"Order edit adjustment"});
         }
-        linkedInv.paid=amtPaid;
+        linkedInv.paid=_round2(amtPaid);
         if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
         auditLog("ORDER_UPDATED","Order #"+o.id+" edited by "+CU.name+" ("+CU.role+")");
         cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+o.id+" updated");
       }else{
         // FIX (2026-07-21): atomic reservation for this new-invoice-on-edit path too
         reserveNextInvoiceId().then(function(newInvId){
-          (D.invoices||[]).push({id:newInvId,cId:cId,amount:price*qty,paid:amtPaid,due:o.date,notes:"Order #"+o.id,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order edit"}]:[]});
+          (D.invoices||[]).push({id:newInvId,orderId:o.id,cId:cId,amount:price*qty,paid:amtPaid,due:o.date,notes:"Order #"+o.id,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order edit"}]:[]});
+          o.invoiceId=newInvId;
           if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
           auditLog("ORDER_UPDATED","Order #"+o.id+" edited by "+CU.name+" ("+CU.role+")");
           cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+o.id+" updated");
@@ -4959,7 +5173,7 @@ function saveOrd(){
       }
     }else{
       if(linkedInv){
-        linkedInv.amount=price*qty;linkedInv.paid=price*qty;
+        linkedInv.amount=_round2(price*qty);linkedInv.paid=_round2(price*qty);
       }
       if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
       auditLog("ORDER_UPDATED","Order #"+o.id+" edited by "+CU.name+" ("+CU.role+")");
@@ -4982,7 +5196,7 @@ function saveOrd(){
     if(window._savingOrderSafetyNet)clearTimeout(window._savingOrderSafetyNet);
     window._savingOrderSafetyNet=setTimeout(function(){window._savingOrder=false;if(_saveBtnC){_saveBtnC.disabled=false;_saveBtnC.innerHTML="<i class=\"ti ti-check\"></i> Place order";}},15000);
     reserveNextOrderId().then(function(newOrdId){
-      (D.orders||[]).push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:0,cost:0,date:el("od").value,status:"Pending",paid:"Unpaid",amtPaid:0,driver:el("odrv").value,deliver:sanitizeInput(el("odlvr").value),bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?sanitizeInput(el("onotes").value):"",prodConfirmed:false,_ts:Date.now()});
+      (D.orders||[]).push({id:newOrdId,cId:cId,prod:pn,stockId:stCost?stCost.id:null,qty:qty,price:0,cost:0,date:el("od").value,status:"Pending",paid:"Unpaid",amtPaid:0,driver:el("odrv").value,deliver:sanitizeInput(el("odlvr").value),bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?sanitizeInput(el("onotes").value):"",prodConfirmed:false,_ts:Date.now()});
       auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty+" (category/TBC) — customer #"+cId+" "+(function(){var _c=(D.customers||[]).find(function(x){return x.id===cId;});return _c?unescapeForEdit(_c.name):"unknown";})());
       if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
       rDel();
@@ -5009,7 +5223,7 @@ function saveOrd(){
     if(!confirm("⚠️ Stock Alert\n\n"+unescapeForEdit(pn)+" has only "+st.qty+" unit(s) in stock but you are ordering "+qty+".\n\nThe order will be recorded. Please restock soon.\n\nContinue?")){window._savingOrder=false;return;}
   }
   var total=price*qty;
-  var amtPaid=can("mPaid")?(parseFloat(el("oamt").value)||0):0;
+  var amtPaid=can("mPaid")?_round2(parseFloat(el("oamt").value)||0):0;
   var payStatus=can("mPaid")?el("opay").value:"Unpaid";
   if(amtPaid>=total){payStatus="Paid";}
   else if(amtPaid>0){payStatus="Partial";}
@@ -5027,12 +5241,12 @@ function saveOrd(){
       if(st.history.length>50)st.history=st.history.slice(-50);
       updateStockBadge();
     }
-    (D.orders||[]).push({id:newOrdId,cId:cId,prod:pn,qty:qty,price:price,cost:costAtSale,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:sanitizeInput(el("odlvr").value),bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?sanitizeInput(el("onotes").value):"",_ts:Date.now(),prodConfirmed:true});
+    (D.orders||[]).push({id:newOrdId,cId:cId,prod:pn,stockId:stCost?stCost.id:null,invoiceId:newInvId,qty:qty,price:price,cost:costAtSale,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:sanitizeInput(el("odlvr").value),bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?sanitizeInput(el("onotes").value):"",_ts:Date.now(),prodConfirmed:true});
     console.log("[NDSYNC] order created id="+newOrdId+" D.orders.length="+(D.orders||[]).length+" FB_READY="+FB_READY+" _cloudDataConfirmed="+_cloudDataConfirmed+" FB_WRITING="+FB_WRITING);
     // Always create invoice for exact orders — provides full financial trail
     // FIX (2026-07-21): both IDs now reserved together in ONE transaction -
     // see reserveNextOrderAndInvoiceIds - instead of two sequential ones.
-    (D.invoices||[]).push({id:newInvId,cId:cId,amount:total,paid:amtPaid,due:(function(){var dd=new Date((el("od").value||tday())+"T12:00:00");dd.setDate(dd.getDate()+7);return dd.toISOString().split("T")[0];})(),notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
+    (D.invoices||[]).push({id:newInvId,orderId:newOrdId,cId:cId,amount:total,paid:amtPaid,due:(function(){var dd=new Date((el("od").value||tday())+"T12:00:00");dd.setDate(dd.getDate()+7);return dd.toISOString().split("T")[0];})(),notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
     auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty+" — customer #"+cId+" "+(function(){var _c=(D.customers||[]).find(function(x){return x.id===cId;});return _c?unescapeForEdit(_c.name):"unknown";})());
     if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
     rDel();
@@ -5166,7 +5380,7 @@ function completeDlv(){
     }
     // Update order with confirmed product
     o.prod=confirmedProd;
-    o.price=confirmedPrice;
+    o.price=_round2(confirmedPrice);
     o.cost=stCost?stCost.cost:0;
     o.prodConfirmed=true;
   }
@@ -5190,7 +5404,7 @@ function completeDlv(){
   // stays gated by mPaid — staff still route cash through the
   // pendingPayments/director-acknowledgement flow exactly as before.
   var total=o.qty*o.price;
-  var inv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+oid)!==-1;});
+  var inv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.match(new RegExp("#"+oid+"(\\D|$)"));});
   // FIX (2026-07-21): the invoice ID here now goes through the same atomic
   // reservation as order/edit invoice creation, closing the same collision
   // class. Only the branch that actually creates a NEW invoice needs to
@@ -5198,22 +5412,22 @@ function completeDlv(){
   // for this order type) continues immediately with zero added delay.
   function _finishCompleteDlv(){
   if(can("mPaid")){
-    var amt=parseFloat(el("dlv-amt").value)||0;
+    var amt=_round2(parseFloat(el("dlv-amt").value)||0);
     if(amt>0&&inv){
       if(!inv.payments)inv.payments=[];
       var dlvMethod=el("dlv-method")?el("dlv-method").value:"Cash";
       var dlvAmt=Math.min(amt,inv.amount-inv.paid); // never overpay invoice
       if(dlvAmt>0){
-        inv.payments.push({date:tday(),amt:dlvAmt,method:dlvMethod,ref:"Delivery #"+oid});
-        inv.paid=inv.payments.reduce(function(s,p){return s+(p.amt||0);},0); // source of truth
+        inv.payments.push({pid:uid(),date:tday(),amt:dlvAmt,method:dlvMethod,ref:"Delivery #"+oid});
+        inv.paid=_round2(inv.payments.reduce(function(s,p){return s+(p.amt||0);},0)); // source of truth
         // Overpayment → customer credit
         var dlvOver=amt-dlvAmt;
         if(dlvOver>0){
           var dlvCu=(D.customers||[]).find(function(x){return x.id===o.cId;});
           if(dlvCu){
-            dlvCu.credit=(dlvCu.credit||0)+dlvOver;
+            dlvCu.credit=_round2((dlvCu.credit||0)+dlvOver);
             if(!dlvCu.creditLog)dlvCu.creditLog=[];
-            dlvCu.creditLog.push({date:tday(),amt:dlvOver,type:"overpayment",ordId:o.id,method:dlvMethod,by:CU.name,role:CU.role,note:"Overpayment at delivery of Order #"+o.id});
+            dlvCu.creditLog.push({cid:uid(),date:tday(),amt:dlvOver,type:"overpayment",ordId:o.id,method:dlvMethod,by:CU.name,role:CU.role,note:"Overpayment at delivery of Order #"+o.id});
           }
         }
       }
@@ -5223,8 +5437,8 @@ function completeDlv(){
       else if(inv.paid>0){o.paid="Partial";o.amtPaid=inv.paid;}
       else{o.paid="Unpaid";}
     }else if(amt>0){
-      if(amt>=total){o.paid="Paid";o.amtPaid=amt;}
-      else{o.paid="Partial";o.amtPaid=amt;}
+      if(amt>=total){o.paid="Paid";o.amtPaid=_round2(amt);}
+      else{o.paid="Partial";o.amtPaid=_round2(amt);}
     }
   }else{
     // Staff/driver: reflect whatever the invoice already shows (e.g. a prior
@@ -5241,7 +5455,7 @@ function completeDlv(){
 
   // Staff/driver cash collection: record as pending approval
   if(!can("mPaid")){
-    var staffCash=el("dlv-amt")?(parseFloat(el("dlv-amt").value)||0):0;
+    var staffCash=el("dlv-amt")?_round2(parseFloat(el("dlv-amt").value)||0):0;
     if(staffCash>0){
       if(!D.pendingPayments)D.pendingPayments=[];
       var dlvMeth=el("dlv-method")?el("dlv-method").value:"Cash";
@@ -5286,8 +5500,9 @@ function completeDlv(){
   }
   if(isCat&&!inv&&total>0){
     reserveNextInvoiceId().then(function(newInvId){
-      inv={id:newInvId,cId:o.cId,amount:total,paid:0,due:tday(),notes:"Order #"+oid,date:tday(),payments:[]};
+      inv={id:newInvId,orderId:oid,cId:o.cId,amount:total,paid:0,due:tday(),notes:"Order #"+oid,date:tday(),payments:[]};
       (D.invoices||[]).push(inv);
+      o.invoiceId=newInvId;
       _finishCompleteDlv();
     });
   }else{
@@ -5297,7 +5512,7 @@ function completeDlv(){
 function delO(id){
   if(!can("dOrd"))return;
   var o=(D.orders||[]).find(function(x){return x.id===id;});if(!o)return;
-  var linkedInv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+id)!==-1;});
+  var linkedInv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.match(new RegExp("#"+id+"(\\D|$)"));});
   var outstandingBal=(linkedInv&&!linkedInv.voided)?Math.max(0,linkedInv.amount-linkedInv.paid):0;
 
   // ENTERPRISE RULE 1: an order that hasn't been delivered yet and still has a
@@ -5333,7 +5548,7 @@ function delO(id){
     if(!confirm("Delete order #"+id+"?"+(linkedInv?" The linked invoice will also be removed.":"")))return;
   }
   // Restore stock — skip for category orders (prodConfirmed===false means no stock was deducted)
-  var st=(D.stock||[]).find(function(s){return s.name===o.prod;});
+  var st=(D.stock||[]).find(function(s){return (o.stockId&&s.id===o.stockId)||s.name===o.prod;});
   var wasStockDeducted=(o.prodConfirmed!==false);
   if(st&&o.status!=="Delivered"&&o.status!=="Cancelled"&&wasStockDeducted){
     st.qty+=o.qty;_recordStockDelta(st.id,o.qty);
@@ -5355,7 +5570,7 @@ function delO(id){
   // remove an invoice with zero payment history, and keep one with real
   // payment history for the books, exactly as before.
   D.invoices=(D.invoices||[]).filter(function(i){
-    var linked=i.notes&&i.notes.indexOf("#"+id)!==-1;
+    var linked=i.notes&&i.notes.match(new RegExp("#"+id+"(\\D|$)"));
     if(linked&&i.paid<=0)return false;
     return true;
   });
@@ -5379,7 +5594,7 @@ function cancelO(id){
   var o=(D.orders||[]).find(function(x){return x.id===id;});if(!o)return;
   if(o.status==="Cancelled"){toast("Already cancelled");return;}
   if(o.status==="Delivered"){toast("Cannot cancel a delivered order — delete it if needed","err");return;}
-  var inv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+id)!==-1;});
+  var inv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.match(new RegExp("#"+id+"(\\D|$)"));});
   var hasPaid=inv&&inv.paid>0;
   // ENTERPRISE RULE: cancelling an order that already has money paid against
   // it must not leave the fate of that money ambiguous. It used to just zero
@@ -5394,7 +5609,7 @@ function cancelO(id){
 }
 function _openCancelDisposition(id){
   var o=(D.orders||[]).find(function(x){return x.id===id;});if(!o)return;
-  var inv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+id)!==-1;});
+  var inv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.match(new RegExp("#"+id+"(\\D|$)"));});
   if(!inv)return;
   var cu=(D.customers||[]).find(function(x){return x.id===o.cId;});
   var isCatOrder=(o.prodConfirmed===false);
@@ -5432,12 +5647,17 @@ function _confirmCancelDisposition(id){
   _finishCancelO(id,disp);
 }
 function _finishCancelO(id,disposition){
+  // FIX (2026-07-21): found in the same permission sweep as doAssignDriver -
+  // this is only ever reached through cancelO(), which checks eOrd, but
+  // this function - the one that actually performs the mutation - never
+  // re-verified it itself.
+  if(!can("eOrd"))return;
   var o=(D.orders||[]).find(function(x){return x.id===id;});if(!o)return;
-  var inv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+id)!==-1;});
+  var inv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.match(new RegExp("#"+id+"(\\D|$)"));});
   var hasPaid=inv&&inv.paid>0;
   var isCatOrder=(o.prodConfirmed===false);
   var skipStockRestore=isCatOrder;
-  var st=(D.stock||[]).find(function(s){return s.name===o.prod;});
+  var st=(D.stock||[]).find(function(s){return (o.stockId&&s.id===o.stockId)||s.name===o.prod;});
   if(st&&!skipStockRestore){
     st.qty+=o.qty;_recordStockDelta(st.id,o.qty);
     if(!st.history)st.history=[];
@@ -5456,9 +5676,9 @@ function _finishCancelO(id,disposition){
       if(disposition==="credit"){
         var cu=(D.customers||[]).find(function(x){return x.id===o.cId;});
         if(cu){
-          cu.credit=(cu.credit||0)+inv.paid;
+          cu.credit=_round2((cu.credit||0)+inv.paid);
           if(!cu.creditLog)cu.creditLog=[];
-          cu.creditLog.push({date:tday(),amt:inv.paid,type:"overpayment",ordId:id,by:CU.name,role:CU.role,note:"Order #"+id+" cancelled — KSh "+inv.paid+" converted to store credit"});
+          cu.creditLog.push({cid:uid(),date:tday(),amt:inv.paid,type:"overpayment",ordId:id,by:CU.name,role:CU.role,note:"Order #"+id+" cancelled — KSh "+inv.paid+" converted to store credit"});
         }
         dispNote=" \u2014 KSh "+inv.paid+" converted to customer credit";
       }else if(disposition==="refund"){
@@ -5499,6 +5719,10 @@ function assignDriver(oid){
   om("m-assign");
 }
 function doAssignDriver(){
+  // FIX (2026-07-21): found in the same permission-gate sweep as
+  // saveFollowUp - the opening function (assignDriver) checks eOrd, but
+  // this, the actual save action, never re-verified it.
+  if(!can("eOrd")){toast("Managers only","err");return;}
   var o=(D.orders||[]).find(function(x){return x.id===_assignOid;});if(!o)return;
   var name=el("assign-who")?el("assign-who").value:"";
   var prev=o.driver||"Unassigned";
@@ -5714,8 +5938,8 @@ function saveSt(){
   if(editId){
     var s=(D.stock||[]).find(function(x){return String(x.id)===String(editId);});
     if(s){
-      s.name=n;s.size=sanitizeInput(el("ss").value);s.price=parseFloat(el("sp").value)||0;
-      s.cost=parseFloat(el("sc").value)||0;s.min=parseInt(el("sm").value)||10;
+      s.name=n;s.size=sanitizeInput(el("ss").value);s.price=_round2(parseFloat(el("sp").value)||0);
+      s.cost=_round2(parseFloat(el("sc").value)||0);s.min=parseInt(el("sm").value)||10;
       // FIX (2026-07-21): this used to also set s.qty=parseInt(el("sq").value)
       // here - meaning editing a product's name, price, or any other detail
       // would ALSO silently overwrite its quantity with whatever the form
@@ -5736,7 +5960,7 @@ cm("m-s");rStock();dirty();
       return;
     }
   }
-  (D.stock||[]).push({id:uid(),name:n,size:sanitizeInput(el("ss").value),price:parseFloat(el("sp").value)||0,cost:parseFloat(el("sc").value)||0,qty:parseInt(el("sq").value)||0,min:parseInt(el("sm").value)||10,isWater:el("sw")&&el("sw").checked?true:false});
+  (D.stock||[]).push({id:uid(),name:n,size:sanitizeInput(el("ss").value),price:_round2(parseFloat(el("sp").value)||0),cost:_round2(parseFloat(el("sc").value)||0),qty:parseInt(el("sq").value)||0,min:parseInt(el("sm").value)||10,isWater:el("sw")&&el("sw").checked?true:false});
   ["sn","ss","sp","sc","sq","sm"].forEach(function(id){el(id).value="";});cm("m-s");rStock();dirty();toast(n+" added");
 }
 function editSt(id){
@@ -5788,7 +6012,7 @@ function _computeMissingOrders(){
     if(rec.auditCId){
       cust=(D.customers||[]).find(function(c){return c.id===rec.auditCId;});
     }
-    var inv=(D.invoices||[]).find(function(i){return i.notes&&i.notes.indexOf("#"+id)!==-1;});
+    var inv=(D.invoices||[]).find(function(i){return i.notes&&i.notes.match(new RegExp("#"+id+"(\\D|$)"));});
     if(!cust&&inv){
       cust=(D.customers||[]).find(function(c){return c.id===inv.cId;});
     }
@@ -5967,7 +6191,7 @@ function recreateOrder(idx){
   var cId=parseInt(row.querySelector(".recon-cust-search").value)||0;
   var prod=sanitizeInput(row.querySelector(".recon-prod").value.trim());
   var qty=parseInt(row.querySelector(".recon-qty").value)||0;
-  var price=parseFloat(row.querySelector(".recon-price").value)||0;
+  var price=_round2(parseFloat(row.querySelector(".recon-price").value)||0);
   if(!cId){toast("Select a customer first","err");return;}
   if(!prod||qty<=0||price<=0){toast("Fill product, quantity and price","err");return;}
   var orig=window._reconMissing[idx].origId;
@@ -5979,7 +6203,8 @@ function recreateOrder(idx){
   // collide again.
   reserveNextOrderId().then(function(newId){
     var cust=(D.customers||[]).find(function(c){return c.id===cId;});
-    D.orders.push({id:newId,cId:cId,prod:prod,qty:qty,price:price,status:"Pending",date:tday(),_ts:Date.now(),
+    var _stMatch=(D.stock||[]).find(function(s){return unescapeForEdit(s.name).toLowerCase()===unescapeForEdit(prod).toLowerCase();});
+    D.orders.push({id:newId,cId:cId,prod:prod,stockId:_stMatch?_stMatch.id:null,qty:qty,price:price,status:"Pending",date:tday(),_ts:Date.now(),
       driver:"",paid:"Unpaid",notes:"Recovered via reconciliation — originally Order #"+orig});
     auditLog("ORDER_PLACED","#"+newId+" "+prod+" x"+qty+" (recovered — originally #"+orig+") — customer #"+cId+" "+(function(){var _c=(D.customers||[]).find(function(x){return x.id===cId;});return _c?unescapeForEdit(_c.name):"unknown";})()+" by "+CU.name);
     toast("Order recreated as #"+newId);
@@ -6139,7 +6364,7 @@ function editInv(id){
 }
 function saveInv(){
   if(!can("aInv")&&!can("eInv"))return;
-  var cId=parseInt(el("ivc")&&el("ivc").value)||0;var a=parseFloat(el("iva").value)||0;var p=parseFloat(el("ivp").value)||0;
+  var cId=parseInt(el("ivc")&&el("ivc").value)||0;var a=_round2(parseFloat(el("iva").value)||0);var p=_round2(parseFloat(el("ivp").value)||0);
   if(!a||a<=0){toast("Amount must be greater than 0","err");return;}
   // Default due date to 30 days from today if not set
   if(el("ivd")&&!el("ivd").value){var d30=new Date();d30.setDate(d30.getDate()+30);el("ivd").value=d30.toISOString().split("T")[0];}
@@ -6155,19 +6380,20 @@ function saveInv(){
           +CU.name+" from KSh "+i.amount+" to KSh "+a+". Previous paid: KSh "+i.paid);
       }
       // Update safe fields always
-      i.cId=cId;i.amount=a;i.due=el("ivd").value;i.notes=el("ivn").value;
+      i.cId=cId;i.amount=_round2(a);i.due=el("ivd").value;i.notes=el("ivn").value;
       // Only touch paid/payments if no real payments exist yet
       if(!i.payments||!i.payments.length){
-        i.paid=p;
+        i.paid=_round2(p);
         if(p>0)i.payments=[{date:tday(),amt:p,method:"Cash",ref:"Opening balance"}];
       }
       // If payments exist, recalculate paid from them — never overwrite
       if(i.payments&&i.payments.length){
-        i.paid=i.payments.reduce(function(s,py){return s+(py.amt||0);},0);
+        i.paid=_round2(i.payments.reduce(function(s,py){return s+(py.amt||0);},0));
       }
       // Sync linked order
       var ordMatch=i.notes&&i.notes.match(/#(\d+)/);
-      if(ordMatch){var o=(D.orders||[]).find(function(x){return String(x.id)===ordMatch[1];});if(o){if(i.paid>=i.amount){o.paid="Paid";}else if(i.paid>0){o.paid="Partial";}else{o.paid="Unpaid";}o.amtPaid=i.paid;}}
+      var _o5=i.orderId?(D.orders||[]).find(function(x){return x.id===i.orderId;}):(ordMatch?(D.orders||[]).find(function(x){return String(x.id)===ordMatch[1];}):null);
+      if(_o5){if(i.paid>=i.amount){_o5.paid="Paid";}else if(i.paid>0){_o5.paid="Partial";}else{_o5.paid="Unpaid";}_o5.amtPaid=i.paid;}
       cm("m-iv");rInvs(undefined,INV_PAGE);dirty();toast("Invoice #"+editId+" updated");
       return;
     }
@@ -6195,7 +6421,7 @@ function ackPendingPay(id){
   // invoice only if no order-specific invoice exists, and route any leftover
   // to customer credit — exactly like recPay()/completeDlv() already do for
   // director-recorded payments.
-  var inv=(D.invoices||[]).find(function(i){return i.cId===pp.cId&&i.notes&&i.notes.indexOf("#"+pp.ordId)!==-1;});
+  var inv=(D.invoices||[]).find(function(i){return i.cId===pp.cId&&i.notes&&i.notes.match(new RegExp("#"+pp.ordId+"(\\D|$)"));});
   if(!inv){
     inv=(D.invoices||[]).filter(function(i){return i.cId===pp.cId&&i.paid<i.amount&&!i.voided;})
       .sort(function(a,b){return a.date>b.date?1:-1;})[0];
@@ -6205,8 +6431,8 @@ function ackPendingPay(id){
     var apply=Math.min(remaining,inv.amount-inv.paid);
     if(apply>0){
       if(!inv.payments)inv.payments=[];
-      inv.payments.push({date:tday(),amt:apply,method:pp.method,ref:"Staff collection by "+pp.collectedBy+" — ack by "+CU.name});
-      inv.paid=inv.payments.reduce(function(s,p){return s+(p.amt||0);},0);
+      inv.payments.push({pid:uid(),date:tday(),amt:apply,method:pp.method,ref:"Staff collection by "+pp.collectedBy+" — ack by "+CU.name});
+      inv.paid=_round2(inv.payments.reduce(function(s,p){return s+(p.amt||0);},0));
       remaining-=apply;
       var o=(D.orders||[]).find(function(x){return x.id===pp.ordId;});
       if(o){
@@ -6220,9 +6446,9 @@ function ackPendingPay(id){
   if(remaining>0){
     var cu=(D.customers||[]).find(function(x){return x.id===pp.cId;});
     if(cu){
-      cu.credit=(cu.credit||0)+remaining;
+      cu.credit=_round2((cu.credit||0)+remaining);
       if(!cu.creditLog)cu.creditLog=[];
-      cu.creditLog.push({date:tday(),amt:remaining,type:"overpayment",ordId:pp.ordId,method:pp.method,by:CU.name,role:CU.role,note:"Overpayment acknowledging "+pp.collectedBy+"'s collection for Order #"+pp.ordId});
+      cu.creditLog.push({cid:uid(),date:tday(),amt:remaining,type:"overpayment",ordId:pp.ordId,method:pp.method,by:CU.name,role:CU.role,note:"Overpayment acknowledging "+pp.collectedBy+"'s collection for Order #"+pp.ordId});
     }
   }
   pp.ack=true;pp.ackedBy=CU.name;pp.ackedDate=tday();
@@ -6245,7 +6471,7 @@ function payI(id){
   openPayInv(id); // opens standard payment modal pre-filled
 }
 function payCalc(){
-  var amt=parseFloat(el("pay-amt").value)||0;
+  var amt=_round2(parseFloat(el("pay-amt").value)||0);
   var pc=el("pay-calc");if(!pc)return;
   if(amt<=0){pc.style.display="none";return;}
   // Determine context: invoice-specific or customer-level
@@ -6350,10 +6576,8 @@ function rDebts(q,pg){
       // Use the linked order's date — the actual date the debt was created
       var ordDate="";
       var ordMatch=i.notes&&i.notes.match(/#(\d+)/);
-      if(ordMatch){
-        var _o=(D.orders||[]).find(function(x){return String(x.id)===ordMatch[1];});
-        if(_o)ordDate=_o.date||"";
-      }
+      var _o=i.orderId?(D.orders||[]).find(function(x){return x.id===i.orderId;}):(ordMatch?(D.orders||[]).find(function(x){return String(x.id)===ordMatch[1];}):null);
+      if(_o)ordDate=_o.date||"";
       if(!ordDate)return false; // no linked order = exclude from period views
       if(DEBT_PERIOD==="today") return ordDate===td;
       if(DEBT_PERIOD==="week")  return ordDate>=_dwkS&&ordDate<=td;
@@ -6658,6 +6882,10 @@ function addRoute(){
   setTimeout(function(){var n=el("route-name-inp");if(n)n.focus();},300);
 }
 addRoute._save=function(){
+  // FIX (2026-07-21): found in the same permission sweep as doAssignDriver
+  // and _finishCancelO - the opening function (addRoute) checks eOrd, but
+  // this, the actual save action, never re-verified it.
+  if(!can("eOrd")){toast("Managers only","err");return;}
   var name=sanitizeInput(el("route-name-inp")?el("route-name-inp").value.trim():"");
   if(!name){toast("Route name required","err");return;}
   var estates=el("route-areas-inp")?el("route-areas-inp").value:"";
@@ -6756,22 +6984,22 @@ function exportReportXL(){
     if(from&&dd<from)return false;if(to2&&dd>to2)return false;return true;
   });
   var byProd={};delivered.forEach(function(o){
-    if(!byProd[o.prod])byProd[o.prod]={Product:o.prod,Units:0,Revenue:0};
+    if(!byProd[o.prod])byProd[o.prod]={Product:unescapeForEdit(o.prod),Units:0,Revenue:0};
     byProd[o.prod].Units+=o.qty;byProd[o.prod].Revenue+=o.qty*o.price;});
   var byCust={};delivered.forEach(function(o){
     var cu=(D.customers||[]).find(function(x){return x.id===o.cId;});var n=cu?cu.name:"Unknown";
-    if(!byCust[n])byCust[n]={Customer:n,Orders:0,Revenue:0};
+    if(!byCust[n])byCust[n]={Customer:cu?unescapeForEdit(cu.name):"Unknown",Orders:0,Revenue:0};
     byCust[n].Orders++;byCust[n].Revenue+=o.qty*o.price;});
   var wb=XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(Object.values(byProd)),"By Product");
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(Object.values(byCust).sort(function(a,b){return b.Revenue-a.Revenue;})),"By Customer");
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(delivered.map(function(o){var cu=(D.customers||[]).find(function(x){return x.id===o.cId;});return{Date:o.deliveredAt||o.date,Order:o.id,Customer:cu?cu.name:"",Product:o.prod,Qty:o.qty,Price:o.price,Revenue:o.qty*o.price,Driver:o.driver||"",Payment:o.paid};})),"Orders Detail");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(delivered.map(function(o){var cu=(D.customers||[]).find(function(x){return x.id===o.cId;});return{Date:o.deliveredAt||o.date,Order:o.id,Customer:cu?unescapeForEdit(cu.name):"",Product:unescapeForEdit(o.prod),Qty:o.qty,Price:o.price,Revenue:o.qty*o.price,Driver:unescapeForEdit(o.driver||""),Payment:o.paid};})),"Orders Detail");
   // Driver performance sheet
-  var drvMap2={};delivered.forEach(function(o){var d=o.completedBy||o.driver||"Unassigned";var asgn=o.driver||"Unassigned";if(!drvMap2[d])drvMap2[d]={"Completed By":d,"Assigned Driver":asgn===d?"(same)":asgn,Deliveries:0,Units:0,Revenue:0};drvMap2[d].Deliveries++;drvMap2[d].Units+=o.qty;drvMap2[d].Revenue+=o.qty*o.price;});
+  var drvMap2={};delivered.forEach(function(o){var d=o.completedBy||o.driver||"Unassigned";var asgn=o.driver||"Unassigned";if(!drvMap2[d])drvMap2[d]={"Completed By":unescapeForEdit(d),"Assigned Driver":asgn===d?"(same)":unescapeForEdit(asgn),Deliveries:0,Units:0,Revenue:0};drvMap2[d].Deliveries++;drvMap2[d].Units+=o.qty;drvMap2[d].Revenue+=o.qty*o.price;});
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(Object.values(drvMap2).sort(function(a,b){return b.Deliveries-a.Deliveries;})),"Driver Performance");
   // Audit log sheet (last 100 events)
   if(D.auditLog&&(D.auditLog||[]).length){
-    var auditRows=(D.auditLog||[]).slice().reverse().map(function(e){return{Timestamp:e.ts,User:e.user,Role:e.role,Action:e.action,Details:e.details||""};});
+    var auditRows=(D.auditLog||[]).slice().reverse().map(function(e){return{Timestamp:e.ts,User:unescapeForEdit(e.user||""),Role:e.role,Action:e.action,Details:unescapeForEdit(e.details||"")};});
     XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(auditRows),"Audit Log");
   }
   XLSX.writeFile(wb,"NewDawn_Report_"+new Date().toISOString().slice(0,10)+".xlsx");
@@ -6833,12 +7061,10 @@ function rReports(){
     if(i.paid>=i.amount||i.voided)return false;
     if(!RPT_FROM&&!RPT_TO)return true;
     var ordMatch=i.notes&&i.notes.match(/#(\d+)/);
-    if(ordMatch){
-      var _ao=(D.orders||[]).find(function(x){return String(x.id)===ordMatch[1];});
-      if(_ao&&_ao.date){
-        if(RPT_FROM&&_ao.date<RPT_FROM)return false;
-        if(RPT_TO&&_ao.date>RPT_TO)return false;
-      }
+    var _ao=i.orderId?(D.orders||[]).find(function(x){return x.id===i.orderId;}):(ordMatch?(D.orders||[]).find(function(x){return String(x.id)===ordMatch[1];}):null);
+    if(_ao&&_ao.date){
+      if(RPT_FROM&&_ao.date<RPT_FROM)return false;
+      if(RPT_TO&&_ao.date>RPT_TO)return false;
     }
     return true;
   }).forEach(function(inv){
@@ -6971,8 +7197,9 @@ function exportAuditCSV(){
   var rows=["Timestamp,User,Role,Action,Details"];
   logs.forEach(function(e){
     var dt=e.ts?new Date(e.ts).toISOString().replace("T"," ").slice(0,19):"";
-    var det=(e.details||"").replace(/,/g,";").replace(/"/g,"'");
-    rows.push('"'+dt+'","'+(e.user||"")+'","'+(e.role||"")+'","'+(e.action||"")+'","'+det+'"');
+    var det=unescapeForEdit(e.details||"").replace(/,/g,";").replace(/"/g,"'");
+    var usr=unescapeForEdit(e.user||"");
+    rows.push('"'+dt+'","'+usr+'","'+(e.role||"")+'","'+(e.action||"")+'","'+det+'"');
   });
   var csv=rows.join("\n");
   var blob=new Blob([csv],{type:"text/csv"});
@@ -7440,13 +7667,13 @@ function buildBackupWB(){
   if(!can("exp"))return null;
   var wb=XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.customers||[]).map(function(c){return{ID:c.id,Name:unescapeForEdit(c.name),Phone:unescapeForEdit(c.phone),Phone2:unescapeForEdit(c.phone2||""),IDNo:unescapeForEdit(c.idno||""),Estate:unescapeForEdit(c.estate||""),Court:unescapeForEdit(c.court||""),HouseNo:unescapeForEdit(c.house||""),HouseType:c.htype||"",Road:unescapeForEdit(c.road||""),Zone:unescapeForEdit(c.zone||""),Type:c.ctype,Credit:c.credit||0,CreditLimit:c.creditLimit||0,CreditLog:c.creditLog&&c.creditLog.length?JSON.stringify(c.creditLog):"",Notes:unescapeForEdit(c.notes||""),Created:c.created||""};})),"Customers");
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.orders||[]).map(function(o){var c=(D.customers||[]).find(function(x){return x.id===o.cId;});return{ID:o.id,CustomerID:o.cId,CustomerName:c?c.name:"",Product:o.prod,Qty:o.qty,UnitPrice:o.price,Total:o.qty*o.price,Date:o.date,Status:o.status,Payment:o.paid,AmtPaid:o.amtPaid||0,Driver:o.driver||"",DeliveryAddr:o.deliver||"",BottleBefore:o.bottle_before||"",BottleAfter:o.bottle_after||"",Notes:o.notes||""};})),"Orders");
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.stock||[]).map(function(s){return{ID:s.id,Name:s.name,Size:s.size,SalePrice:s.price,CostPrice:s.cost,InStock:s.qty,MinLevel:s.min};})),"Stock");
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.offers||[]).map(function(o){return{ID:o.id,Title:o.title,Discount:o.disc,MinQty:o.minqty,Product:o.prod,StartDate:o.start,EndDate:o.end,Description:o.desc||"",Active:o.active?"Yes":"No"};})),"Offers");
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.invoices||[]).map(function(i){var c=(D.customers||[]).find(function(x){return x.id===i.cId;});var lp=(i.payments||[]).slice().sort(function(a,b){return b.date>a.date?1:-1;})[0];return{ID:i.id,CustomerID:i.cId,CustomerName:c?c.name:"",Amount:i.amount,Paid:i.paid,Balance:i.amount-i.paid,DueDate:i.due,IssueDate:i.date,Notes:i.notes||"",LastPayDate:lp?lp.date:"",LastPayAmt:lp?lp.amt:0,LastPayMethod:lp?lp.method:""};})),"Invoices");
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.complaints||[]).map(function(c){var cu=(D.customers||[]).find(function(x){return x.id===c.cId;});return{ID:c.id,CustomerID:c.cId,CustomerName:cu?cu.name:"",Type:c.type,Details:c.details,ActionTaken:c.action||"",Status:c.status,Date:c.date};})),"Complaints");
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.routes||[]).map(function(r){return{Name:r.name,Driver:r.driver,Vehicle:r.vehicle,Zone:r.zone,Days:r.days};})),"DeliveryRoutes");
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((USERS||[]).map(function(u){return{ID:u.id,Name:u.name,Role:u.role,Initials:u.ini};})),"Team");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.orders||[]).map(function(o){var c=(D.customers||[]).find(function(x){return x.id===o.cId;});return{ID:o.id,CustomerID:o.cId,CustomerName:c?unescapeForEdit(c.name):"",Product:unescapeForEdit(o.prod),StockID:o.stockId||"",InvoiceID:o.invoiceId||"",Qty:o.qty,UnitPrice:o.price,Total:o.qty*o.price,Date:o.date,Status:o.status,Payment:o.paid,AmtPaid:o.amtPaid||0,Driver:unescapeForEdit(o.driver||""),DeliveryAddr:unescapeForEdit(o.deliver||""),BottleBefore:o.bottle_before||"",BottleAfter:o.bottle_after||"",Notes:unescapeForEdit(o.notes||"")};})),"Orders");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.stock||[]).map(function(s){return{ID:s.id,Name:unescapeForEdit(s.name),Size:unescapeForEdit(s.size||""),SalePrice:s.price,CostPrice:s.cost,InStock:s.qty,MinLevel:s.min};})),"Stock");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.offers||[]).map(function(o){return{ID:o.id,Title:unescapeForEdit(o.title),Discount:o.disc,MinQty:o.minqty,Product:unescapeForEdit(o.prod),StartDate:o.start,EndDate:o.end,Description:unescapeForEdit(o.desc||""),Active:o.active?"Yes":"No"};})),"Offers");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.invoices||[]).map(function(i){var c=(D.customers||[]).find(function(x){return x.id===i.cId;});var lp=(i.payments||[]).slice().sort(function(a,b){return b.date>a.date?1:-1;})[0];return{ID:i.id,OrderID:i.orderId||"",CustomerID:i.cId,CustomerName:c?unescapeForEdit(c.name):"",Amount:i.amount,Paid:i.paid,Balance:i.amount-i.paid,DueDate:i.due,IssueDate:i.date,Notes:unescapeForEdit(i.notes||""),LastPayDate:lp?lp.date:"",LastPayAmt:lp?lp.amt:0,LastPayMethod:lp?unescapeForEdit(lp.method||""):""};})),"Invoices");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.complaints||[]).map(function(c){var cu=(D.customers||[]).find(function(x){return x.id===c.cId;});return{ID:c.id,CustomerID:c.cId,CustomerName:cu?unescapeForEdit(cu.name):"",Type:c.type,Details:unescapeForEdit(c.details||""),ActionTaken:unescapeForEdit(c.action||""),Status:c.status,Date:c.date};})),"Complaints");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.routes||[]).map(function(r){return{Name:unescapeForEdit(r.name||""),Driver:unescapeForEdit(r.driver||""),Vehicle:unescapeForEdit(r.vehicle||""),Zone:unescapeForEdit(r.zone||""),Days:r.days};})),"DeliveryRoutes");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((USERS||[]).map(function(u){return{ID:u.id,Name:unescapeForEdit(u.name),Role:u.role,Initials:u.ini};})),"Team");
   // FIX (2026-07-21): format-version marker, so a future import can detect
   // whether this workbook came from the old export code (no separate Credit
   // column - the balance was written under the CreditLimit header instead)
@@ -7720,6 +7947,12 @@ function saveEJConfig(){
   rExcel();
 }
 function sendEmailBackup(manual){
+  // FIX (2026-07-21): the "Send test now" button was only UI-gated (the
+  // whole card is hidden for non-directors) - this adds a real check for
+  // the manual, user-triggered path specifically, without touching the
+  // automatic scheduled path, which legitimately needs to run regardless
+  // of who happens to be logged in when it fires.
+  if(manual&&!can("rest")){toast("Only Directors can send a manual backup","err");return;}
   if(!ejConfigured()){if(manual)toast("Set up email backup first in Data tab","err");return;}
   var today=new Date().toISOString().split("T")[0];
   if(!manual&&EJ_LAST_SENT===today){return;}
@@ -7919,22 +8152,22 @@ function restoreXL(input){
         toast("⚠️ This backup predates the Credit/CreditLimit fix — every customer's Credit and CreditLimit have been set to ZERO (not preserved) to avoid misreading old data. Re-enter any real customer credit manually.","warn");
       }
 
-      var c=get("Customers");if(c&&c.length)D.customers=c.map(function(r){var _cLog=[];if(!_isLegacyFormat&&r.CreditLog){try{_cLog=JSON.parse(r.CreditLog);}catch(e){_cLog=[];}}return{id:(r.ID!==undefined&&r.ID!==null&&r.ID!=="")?r.ID:Date.now()+Math.floor(Math.random()*1000),name:sanitizeInput(r.Name||""),phone:sanitizeInput(r.Phone||""),phone2:sanitizeInput(r.Phone2||""),idno:sanitizeInput(r.IDNo||""),estate:sanitizeInput(r.Estate||""),court:sanitizeInput(r.Court||""),house:sanitizeInput(r.HouseNo||""),htype:r.HouseType||"House",road:sanitizeInput(r.Road||""),zone:sanitizeInput(r.Zone||""),ctype:r.Type||"Residential",credit:_isLegacyFormat?0:(r.Credit||0),creditLimit:_isLegacyFormat?0:(r.CreditLimit||0),creditLog:_cLog,notes:sanitizeInput(r.Notes||""),created:r.Created||""};});
+      var c=get("Customers");if(c&&c.length)D.customers=c.map(function(r){var _cLog=[];if(!_isLegacyFormat&&r.CreditLog){try{_cLog=JSON.parse(r.CreditLog);}catch(e){_cLog=[];}}return{id:(r.ID!==undefined&&r.ID!==null&&r.ID!=="")?Number(r.ID):Date.now()+Math.floor(Math.random()*1000),name:sanitizeInput(r.Name||""),phone:sanitizeInput(r.Phone||""),phone2:sanitizeInput(r.Phone2||""),idno:sanitizeInput(r.IDNo||""),estate:sanitizeInput(r.Estate||""),court:sanitizeInput(r.Court||""),house:sanitizeInput(r.HouseNo||""),htype:r.HouseType||"House",road:sanitizeInput(r.Road||""),zone:sanitizeInput(r.Zone||""),ctype:r.Type||"Residential",credit:_isLegacyFormat?0:(_numCoerce(r.Credit)),creditLimit:_isLegacyFormat?0:(_numCoerce(r.CreditLimit)),creditLog:_cLog,notes:sanitizeInput(r.Notes||""),created:r.Created||""};});
       else if(c)D.customers=[];
 
-      var o=get("Orders");if(o&&o.length)D.orders=o.map(function(r){return{id:(r.ID!==undefined&&r.ID!==null&&r.ID!=="")?r.ID:Date.now()+Math.floor(Math.random()*1000),cId:r.CustomerID||0,prod:sanitizeInput(r.Product||""),qty:r.Qty||0,price:r.UnitPrice||0,date:r.Date||"",status:r.Status||"Pending",paid:r.Payment||"Unpaid",amtPaid:r.AmtPaid||0,driver:sanitizeInput(r.Driver||""),deliver:sanitizeInput(r.DeliveryAddr||""),bottle_before:sanitizeInput(r.BottleBefore||"Good"),bottle_after:r.BottleAfter?sanitizeInput(r.BottleAfter):null,notes:sanitizeInput(r.Notes||"")};});
+      var o=get("Orders");if(o&&o.length)D.orders=o.map(function(r){return{id:(r.ID!==undefined&&r.ID!==null&&r.ID!=="")?Number(r.ID):Date.now()+Math.floor(Math.random()*1000),cId:_numCoerce(r.CustomerID),prod:sanitizeInput(r.Product||""),stockId:r.StockID?_numCoerce(r.StockID):null,invoiceId:r.InvoiceID?_numCoerce(r.InvoiceID):null,qty:_numCoerce(r.Qty),price:_numCoerce(r.UnitPrice),date:r.Date||"",status:r.Status||"Pending",paid:r.Payment||"Unpaid",amtPaid:_numCoerce(r.AmtPaid),driver:sanitizeInput(r.Driver||""),deliver:sanitizeInput(r.DeliveryAddr||""),bottle_before:sanitizeInput(r.BottleBefore||"Good"),bottle_after:r.BottleAfter?sanitizeInput(r.BottleAfter):null,notes:sanitizeInput(r.Notes||"")};});
       else if(o)D.orders=[];
 
-      var s=get("Stock");if(s&&s.length)D.stock=s.map(function(r){return{id:(r.ID!==undefined&&r.ID!==null&&r.ID!=="")?r.ID:Date.now()+Math.floor(Math.random()*1000),name:sanitizeInput(r.Name||""),size:sanitizeInput(r.Size||""),price:r.SalePrice||0,cost:r.CostPrice||0,qty:r.InStock||0,min:r.MinLevel||10};});
+      var s=get("Stock");if(s&&s.length)D.stock=s.map(function(r){return{id:(r.ID!==undefined&&r.ID!==null&&r.ID!=="")?Number(r.ID):Date.now()+Math.floor(Math.random()*1000),name:sanitizeInput(r.Name||""),size:sanitizeInput(r.Size||""),price:_numCoerce(r.SalePrice),cost:_numCoerce(r.CostPrice),qty:_numCoerce(r.InStock),min:_numCoerce(r.MinLevel)||10};});
       else if(s)D.stock=[];
 
-      var of=get("Offers");if(of&&of.length)D.offers=of.map(function(r){return{id:(r.ID!==undefined&&r.ID!==null&&r.ID!=="")?r.ID:Date.now()+Math.floor(Math.random()*1000),title:sanitizeInput(r.Title||""),disc:r.Discount||0,minqty:r.MinQty||1,prod:sanitizeInput(r.Product||""),start:r.StartDate||"",end:r.EndDate||"",desc:sanitizeInput(r.Description||""),active:r.Active==="Yes"};});
+      var of=get("Offers");if(of&&of.length)D.offers=of.map(function(r){return{id:(r.ID!==undefined&&r.ID!==null&&r.ID!=="")?Number(r.ID):Date.now()+Math.floor(Math.random()*1000),title:sanitizeInput(r.Title||""),disc:_numCoerce(r.Discount),minqty:_numCoerce(r.MinQty)||1,prod:sanitizeInput(r.Product||""),start:r.StartDate||"",end:r.EndDate||"",desc:sanitizeInput(r.Description||""),active:r.Active==="Yes"};});
       else if(of)D.offers=[];
 
-      var iv=get("Invoices");if(iv&&iv.length)D.invoices=iv.map(function(r){var pays=[];if(r.LastPayAmt&&r.LastPayAmt>0)pays.push({date:r.LastPayDate||tday(),amt:r.LastPayAmt,method:sanitizeInput(r.LastPayMethod||"Cash"),ref:"Restored"});return{id:(r.ID!==undefined&&r.ID!==null&&r.ID!=="")?r.ID:Date.now()+Math.floor(Math.random()*1000),cId:r.CustomerID||0,amount:r.Amount||0,paid:r.Paid||0,due:r.DueDate||"",notes:sanitizeInput(r.Notes||""),date:r.IssueDate||tday(),payments:pays};});
+      var iv=get("Invoices");if(iv&&iv.length)D.invoices=iv.map(function(r){var pays=[];if(r.LastPayAmt&&_numCoerce(r.LastPayAmt)>0)pays.push({date:r.LastPayDate||tday(),amt:_numCoerce(r.LastPayAmt),method:sanitizeInput(r.LastPayMethod||"Cash"),ref:"Restored"});return{id:(r.ID!==undefined&&r.ID!==null&&r.ID!=="")?Number(r.ID):Date.now()+Math.floor(Math.random()*1000),orderId:r.OrderID?_numCoerce(r.OrderID):null,cId:_numCoerce(r.CustomerID),amount:_numCoerce(r.Amount),paid:_numCoerce(r.Paid),due:r.DueDate||"",notes:sanitizeInput(r.Notes||""),date:r.IssueDate||tday(),payments:pays};});
       else if(iv)D.invoices=[];
 
-      var cmp=get("Complaints");if(cmp&&cmp.length)D.complaints=cmp.map(function(r){return{id:(r.ID!==undefined&&r.ID!==null&&r.ID!=="")?r.ID:Date.now()+Math.floor(Math.random()*1000),cId:r.CustomerID||0,type:sanitizeInput(r.Type||"Other"),details:sanitizeInput(r.Details||""),action:sanitizeInput(r.ActionTaken||""),status:r.Status||"Open",date:r.Date||tday()};});
+      var cmp=get("Complaints");if(cmp&&cmp.length)D.complaints=cmp.map(function(r){return{id:(r.ID!==undefined&&r.ID!==null&&r.ID!=="")?Number(r.ID):Date.now()+Math.floor(Math.random()*1000),cId:_numCoerce(r.CustomerID),type:sanitizeInput(r.Type||"Other"),details:sanitizeInput(r.Details||""),action:sanitizeInput(r.ActionTaken||""),status:r.Status||"Open",date:r.Date||tday()};});
       else if(cmp)D.complaints=[];
 
       var rt=get("DeliveryRoutes");if(rt&&rt.length)D.routes=rt.map(function(r){return{name:sanitizeInput(r.Name||""),driver:sanitizeInput(r.Driver||""),vehicle:sanitizeInput(r.Vehicle||""),zone:sanitizeInput(r.Zone||""),days:sanitizeInput(r.Days||"")};});
@@ -7942,8 +8175,8 @@ function restoreXL(input){
 
       var tm=get("Team");if(tm&&tm.length){
         var restoredUsers=tm.map(function(r){
-          var existing=(USERS||[]).find(function(u){return u.id===r.ID;});
-          return existing||{id:r.ID||Date.now(),name:r.Name||"User",role:(R[r.Role]?r.Role:"staff"),pin:"1234",ini:r.Initials||"US",col:"#1a1560"};
+          var existing=(USERS||[]).find(function(u){return u.id===Number(r.ID);});
+          return existing||{id:Number(r.ID)||Date.now(),name:r.Name||"User",role:(R[r.Role]?r.Role:"staff"),pin:"1234",ini:r.Initials||"US",col:"#1a1560"};
         });
         if(restoredUsers.length)USERS=restoredUsers;
       }
@@ -8092,6 +8325,11 @@ function runIntegrityCheck(){
   // Check 3: orphaned invoices (no matching order, amount unpaid)
   (D.invoices||[]).forEach(function(inv){
     if(inv.paid>=inv.amount||inv.voided)return; // paid or voided — ignore
+    if(inv.orderId){
+      var o2=(D.orders||[]).find(function(x){return x.id===inv.orderId;});
+      if(!o2)issues.push("Invoice #"+inv.id+" references deleted order #"+inv.orderId+" — KSh "+(inv.amount-inv.paid)+" outstanding");
+      return;
+    }
     var ordMatch=inv.notes&&inv.notes.match(/#(\d+)/);
     if(ordMatch){
       var o=(D.orders||[]).find(function(x){return String(x.id)===ordMatch[1];});
@@ -8172,7 +8410,7 @@ function syncPaymentStatuses(){
     // cancelled order as "Paid", masking the fact that it was cancelled.
     if(o.status==="Cancelled")return;
     var inv=(D.invoices||[]).find(function(i){
-      return i.cId===o.cId&&i.notes&&i.notes.indexOf("#"+o.id)!==-1;
+      return i.cId===o.cId&&((o.invoiceId&&i.id===o.invoiceId)||(!o.invoiceId&&i.notes&&i.notes.match(new RegExp("#"+o.id+"(\\D|$)"))));
     });
     // Same principle applies to a voided invoice — voidInvoice._confirm()
     // deliberately sets o.paid="Voided" so the write-off is visible on the
@@ -8213,42 +8451,42 @@ function mergeXL(input){
 
       get("Customers").forEach(function(r){
         if(!hasId(r.ID)||!r.Name)return;
-        if((D.customers||[]).find(function(x){return x.id===r.ID;})){rep.customers.skipped++;return;}
+        if((D.customers||[]).find(function(x){return x.id===Number(r.ID);})){rep.customers.skipped++;return;}
         var _mCLog=[];if(!_mergeIsLegacy&&r.CreditLog){try{_mCLog=JSON.parse(r.CreditLog);}catch(e){_mCLog=[];}}
-        (D.customers||[]).push({id:r.ID,name:sanitizeInput(r.Name||""),phone:sanitizeInput(r.Phone||""),phone2:sanitizeInput(r.Phone2||""),idno:sanitizeInput(r.IDNo||""),estate:sanitizeInput(r.Estate||""),court:sanitizeInput(r.Court||""),house:sanitizeInput(r.HouseNo||""),htype:r.HouseType||"House",road:sanitizeInput(r.Road||""),zone:sanitizeInput(r.Zone||""),ctype:r.Type||"Residential",credit:_mergeIsLegacy?0:(r.Credit||0),creditLimit:_mergeIsLegacy?0:(r.CreditLimit||0),creditLog:_mCLog,notes:sanitizeInput(r.Notes||""),created:r.Created||""});
+        (D.customers||[]).push({id:Number(r.ID),name:sanitizeInput(r.Name||""),phone:sanitizeInput(r.Phone||""),phone2:sanitizeInput(r.Phone2||""),idno:sanitizeInput(r.IDNo||""),estate:sanitizeInput(r.Estate||""),court:sanitizeInput(r.Court||""),house:sanitizeInput(r.HouseNo||""),htype:r.HouseType||"House",road:sanitizeInput(r.Road||""),zone:sanitizeInput(r.Zone||""),ctype:r.Type||"Residential",credit:_mergeIsLegacy?0:(_numCoerce(r.Credit)),creditLimit:_mergeIsLegacy?0:(_numCoerce(r.CreditLimit)),creditLog:_mCLog,notes:sanitizeInput(r.Notes||""),created:r.Created||""});
         rep.customers.added++;
       });
       get("Orders").forEach(function(r){
         if(!hasId(r.ID))return;
-        if((D.orders||[]).find(function(x){return x.id===r.ID;})){rep.orders.skipped++;return;}
-        (D.orders||[]).push({id:r.ID,cId:r.CustomerID||0,prod:sanitizeInput(r.Product||""),qty:r.Qty||0,price:r.UnitPrice||0,date:r.Date||"",status:r.Status||"Pending",paid:r.Payment||"Unpaid",amtPaid:r.AmtPaid||0,driver:sanitizeInput(r.Driver||""),deliver:sanitizeInput(r.DeliveryAddr||""),bottle_before:sanitizeInput(r.BottleBefore||"Good"),bottle_after:r.BottleAfter?sanitizeInput(r.BottleAfter):null,notes:sanitizeInput(r.Notes||"")});
+        if((D.orders||[]).find(function(x){return x.id===Number(r.ID);})){rep.orders.skipped++;return;}
+        (D.orders||[]).push({id:Number(r.ID),cId:_numCoerce(r.CustomerID),prod:sanitizeInput(r.Product||""),stockId:r.StockID?_numCoerce(r.StockID):null,invoiceId:r.InvoiceID?_numCoerce(r.InvoiceID):null,qty:_numCoerce(r.Qty),price:_numCoerce(r.UnitPrice),date:r.Date||"",status:r.Status||"Pending",paid:r.Payment||"Unpaid",amtPaid:_numCoerce(r.AmtPaid),driver:sanitizeInput(r.Driver||""),deliver:sanitizeInput(r.DeliveryAddr||""),bottle_before:sanitizeInput(r.BottleBefore||"Good"),bottle_after:r.BottleAfter?sanitizeInput(r.BottleAfter):null,notes:sanitizeInput(r.Notes||"")});
         rep.orders.added++;
       });
       get("Invoices").forEach(function(r){
         if(!hasId(r.ID))return;
-        var ex=(D.invoices||[]).find(function(x){return x.id===r.ID;});
+        var ex=(D.invoices||[]).find(function(x){return x.id===Number(r.ID);});
         if(ex){
-          if(r.Paid>ex.paid){var diff=r.Paid-ex.paid;if(!ex.payments)ex.payments=[];ex.payments.push({date:r.LastPayDate||tday(),amt:diff,method:sanitizeInput(r.LastPayMethod||"Cash"),ref:"Merged"});ex.paid=r.Paid;}
+          var _rPaid=_numCoerce(r.Paid);if(_rPaid>ex.paid){var diff=_round2(_rPaid-ex.paid);if(!ex.payments)ex.payments=[];ex.payments.push({pid:uid(),date:r.LastPayDate||tday(),amt:diff,method:sanitizeInput(r.LastPayMethod||"Cash"),ref:"Merged"});ex.paid=_rPaid;}
           rep.invoices.skipped++;return;
         }
-        (D.invoices||[]).push({id:r.ID,cId:r.CustomerID||0,amount:r.Amount||0,paid:r.Paid||0,due:r.DueDate||"",notes:sanitizeInput(r.Notes||""),date:r.IssueDate||tday(),payments:r.Paid>0?[{date:r.LastPayDate||tday(),amt:r.Paid,method:sanitizeInput(r.LastPayMethod||"Cash"),ref:"Merged"}]:[]});
+        (D.invoices||[]).push({id:Number(r.ID),orderId:r.OrderID?_numCoerce(r.OrderID):null,cId:_numCoerce(r.CustomerID),amount:_numCoerce(r.Amount),paid:_numCoerce(r.Paid),due:r.DueDate||"",notes:sanitizeInput(r.Notes||""),date:r.IssueDate||tday(),payments:_numCoerce(r.Paid)>0?[{date:r.LastPayDate||tday(),amt:_numCoerce(r.Paid),method:sanitizeInput(r.LastPayMethod||"Cash"),ref:"Merged"}]:[]});
         rep.invoices.added++;
       });
       get("Complaints").forEach(function(r){
         if(!hasId(r.ID))return;
-        if((D.complaints||[]).find(function(x){return x.id===r.ID;})){rep.complaints.skipped++;return;}
-        (D.complaints||[]).push({id:r.ID,cId:r.CustomerID||0,type:sanitizeInput(r.Type||"Other"),details:sanitizeInput(r.Details||""),action:sanitizeInput(r.ActionTaken||""),status:r.Status||"Open",date:r.Date||tday()});
+        if((D.complaints||[]).find(function(x){return x.id===Number(r.ID);})){rep.complaints.skipped++;return;}
+        (D.complaints||[]).push({id:Number(r.ID),cId:_numCoerce(r.CustomerID),type:sanitizeInput(r.Type||"Other"),details:sanitizeInput(r.Details||""),action:sanitizeInput(r.ActionTaken||""),status:r.Status||"Open",date:r.Date||tday()});
         rep.complaints.added++;
       });
       get("Stock").forEach(function(r){
         if(!hasId(r.ID)||!r.Name)return;
-        var ex=(D.stock||[]).find(function(x){return x.id===r.ID;});
-        if(ex){if(ex.qty!==r.InStock)rep.stock.conflicts.push({id:r.ID,name:sanitizeInput(r.Name),master:ex.qty,incoming:r.InStock});return;}
-        (D.stock||[]).push({id:r.ID,name:sanitizeInput(r.Name||""),size:sanitizeInput(r.Size||""),price:r.SalePrice||0,cost:r.CostPrice||0,qty:r.InStock||0,min:r.MinLevel||10});
+        var ex=(D.stock||[]).find(function(x){return x.id===Number(r.ID);});
+        if(ex){if(ex.qty!==r.InStock)rep.stock.conflicts.push({id:Number(r.ID),name:sanitizeInput(r.Name),master:ex.qty,incoming:r.InStock});return;}
+        (D.stock||[]).push({id:Number(r.ID),name:sanitizeInput(r.Name||""),size:sanitizeInput(r.Size||""),price:_numCoerce(r.SalePrice),cost:_numCoerce(r.CostPrice),qty:_numCoerce(r.InStock),min:_numCoerce(r.MinLevel)||10});
       });
       get("Offers").forEach(function(r){
         if(!hasId(r.ID))return;
-        if(!(D.offers||[]).find(function(x){return x.id===r.ID;}))(D.offers||[]).push({id:r.ID,title:sanitizeInput(r.Title||""),disc:r.Discount||0,minqty:r.MinQty||1,prod:sanitizeInput(r.Product||""),start:r.StartDate||"",end:r.EndDate||"",desc:sanitizeInput(r.Description||""),active:r.Active==="Yes"});
+        if(!(D.offers||[]).find(function(x){return x.id===Number(r.ID);}))(D.offers||[]).push({id:Number(r.ID),title:sanitizeInput(r.Title||""),disc:_numCoerce(r.Discount),minqty:_numCoerce(r.MinQty)||1,prod:sanitizeInput(r.Product||""),start:r.StartDate||"",end:r.EndDate||"",desc:sanitizeInput(r.Description||""),active:r.Active==="Yes"});
       });
 
       syncIdCounters();
@@ -8292,6 +8530,10 @@ function mergeXL(input){
   reader.readAsArrayBuffer(file);input.value="";
 }
 function resStock(id,qty){
+  // FIX (2026-07-21): same pattern found and fixed 4 times already today -
+  // this is only ever reachable through mergeXL's director-only gate, but
+  // never re-verified the permission itself.
+  if(!can("rest")){toast("Only Directors can resolve import conflicts","err");return;}
   var s=(D.stock||[]).find(function(x){return x.id===id;});
   if(s){s.qty=qty;dirty();toast(unescapeForEdit(s.name)+" qty set to "+qty);}
 }
