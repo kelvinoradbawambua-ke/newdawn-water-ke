@@ -1731,15 +1731,28 @@ function startCloudListener(isWarmRefresh){
         if(!isOwnWrite){
           var remoteOrdIds={};
           data.D.orders.forEach(function(o){remoteOrdIds[o.id]=true;});
-          var fiveMinAgo=Date.now()-300000;
+          // FIX (2026-07-25): this used to also remove an order older than
+          // 5 minutes with no tombstone, purely on a status/age guess - a
+          // real, ongoing cause of orders silently vanishing. A genuine
+          // real-world sync delay (a phone losing signal, the app going to
+          // the background mid-delivery, a slow connection) longer than 5
+          // minutes between an order being created and its own write
+          // reaching the server was all it took: another device's
+          // snapshot would arrive in the meantime, this order wouldn't be
+          // in it yet, no tombstone existed because nobody ever deleted
+          // it, and it was removed anyway. This is the exact class of loss
+          // the reconciliation tool was built to recover from after the
+          // fact - closing it here is better than recovering from it
+          // afterward. Orders now follow the same safe rule already used
+          // for customers: never removed without an explicit tombstone,
+          // regardless of age or status. A stray extra record a director
+          // can dismiss is far cheaper than a silently lost one.
           D.orders=(D.orders||[]).filter(function(o){
             if(remoteOrdIds[o.id])return true; // still present remotely — keep
             var _sharedDelAt=(data.D.deletedOrderIds&&data.D.deletedOrderIds[o.id])||(D.deletedOrderIds&&D.deletedOrderIds[o.id]);
             var _delAt=_recentlyDeletedOrderIds[o.id]||_sharedDelAt;
             if(_delAt){console.log("[NDSYNC] order id="+o.id+" REMOVED — explicit tombstone found");return false;}
-            var keep=o.status==="Delivered"||(o._ts&&o._ts>fiveMinAgo);
-            if(!keep)console.log("[NDSYNC] order id="+o.id+" REMOVED — not in remote, no tombstone, status="+o.status+" _ts age(ms)="+(o._ts?Date.now()-o._ts:"none"));
-            return keep;
+            return true; // no tombstone — never infer deletion from absence alone
           });
         }
       }
@@ -6001,6 +6014,22 @@ function _computeMissingOrders(){
     var cm=e.details.match(/customer #(\d+)/);
     placed[m[1]]={id:parseInt(m[1]),prod:m[2],qty:parseInt(m[3]),ts:e.ts,auditCId:cm?parseInt(cm[1]):null,placedByUid:e.uid,placedByName:e.user};
   });
+  // ENHANCEMENT (2026-07-25): also check whether the missing order was
+  // already completed before it went missing - a real, recurring pattern
+  // (place and deliver within the same minute, a genuine walk-in/on-the-
+  // spot handover) meant orders were being lost AFTER already being
+  // delivered, cash collected and all. Recreating those as a fresh
+  // "Pending" order loses that real history and creates confusing double
+  // work. If a completion entry exists for this same order, the
+  // recreation should reflect that it already happened.
+  var delivered={};
+  (D.auditLog||[]).forEach(function(e){
+    if(e.action!=="DELIVERY_COMPLETE")return;
+    var dm=e.details&&e.details.match(/^Order #(\d+) completed by ([^(]+)\(/);
+    if(!dm)return;
+    var cashM=e.details.match(/Cash collected: KSh ([\d,.]+)/);
+    delivered[dm[1]]={driver:dm[2].trim(),cash:cashM?parseFloat(cashM[1].replace(/,/g,"")):0,ts:e.ts};
+  });
   var liveIds={};
   (D.orders||[]).forEach(function(o){liveIds[o.id]=true;});
   var missing=[];
@@ -6041,6 +6070,7 @@ function _computeMissingOrders(){
     });
     missing.push({
       origId:rec.id,prod:rec.prod,qty:rec.qty,ts:rec.ts,nearby:nearby,placedByUid:rec.placedByUid,placedByName:rec.placedByName,
+      wasDelivered:!!delivered[id],deliveredBy:delivered[id]?delivered[id].driver:null,cashCollected:delivered[id]?delivered[id].cash:0,
       cId:cust?cust.id:null,cName:cust?cust.name:"Unknown — select manually",
       price:inv?(inv.amount/rec.qty):null,
       source:(rec.auditCId&&cust)?"audit trail (most reliable)":(inv?"invoice":(viaCycle?"cycle history (price unknown — enter manually)":"none found"))
@@ -6194,19 +6224,49 @@ function recreateOrder(idx){
   var price=_round2(parseFloat(row.querySelector(".recon-price").value)||0);
   if(!cId){toast("Select a customer first","err");return;}
   if(!prod||qty<=0||price<=0){toast("Fill product, quantity and price","err");return;}
-  var orig=window._reconMissing[idx].origId;
-  if(!confirm("Recreate order originally #"+orig+" for this customer: "+unescapeForEdit(prod)+" x"+qty+" @ KSh "+price+"?\n\nThis creates a NEW order (Pending status) — you can then process/deliver it normally."))return;
+  var missingInfo=window._reconMissing[idx];
+  var orig=missingInfo.origId;
+  var wasDelivered=missingInfo.wasDelivered;
+  var deliveredBy=missingInfo.deliveredBy||"";
+  var cashCollected=missingInfo.cashCollected||0;
+  var confirmMsg="Recreate order originally #"+orig+" for this customer: "+unescapeForEdit(prod)+" x"+qty+" @ KSh "+price+"?";
+  if(wasDelivered){
+    confirmMsg+="\n\nThe audit trail shows this order was already delivered by "+unescapeForEdit(deliveredBy)+(cashCollected>0?" (KSh "+cashCollected+" collected)":"")+". It will be recreated already marked Delivered, with an invoice reflecting what was actually collected — not as a fresh Pending order.";
+  }else{
+    confirmMsg+="\n\nThis creates a NEW order (Pending status) — you can then process/deliver it normally.";
+  }
+  if(!confirm(confirmMsg))return;
   // FIX (2026-07-21): this was the one remaining raw nOId++ allocation
   // outside the reservation helpers - notably in the order-RECOVERY path,
   // used specifically to restore orders lost to the original ID-collision
   // bug. Recreating a lost order through the unfixed mechanism could
   // collide again.
-  reserveNextOrderId().then(function(newId){
+  reserveNextOrderAndInvoiceIds().then(function(reserved){
+    var newId=reserved.orderId,newInvId=reserved.invoiceId;
     var cust=(D.customers||[]).find(function(c){return c.id===cId;});
     var _stMatch=(D.stock||[]).find(function(s){return unescapeForEdit(s.name).toLowerCase()===unescapeForEdit(prod).toLowerCase();});
-    D.orders.push({id:newId,cId:cId,prod:prod,stockId:_stMatch?_stMatch.id:null,qty:qty,price:price,status:"Pending",date:tday(),_ts:Date.now(),
-      driver:"",paid:"Unpaid",notes:"Recovered via reconciliation — originally Order #"+orig});
-    auditLog("ORDER_PLACED","#"+newId+" "+prod+" x"+qty+" (recovered — originally #"+orig+") — customer #"+cId+" "+(function(){var _c=(D.customers||[]).find(function(x){return x.id===cId;});return _c?unescapeForEdit(_c.name):"unknown";})()+" by "+CU.name);
+    var total=_round2(price*qty);
+    var newOrder={id:newId,cId:cId,prod:prod,stockId:_stMatch?_stMatch.id:null,qty:qty,price:price,date:tday(),_ts:Date.now(),
+      notes:"Recovered via reconciliation — originally Order #"+orig};
+    if(wasDelivered){
+      newOrder.status="Delivered";
+      newOrder.driver=unescapeForEdit(deliveredBy);
+      newOrder.invoiceId=newInvId;
+      newOrder.paid=cashCollected>=total?"Paid":(cashCollected>0?"Partial":"Unpaid");
+      newOrder.amtPaid=cashCollected;
+      D.orders.push(newOrder);
+      (D.invoices||[]).push({id:newInvId,orderId:newId,cId:cId,amount:total,paid:_round2(cashCollected),due:tday(),date:tday(),
+        notes:"Order #"+newId,payments:cashCollected>0?[{pid:uid(),date:tday(),amt:_round2(cashCollected),method:"Cash",ref:"Recovered from delivery-completion audit record"}]:[]});
+      // Stock deliberately NOT re-deducted here — the real, physical stock
+      // was already given to the customer the first time this order was
+      // delivered. Re-deducting now would double-count against reality.
+    }else{
+      newOrder.status="Pending";
+      newOrder.driver="";
+      newOrder.paid="Unpaid";
+      D.orders.push(newOrder);
+    }
+    auditLog("ORDER_PLACED","#"+newId+" "+prod+" x"+qty+" (recovered — originally #"+orig+(wasDelivered?", already delivered":"")+") — customer #"+cId+" "+(cust?unescapeForEdit(cust.name):"unknown")+" by "+CU.name);
     toast("Order recreated as #"+newId);
     rOrds(undefined,ORD_PAGE);rDel();
     if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
