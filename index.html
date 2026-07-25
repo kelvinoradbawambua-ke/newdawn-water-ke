@@ -224,6 +224,23 @@ var _idleWarnTimer=null;
 var _recentlyDeletedOrderIds={}; // id->timestamp, prevents sync from resurrecting a just-deleted order
 var _recentlyVoidedInvoiceIds={}; // id->timestamp, prevents sync from silently un-voiding an invoice
 var _recentlyDeletedCustomerIds={}; // id->timestamp, prevents sync from resurrecting a just-deleted customer
+// FIX (2026-07-25): routes and complaints previously had no tombstone
+// system at all, which is why their rescue logic fell back to the same
+// 5-minute age-window heuristic already proven to cause orders to
+// silently vanish. Real tombstones here close that reintroduced gap.
+var _recentlyDeletedRouteIds={};
+var _recentlyDeletedComplaintIds={};
+// FIX (2026-07-25): proactive tombstone plumbing for stock and offers -
+// no delete feature exists for either today, which is exactly why their
+// rescue logic currently has no tombstone awareness at all. That's a
+// landmine: the moment a delete-stock or delete-offer feature is ever
+// added, every deleted item would resurrect on the very next snapshot,
+// silently, because the rescue would have nothing to check against. This
+// closes that ahead of time - a future delete feature only needs to set
+// these tombstones, matching the pattern used everywhere else, and the
+// rescue logic already correctly respects them.
+var _recentlyDeletedStockIds={};
+var _recentlyDeletedOfferIds={};
 var _idleWarnEl=null;
 var FB_RECONNECT_TIMER=null;
 var FB_LAST_SNAPSHOT=0; // timestamp of last successful snapshot — for heartbeat
@@ -480,22 +497,43 @@ function ia(v){return can("vInv")?"KSh "+Number(v).toLocaleString():"KSh "+Strin
 function sb(s){var m={"Delivered":"bg","Pending":"ba","Out for delivery":"bp","Processing":"bb","Cancelled":"br"};var ic={"Delivered":"ti-circle-check","Pending":"ti-clock","Out for delivery":"ti-truck","Processing":"ti-loader","Cancelled":"ti-x"};return "<span class=\"badge "+(m[s]||"ba")+"\"><i class=\"ti "+(ic[s]||"ti-circle")+"\" style=\"font-size:10px;margin-right:2px\"></i>"+s+"</span>";}
 function pb(p){if(p==="Cancelled")return "<span class=\"badge\" style=\"background:#f0f0f0;color:#999;border:1px solid #ddd\"><i class=\"ti ti-x\" style=\"font-size:10px;margin-right:2px\"></i>Cancelled</span>";var ic=p==="Paid"?"ti-check":p==="Partial"?"ti-clock":"ti-alert-circle";return "<span class=\"badge "+(p==="Paid"?"bg":p==="Partial"?"ba":"br")+"\"><i class=\"ti "+ic+"\" style=\"font-size:10px;margin-right:2px\"></i>"+p+"</span>";}
 function btl(v){if(!v||v==="Good")return "<span class=\"badge bg\">Good</span>";if(v==="Damaged")return "<span class=\"badge br\">Damaged</span>";if(v==="Cracked")return "<span class=\"badge ba\">Cracked</span>";return "<span class=\"badge bgr\">"+v+"</span>";}
+// FIX (2026-07-25): custDebt() is called once per customer when building a
+// debt map (dashboard, debtors page, and several other views) - each call
+// used to do a full .find() over every order for every unpaid invoice,
+// making the whole function O(invoices x orders) per customer. At a few
+// hundred customers/invoices/orders this is tens of millions of operations
+// per render. A lazily-rebuilt order-by-id index turns that inner lookup
+// into O(1). Rebuilding only when the order COUNT changes is safe and
+// cheap: JavaScript objects are references, so an existing order having a
+// field mutated (status, driver, etc.) is already reflected in the cached
+// reference without needing a rebuild - only a genuine add or delete
+// changes the count and requires one.
+var _ordByIdCache=null,_ordByIdCacheLen=-1;
+function _getOrdByIdIndex(){
+  var orders=D.orders||[];
+  if(_ordByIdCache&&_ordByIdCacheLen===orders.length)return _ordByIdCache;
+  _ordByIdCache={};
+  orders.forEach(function(o){_ordByIdCache[o.id]=o;});
+  _ordByIdCacheLen=orders.length;
+  return _ordByIdCache;
+}
 function custDebt(id){
   var cu=(D.customers||[]).find(function(x){return x.id===id;});
   var credit=(cu&&cu.credit>0)?cu.credit:0;
+  var _ordIdx=_getOrdByIdIndex();
   var gross=(D.invoices||[]).filter(function(i){
     if(i.cId!==id)return false;
     if(i.paid>=i.amount)return false; // fully paid, no debt
     if(i.voided)return false; // voided/written-off — excluded from debt
     // Check if linked to a cancelled or deleted order
     if(i.orderId){
-      var o=(D.orders||[]).find(function(x){return x.id===i.orderId;});
+      var o=_ordIdx[i.orderId];
       if(!o||o.status==="Cancelled")return false; // order gone or cancelled
     }else if(i.notes&&i.notes.indexOf("#")!==-1){
       var match=i.notes.match(/#(\d+)/);
       if(match){
         var oid=parseInt(match[1]);
-        var o=(D.orders||[]).find(function(x){return x.id===oid;});
+        var o=_ordIdx[oid];
         if(!o||o.status==="Cancelled")return false; // order gone or cancelled
       }
     }
@@ -727,7 +765,7 @@ function _mergeInvoicePayments(a,b){
   // key (date+amount+method+reference) now stands in as identity for any
   // entry that predates the pid field - two genuinely different payments
   // sharing all four of those exactly is not a realistic risk.
-  function _payKey(p){return p.pid||(p.date+"|"+p.amt+"|"+p.method+"|"+p.ref);}
+  function _payKey(p){return p.srcPp?("srcPp:"+p.srcPp):(p.pid||(p.date+"|"+p.amt+"|"+p.method+"|"+p.ref));}
   var merged=(a&&a.payments)?a.payments.slice():[];
   var seen={};
   merged.forEach(function(p){seen[_payKey(p)]=true;});
@@ -828,8 +866,14 @@ function processWriteQueue(){
   var cutoffDate=sixMonthsAgo.toISOString().split("T")[0];
   if(DforSync.orders&&DforSync.orders.length>500){
     // Keep all non-delivered + recent delivered; archive old delivered to backup
+    // FIX (2026-07-25): a delivered order with both deliveredAt and date
+    // blank used to evaluate as "" >= cutoffDate, which is always false -
+    // silently trimming it as if it were ancient. Mainly a real risk for
+    // CSV-imported delivered orders with a blank date column. A genuinely
+    // missing date now explicitly means "keep it," not "assume it's old."
     DforSync.orders=DforSync.orders.filter(function(o){
-      return o.status!=="Delivered"||(o.deliveredAt||o.date)>=cutoffDate;
+      var d=o.deliveredAt||o.date;
+      return o.status!=="Delivered"||!d||d>=cutoffDate;
     });
   }
   // SAME GUARD APPLIED TO COMPLAINTS (2026-07-21): unlike stock (bounded by
@@ -842,13 +886,13 @@ function processWriteQueue(){
   // every write is trimmed.
   if(DforSync.complaints&&DforSync.complaints.length>300){
     DforSync.complaints=DforSync.complaints.filter(function(c){
-      return c.status!=="Resolved"||(c.date||"")>=cutoffDate;
+      return c.status!=="Resolved"||!c.date||c.date>=cutoffDate;
     });
   }
   if(DforSync.invoices&&DforSync.invoices.length>500){
     // Keep unpaid + recent paid invoices
     DforSync.invoices=DforSync.invoices.filter(function(i){
-      return i.paid<i.amount||i.date>=cutoffDate;
+      return i.paid<i.amount||!i.date||i.date>=cutoffDate;
     });
   }
   // RACE-CONDITION MITIGATION (2026-07-20): before writing, check the
@@ -1552,6 +1596,14 @@ function startCloudListener(isWarmRefresh){
     console.log("[NDSYNC] startCloudListener called (warm refresh) — _cloudDataConfirmed left as-is ("+_cloudDataConfirmed+")");
   }
   FB_UNSUB=FB_DOC_REF.onSnapshot(function(doc){
+    // FIX (2026-07-25): the read-side rescue logic below keeps a rescued
+    // record in local memory, but never re-persisted it back to the cloud
+    // on its own - if the app reloaded before its next unrelated write,
+    // the rescue was undone, since the cloud still never had it. This
+    // flag, set by any rescue below, triggers exactly one debounced write
+    // at the end of this handler if anything was rescued this cycle -
+    // auto-healing every collection at once, not just orders.
+    var _anyRescueThisSync=false;
     FB_LAST_SNAPSHOT=Date.now();FB_RECONNECT_ATTEMPTS=0; // reset backoff on success
     _cloudDataConfirmed=true; // we now have authoritative knowledge of real state — safe to write from here on
     console.log("[NDSYNC] snapshot arrived — _cloudDataConfirmed=true, doc.exists="+doc.exists+", doc.metadata.fromCache="+(doc.metadata&&doc.metadata.fromCache));
@@ -1655,8 +1707,8 @@ function startCloudListener(isWarmRefresh){
     // 1. Preserve current audit log across merge
     var _prevAuditLog=D.auditLog&&(D.auditLog||[]).length?D.auditLog.slice():[];
     if(data.D.auditLog&&data.D.auditLog.length){
-      var _ex={};_prevAuditLog.forEach(function(e){if(e.ts)_ex[e.ts]=true;});
-      data.D.auditLog.forEach(function(e){if(e.ts&&!_ex[e.ts]){_prevAuditLog.push(e);_ex[e.ts]=true;}});
+      var _ex={};_prevAuditLog.forEach(function(e){var k=e._cid||e.ts;if(k)_ex[k]=true;});
+      data.D.auditLog.forEach(function(e){var k=e._cid||e.ts;if(k&&!_ex[k]){_prevAuditLog.push(e);_ex[k]=true;}});
       _prevAuditLog.sort(function(a,b){return a.ts<b.ts?-1:a.ts>b.ts?1:0;});
     }
 
@@ -1711,7 +1763,28 @@ function startCloudListener(isWarmRefresh){
           } else if(lo.status==="Delivered"&&ro.status!=="Delivered"){
             // Local already delivered — keep local (don't regress)
           } else if(!isOwnWrite){
-            // Neutral: take remote for other status changes
+            // FIX (2026-07-25): this used to be Object.assign(lo,ro) here
+            // too - taking the WHOLE remote order, meaning if one person
+            // edited the driver while another edited notes or delivery
+            // address on the same order, whichever snapshot happened to
+            // arrive last silently discarded the other's change. The order
+            // itself never vanished (unlike the bugs found elsewhere in
+            // this sweep) - just one edit quietly lost. Merges the fields
+            // most likely to be independently edited by different people
+            // field-by-field instead of wholesale: if local and remote
+            // disagree on driver/notes/deliver, prefer whichever side has
+            // a genuinely non-empty value over an empty one (an edit is
+            // more informative than the absence of one); if both sides
+            // have a real value, prefer local, since this device's own
+            // in-memory edit - not yet reflected in this remote snapshot -
+            // is the one actually at risk of being silently overwritten
+            // here. Every other field still takes remote as before.
+            var _preserveFields=["driver","notes","deliver"];
+            _preserveFields.forEach(function(f){
+              var lv=lo[f],rv=ro[f];
+              if(lv&&!rv)ro[f]=lv; // local has a real value, remote doesn't - keep local's
+              else if(lv&&rv&&lv!==rv)ro[f]=lv; // both have real, differing values - prefer this device's own in-memory edit
+            });
             Object.assign(lo,ro);
           }
         });
@@ -1752,6 +1825,8 @@ function startCloudListener(isWarmRefresh){
             var _sharedDelAt=(data.D.deletedOrderIds&&data.D.deletedOrderIds[o.id])||(D.deletedOrderIds&&D.deletedOrderIds[o.id]);
             var _delAt=_recentlyDeletedOrderIds[o.id]||_sharedDelAt;
             if(_delAt){console.log("[NDSYNC] order id="+o.id+" REMOVED — explicit tombstone found");return false;}
+            console.log("[NDSYNC] order id="+o.id+" kept locally though absent from this snapshot — no tombstone, scheduling a re-persist");
+            _anyRescueThisSync=true;
             return true; // no tombstone — never infer deletion from absence alone
           });
         }
@@ -1805,10 +1880,47 @@ function startCloudListener(isWarmRefresh){
             }
             return ri;
           });
+          // CRITICAL FIX (2026-07-25): the map() above only ever produces
+          // one output per REMOTE invoice - a brand-new invoice created
+          // locally (e.g. moments ago, when an order was placed) that
+          // hadn't yet reached the server was never in data.D.invoices at
+          // all, so it was silently dropped from the result entirely, not
+          // merged incorrectly - just gone. This is very likely a real
+          // contributor to orders going missing alongside their invoices,
+          // since both are created together and both were vulnerable to
+          // the same kind of gap. Rescues any local-only invoice not yet
+          // present remotely, unless it's been explicitly deleted.
+          var _remoteInvIds={};data.D.invoices.forEach(function(ri){_remoteInvIds[ri.id]=true;});
+          Object.keys(localInvMap).forEach(function(k){
+            var li=localInvMap[k];
+            if(_remoteInvIds[li.id])return; // already in the result via the map above
+            var _delTomb=(data.D.deletedInvoiceIds&&data.D.deletedInvoiceIds[li.id])||(D.deletedInvoiceIds&&D.deletedInvoiceIds[li.id]);
+            if(_delTomb)return; // explicitly deleted — do not resurrect
+            D.invoices.push(li);
+            _anyRescueThisSync=true;
+            console.log("[NDSYNC] snapshot merge RESCUED invoice id="+li.id+" that would otherwise have been silently dropped (not yet in remote)");
+          });
         }
       }
-      // Stock: take remote (restocks on any device)
-      if(data.D.stock)D.stock=data.D.stock;
+      // CRITICAL FIX (2026-07-25): this used to be a pure wholesale
+      // replacement (D.stock=data.D.stock) with zero protection for a
+      // brand-new, not-yet-synced product - a director adding a new item,
+      // then any other device's snapshot arriving within seconds, would
+      // silently wipe it out entirely, the same class of bug found and
+      // fixed for orders and invoices. There is no delete-stock function
+      // anywhere in this app, so the safe fix is simple here: always
+      // rescue any local-only stock item, since there is no legitimate
+      // deletion scenario to protect against for this entity type at all.
+      if(data.D.stock){
+        var _remoteStIds={};data.D.stock.forEach(function(s){_remoteStIds[s.id]=true;});
+        var _rescuedSt=(D.stock||[]).filter(function(s){
+          if(_remoteStIds[s.id])return false;
+          var _stDelAt=(data.D.deletedStockIds&&data.D.deletedStockIds[s.id])||(D.deletedStockIds&&D.deletedStockIds[s.id])||_recentlyDeletedStockIds[s.id];
+          return !_stDelAt;
+        });
+        D.stock=data.D.stock.concat(_rescuedSt);
+        if(_rescuedSt.length){_anyRescueThisSync=true;console.log("[NDSYNC] snapshot merge RESCUED "+_rescuedSt.length+" local-only stock item(s) not yet in remote");}
+      }
       // Pending payments: take remote wholesale, same as stock/invoices/routes
       // below — NOT an add-only merge. The old add-only approach ("only push
       // entries this device has never seen") meant that once a device had
@@ -1819,11 +1931,105 @@ function startCloudListener(isWarmRefresh){
       // The phone would keep showing "pending approval" forever, until logout
       // forced a full fresh load. A live OLTP system can't require a logout
       // to see a field change on a record it already has.
-      if(data.D.pendingPayments)D.pendingPayments=data.D.pendingPayments;
+      // CRITICAL FIX (2026-07-25): pendingPayments was a pure wholesale
+      // replacement with zero protection - the worst instance of this bug
+      // family, since it means a staff member's real, physical cash
+      // collection could vanish before it was ever acknowledged. The cash
+      // is genuinely in hand, but the system would have no record of it,
+      // the customer's debt never clears, and nobody gets prompted to
+      // acknowledge something that no longer exists. Pending payments are
+      // never deleted anywhere in this app, so a local-only record is
+      // always safe to rescue. Also properly merges the ack field for
+      // existing records: acknowledgment is a one-way transition, so if
+      // either side shows it acknowledged, that wins - closing the door on
+      // an already-acknowledged record ever reverting to "still pending"
+      // because a stale, not-yet-acknowledged copy arrived from elsewhere.
+      if(data.D.pendingPayments){
+        var _localPpMap={};(D.pendingPayments||[]).forEach(function(p){_localPpMap[p.id]=p;});
+        var _remotePpIds={};
+        D.pendingPayments=data.D.pendingPayments.map(function(rp){
+          var lp=_localPpMap[rp.id];
+          _remotePpIds[rp.id]=true;
+          if(lp&&lp.ack&&!rp.ack)return lp; // local already acknowledged - never let a stale remote copy undo that
+          return rp;
+        });
+        Object.keys(_localPpMap).forEach(function(k){
+          var lp=_localPpMap[k];
+          if(_remotePpIds[lp.id])return;
+          D.pendingPayments.push(lp);
+          _anyRescueThisSync=true;
+          console.log("[NDSYNC] snapshot merge RESCUED pending payment id="+lp.id+" that would otherwise have been silently dropped (not yet in remote)");
+        });
+      }
       // Routes, offers, complaints: take remote
-      if(data.D.routes)D.routes=data.D.routes;
-      if(data.D.offers)D.offers=data.D.offers;
-      if(data.D.complaints)D.complaints=data.D.complaints;
+      // FIX (2026-07-25): this used to rescue a local-only route only if
+      // it was created within the last 5 minutes - the exact same
+      // heuristic already proven to cause orders to silently vanish,
+      // reintroduced here because routes had no deletion tombstone at all.
+      // Now checks the real tombstone (added to delRoute above) instead of
+      // guessing from age, so a route created in the field with a genuine
+      // sync delay longer than 5 minutes is correctly rescued rather than
+      // silently dropped.
+      if(data.D.routes){
+        var _remoteRtIds={};data.D.routes.forEach(function(r){_remoteRtIds[r.id]=true;});
+        var _rescuedRt=(D.routes||[]).filter(function(r){
+          if(_remoteRtIds[r.id])return false;
+          var _rtDelAt=(data.D.deletedRouteIds&&data.D.deletedRouteIds[r.id])||(D.deletedRouteIds&&D.deletedRouteIds[r.id])||_recentlyDeletedRouteIds[r.id];
+          return !_rtDelAt;
+        });
+        D.routes=data.D.routes.concat(_rescuedRt);
+        if(_rescuedRt.length){_anyRescueThisSync=true;console.log("[NDSYNC] snapshot merge RESCUED "+_rescuedRt.length+" local-only route(s) not yet in remote");}
+      }
+      // Same fix as stock above - no delete-offer function exists, so
+      // always rescue any local-only offer not yet in the remote snapshot.
+      if(data.D.offers){
+        var _remoteOffIds={};data.D.offers.forEach(function(o){_remoteOffIds[o.id]=true;});
+        var _rescuedOff=(D.offers||[]).filter(function(o){
+          if(_remoteOffIds[o.id])return false;
+          var _offDelAt=(data.D.deletedOfferIds&&data.D.deletedOfferIds[o.id])||(D.deletedOfferIds&&D.deletedOfferIds[o.id])||_recentlyDeletedOfferIds[o.id];
+          return !_offDelAt;
+        });
+        D.offers=data.D.offers.concat(_rescuedOff);
+        if(_rescuedOff.length){_anyRescueThisSync=true;console.log("[NDSYNC] snapshot merge RESCUED "+_rescuedOff.length+" local-only offer(s) not yet in remote");}
+      }
+      // Same fix as routes above - real tombstone (added to delCmp),
+      // replacing the reintroduced 5-minute age-window vulnerability. For
+      // a customer-service record, a silently-dropped complaint is both a
+      // data-loss and a trust problem.
+      if(data.D.complaints){
+        var _remoteCmpIds={};data.D.complaints.forEach(function(c){_remoteCmpIds[c.id]=true;});
+        var _rescuedCmp=(D.complaints||[]).filter(function(c){
+          if(_remoteCmpIds[c.id])return false;
+          var _cmpDelAt=(data.D.deletedComplaintIds&&data.D.deletedComplaintIds[c.id])||(D.deletedComplaintIds&&D.deletedComplaintIds[c.id])||_recentlyDeletedComplaintIds[c.id];
+          return !_cmpDelAt;
+        });
+        D.complaints=data.D.complaints.concat(_rescuedCmp);
+        if(_rescuedCmp.length){_anyRescueThisSync=true;console.log("[NDSYNC] snapshot merge RESCUED "+_rescuedCmp.length+" local-only complaint(s) not yet in remote");}
+      }
+      // Merge the new tombstones themselves - union of local and remote,
+      // same pattern already used for orders/customers/invoices, so any
+      // device's deletion is remembered regardless of who deletes or syncs.
+      if(data.D.deletedRouteIds){
+        if(!D.deletedRouteIds)D.deletedRouteIds={};
+        Object.keys(data.D.deletedRouteIds).forEach(function(k){D.deletedRouteIds[k]=data.D.deletedRouteIds[k];});
+      }
+      if(data.D.deletedComplaintIds){
+        if(!D.deletedComplaintIds)D.deletedComplaintIds={};
+        Object.keys(data.D.deletedComplaintIds).forEach(function(k){D.deletedComplaintIds[k]=data.D.deletedComplaintIds[k];});
+      }
+      // Same tombstone-merging, proactively added for stock and offers -
+      // no delete feature exists for either yet, but this plumbing means
+      // one added later works correctly from day one, rather than needing
+      // this same fix applied retroactively after silently resurrecting
+      // deleted items in the meantime.
+      if(data.D.deletedStockIds){
+        if(!D.deletedStockIds)D.deletedStockIds={};
+        Object.keys(data.D.deletedStockIds).forEach(function(k){D.deletedStockIds[k]=data.D.deletedStockIds[k];});
+      }
+      if(data.D.deletedOfferIds){
+        if(!D.deletedOfferIds)D.deletedOfferIds={};
+        Object.keys(data.D.deletedOfferIds).forEach(function(k){D.deletedOfferIds[k]=data.D.deletedOfferIds[k];});
+      }
     }
 
     // 3. Customers: proper ID-level merge with deletion tombstones — NOT a
@@ -2004,6 +2210,19 @@ function startCloudListener(isWarmRefresh){
       refreshCurrentPage();
     }else{
       renderUG();
+    }
+    // FIX (2026-07-25): if any rescue happened this cycle, the rescued
+    // record was only ever safe in local memory - the cloud still didn't
+    // have it. Without this, a reload before the next unrelated write
+    // would load straight from the cloud and lose it all over again,
+    // exactly as described: "A rescues X, but if A's app is closed,
+    // backgrounded, or refreshed before its next write - X is gone
+    // everywhere." One debounced write here closes that gap for every
+    // collection at once, auto-healing the moment a rescue occurs rather
+    // than waiting on an unrelated action to happen to include it.
+    if(_anyRescueThisSync){
+      console.log("[NDSYNC] rescue occurred this sync cycle - scheduling a re-persist to restore it to the cloud");
+      dirty();
     }
   },function(err){
     var c=el("cloud-status");if(c)c.innerHTML="<i class=\"ti ti-cloud-off\"></i> Reconnecting\u2026";
@@ -2583,8 +2802,22 @@ function checkAutoSaveRecovery(){
     var snapTs=snap.ts?new Date(snap.ts).getTime():0;
     var snapIsNewer=snapTs>0&&snapTs>Date.now()-30*60*1000; // within 30 min
     if(snapHasData&&snapIsBetter){
-      // Director fast-path: if local is clearly better and very recent, auto-restore
-      if(snapIsNewer&&snapCusts>currCusts+5){
+      // FIX (2026-07-25): this used to have an automatic, no-confirmation
+      // "fast path" here that replaced the entire live dataset with this
+      // local snapshot and pushed it straight to the cloud - the most
+      // dangerous single mechanism found in this whole missing-data sweep,
+      // since it bypasses every careful, item-level merge fix built today
+      // and can happen with zero human confirmation, based purely on a
+      // count comparison that has no way to know WHY the counts differ.
+      // Always asks now, with the exact same information a director would
+      // have seen either way - a count-based guess is not a safe basis for
+      // a decision this consequential.
+      var snapTime=snap.ts?new Date(snap.ts).toLocaleString():"earlier session";
+      var msg="Found an auto-saved session from "+snapTime+" on this device with "+snapCusts+" customers and "+snapOrds+" orders.";
+      if(hasCurrentData)msg+="\n\nLive cloud data currently has "+currCusts+" customers and "+currOrds+" orders.";
+      msg+="\n\n\u26a0\ufe0f Restoring will REPLACE the live cloud data with this local snapshot.";
+      msg+="\n\nRestore this data now?";
+      if(confirm(msg)){
         D=snap.D;
         if(!D.routes)D.routes=[];
         if(!D.complaints)D.complaints=[];
@@ -2598,30 +2831,7 @@ function checkAutoSaveRecovery(){
         FB_LAST_LOCAL_WRITE=Date.now();
         setTimeout(function(){pushToCloud();},500);
         autoSaveLocal();
-        toast("Local session auto-restored — "+snapCusts+" customers. Syncing...","ok");
-      }else{
-        // Ask director to confirm (older local data or smaller difference)
-        var snapTime=snap.ts?new Date(snap.ts).toLocaleString():"earlier session";
-        var msg="Found an auto-saved session from "+snapTime+" on this device with "+snapCusts+" customers and "+snapOrds+" orders.";
-        if(hasCurrentData)msg+="\n\nLive cloud data currently has "+currCusts+" customers and "+currOrds+" orders.";
-        msg+="\n\n\u26a0\ufe0f Restoring will REPLACE the live cloud data with this local snapshot.";
-        msg+="\n\nRestore this data now?";
-        if(confirm(msg)){
-          D=snap.D;
-          if(!D.routes)D.routes=[];
-          if(!D.complaints)D.complaints=[];
-          if(!D.offers)D.offers=[];
-          if(!D.auditLog)D.auditLog=[];
-          if(!D.pendingPayments)D.pendingPayments=[];
-          if(snap.USERS&&snap.USERS.length>=USERS.length)USERS=snap.USERS;
-          nOId=Math.max(snap.nOId||0,nOId);nIId=Math.max(snap.nIId||0,nIId);nCId=Math.max(snap.nCId||0,nCId);nCmpId=Math.max(snap.nCmpId||0,nCmpId);
-          FB_SETUP_DONE=snap.setupDone===true||FB_SETUP_DONE;
-          syncIdCounters();syncPaymentStatuses();
-          FB_LAST_LOCAL_WRITE=Date.now();
-          setTimeout(function(){pushToCloud();},500);
-          autoSaveLocal();
-          toast("Session restored — "+snapCusts+" customers. Syncing to all devices...","ok");
-        }
+        toast("Session restored — "+snapCusts+" customers. Syncing to all devices...","ok");
       }
     }
   }
@@ -3715,17 +3925,24 @@ function rCusts(q,pg,sort,type){
   var del=(D.orders||[]).filter(function(o){return o.status==="Delivered";});
   var revMap={};var delCusts=(D.orders||[]).filter(function(o){return o.status==="Delivered";});delCusts.forEach(function(o){revMap[o.cId]=(revMap[o.cId]||0)+o.qty*o.price;});
   var debtMap={};(D.customers||[]).forEach(function(cu){debtMap[cu.id]=custDebt(cu.id);});
+  // FIX (2026-07-25): the debt and nodebts sorts below used to call
+  // custDebt() directly inside the comparator, completely ignoring the
+  // debtMap already built one line above - meaning an O(invoices x orders)
+  // function ran twice per comparison, in a sort that runs O(n log n)
+  // comparisons. Same fix applied to the orders sort, which recomputed a
+  // full filter().length on every single comparison instead of using a
+  // count built once.
+  var orderCountMap={};(D.orders||[]).forEach(function(o){orderCountMap[o.cId]=(orderCountMap[o.cId]||0)+1;});
   fil=fil.slice().sort(function(a,b){
-    if(sort2==="debt"){return custDebt(b.id)-custDebt(a.id);}
+    if(sort2==="debt"){return (debtMap[b.id]||0)-(debtMap[a.id]||0);}
     if(sort2==="orders"){
-      return (D.orders||[]).filter(function(o){return o.cId===b.id;}).length-
-             (D.orders||[]).filter(function(o){return o.cId===a.id;}).length;
+      return (orderCountMap[b.id]||0)-(orderCountMap[a.id]||0);
     }
     if(sort2==="revenue"){
       return (revMap[b.id]||0)-(revMap[a.id]||0);
     }
     if(sort2==="name"){return(a.name||"").localeCompare(b.name||"");}
-    if(sort2==="nodebts"){return custDebt(a.id)-custDebt(b.id);}
+    if(sort2==="nodebts"){return (debtMap[a.id]||0)-(debtMap[b.id]||0);}
     // recent = by ID desc (most recently added)
     return b.id-a.id;
   });
@@ -3839,7 +4056,14 @@ cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer updated");
         +(can("vPhone")?unescapeForEdit(dupAddr.name):maskName(unescapeForEdit(dupAddr.name)))+"\n\nContinue adding a new customer?"))return;
     }
   }
-  (D.customers||[]).push({id:uid(),name:n,phone:sanitizeInput(ph),phone2:sanitizeInput(el("cph2").value),idno:sanitizeInput(el("cid").value),estate:sanitizeInput(el("cestate").value),court:sanitizeInput(el("ccourt").value),house:sanitizeInput(el("chouse").value),htype:el("chtype").value,road:sanitizeInput(el("croad").value),zone:sanitizeInput(el("czone").value),ctype:el("ctype").value,creditLimit:_round2(parseFloat(el("ccl").value)||0),notes:sanitizeInput(el("cnotes").value),created:tday(),_ts:Date.now()});
+  var _newCustId=uid();
+  (D.customers||[]).push({id:_newCustId,name:n,phone:sanitizeInput(ph),phone2:sanitizeInput(el("cph2").value),idno:sanitizeInput(el("cid").value),estate:sanitizeInput(el("cestate").value),court:sanitizeInput(el("ccourt").value),house:sanitizeInput(el("chouse").value),htype:el("chtype").value,road:sanitizeInput(el("croad").value),zone:sanitizeInput(el("czone").value),ctype:el("ctype").value,creditLimit:_round2(parseFloat(el("ccl").value)||0),notes:sanitizeInput(el("cnotes").value),created:tday(),_ts:Date.now()});
+  // FIX (2026-07-25): found in a missing-customer sweep - customer creation
+  // was never logged to the audit trail at all, unlike every other entity
+  // type in this app. Matches the exact pattern that made order recovery
+  // possible after the #1255 incident - without this, a customer that ever
+  // needed recovery would have nothing to recover from.
+  auditLog("CUSTOMER_ADDED","#"+_newCustId+" "+n+" added by "+CU.name+" ("+CU.role+")");
   ["cn","cph","cph2","cid","cestate","ccourt","chouse","croad","czone","cnotes"].forEach(function(id){el(id).value="";});el("ccl").value="0";
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
 cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer added");
@@ -5083,6 +5307,18 @@ function saveOrd(){
   var delivDate=el("od")?el("od").value:"";
   if(!delivDate){toast("Please set a delivery date","err");if(el("od"))el("od").focus();return;}
   var editId=el("o-edit-id").value;
+  // CRITICAL FIX (2026-07-25): verified root cause of orders vanishing -
+  // order creation was the ONE record type that never forced a pre-write
+  // freshness check, unlike customer creation and payment recording, which
+  // both already do. That check is what rescues another device's
+  // just-created record before this device's own write can overwrite it.
+  // Without it, order creation could ride the 25-second "skip" burst
+  // window and write the whole document without first reading the cloud's
+  // current state - silently discarding another device's order created
+  // moments earlier but not yet received in this device's own snapshot.
+  // Only applies to genuine creation, not edits, since editing an existing
+  // order doesn't add a new id to the set.
+  if(!editId)_hasPendingCriticalEdit=true;
 
   // ── DEBT ALERT (new orders only, not edits) ──
   if(!editId){
@@ -6224,6 +6460,8 @@ function recreateOrder(idx){
   var price=_round2(parseFloat(row.querySelector(".recon-price").value)||0);
   if(!cId){toast("Select a customer first","err");return;}
   if(!prod||qty<=0||price<=0){toast("Fill product, quantity and price","err");return;}
+  // Same fix as saveOrd above - this is also a genuine order-creation path.
+  _hasPendingCriticalEdit=true;
   var missingInfo=window._reconMissing[idx];
   var orig=missingInfo.origId;
   var wasDelivered=missingInfo.wasDelivered;
@@ -6491,7 +6729,7 @@ function ackPendingPay(id){
     var apply=Math.min(remaining,inv.amount-inv.paid);
     if(apply>0){
       if(!inv.payments)inv.payments=[];
-      inv.payments.push({pid:uid(),date:tday(),amt:apply,method:pp.method,ref:"Staff collection by "+pp.collectedBy+" — ack by "+CU.name});
+      inv.payments.push({pid:uid(),srcPp:pp.id,date:tday(),amt:apply,method:pp.method,ref:"Staff collection by "+pp.collectedBy+" — ack by "+CU.name});
       inv.paid=_round2(inv.payments.reduce(function(s,p){return s+(p.amt||0);},0));
       remaining-=apply;
       var o=(D.orders||[]).find(function(x){return x.id===pp.ordId;});
@@ -6897,7 +7135,7 @@ function saveCmp(){
     }
   }
   reserveNextComplaintId().then(function(newCmpId){
-    (D.complaints||[]).push({id:newCmpId,cId:parseInt(el("cmp-c").value),type:el("cmp-t").value,details:det,action:sanitizeInput(el("cmp-act").value),status:el("cmp-s").value,date:el("cmp-d").value});el("cmp-det").value="";el("cmp-act").value="";auditLog("COMPLAINT_LOGGED","Complaint logged by "+CU.name+" ("+CU.role+"): "+el("cmp-t").value);
+    (D.complaints||[]).push({id:newCmpId,cId:parseInt(el("cmp-c").value),type:el("cmp-t").value,details:det,action:sanitizeInput(el("cmp-act").value),status:el("cmp-s").value,date:el("cmp-d").value,_ts:Date.now()});el("cmp-det").value="";el("cmp-act").value="";auditLog("COMPLAINT_LOGGED","Complaint logged by "+CU.name+" ("+CU.role+"): "+el("cmp-t").value);
     if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
     cm("m-cmp");rCmps(undefined,CMP_PAGE);dirty();toast("Complaint logged");
   });
@@ -6922,7 +7160,17 @@ function editCmp(id){
   om("m-cmp");
 }
 function resolveCmp(id){if(!can("mCmp")){toast("Only managers can resolve complaints","err");return;}var c=(D.complaints||[]).find(function(x){return x.id===id;});if(c)c.status="Resolved";rCmps(undefined,CMP_PAGE);if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();dirty();toast("Complaint resolved");}
-function delCmp(id){if(!can("dCmp")){toast("Only managers can delete complaints","err");return;}var cmp=(D.complaints||[]).find(function(x){return x.id===id;});if(!cmp)return;var cu=(D.customers||[]).find(function(x){return x.id===cmp.cId;});var cmpText=unescapeForEdit(cmp.details||"");var msg="Delete complaint from "+(cu?(can("vPhone")?unescapeForEdit(cu.name):"this customer"):"unknown")+"?\n\n\""+cmpText.slice(0,80)+(cmpText.length>80?"…":"")+"\"\n\nThis cannot be undone.";if(!confirm(msg))return;D.complaints=(D.complaints||[]).filter(function(c){return c.id!==id;});rCmps(undefined,CMP_PAGE);if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();dirty();}
+function delCmp(id){if(!can("dCmp")){toast("Only managers can delete complaints","err");return;}var cmp=(D.complaints||[]).find(function(x){return x.id===id;});if(!cmp)return;var cu=(D.customers||[]).find(function(x){return x.id===cmp.cId;});var cmpText=unescapeForEdit(cmp.details||"");var msg="Delete complaint from "+(cu?(can("vPhone")?unescapeForEdit(cu.name):"this customer"):"unknown")+"?\n\n\""+cmpText.slice(0,80)+(cmpText.length>80?"…":"")+"\"\n\nThis cannot be undone.";if(!confirm(msg))return;
+  // FIX (2026-07-25): complaints had no deletion tombstone at all, which is
+  // exactly why the merge logic fell back to the same 5-minute age window
+  // already proven to cause orders to silently vanish. A complaint logged
+  // in the field with a real sync delay - lost signal, app backgrounded -
+  // is not a deletion and should never be treated as one. Adding a real
+  // tombstone here means the rescue logic can drop the age guess entirely.
+  if(!D.deletedComplaintIds)D.deletedComplaintIds={};
+  D.deletedComplaintIds[id]=Date.now();
+  _recentlyDeletedComplaintIds[id]=Date.now();
+  D.complaints=(D.complaints||[]).filter(function(c){return c.id!==id;});rCmps(undefined,CMP_PAGE);if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();dirty();}
 
 function addRoute(){
   if(!can("eOrd")){toast("Managers only","err");return;}
@@ -6950,7 +7198,7 @@ addRoute._save=function(){
   if(!name){toast("Route name required","err");return;}
   var estates=el("route-areas-inp")?el("route-areas-inp").value:"";
   if(!D.routes)D.routes=[];
-  D.routes.push({id:uid(),name:name,estates:(estates||"").split(",").map(function(e){return sanitizeInput(e.trim());}).filter(Boolean),created:tday()});
+  D.routes.push({id:uid(),name:name,estates:(estates||"").split(",").map(function(e){return sanitizeInput(e.trim());}).filter(Boolean),created:tday(),_ts:Date.now()});
   dirty();
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   rDel();cm("m-generic");rOffers();toast("Route \""+unescapeForEdit(name)+"\" added");
@@ -6961,6 +7209,11 @@ function delRoute(id){
   var areas=(rt.estates||[]).slice(0,3).join(", ")+((rt.estates||[]).length>3?" +"+((rt.estates||[]).length-3)+" more":"");
   var msg="Remove route: \""+unescapeForEdit(rt.name)+"\"?"+(areas?"\nCovers: "+areas:"")+"\n\nThis cannot be undone.";
   if(!confirm(msg))return;
+  // Same fix as delCmp above - a real tombstone here, matching the
+  // already-proven order pattern.
+  if(!D.deletedRouteIds)D.deletedRouteIds={};
+  D.deletedRouteIds[id]=Date.now();
+  _recentlyDeletedRouteIds[id]=Date.now();
   D.routes=(D.routes||[]).filter(function(r){return r.id!==id;});
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   dirty();rOffers();
@@ -7284,6 +7537,7 @@ function rAuditLog(pg){
     "CASH_ACKNOWLEDGED":{ic:"ti-circle-check",col:"#27ae60",bg:"#f0fdf4",label:"Cash acknowledged"},
     "COMPLAINT_LOGGED": {ic:"ti-message-report",col:"#e74c3c",bg:"#fff0f0",label:"Complaint logged"},
     "COMPLAINT_UPDATED":{ic:"ti-message-report",col:"#e67e22",bg:"#fff8f0",label:"Complaint updated"},
+    "CUSTOMER_ADDED": {ic:"ti-user-plus",col:"#27ae60",bg:"#f0fdf4",label:"Customer added"},
     "CUSTOMER_UPDATED": {ic:"ti-user-edit",col:"#7c3aed",bg:"#faf5ff",label:"Customer updated"},
     "CUSTOMER_DELETED": {ic:"ti-user-x",col:"#c0392b",bg:"#fff0f0",label:"Customer deleted"},
     "USER_CREATED":     {ic:"ti-user-plus",col:"#185FA5",bg:"#eaf0ff",label:"Team member added"},
