@@ -1112,6 +1112,15 @@ function processWriteQueue(){
           }
         });
       }
+      // Same fix as the read-side merge - union dismissedMissingOrders
+      // rather than trusting either side wholesale, so both merge paths
+      // agree on the identical rule for this field.
+      if(freshD.dismissedMissingOrders){
+        var _dismissedSetFC={};
+        (DforSync.dismissedMissingOrders||[]).forEach(function(id){_dismissedSetFC[id]=true;});
+        freshD.dismissedMissingOrders.forEach(function(id){_dismissedSetFC[id]=true;});
+        DforSync.dismissedMissingOrders=Object.keys(_dismissedSetFC).map(function(k){return parseInt(k);});
+      }
     }
     _sendWritePayload();
   }).catch(function(){
@@ -2029,6 +2038,20 @@ function startCloudListener(isWarmRefresh){
       if(data.D.deletedOfferIds){
         if(!D.deletedOfferIds)D.deletedOfferIds={};
         Object.keys(data.D.deletedOfferIds).forEach(function(k){D.deletedOfferIds[k]=data.D.deletedOfferIds[k];});
+      }
+      // FIX (2026-07-25): the actual reported bug - dismissedMissingOrders
+      // had zero merge protection at all, a plain array with no id-level
+      // merge logic anywhere. Whichever device's write landed last simply
+      // discarded the other's dismissals entirely, which is exactly why
+      // the same order kept reappearing and getting dismissed again by a
+      // different person - each dismissal was silently overwriting the
+      // one before it rather than accumulating. Unions and dedupes both
+      // sides instead of trusting either wholesale.
+      if(data.D.dismissedMissingOrders){
+        var _dismissedSet={};
+        (D.dismissedMissingOrders||[]).forEach(function(id){_dismissedSet[id]=true;});
+        data.D.dismissedMissingOrders.forEach(function(id){_dismissedSet[id]=true;});
+        D.dismissedMissingOrders=Object.keys(_dismissedSet).map(function(k){return parseInt(k);});
       }
     }
 
@@ -6445,6 +6468,16 @@ function reconCustSelect(idx,cId,e){
 function dismissMissingOrder(origId){
   if(!can("rest")){toast("Only directors can resolve reconciliation items","err");return;}
   if(!confirm("Mark order #"+origId+" as resolved without recreating it?\n\nUse this only if you're confident it genuinely cannot or shouldn't be recreated — e.g. the customer could not be identified after asking around. This will stop it appearing in future reconciliation checks.\n\nThis does not delete anything — it only stops flagging this specific gap."))return;
+  // FIX (2026-07-25): dismissedMissingOrders had zero sync protection at
+  // all - no merge logic on the read side, and this write never forced a
+  // freshness check. A device with a stale, not-yet-synced copy of this
+  // array could silently overwrite another device's more recent
+  // dismissal, exactly what happened live: Director dismissed an order,
+  // then ICT's device - which hadn't yet received that update - dismissed
+  // it again, and the alert never actually cleared because each write was
+  // stepping on the other's addition to this list. Same fix already
+  // proven for order creation.
+  _hasPendingCriticalEdit=true;
   if(!D.dismissedMissingOrders)D.dismissedMissingOrders=[];
   if(D.dismissedMissingOrders.indexOf(origId)===-1)D.dismissedMissingOrders.push(origId);
   auditLog("ORDER_UPDATED","Missing order #"+origId+" marked resolved without recreating, by "+CU.name+" ("+CU.role+")");
