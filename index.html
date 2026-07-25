@@ -8502,7 +8502,7 @@ function restoreXL(input){
       var c=get("Customers");if(c&&c.length)D.customers=c.map(function(r){var _cLog=[];if(!_isLegacyFormat&&r.CreditLog){try{_cLog=JSON.parse(r.CreditLog);}catch(e){_cLog=[];}}return{id:(r.ID!==undefined&&r.ID!==null&&r.ID!=="")?Number(r.ID):Date.now()+Math.floor(Math.random()*1000),name:sanitizeInput(r.Name||""),phone:sanitizeInput(r.Phone||""),phone2:sanitizeInput(r.Phone2||""),idno:sanitizeInput(r.IDNo||""),estate:sanitizeInput(r.Estate||""),court:sanitizeInput(r.Court||""),house:sanitizeInput(r.HouseNo||""),htype:r.HouseType||"House",road:sanitizeInput(r.Road||""),zone:sanitizeInput(r.Zone||""),ctype:r.Type||"Residential",credit:_isLegacyFormat?0:(_numCoerce(r.Credit)),creditLimit:_isLegacyFormat?0:(_numCoerce(r.CreditLimit)),creditLog:_cLog,notes:sanitizeInput(r.Notes||""),created:r.Created||""};});
       else if(c)D.customers=[];
 
-      var o=get("Orders");if(o&&o.length)D.orders=o.map(function(r){return{id:(r.ID!==undefined&&r.ID!==null&&r.ID!=="")?Number(r.ID):Date.now()+Math.floor(Math.random()*1000),cId:_numCoerce(r.CustomerID),prod:sanitizeInput(r.Product||""),stockId:r.StockID?_numCoerce(r.StockID):null,invoiceId:r.InvoiceID?_numCoerce(r.InvoiceID):null,qty:_numCoerce(r.Qty),price:_numCoerce(r.UnitPrice),date:r.Date||"",status:r.Status||"Pending",paid:r.Payment||"Unpaid",amtPaid:_numCoerce(r.AmtPaid),driver:sanitizeInput(r.Driver||""),deliver:sanitizeInput(r.DeliveryAddr||""),bottle_before:sanitizeInput(r.BottleBefore||"Good"),bottle_after:r.BottleAfter?sanitizeInput(r.BottleAfter):null,notes:sanitizeInput(r.Notes||"")};});
+      var o=get("Orders");if(o&&o.length)D.orders=o.map(function(r){var _pStatus=["Paid","Partial","Unpaid","Cancelled"].indexOf(r.Payment)!==-1?r.Payment:"Unpaid";return{id:(r.ID!==undefined&&r.ID!==null&&r.ID!=="")?Number(r.ID):Date.now()+Math.floor(Math.random()*1000),cId:_numCoerce(r.CustomerID),prod:sanitizeInput(r.Product||""),stockId:r.StockID?_numCoerce(r.StockID):null,invoiceId:r.InvoiceID?_numCoerce(r.InvoiceID):null,qty:_numCoerce(r.Qty),price:_numCoerce(r.UnitPrice),date:r.Date||"",status:r.Status||"Pending",paid:_pStatus,amtPaid:_numCoerce(r.AmtPaid),driver:sanitizeInput(r.Driver||""),deliver:sanitizeInput(r.DeliveryAddr||""),bottle_before:sanitizeInput(r.BottleBefore||"Good"),bottle_after:r.BottleAfter?sanitizeInput(r.BottleAfter):null,notes:sanitizeInput(r.Notes||"")};});
       else if(o)D.orders=[];
 
       var s=get("Stock");if(s&&s.length)D.stock=s.map(function(r){return{id:(r.ID!==undefined&&r.ID!==null&&r.ID!=="")?Number(r.ID):Date.now()+Math.floor(Math.random()*1000),name:sanitizeInput(r.Name||""),size:sanitizeInput(r.Size||""),price:_numCoerce(r.SalePrice),cost:_numCoerce(r.CostPrice),qty:_numCoerce(r.InStock),min:_numCoerce(r.MinLevel)||10};});
@@ -8773,9 +8773,15 @@ function syncPaymentStatuses(){
       else{o.paid="Unpaid";}
     }else{
       // No invoice: if order was explicitly set Paid at creation, keep it
-      // Don't change Unpaid orders that just don't have invoices (shouldn't happen but be safe)
+      // FIX (2026-07-25): this used to default a corrupted/unrecognized
+      // payment status to "Paid" - the wrong, riskier direction. If the
+      // value is genuinely unknown (e.g. "missing", from an unvalidated
+      // import before that fix), assuming it was already paid could
+      // silently write off a real debt with no invoice trail to catch it.
+      // "Unpaid" is the safe default: worst case is a false debt flag to
+      // double-check manually, not lost revenue.
       if(o.paid!=="Paid"&&o.paid!=="Unpaid"&&o.paid!=="Partial"){
-        o.paid="Paid"; // fix any corrupted status
+        o.paid="Unpaid"; // fix any corrupted status to the safe default
       }
     }
   });
@@ -8806,7 +8812,8 @@ function mergeXL(input){
       get("Orders").forEach(function(r){
         if(!hasId(r.ID))return;
         if((D.orders||[]).find(function(x){return x.id===Number(r.ID);})){rep.orders.skipped++;return;}
-        (D.orders||[]).push({id:Number(r.ID),cId:_numCoerce(r.CustomerID),prod:sanitizeInput(r.Product||""),stockId:r.StockID?_numCoerce(r.StockID):null,invoiceId:r.InvoiceID?_numCoerce(r.InvoiceID):null,qty:_numCoerce(r.Qty),price:_numCoerce(r.UnitPrice),date:r.Date||"",status:r.Status||"Pending",paid:r.Payment||"Unpaid",amtPaid:_numCoerce(r.AmtPaid),driver:sanitizeInput(r.Driver||""),deliver:sanitizeInput(r.DeliveryAddr||""),bottle_before:sanitizeInput(r.BottleBefore||"Good"),bottle_after:r.BottleAfter?sanitizeInput(r.BottleAfter):null,notes:sanitizeInput(r.Notes||"")});
+        var _pStatus2=["Paid","Partial","Unpaid","Cancelled"].indexOf(r.Payment)!==-1?r.Payment:"Unpaid";
+        (D.orders||[]).push({id:Number(r.ID),cId:_numCoerce(r.CustomerID),prod:sanitizeInput(r.Product||""),stockId:r.StockID?_numCoerce(r.StockID):null,invoiceId:r.InvoiceID?_numCoerce(r.InvoiceID):null,qty:_numCoerce(r.Qty),price:_numCoerce(r.UnitPrice),date:r.Date||"",status:r.Status||"Pending",paid:_pStatus2,amtPaid:_numCoerce(r.AmtPaid),driver:sanitizeInput(r.Driver||""),deliver:sanitizeInput(r.DeliveryAddr||""),bottle_before:sanitizeInput(r.BottleBefore||"Good"),bottle_after:r.BottleAfter?sanitizeInput(r.BottleAfter):null,notes:sanitizeInput(r.Notes||"")});
         rep.orders.added++;
       });
       get("Invoices").forEach(function(r){
