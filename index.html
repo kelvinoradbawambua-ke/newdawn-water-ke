@@ -1695,6 +1695,24 @@ function startCloudListener(isWarmRefresh){
     _cloudDataConfirmed=true; // we now have authoritative knowledge of real state — safe to write from here on
     console.log("[NDSYNC] snapshot arrived — _cloudDataConfirmed=true, doc.exists="+doc.exists+", doc.metadata.fromCache="+(doc.metadata&&doc.metadata.fromCache));
     if(!doc.exists){
+      // CRITICAL FIX (2026-07-26): "document doesn't exist" must NEVER be
+      // trusted from a locally-cached read - only from a confirmed server
+      // response. Firestore's offline cache can report a document as
+      // missing based on nothing more than an empty or cleared local
+      // cache (a real, plausible event on a mobile device under storage
+      // pressure, in private browsing, or during a brief connectivity
+      // gap) - even though the real document, with all of this business's
+      // live orders and customers, is sitting completely intact on the
+      // server. Proceeding past this point without that confirmation
+      // risks eventually overwriting real, live data with an empty clean
+      // slate the moment connectivity returns - exactly the kind of
+      // "reset" that must never happen to a business already running on
+      // this system. Wait for a genuine server-confirmed snapshot before
+      // ever considering the document genuinely, authoritatively missing.
+      if(doc.metadata&&doc.metadata.fromCache){
+        console.log("[NDSYNC] doc.exists=false but this read is from LOCAL CACHE, not the server - refusing to treat as authoritative, waiting for a server-confirmed read before considering any recovery/clean-slate action");
+        return;
+      }
       // SAFETY GUARD: Check all recovery sources before writing clean slate
       var snap=autoSaveCheckLocal();
       var hasLocalData=D&&((D.customers&&(D.customers||[]).length>0)||(D.orders&&(D.orders||[]).length>0)||(D.stock&&(D.stock||[]).length>0));
@@ -1736,7 +1754,7 @@ function startCloudListener(isWarmRefresh){
             USERS:[{id:1,name:"Director",role:"director",pin:"1234",ini:"DR",col:"#1a1560"}],
             nOId:1001,nIId:2001,nCId:3001,
             setupDone:false,
-            updatedAt:Date.now()
+            updatedAt:firebase.firestore.FieldValue.serverTimestamp()
           };
           FB_DOC_REF.set(cleanSlate).then(function(){FB_READY=true;scheduleCloudSync();});
         });
@@ -1748,7 +1766,7 @@ function startCloudListener(isWarmRefresh){
         USERS:[{id:1,name:"Director",role:"director",pin:"1234",ini:"DR",col:"#1a1560"}],
         nOId:1001,nIId:2001,nCId:3001,
         setupDone:false,
-        updatedAt:Date.now()
+        updatedAt:firebase.firestore.FieldValue.serverTimestamp()
       };
       FB_DOC_REF.set(cleanSlate).then(function(){FB_READY=true;scheduleCloudSync();});
       return;
@@ -3379,7 +3397,7 @@ function _wizFinishWrite(finalUsers){
     USERS:finalUsers,
     nOId:1001,nIId:2001,nCId:3001,
     setupDone:true,
-    updatedAt:Date.now()
+    updatedAt:firebase.firestore.FieldValue.serverTimestamp()
   };
 
   FB_DOC_REF.set(JSON.parse(JSON.stringify(cleanPayload)),{merge:false}).then(function(){
