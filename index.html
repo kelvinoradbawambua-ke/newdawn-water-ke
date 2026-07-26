@@ -1151,6 +1151,7 @@ function processWriteQueue(){
     _stockQtyDeltas={}; // deltas are now reflected in the confirmed write — must not be re-applied next cycle
     _stockDeltasByOrder={}; // same reasoning - once confirmed, no longer pending/reversible, no need to keep tracking
     _hasPendingCriticalEdit=false; // same reasoning - this write's critical edits are now confirmed
+    _clearConfirmedLedgerEntries(); // any pending-order token now present in D.orders genuinely made it - stop tracking it
     FB_WRITE_RETRY_ATTEMPTS=0; // a successful write means the connection/quota is healthy again
     _hideCloudOfflineBanner();
     var e=el("sts");if(e){e.className="sts saved";e.innerHTML="<i class=\"ti ti-cloud-check\"></i> Synced "+new Date().toLocaleTimeString();}
@@ -1884,6 +1885,65 @@ function startCloudListener(isWarmRefresh){
           if(!D.deletedOrderIds[k])D.deletedOrderIds[k]=data.D.deletedOrderIds[k];
         });
       }
+      // FIX (2026-07-26): the same union for INVOICE deletion markers. Without
+      // it, a recovery-duplicate invoice tombstone (set by the dedup below)
+      // stayed local to whichever device ran the dedup and never converged, so
+      // another device had no record that the duplicate invoice was meant to be
+      // gone. Mirrors the order-tombstone union above exactly.
+      if(data.D.deletedInvoiceIds){
+        if(!D.deletedInvoiceIds)D.deletedInvoiceIds={};
+        Object.keys(data.D.deletedInvoiceIds).forEach(function(k){
+          if(!D.deletedInvoiceIds[k])D.deletedInvoiceIds[k]=data.D.deletedInvoiceIds[k];
+        });
+      }
+      // RECOVERY-DUPLICATE DEDUP (2026-07-26): two directors recreating the
+      // SAME missing order on two devices within one sync window each mint a
+      // different, atomically-unique order id, but tagged with the same
+      // deterministic "recon-"+origId token. Nothing else catches this -
+      // every merge/rescue path above matches orders by their own id, never
+      // by _cid - so both would otherwise survive as a genuine financial
+      // duplicate: double revenue, and if the recovered order was already
+      // delivered, double the "cash collected" figure across two separate
+      // invoices for one real transaction. This check is safe specifically
+      // because the token is deterministic and namespaced (recon-*) - unlike
+      // a normal order's random token, which can never legitimately collide
+      // across devices (why this same check was correctly NOT added for
+      // ordinary order creation), two orders sharing a recon-* token can
+      // only exist if they're both genuine recovery attempts for the exact
+      // same historical missing order number - never a false positive.
+      // Deterministic tie-break (lowest order id = created first) so every
+      // device independently reaches the identical decision without needing
+      // to coordinate; the discarded order and its invoice (if any) are
+      // properly tombstoned, not just locally removed, so this decision
+      // propagates and neither one can be silently rescued back by the very
+      // "never infer deletion from absence" protection built earlier.
+      var _reconGroups={};
+      (D.orders||[]).forEach(function(o){
+        if(o._cid&&o._cid.indexOf("recon-")===0){
+          if(!_reconGroups[o._cid])_reconGroups[o._cid]=[];
+          _reconGroups[o._cid].push(o);
+        }
+      });
+      Object.keys(_reconGroups).forEach(function(rcid){
+        var group=_reconGroups[rcid];
+        if(group.length<2)return; // no duplicate — the common case
+        group.sort(function(a,b){return a.id-b.id;});
+        var discard=group.slice(1); // keep group[0], the lowest id
+        discard.forEach(function(dup){
+          console.log("[NDSYNC] recovery duplicate detected — order id="+dup.id+" shares token "+rcid+" with kept order id="+group[0].id+" — removing duplicate, keeping the earlier one");
+          if(!D.deletedOrderIds)D.deletedOrderIds={};
+          D.deletedOrderIds[dup.id]=Date.now();
+          _recentlyDeletedOrderIds[dup.id]=Date.now();
+          if(dup.invoiceId){
+            if(!D.deletedInvoiceIds)D.deletedInvoiceIds={};
+            D.deletedInvoiceIds[dup.invoiceId]=Date.now();
+            D.invoices=(D.invoices||[]).filter(function(i){return i.id!==dup.invoiceId;});
+          }
+        });
+        var _discardIds={};discard.forEach(function(d){_discardIds[d.id]=true;});
+        D.orders=(D.orders||[]).filter(function(o){return !_discardIds[o.id];});
+        _anyRescueThisSync=true; // reuses the existing re-persist trigger — this decision must propagate to the cloud too, not just this device's local view
+      });
       // Invoices: take remote (payments recorded on any device) — but respect
       // any recently-voided invoice here for 60s, and never blindly overwrite
       // during our own write window, so a void action can never be silently
@@ -1909,7 +1969,20 @@ function startCloudListener(isWarmRefresh){
           // by applying the identical principle here too, so both merge
           // paths agree on the same rule regardless of which one a given
           // moment happens to go through.
-          D.invoices=data.D.invoices.map(function(ri){
+          // FIX (2026-07-26): honor invoice deletion tombstones the same way
+          // the order merge above honors deletedOrderIds. Without this filter,
+          // a recovery-duplicate invoice that the dedup removed and tombstoned
+          // was resurrected straight back here on the very next merge - the map
+          // took every remote invoice at face value - leaving one order but two
+          // invoices: an orphaned duplicate still counting toward revenue and
+          // "cash collected", exactly the financial double-count the dedup was
+          // built to prevent. Dropping tombstoned invoices before the map (and
+          // the unioned tombstones above) makes the removal stick and converge.
+          D.invoices=data.D.invoices.filter(function(ri){
+            var _delTomb=(data.D.deletedInvoiceIds&&data.D.deletedInvoiceIds[ri.id])||(D.deletedInvoiceIds&&D.deletedInvoiceIds[ri.id]);
+            if(_delTomb){console.log("[NDSYNC] invoice id="+ri.id+" dropped from merge — explicit deletion tombstone");return false;}
+            return true;
+          }).map(function(ri){
             var tombAt=_recentlyVoidedInvoiceIds[ri.id];
             var li=localInvMap[ri.id];
             if(li&&li.voided&&tombAt&&Date.now()-tombAt<60000)return li; // respect our recent void
@@ -2266,6 +2339,7 @@ function startCloudListener(isWarmRefresh){
         CU=stillExists;
       }
       _APP_READY=true;
+      if(!window._pendingOrderLedgerChecked){window._pendingOrderLedgerChecked=true;setTimeout(_pendingOrderLedgerCheck,1500);}
       refreshCurrentPage();
     }else{
       renderUG();
@@ -4920,9 +4994,19 @@ function setOrderMode(mode){
   checkCycleWarn();
   calcO();
 }
+// Form-scoped idempotency token for a new order. Minted ONCE when the new-order
+// form is prepared and reused across every saveOrd() invocation for that same
+// form instance, so a repeat submission of the SAME order (e.g. the button
+// re-enabled by the safety net and tapped again on a slow connection) carries
+// the same token - which saveOrd() then recognizes and refuses to create twice.
+// A genuinely new order re-opens the form -> prepO() runs -> a fresh token, so
+// distinct orders never share one. Reset per form open; never reused after the
+// modal closes on success.
+var _currentOrderFormCid=null;
 function prepO(){
   var od=el("od"),odrv=el("odrv");if(!od||!odrv)return;
   el("o-edit-id").value="";
+  _currentOrderFormCid=Date.now()+"-"+Math.random().toString(36).slice(2,9); // fresh token for this new-order form instance
   // Reset mode to exact brand
   if(el("o-mode"))el("o-mode").value="exact";
   setOrderMode("exact");
@@ -5340,6 +5424,28 @@ function saveOrd(){
   // such roles, but this function itself did not actually enforce the distinction.
   // Now the correct permission is required for the specific action being taken.
   var _isEditingOrder=!!el("o-edit-id").value;
+  // Idempotency token for a genuinely new order. Reuse the FORM-SCOPED token
+  // minted in prepO() (so a repeat submission of the same form carries the same
+  // token); fall back to a fresh one only if somehow absent, preserving old
+  // behavior. This exists for the whole creation attempt, independent of
+  // validation outcome or any confirm() dialog that follows.
+  var _orderCid=_isEditingOrder?null:(_currentOrderFormCid||(Date.now()+"-"+Math.random().toString(36).slice(2,9)));
+  // IDEMPOTENCY GUARD (2026-07-26): if an order carrying this exact token
+  // already exists, this is a repeat submission of the same order - the button
+  // was re-enabled by the safety net and tapped again on a slow connection, the
+  // classic remaining duplicate window that the button-disable alone can't close
+  // once the reservation runs long. The order ID comes from an atomic counter,
+  // so a true double-submit would otherwise mint a SECOND number silently; the
+  // shared token is what lets us recognize and refuse it. Structural, synchronous,
+  // and independent of any timer.
+  if(_orderCid&&(D.orders||[]).some(function(o){return o._cid===_orderCid;})){
+    window._savingOrder=false;
+    if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}
+    if(window._savingOrderSafetyNet)clearTimeout(window._savingOrderSafetyNet);
+    cm("m-o");
+    toast("That order was already placed — check the Orders list.","warn");
+    return;
+  }
   if(_isEditingOrder){if(!can("eOrd")){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}}else{if(!can("aOrd")){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}}
   if(!(D.customers||[]).length){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}toast("Add a customer first","err");return;}
   var cId=parseInt(el("oc")&&el("oc").value)||0;
@@ -5517,8 +5623,10 @@ function saveOrd(){
     if(_saveBtnC){_saveBtnC.disabled=true;_saveBtnC.innerHTML="<i class=\"ti ti-loader-2\"></i> Placing order...";}
     if(window._savingOrderSafetyNet)clearTimeout(window._savingOrderSafetyNet);
     window._savingOrderSafetyNet=setTimeout(function(){window._savingOrder=false;if(_saveBtnC){_saveBtnC.disabled=false;_saveBtnC.innerHTML="<i class=\"ti ti-check\"></i> Place order";}},15000);
+    var _custForLedgerC=(D.customers||[]).find(function(x){return x.id===cId;});
+    if(_orderCid)_pendingOrderLedgerAdd(_orderCid,_custForLedgerC?_custForLedgerC.name:"customer #"+cId,pn,qty);
     reserveNextOrderId().then(function(newOrdId){
-      (D.orders||[]).push({id:newOrdId,cId:cId,prod:pn,stockId:stCost?stCost.id:null,qty:qty,price:0,cost:0,date:el("od").value,status:"Pending",paid:"Unpaid",amtPaid:0,driver:el("odrv").value,deliver:sanitizeInput(el("odlvr").value),bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?sanitizeInput(el("onotes").value):"",prodConfirmed:false,_ts:Date.now()});
+      (D.orders||[]).push({id:newOrdId,cId:cId,prod:pn,stockId:stCost?stCost.id:null,qty:qty,price:0,cost:0,date:el("od").value,status:"Pending",paid:"Unpaid",amtPaid:0,driver:el("odrv").value,deliver:sanitizeInput(el("odlvr").value),bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?sanitizeInput(el("onotes").value):"",prodConfirmed:false,_ts:Date.now(),_cid:_orderCid});
       auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty+" (category/TBC) — customer #"+cId+" "+(function(){var _c=(D.customers||[]).find(function(x){return x.id===cId;});return _c?unescapeForEdit(_c.name):"unknown";})());
       if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
       rDel();
@@ -5554,6 +5662,8 @@ function saveOrd(){
   if(_saveBtn){_saveBtn.disabled=true;_saveBtn.innerHTML="<i class=\"ti ti-loader-2\"></i> Placing order...";}
   if(window._savingOrderSafetyNet)clearTimeout(window._savingOrderSafetyNet);
   window._savingOrderSafetyNet=setTimeout(function(){window._savingOrder=false;if(_saveBtn){_saveBtn.disabled=false;_saveBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}},15000);
+  var _custForLedger=(D.customers||[]).find(function(x){return x.id===cId;});
+  if(_orderCid)_pendingOrderLedgerAdd(_orderCid,_custForLedger?_custForLedger.name:"customer #"+cId,pn,qty);
   reserveNextOrderAndInvoiceIds().then(function(reserved){
     var newOrdId=reserved.orderId,newInvId=reserved.invoiceId;
     if(st){
@@ -5563,7 +5673,7 @@ function saveOrd(){
       if(st.history.length>50)st.history=st.history.slice(-50);
       updateStockBadge();
     }
-    (D.orders||[]).push({id:newOrdId,cId:cId,prod:pn,stockId:stCost?stCost.id:null,invoiceId:newInvId,qty:qty,price:price,cost:costAtSale,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:sanitizeInput(el("odlvr").value),bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?sanitizeInput(el("onotes").value):"",_ts:Date.now(),prodConfirmed:true});
+    (D.orders||[]).push({id:newOrdId,cId:cId,prod:pn,stockId:stCost?stCost.id:null,invoiceId:newInvId,qty:qty,price:price,cost:costAtSale,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:sanitizeInput(el("odlvr").value),bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?sanitizeInput(el("onotes").value):"",_ts:Date.now(),_cid:_orderCid,prodConfirmed:true});
     console.log("[NDSYNC] order created id="+newOrdId+" D.orders.length="+(D.orders||[]).length+" FB_READY="+FB_READY+" _cloudDataConfirmed="+_cloudDataConfirmed+" FB_WRITING="+FB_WRITING);
     // Always create invoice for exact orders — provides full financial trail
     // FIX (2026-07-21): both IDs now reserved together in ONE transaction -
@@ -6572,13 +6682,32 @@ function recreateOrder(idx){
   var wasDelivered=missingInfo.wasDelivered;
   var deliveredBy=missingInfo.deliveredBy||"";
   var cashCollected=missingInfo.cashCollected||0;
+  if(window._recreatingOrder)return;
+  window._recreatingOrder=true;
+  var _recreateBtn=row.querySelector("button.btn-navy");
+  if(_recreateBtn){_recreateBtn.disabled=true;_recreateBtn.innerHTML="<i class=\"ti ti-loader-2\"></i> Recreating...";}
+  // Deterministic token from the original missing order's id - simpler and
+  // more robust than a random one here, since orig is already a stable,
+  // unique identifier for this specific recovery attempt regardless of how
+  // many times this function gets called for it.
+  var _recreateCid="recon-"+orig;
+  if((D.orders||[]).some(function(o){return o._cid===_recreateCid;})){
+    window._recreatingOrder=false;
+    if(_recreateBtn){_recreateBtn.disabled=false;_recreateBtn.innerHTML="<i class=\"ti ti-check\"></i> Recreate";}
+    toast("That order was already recreated — check the Orders list.","warn");
+    return;
+  }
   var confirmMsg="Recreate order originally #"+orig+" for this customer: "+unescapeForEdit(prod)+" x"+qty+" @ KSh "+price+"?";
   if(wasDelivered){
     confirmMsg+="\n\nThe audit trail shows this order was already delivered by "+unescapeForEdit(deliveredBy)+(cashCollected>0?" (KSh "+cashCollected+" collected)":"")+". It will be recreated already marked Delivered, with an invoice reflecting what was actually collected — not as a fresh Pending order.";
   }else{
     confirmMsg+="\n\nThis creates a NEW order (Pending status) — you can then process/deliver it normally.";
   }
-  if(!confirm(confirmMsg))return;
+  if(!confirm(confirmMsg)){
+    window._recreatingOrder=false;
+    if(_recreateBtn){_recreateBtn.disabled=false;_recreateBtn.innerHTML="<i class=\"ti ti-check\"></i> Recreate";}
+    return;
+  }
   // FIX (2026-07-21): this was the one remaining raw nOId++ allocation
   // outside the reservation helpers - notably in the order-RECOVERY path,
   // used specifically to restore orders lost to the original ID-collision
@@ -6589,7 +6718,7 @@ function recreateOrder(idx){
     var cust=(D.customers||[]).find(function(c){return c.id===cId;});
     var _stMatch=(D.stock||[]).find(function(s){return unescapeForEdit(s.name).toLowerCase()===unescapeForEdit(prod).toLowerCase();});
     var total=_round2(price*qty);
-    var newOrder={id:newId,cId:cId,prod:prod,stockId:_stMatch?_stMatch.id:null,qty:qty,price:price,date:tday(),_ts:Date.now(),
+    var newOrder={id:newId,cId:cId,prod:prod,stockId:_stMatch?_stMatch.id:null,qty:qty,price:price,date:tday(),_ts:Date.now(),_cid:_recreateCid,
       notes:"Recovered via reconciliation — originally Order #"+orig};
     if(wasDelivered){
       newOrder.status="Delivered";
@@ -6615,6 +6744,11 @@ function recreateOrder(idx){
     if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
     dirty();
     row.style.opacity="0.4";row.querySelector("button").disabled=true;row.querySelector("button").textContent="Done";
+    window._recreatingOrder=false;
+  }).catch(function(){
+    window._recreatingOrder=false;
+    if(_recreateBtn){_recreateBtn.disabled=false;_recreateBtn.innerHTML="<i class=\"ti ti-check\"></i> Recreate";}
+    toast("Something went wrong recreating this order — please try again","err");
   });
 }
 
@@ -8448,6 +8582,95 @@ function autoSaveLocal(){
     try{sessionStorage.setItem("newdawn_session_backup",json);}catch(e2){}
     return true;
   }catch(e){return false;}
+}
+// FIX (2026-07-26): pending-order recovery ledger. The atomic transaction
+// fix closes the concurrent-write clobber, and the button-disable fix
+// closes the confirm()-dialog double-submit - but neither can help if the
+// device itself is closed, killed, or loses power between an order being
+// created locally and its transaction actually committing to the cloud.
+// autoSaveLocal() already writes D (including the new order) to
+// localStorage synchronously, immediately after creation - so the data
+// itself already survives a crash. What was missing was a targeted way to
+// notice, specifically, that THIS one order never got confirmed - the
+// existing recovery check only triggers on a much larger divergence (5+
+// customers or 10+ orders different), which a single unsynced order would
+// never reach. This ledger is deliberately small and specific: one entry
+// per in-flight order creation, added the instant creation begins and
+// removed the instant it's confirmed committed. On next launch, anything
+// still in the ledger is surfaced to a human to confirm before
+// resubmitting - never auto-resubmitted silently, matching how every other
+// recovery action in this app already works.
+function _clearConfirmedLedgerEntries(){
+  try{
+    var raw=localStorage.getItem("nd_pending_orders");
+    if(!raw)return;
+    var ledger=JSON.parse(raw);
+    var cids=Object.keys(ledger);
+    if(!cids.length)return;
+    var liveCids={};
+    (D.orders||[]).forEach(function(o){if(o._cid)liveCids[o._cid]=true;});
+    var changed=false;
+    cids.forEach(function(cid){if(liveCids[cid]){delete ledger[cid];changed=true;}});
+    if(changed)localStorage.setItem("nd_pending_orders",JSON.stringify(ledger));
+  }catch(e){/* best-effort - never let this affect the write-success path */}
+}
+function _pendingOrderLedgerAdd(cid,customerName,prod,qty){
+  try{
+    var raw=localStorage.getItem("nd_pending_orders");
+    var ledger=raw?JSON.parse(raw):{};
+    ledger[cid]={cid:cid,customerName:customerName,prod:prod,qty:qty,ts:Date.now()};
+    localStorage.setItem("nd_pending_orders",JSON.stringify(ledger));
+  }catch(e){/* best-effort - never block order creation on this */}
+}
+function _pendingOrderLedgerConfirm(cid){
+  try{
+    var raw=localStorage.getItem("nd_pending_orders");
+    if(!raw)return;
+    var ledger=JSON.parse(raw);
+    delete ledger[cid];
+    localStorage.setItem("nd_pending_orders",JSON.stringify(ledger));
+  }catch(e){/* best-effort */}
+}
+function _pendingOrderLedgerCheck(){
+  try{
+    var raw=localStorage.getItem("nd_pending_orders");
+    if(!raw)return;
+    var ledger=JSON.parse(raw);
+    var cids=Object.keys(ledger);
+    if(!cids.length)return;
+    var liveCids={};
+    (D.orders||[]).forEach(function(o){if(o._cid)liveCids[o._cid]=true;});
+    // FIX (2026-07-26): the ceiling below compared an AGE (a duration) against
+    // oneDayAgo (an absolute timestamp), so it was always true and did nothing -
+    // entries never aged out. Both sides are now durations. Surface anything
+    // older than 2 minutes (had a fair chance to sync) and younger than 30 days
+    // (beyond that it was surely reconciled by other means); a genuinely stale
+    // entry is still shown once, then cleared, so nothing is silently lost.
+    var _minLedgerAgeMs=120000, _maxLedgerAgeMs=2592000000; // 2 min .. 30 days
+    var unresolved=cids.filter(function(cid){
+      var entry=ledger[cid];
+      // If it's now present (by token) in the synced data, it made it -
+      // clear it and move on, nothing to ask about.
+      if(liveCids[cid]){delete ledger[cid];return false;}
+      var _age=Date.now()-entry.ts;
+      return _age>_minLedgerAgeMs&&_age<_maxLedgerAgeMs;
+    });
+    localStorage.setItem("nd_pending_orders",JSON.stringify(ledger));
+    if(!unresolved.length)return;
+    var e=ledger[unresolved[0]]||JSON.parse(raw)[unresolved[0]];
+    if(!e)return;
+    var msg="An order you placed earlier may not have saved:\n\n"+
+      unescapeForEdit(e.customerName)+" — "+unescapeForEdit(e.prod)+" x"+e.qty+
+      "\n\nThis can happen if the app closed or lost connection right after placing it. "+
+      "Re-check the Orders list first — it may already be there under a different number. "+
+      "If it's genuinely missing, place it again now.";
+    if(confirm(msg)){
+      _pendingOrderLedgerConfirm(unresolved[0]); // don't ask again regardless of what they do next
+      nav("orders",null);
+    }else{
+      _pendingOrderLedgerConfirm(unresolved[0]);
+    }
+  }catch(e){/* best-effort - never block app startup on this */}
 }
 function autoSaveCheckLocal(){
   try{
