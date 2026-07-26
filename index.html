@@ -258,6 +258,47 @@ var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
 var APP_VERSION="2026-07-21-v35";
+/* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
+   This single-file app has no framework error boundary. Before this, ANY
+   uncaught exception during a render or during the onSnapshot merge (which
+   runs seconds after login and re-renders the current page) left the user
+   staring at a blank/frozen screen with only a console message they never
+   see — the "page disappears after login" symptom. This converts every such
+   silent failure into a visible, reassuring, recoverable banner with a
+   Reload button, and logs the detail for diagnosis. It never blocks the app
+   for non-fatal errors (the banner is dismissible); it simply guarantees the
+   user is never stranded on a blank screen with no way forward. */
+window._ndErrCount=0;
+function _ndShowErrorBanner(detail){
+  try{
+    window._ndErrCount++;
+    var existing=document.getElementById("nd-err-banner");
+    if(existing){var c=existing.querySelector("#nd-err-count");if(c)c.textContent=window._ndErrCount>1?(" ("+window._ndErrCount+")"):"";return;}
+    if(!document.body){return;} // body not ready yet — nothing to attach to
+    var b=document.createElement("div");
+    b.id="nd-err-banner";
+    b.style.cssText="position:fixed;top:0;left:0;right:0;z-index:2147483647;background:#c0392b;color:#fff;padding:10px 14px;font-family:system-ui,-apple-system,sans-serif;font-size:13px;display:flex;align-items:center;justify-content:center;gap:12px;box-shadow:0 2px 8px rgba(0,0,0,.25);flex-wrap:wrap";
+    b.innerHTML="<span style=\"font-weight:700\">\u26a0\ufe0f A display error occurred<span id=\"nd-err-count\"></span></span>"
+      +"<span style=\"opacity:.9\">Your data is safe and saved — this is a screen glitch, not lost information.</span>"
+      +"<button onclick=\"location.reload()\" style=\"background:#fff;color:#c0392b;border:none;border-radius:6px;padding:7px 16px;font-weight:800;font-size:13px;cursor:pointer\">Reload</button>"
+      +"<button onclick=\"var e=document.getElementById('nd-err-banner');if(e)e.remove();\" style=\"background:transparent;color:#fff;border:1px solid rgba(255,255,255,.6);border-radius:6px;padding:7px 12px;font-size:12px;cursor:pointer\">Dismiss</button>";
+    document.body.appendChild(b);
+    try{if(typeof auditLog==="function"&&window.CU)auditLog("SECURITY_VIOLATION","Client display error caught: "+String(detail||"").slice(0,140));}catch(_){}
+  }catch(_){}
+}
+window.addEventListener("error",function(ev){
+  // Only genuine uncaught script errors — NOT resource (img/script) load
+  // errors, which fire this same event with ev.target being the element.
+  if(ev&&(ev.error||(ev.message&&(ev.target===window||!ev.target)))){
+    try{console.error("[NDSYNC] uncaught error:",ev.message,ev.error&&ev.error.stack);}catch(_){}
+    _ndShowErrorBanner(ev.message||(ev.error&&ev.error.message)||"unknown");
+  }
+},true);
+window.addEventListener("unhandledrejection",function(ev){
+  try{console.error("[NDSYNC] unhandled promise rejection:",ev&&ev.reason);}catch(_){}
+  // Promise rejections are usually network/Firestore transients that the app
+  // already retries — log them, but do NOT banner the user for those.
+});
 /* ── EMAILJS CONFIG (set via Settings in app) ── */
 var EJ_PUBLIC_KEY=localStorage.getItem("nd_ej_pk")||"";
 var EJ_SERVICE_ID=localStorage.getItem("nd_ej_sid")||"";
@@ -2518,7 +2559,14 @@ function refreshCurrentPage(){
     excel:function(){AUDIT_PAGE=0;AUDIT_Q="";AUDIT_TYPE="";rExcel();startAuditListener();},
     users:rUsers
   };
-  if(fns[pid])fns[pid]();
+  // Guard the re-render: this runs on EVERY incoming snapshot. A single
+  // transient bad render (e.g. a half-merged record mid-sync) must not throw
+  // uncaught and blank the whole app — log it, keep the last good screen, and
+  // let the next clean snapshot re-render normally. The global error banner
+  // still exists as a last resort, but this keeps ordinary sync hiccups
+  // completely invisible to the user.
+  try{ if(fns[pid])fns[pid](); }
+  catch(_e){ try{console.error("[NDSYNC] refreshCurrentPage render error on '"+pid+"':",_e);}catch(__){} }
   // Update notification badges
   if(el("tnav")&&CU){
     var pO=(D.orders||[]).filter(function(o){return o.status==="Pending"||o.status==="Processing";}).length;
@@ -3424,7 +3472,10 @@ function nav(p,btn){
   });
   el("um").classList.remove("open");
   var fns={dashboard:rDash,customers:function(){rCusts(undefined,CUST_PAGE);},orders:function(){ORD_STATUS_F="";ORD_DATE_F="";rOrds(undefined,ORD_PAGE);},delivery:function(){DEL_Q="";rDel();},stock:function(){rStock(undefined,STK_PAGE);},invoices:function(){INV_Q="";INV_PAGE=0;rInvs();},debts:function(){DEBT_Q="";DEBT_PAGE=0;rDebts();},complaints:function(){CMP_Q="";CMP_PAGE=0;rCmps();},offers:rOffers,reports:rReports,excel:function(){rExcel();setTimeout(startAuditListener,300);},users:rUsers};
-  if(fns[p])fns[p]();
+  // Guarded so the first render right after login (buildApp calls nav()) can
+  // never throw uncaught and leave a blank screen; the banner is the backstop.
+  try{ if(fns[p])fns[p](); }
+  catch(_e){ try{console.error("[NDSYNC] nav render error on '"+p+"':",_e);}catch(__){} }
 }
 
 function buildMods(){
@@ -4467,7 +4518,7 @@ function showPayments(invId){
         +"<div><div style=\"font-weight:800;font-size:13px\">KSh "+p.amt.toLocaleString()+"</div>"
         +"<div style=\"font-size:11px;color:var(--tx2);margin-top:2px\">"
         +p.method+" &nbsp;&middot;&nbsp; "+p.date+(p.ref?" &nbsp;&middot;&nbsp; "+p.ref:"")+"</div></div></div>"
-        +"<button class=\"btn btn-xs btn-red\" onclick=\"showPayments._confirm("+invId+","+idx+")\" style=\"min-width:80px;justify-content:center\">"
+        +"<button class=\"btn btn-xs btn-red\" onclick=\"showPayments._confirm("+invId+","+(p.pid!=null?p.pid:-1)+","+idx+")\" style=\"min-width:80px;justify-content:center\">"
         +"<i class=\"ti ti-arrow-back-up\"></i> Reverse</button></div>";
     }).join("");
     html+="</div>";
@@ -4477,9 +4528,14 @@ function showPayments(invId){
   om("m-generic");
 }
 // Reversal confirmation — shown inside the existing modal, no nested confirm()
-showPayments._confirm=function(invId,idx){
+showPayments._confirm=function(invId,pid,idx){
   var inv=D.invoices.find(function(x){return x.id===invId;});if(!inv)return;
-  var pay=(inv.payments||[])[idx];if(!pay)return;
+  var pays=inv.payments||[];
+  // Resolve by stable pid first (robust to array reordering); index fallback
+  // only for legacy pid-less payments.
+  var _i=(pid!=null&&pid>0)?pays.findIndex(function(p){return p.pid===pid;}):idx;
+  if(_i<0||_i>=pays.length)_i=idx;
+  var pay=pays[_i];if(!pay)return;
   var cu=D.customers.find(function(x){return x.id===inv.cId;});
   var custName=cu?(can("vPhone")?cu.name:maskName(cu.name)):"Customer";
   var gb=el("m-generic-body");if(!gb)return;
@@ -4496,19 +4552,27 @@ showPayments._confirm=function(invId,idx){
     +"</div></div></div>"
     +"<div class=\"mft\">"
     +"<button class=\"btn\" onclick=\"showPayments("+invId+")\" >Cancel</button>"
-    +"<button class=\"btn btn-red\" onclick=\"reversePayment("+invId+","+idx+");showPayments("+invId+")\" >"
+    +"<button class=\"btn btn-red\" onclick=\"reversePayment("+invId+","+(pid!=null?pid:-1)+","+_i+");showPayments("+invId+")\" >"
     +"<i class=\"ti ti-arrow-back-up\"></i> Confirm Reversal</button>"
     +"</div></div>";
 }
-function reversePayment(invId,payIdx){
+function reversePayment(invId,pid,payIdx){
   if(!can("rest")){toast("Director only","err");return;}
   var inv=(D.invoices||[]).find(function(x){return x.id===invId;});
   if(!inv){toast("Invoice not found","err");return;}
   var pays=inv.payments||[];
-  if(payIdx<0||payIdx>=pays.length){toast("Payment not found","err");return;}
-  var pay=pays[payIdx];
+  // FIX (2026-07-26): identify the payment by its stable pid, not its array
+  // position. The array can be reordered by a concurrent payment-merge between
+  // when the list was rendered and when Reverse is clicked, and a fast
+  // double-click could otherwise reverse a shifted neighbour - either way
+  // reversing the WRONG payment (real money). pid lookup is exact; index is
+  // used only as a fallback for legacy payments minted before pids existed.
+  var _t=(pid!=null&&pid>0)?pays.findIndex(function(p){return p.pid===pid;}):-1;
+  if(_t<0&&(pid==null||pid<=0)&&payIdx>=0&&payIdx<pays.length&&pays[payIdx].pid==null)_t=payIdx;
+  if(_t<0||_t>=pays.length){toast("Payment not found — it may have already been reversed","err");return;}
+  var pay=pays[_t];
   // Remove the payment entry
-  pays.splice(payIdx,1);
+  pays.splice(_t,1);
   // Recalculate paid total from remaining payments — source of truth
   inv.paid=_round2(pays.reduce(function(s,p){return s+(p.amt||0);},0));
   inv.payments=pays;
@@ -5504,7 +5568,7 @@ function saveOrd(){
     var existingDebt=custDebt(cId);
     var cust=(D.customers||[]).find(function(x){return x.id===cId;});
     var creditLimit=cust?(cust.creditLimit||0):0; // creditLimit is separate from credit balance
-    var orderTotal=price*qty;
+    var orderTotal=_round2(price*qty);
     var projectedDebt=existingDebt+orderTotal;
     if(existingDebt>0){
       var debtMsg="⚠️ Debt Alert\n\n"+
@@ -5569,7 +5633,7 @@ function saveOrd(){
     o.prodConfirmed=!isCat;
     o.driver=el("odrv").value;o.deliver=sanitizeInput(el("odlvr").value);o.bottle_before=el("obtl").value;
     var amtPaid=_round2(parseFloat(el("oamt").value)||0);
-    var total=price*qty;
+    var total=_round2(price*qty);
     // Auto-correct payment status based on amount paid
     var payStatus;
     if(amtPaid>=total){payStatus="Paid";}
@@ -5592,7 +5656,7 @@ function saveOrd(){
       }else{
         // FIX (2026-07-21): atomic reservation for this new-invoice-on-edit path too
         reserveNextInvoiceId().then(function(newInvId){
-          (D.invoices||[]).push({id:newInvId,orderId:o.id,cId:cId,amount:price*qty,paid:amtPaid,due:o.date,notes:"Order #"+o.id,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order edit"}]:[]});
+          (D.invoices||[]).push({id:newInvId,orderId:o.id,cId:cId,amount:_round2(price*qty),paid:amtPaid,due:o.date,notes:"Order #"+o.id,date:tday(),payments:amtPaid>0?[{pid:uid(),date:tday(),amt:amtPaid,method:"Cash",ref:"Order edit"}]:[]});
           o.invoiceId=newInvId;
           if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
           auditLog("ORDER_UPDATED","Order #"+o.id+" edited by "+CU.name+" ("+CU.role+")");
@@ -5652,7 +5716,7 @@ function saveOrd(){
   }else if(st&&st.qty<qty){
     if(!confirm("⚠️ Stock Alert\n\n"+unescapeForEdit(pn)+" has only "+st.qty+" unit(s) in stock but you are ordering "+qty+".\n\nThe order will be recorded. Please restock soon.\n\nContinue?")){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}
   }
-  var total=price*qty;
+  var total=_round2(price*qty);
   var amtPaid=can("mPaid")?_round2(parseFloat(el("oamt").value)||0):0;
   var payStatus=can("mPaid")?el("opay").value:"Unpaid";
   if(amtPaid>=total){payStatus="Paid";}
@@ -5678,7 +5742,7 @@ function saveOrd(){
     // Always create invoice for exact orders — provides full financial trail
     // FIX (2026-07-21): both IDs now reserved together in ONE transaction -
     // see reserveNextOrderAndInvoiceIds - instead of two sequential ones.
-    (D.invoices||[]).push({id:newInvId,orderId:newOrdId,cId:cId,amount:total,paid:amtPaid,due:(function(){var dd=new Date((el("od").value||tday())+"T12:00:00");dd.setDate(dd.getDate()+7);return dd.toISOString().split("T")[0];})(),notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
+    (D.invoices||[]).push({id:newInvId,orderId:newOrdId,cId:cId,amount:total,paid:amtPaid,due:(function(){var dd=new Date((el("od").value||tday())+"T12:00:00");dd.setDate(dd.getDate()+7);return dd.toISOString().split("T")[0];})(),notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{pid:uid(),date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
     auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty+" — customer #"+cId+" "+(function(){var _c=(D.customers||[]).find(function(x){return x.id===cId;});return _c?unescapeForEdit(_c.name):"unknown";})());
     if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
     rDel();
@@ -5835,7 +5899,7 @@ function completeDlv(){
   // existence/creation is now unconditional; only *applying a new payment*
   // stays gated by mPaid — staff still route cash through the
   // pendingPayments/director-acknowledgement flow exactly as before.
-  var total=o.qty*o.price;
+  var total=_round2(o.qty*o.price);
   var inv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.match(new RegExp("#"+oid+"(\\D|$)"));});
   // FIX (2026-07-21): the invoice ID here now goes through the same atomic
   // reservation as order/edit invoice creation, closing the same collision
