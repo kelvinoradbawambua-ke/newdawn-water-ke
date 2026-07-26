@@ -6361,6 +6361,28 @@ function showMissingOrders(){
             "</div></div>";
         }
       }
+      // FIX (2026-07-25): found live - a "missing" order can genuinely
+      // already exist under a DIFFERENT order number (e.g. #1290 missing,
+      // but the same real transaction recorded as #1291), which the old
+      // logic could never catch, since it only ever checked for a
+      // duplicate when the customer was still unknown. Once the audit
+      // trail started filling in the customer automatically, this
+      // detection silently stopped running for exactly the cases it
+      // matters most for. This checks regardless of whether the customer
+      // is already known - same customer AND same product AND same
+      // quantity on a nearby order is the strongest possible signal this
+      // is the same real order, not a coincidence, and recreating it
+      // would create a genuine duplicate rather than recover anything.
+      var dupMatch=m.nearby.find(function(n){
+        return n.prod.trim().toLowerCase()===m.prod.trim().toLowerCase()&&n.qty===m.qty&&n.cId&&m.cId&&n.cId===m.cId;
+      });
+      if(dupMatch){
+        suggestHtml+="<div style=\"background:#fdecea;border:1px solid #e6a5a0;border-left:3px solid #c0392b;border-radius:8px;padding:10px 12px;margin-top:12px;font-size:12px\">"+
+          "<div style=\"display:flex;align-items:center;gap:6px\">"+
+          "<i class=\"ti ti-alert-triangle\" style=\"color:#c0392b\"></i>"+
+          "<span><strong>Possible duplicate:</strong> Order #"+dupMatch.id+" ("+dupMatch.cName+") matches this exact customer, product, and quantity. This may already be recorded — verify before recreating, since doing so would create a second real order for the same transaction.</span>"+
+          "</div></div>";
+      }
       nearbyHtml="<div style=\"margin-top:12px\">"+
         "<div style=\"font-size:10px;font-weight:700;color:var(--tx2);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px\"><i class=\"ti ti-route\" style=\"color:var(--gd);margin-right:3px\"></i>Nearby orders — same delivery round</div>"+
         "<div style=\"display:flex;flex-wrap:wrap;gap:6px\">"+
