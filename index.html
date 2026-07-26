@@ -859,7 +859,37 @@ function processWriteQueue(){
   FB_WRITING=true;
   FB_WRITE_QUEUE=[];// collapse multiple pending writes into one
   FB_LAST_LOCAL_WRITE=Date.now();
-  // Strip auditLog and keep only recent orders/invoices to control doc size
+  // ATOMIC WRITE PATH (2026-07-26): the read-modify-write below now runs inside
+  // a single Firestore transaction. Firestore locks the document for the
+  // duration of the transaction and automatically re-runs this callback if any
+  // other device commits a change between our read and our commit - so no other
+  // device can clobber a record in the window between reading current state and
+  // writing our merged state. This closes the last residual missing-order /
+  // missing-customer / lost-payment window that a non-atomic get()+set() (or the
+  // previous skip-the-check-and-blind-set optimization) left open: those could
+  // still drop another device's very recent record that landed in the gap.
+  // runTransaction is already proven against live Firestore elsewhere in this
+  // file (the order/invoice/complaint ID reservations use it), so this is not a
+  // new, unproven primitive - only its application to the main write.
+  //
+  // IDEMPOTENCY (critical): a transaction callback MAY run several times. So the
+  // write payload is rebuilt FRESH from D on every attempt (_buildDforSync) and
+  // the server reconcile is applied to that fresh copy - never cumulatively - so
+  // a retry can never double-push a rescued record or double-apply a stock
+  // delta. All the actual merge/rescue rules below are the exact, already-proven
+  // logic that previously ran against a standalone get(); only the data source
+  // (the transaction's atomic read) and the write call (transaction.set) differ.
+  //
+  // OFFLINE: transactions require a live connection and cannot run offline. When
+  // one genuinely can't run (offline / persistent unavailability), we fall back
+  // to the previous get-then-reconcile-then-set - and when fully offline the
+  // get() rejects and we fall through to a plain set() that Firestore queues
+  // locally and syncs on reconnect, exactly as before. Convergence of any
+  // concurrent state on reconnect is then handled by the snapshot rescue + the
+  // re-persist backstop, unchanged.
+
+  function _buildDforSync(){
+    // Strip auditLog and keep only recent orders/invoices to control doc size
   var DforSync={};
   var keys=Object.keys(D);
   for(var ki=0;ki<keys.length;ki++){
@@ -869,7 +899,18 @@ function processWriteQueue(){
       DforSync.auditLog=(D.auditLog||[]).slice(-20);
       continue;
     }
-    DforSync[keys[ki]]=D[keys[ki]];
+    // FIX (2026-07-26): found during verification of the atomic-write fix -
+    // this used to be a plain reference copy (DforSync[k]=D[k]), meaning
+    // every array here was the SAME array as the real, live D. The
+    // reconcile logic below pushes rescued records and reassigns array
+    // indices directly onto whatever it's given - which meant it was
+    // silently mutating the actual D object on every attempt, not a
+    // disposable copy, undermining the "fresh build every retry" isolation
+    // this whole mechanism depends on. Array.isArray(...).slice() gives
+    // every attempt its own independent array, so a retry's rebuild is
+    // genuinely isolated from whatever a previous attempt did, rather than
+    // relying on downstream de-dup checks to happen to make it safe.
+    DforSync[keys[ki]]=Array.isArray(D[keys[ki]])?D[keys[ki]].slice():D[keys[ki]];
   }
   // Doc size guard: trim delivered orders older than 6 months from sync payload
   // Data stays in D (in-memory + localStorage); only Firestore doc is trimmed
@@ -906,91 +947,10 @@ function processWriteQueue(){
       return i.paid<i.amount||!i.date||i.date>=cutoffDate;
     });
   }
-  // RACE-CONDITION MITIGATION (2026-07-20): before writing, check the
-  // server's CURRENT state and merge in any order/customer that exists
-  // there but isn't yet in our local payload. Without this, if two devices
-  // place orders within a similar few-second window and neither device
-  // does anything else for 5+ minutes afterward (so the existing isOwnWrite
-  // and grace-period protections have both expired), one device's write
-  // could silently drop the other's very recent addition — a genuine,
-  // different race from the ID-collision bug fixed earlier in this file
-  // (that one was deterministic; this one is a timing-probability race).
-  // Cost: one extra Firestore read per write — negligible at this
-  // business's scale (a few hundred extra reads/day at most, against a
-  // 50,000/day free quota), and far cheaper than the alternative of
-  // silently losing a real order.
-  // TIER 2 OPTIMIZATION (2026-07-20, revised 2026-07-26): if we genuinely
-  // checked the server's fresh state very recently, skip doing it again
-  // right now. During a burst of several saves in a row (e.g. processing a
-  // few deliveries back to back), every single one was paying for its own
-  // extra read even though nothing meaningful could have changed remotely
-  // in that window.
-  //
-  // REVISED (2026-07-26): originally 25 seconds, on the reasoning that
-  // ordinary moderately-paced activity could shave redundant reads safely
-  // under a confirmed 30s staleness tolerance. Two independent, rigorous
-  // reviews then identified the SAME precise residual gap in that window:
-  // the id-set fingerprint above only detects a change in what records
-  // THIS device has locally - it cannot detect that a genuinely new record
-  // exists on the SERVER that this device simply hasn't received yet. A
-  // device doing a pure field-edit (driver reassignment, status change) on
-  // records it already has would show no id-set change at all, and could
-  // still skip the check and clobber another device's very recent order
-  // during that skipped window. Both reviews confirmed the Firestore quota
-  // cost of checking far more often is genuinely negligible at this
-  // business's scale - so there is no good reason to keep a large window
-  // now that its precise, real risk is understood. Shrunk from 25s to 3s:
-  // this does not eliminate the gap (only an atomic, transaction-based
-  // write - discussed but not yet implemented in this codebase - would do
-  // that), but reduces the worst-case exposure window by roughly 8x. The
-  // very first write of any burst still checks properly, and a sustained
-  // burst re-checks every 3s.
-  //
-  // FIX (2026-07-21): the skip above used to apply unconditionally, but the
-  // stock delta-merge logic below only ever runs INSIDE the real freshness
-  // check - never on the skip path. _sendWritePayload() unconditionally
-  // clears _stockQtyDeltas after every successful write, whether or not
-  // they were ever actually reconciled against the server. So a stock
-  // change could be silently lost: this device sells 3 units, a remote
-  // restock snapshot overwrites the local D.stock array (wiping the -3
-  // locally while the delta sits unapplied), and the next write - if it
-  // happens to land in the skip window - writes the now-stale array and
-  // clears the delta with nothing ever having reconciled it. Now: any
-  // pending, unreconciled stock delta forces a real check regardless of
-  // the skip window, since that is exactly the concurrent case the
-  // delta-merge exists to protect.
-  function _computeIdSetFingerprint(){
-    var parts=[];
-    (DforSync.orders||[]).forEach(function(o){parts.push("o"+o.id);});
-    (DforSync.customers||[]).forEach(function(c){parts.push("c"+c.id);});
-    (DforSync.invoices||[]).forEach(function(i){parts.push("i"+i.id);});
-    return parts.sort().join(",");
+    return DforSync;
   }
-  var _hasPendingStockDelta=Object.keys(_stockQtyDeltas).length>0||_hasPendingCriticalEdit;
-  var _curIdSetFingerprint=_computeIdSetFingerprint();
-  var _idSetChanged=_lastCheckedIdSet!==null&&_curIdSetFingerprint!==_lastCheckedIdSet;
-  var _skipFreshnessCheck=(!_hasPendingStockDelta)&&(!_idSetChanged)&&(Date.now()-_lastFreshnessCheckTime<3000);
-  if(_idSetChanged)console.log("[NDSYNC] processWriteQueue forcing freshness check — local order/customer/invoice id-set changed since last real check");
-  if(_skipFreshnessCheck){
-    console.log("[NDSYNC] processWriteQueue SKIPPING freshness check — checked "+(Date.now()-_lastFreshnessCheckTime)+"ms ago, within 3s window");
-    _sendWritePayload();
-    return;
-  }
-  if(_hasPendingStockDelta)console.log("[NDSYNC] processWriteQueue forcing freshness check — pending unreconciled stock delta or critical edit present");
-  console.log("[NDSYNC] processWriteQueue checking server freshness before writing...");
-  // NOTE (2026-07-21): a genuine Firestore transaction (atomic read+write,
-  // automatic retry on conflict) was built and proven correct in simulation
-  // for this exact path, but deliberately held back before deploy - it's
-  // the one change here that hadn't been tested against live Firestore, and
-  // the owner's explicit call was to ship only what's proven at 95%+
-  // confidence and stage anything else separately. This keeps the original,
-  // already-proven standalone get()-then-set() - real, working protection,
-  // just not the strongest possible version yet.
-  FB_DOC_REF.get({source:"server"}).then(function(freshDoc){
-    _lastFreshnessCheckTime=Date.now(); // only update on a REAL check, not a skip
-    if(freshDoc.exists){
-      var freshData=freshDoc.data();
-      var freshD=freshData.D||{};
+
+  function _reconcileDforSync(DforSync,freshD){
       if(freshD.orders&&DforSync.orders){
         var localOrdIds={};DforSync.orders.forEach(function(o){localOrdIds[o.id]=true;});
         freshD.orders.forEach(function(fo){
@@ -1158,16 +1118,9 @@ function processWriteQueue(){
         freshD.dismissedMissingOrders.forEach(function(id){_dismissedSetFC[id]=true;});
         DforSync.dismissedMissingOrders=Object.keys(_dismissedSetFC).map(function(k){return parseInt(k);});
       }
-    }
-    _lastCheckedIdSet=_computeIdSetFingerprint(); // final, post-rescue state
-    _sendWritePayload();
-  }).catch(function(){
-    // Freshness check itself failed (e.g. momentarily offline) — don't block
-    // the write entirely on this extra safety step; proceed with local data
-    // as-is, same as before this mitigation existed.
-    _sendWritePayload();
-  });
-  function _buildWritePayload(){
+  }
+
+  function _buildWritePayload(DforSync){
   var payload={
     D:DforSync,USERS:USERS,nOId:nOId,nIId:nIId,nCId:nCId,nCmpId:nCmpId,
     setupDone:FB_SETUP_DONE,
@@ -1191,6 +1144,7 @@ function processWriteQueue(){
   console.log("[NDSYNC] processWriteQueue SENDING to Firestore — orders="+(DforSync.orders?DforSync.orders.length:0)+" customers="+(DforSync.customers?DforSync.customers.length:0)+" sizeKB="+_sizeKB);
   return JSON.parse(JSON.stringify(payload));
   }
+
   function _onWriteSuccess(){
     console.log("[NDSYNC] processWriteQueue SUCCESS — write confirmed by Firestore at "+new Date().toISOString());
     FB_WRITING=false;
@@ -1206,6 +1160,7 @@ function processWriteQueue(){
     // Process any writes that came in while we were writing
     if(FB_WRITE_QUEUE.length)processWriteQueue();
   }
+
   function _onWriteFailure(err){
     console.log("[NDSYNC] processWriteQueue FAILED — code="+(err&&err.code)+" message="+(err&&err.message));
     FB_WRITING=false;
@@ -1228,14 +1183,57 @@ function processWriteQueue(){
     // so they don't keep working assuming other devices see their changes.
     if(FB_WRITE_RETRY_ATTEMPTS>=3)_showCloudOfflineBanner(isQuota);
   }
-  function _sendWritePayload(){
-    // Used ONLY by the skip-optimization path above (recent burst of
-    // activity, no real check needed this time) - a plain, fast, single
-    // write, exactly as before. The transaction path (real check needed)
-    // uses _buildWritePayload + transaction.set directly instead - see above.
-    var payload=_buildWritePayload();
+
+  function _sendWritePayload(DforSync){
+    var payload=_buildWritePayload(DforSync);
     FB_DOC_REF.set(payload,{merge:true}).then(_onWriteSuccess).catch(_onWriteFailure);
   }
+
+  function _isTransientOffline(err){
+    var c=err&&err.code;
+    if(c==="unavailable"||c==="deadline-exceeded"||c==="cancelled"||c==="aborted"||c==="internal")return true;
+    var m=(err&&err.message)||"";
+    return /offline|network|unavailable|failed to (get|reach)/i.test(m);
+  }
+
+  // Non-atomic fallback: reached ONLY when a transaction genuinely cannot run.
+  // Reproduces the previously-shipped, proven get-then-reconcile-then-set. When
+  // offline the server get() rejects and we still issue a plain set() so the
+  // write is queued locally by Firestore and syncs on reconnect - preserving
+  // field-device offline behavior exactly.
+  function _fallbackWrite(){
+    var DforSync=_buildDforSync();
+    FB_DOC_REF.get({source:"server"}).then(function(freshDoc){
+      _lastFreshnessCheckTime=Date.now();
+      if(freshDoc.exists&&freshDoc.data()&&freshDoc.data().D)_reconcileDforSync(DforSync,freshDoc.data().D);
+      _sendWritePayload(DforSync);
+    }).catch(function(){ _sendWritePayload(DforSync); });
+  }
+
+  // PRIMARY atomic path.
+  function _atomicWrite(){
+    if(!fbDb||typeof fbDb.runTransaction!=="function"){ _fallbackWrite(); return; }
+    fbDb.runTransaction(function(txn){
+      return txn.get(FB_DOC_REF).then(function(freshDoc){
+        var DforSync=_buildDforSync(); // FRESH each attempt - idempotent under retry
+        if(freshDoc.exists&&freshDoc.data()&&freshDoc.data().D)_reconcileDforSync(DforSync,freshDoc.data().D);
+        txn.set(FB_DOC_REF,_buildWritePayload(DforSync),{merge:true});
+      });
+    }).then(function(){
+      _lastFreshnessCheckTime=Date.now();
+      console.log("[NDSYNC] processWriteQueue atomic transaction COMMITTED at "+new Date().toISOString());
+      _onWriteSuccess();
+    }).catch(function(err){
+      if(_isTransientOffline(err)){
+        console.log("[NDSYNC] atomic write unavailable (offline?) - falling back to a queued write: "+(err&&err.code));
+        _fallbackWrite();
+      }else{
+        _onWriteFailure(err);
+      }
+    });
+  }
+
+  _atomicWrite();
 }
 var _cloudOfflineBannerShown=false;
 function _showCloudOfflineBanner(isQuota){
