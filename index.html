@@ -703,7 +703,7 @@ var _lastFreshnessCheckTime=0; // Tier 2: tracks the last REAL server-freshness 
 // change, a driver reassignment) never forced a freshness check, and could
 // silently clobber another device's very recent order/customer/invoice
 // that hadn't yet propagated, even though THIS device's own last check was
-// within the 25s window. Tracking the actual id-set seen at each real
+// within the freshness-check skip window. Tracking the actual id-set seen at each real
 // check, and forcing a new check whenever the current id-set differs from
 // it, closes this regardless of which specific action is about to write -
 // no longer dependent on remembering to flag every individual "critical"
@@ -919,16 +919,32 @@ function processWriteQueue(){
   // business's scale (a few hundred extra reads/day at most, against a
   // 50,000/day free quota), and far cheaper than the alternative of
   // silently losing a real order.
-  // TIER 2 OPTIMIZATION (2026-07-20, extended per owner's confirmed 30s
-  // tolerance): if we genuinely checked the server's fresh state within the
-  // last 25 seconds, skip doing it again right now. During a burst of
-  // several saves in a row (e.g. processing a few deliveries back to back),
-  // every single one was paying for its own extra read even though nothing
-  // meaningful could have changed remotely in that window. Extended from
-  // 15s to 25s — still safely under the confirmed 30s staleness tolerance —
-  // to shave more redundant reads during ordinary moderately-paced activity,
-  // not just tight rapid-fire bursts. The very first write of any burst
-  // still checks properly, and a sustained burst re-checks every 25s.
+  // TIER 2 OPTIMIZATION (2026-07-20, revised 2026-07-26): if we genuinely
+  // checked the server's fresh state very recently, skip doing it again
+  // right now. During a burst of several saves in a row (e.g. processing a
+  // few deliveries back to back), every single one was paying for its own
+  // extra read even though nothing meaningful could have changed remotely
+  // in that window.
+  //
+  // REVISED (2026-07-26): originally 25 seconds, on the reasoning that
+  // ordinary moderately-paced activity could shave redundant reads safely
+  // under a confirmed 30s staleness tolerance. Two independent, rigorous
+  // reviews then identified the SAME precise residual gap in that window:
+  // the id-set fingerprint above only detects a change in what records
+  // THIS device has locally - it cannot detect that a genuinely new record
+  // exists on the SERVER that this device simply hasn't received yet. A
+  // device doing a pure field-edit (driver reassignment, status change) on
+  // records it already has would show no id-set change at all, and could
+  // still skip the check and clobber another device's very recent order
+  // during that skipped window. Both reviews confirmed the Firestore quota
+  // cost of checking far more often is genuinely negligible at this
+  // business's scale - so there is no good reason to keep a large window
+  // now that its precise, real risk is understood. Shrunk from 25s to 3s:
+  // this does not eliminate the gap (only an atomic, transaction-based
+  // write - discussed but not yet implemented in this codebase - would do
+  // that), but reduces the worst-case exposure window by roughly 8x. The
+  // very first write of any burst still checks properly, and a sustained
+  // burst re-checks every 3s.
   //
   // FIX (2026-07-21): the skip above used to apply unconditionally, but the
   // stock delta-merge logic below only ever runs INSIDE the real freshness
@@ -953,10 +969,10 @@ function processWriteQueue(){
   var _hasPendingStockDelta=Object.keys(_stockQtyDeltas).length>0||_hasPendingCriticalEdit;
   var _curIdSetFingerprint=_computeIdSetFingerprint();
   var _idSetChanged=_lastCheckedIdSet!==null&&_curIdSetFingerprint!==_lastCheckedIdSet;
-  var _skipFreshnessCheck=(!_hasPendingStockDelta)&&(!_idSetChanged)&&(Date.now()-_lastFreshnessCheckTime<25000);
+  var _skipFreshnessCheck=(!_hasPendingStockDelta)&&(!_idSetChanged)&&(Date.now()-_lastFreshnessCheckTime<3000);
   if(_idSetChanged)console.log("[NDSYNC] processWriteQueue forcing freshness check — local order/customer/invoice id-set changed since last real check");
   if(_skipFreshnessCheck){
-    console.log("[NDSYNC] processWriteQueue SKIPPING freshness check — checked "+(Date.now()-_lastFreshnessCheckTime)+"ms ago, within 25s window");
+    console.log("[NDSYNC] processWriteQueue SKIPPING freshness check — checked "+(Date.now()-_lastFreshnessCheckTime)+"ms ago, within 3s window");
     _sendWritePayload();
     return;
   }
@@ -1887,7 +1903,7 @@ function startCloudListener(isWarmRefresh){
           // FIX (2026-07-21): this used to trust the incoming remote invoice
           // at face value for every case except a recent local void - meaning
           // it had no protection against a remote write that was itself based
-          // on stale data (e.g. written during another device's 25s freshness-
+          // on stale data (e.g. written during another device's freshness-
           // skip window) and so shows LESS progress than what this device
           // already knows locally. The pre-write freshness check already
           // guards this exact scenario in the other direction (preferring
