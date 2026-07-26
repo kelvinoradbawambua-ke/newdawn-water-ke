@@ -698,6 +698,17 @@ var FB_WRITE_RETRY_TIMER=null; // QUOTA GUARD: only one pending write-retry may 
 var FB_WRITE_RETRY_ATTEMPTS=0; // QUOTA GUARD: drives backoff instead of a fixed 5s-forever hammer
 var FB_PENDING_CONFIRM_RETRY=null; // ensures a write attempted before confirmation is never silently lost
 var _lastFreshnessCheckTime=0; // Tier 2: tracks the last REAL server-freshness check, to safely skip redundant ones during a rapid burst of writes
+// FIX (2026-07-26): RCA-confirmed residual gap in the skip-window
+// optimization above - a non-creating device's write (an edit, a status
+// change, a driver reassignment) never forced a freshness check, and could
+// silently clobber another device's very recent order/customer/invoice
+// that hadn't yet propagated, even though THIS device's own last check was
+// within the 25s window. Tracking the actual id-set seen at each real
+// check, and forcing a new check whenever the current id-set differs from
+// it, closes this regardless of which specific action is about to write -
+// no longer dependent on remembering to flag every individual "critical"
+// action by name.
+var _lastCheckedIdSet=null;
 var _stockQtyDeltas={}; // stock id -> net quantity change since last confirmed sync (e.g. -3 for a sale, +10 for a restock)
 // LAYER 1 (2026-07-21): stock id -> { orderId -> delta }. Tracks WHICH order
 // caused each pending, unconfirmed stock change - not just which product.
@@ -932,8 +943,18 @@ function processWriteQueue(){
   // pending, unreconciled stock delta forces a real check regardless of
   // the skip window, since that is exactly the concurrent case the
   // delta-merge exists to protect.
+  function _computeIdSetFingerprint(){
+    var parts=[];
+    (DforSync.orders||[]).forEach(function(o){parts.push("o"+o.id);});
+    (DforSync.customers||[]).forEach(function(c){parts.push("c"+c.id);});
+    (DforSync.invoices||[]).forEach(function(i){parts.push("i"+i.id);});
+    return parts.sort().join(",");
+  }
   var _hasPendingStockDelta=Object.keys(_stockQtyDeltas).length>0||_hasPendingCriticalEdit;
-  var _skipFreshnessCheck=(!_hasPendingStockDelta)&&(Date.now()-_lastFreshnessCheckTime<25000);
+  var _curIdSetFingerprint=_computeIdSetFingerprint();
+  var _idSetChanged=_lastCheckedIdSet!==null&&_curIdSetFingerprint!==_lastCheckedIdSet;
+  var _skipFreshnessCheck=(!_hasPendingStockDelta)&&(!_idSetChanged)&&(Date.now()-_lastFreshnessCheckTime<25000);
+  if(_idSetChanged)console.log("[NDSYNC] processWriteQueue forcing freshness check — local order/customer/invoice id-set changed since last real check");
   if(_skipFreshnessCheck){
     console.log("[NDSYNC] processWriteQueue SKIPPING freshness check — checked "+(Date.now()-_lastFreshnessCheckTime)+"ms ago, within 25s window");
     _sendWritePayload();
@@ -1122,6 +1143,7 @@ function processWriteQueue(){
         DforSync.dismissedMissingOrders=Object.keys(_dismissedSetFC).map(function(k){return parseInt(k);});
       }
     }
+    _lastCheckedIdSet=_computeIdSetFingerprint(); // final, post-rescue state
     _sendWritePayload();
   }).catch(function(){
     // Freshness check itself failed (e.g. momentarily offline) — don't block
@@ -5283,17 +5305,31 @@ function saveOrd(){
   if(window._savingOrder)return;
   window._savingOrder=true;
   if(window._savingOrderSafetyNet)clearTimeout(window._savingOrderSafetyNet);
-  window._savingOrderSafetyNet=setTimeout(function(){window._savingOrder=false;},2500);
+  // FIX (2026-07-25/26): RCA-confirmed root cause of duplicate orders
+  // (specifically the #1290/#1291 incident) - a native confirm() dialog
+  // blocks all JS execution while open, but setTimeout keeps counting
+  // regardless. The old 2.5s safety net could fire WHILE a debt/stock
+  // confirm() dialog was still open (a human reading a warning easily
+  // takes longer than 2.5s), silently clearing the guard before the user
+  // even responded. The guard would then be disarmed the instant JS
+  // resumed, letting an impatient second tap or a stray double-click
+  // create a genuine second order for the same transaction. Disabling the
+  // actual button immediately, here, is timer-independent - it can't be
+  // defeated by any dialog outlasting any fixed duration, which a purely
+  // longer timer still could be.
+  var _placeOrderBtn=el("m-o-save");
+  if(_placeOrderBtn){_placeOrderBtn.disabled=true;_placeOrderBtn.innerHTML="<i class=\"ti ti-loader-2\"></i> Placing...";}
+  window._savingOrderSafetyNet=setTimeout(function(){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}},2500);
   // PERMISSION HARDENING: the old check was `!can("aOrd")&&!can("eOrd")`, which
   // meant a role with aOrd:1 but eOrd:0 (e.g. staff) could pass this gate even
   // while editing an existing order — the UI already hides the Edit button from
   // such roles, but this function itself did not actually enforce the distinction.
   // Now the correct permission is required for the specific action being taken.
   var _isEditingOrder=!!el("o-edit-id").value;
-  if(_isEditingOrder){if(!can("eOrd"))return;}else{if(!can("aOrd"))return;}
-  if(!(D.customers||[]).length){toast("Add a customer first","err");return;}
+  if(_isEditingOrder){if(!can("eOrd")){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}}else{if(!can("aOrd")){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}}
+  if(!(D.customers||[]).length){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}toast("Add a customer first","err");return;}
   var cId=parseInt(el("oc")&&el("oc").value)||0;
-  if(!cId){toast("Please select a customer","err");if(el("oc-search"))el("oc-search").focus();return;}
+  if(!cId){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}toast("Please select a customer","err");if(el("oc-search"))el("oc-search").focus();return;}
 
   // Determine order mode
   var mode=el("o-mode")?el("o-mode").value:"exact";
@@ -5303,19 +5339,19 @@ function saveOrd(){
   if(isCat){
     // Category mode — product TBC at delivery
     pn=el("op-cat")?el("op-cat").value:"";
-    if(!pn){toast("Please select a category","err");return;}
+    if(!pn){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}toast("Please select a category","err");return;}
     price=0; // price unknown until delivery
   }else{
     // Exact product mode
-    if(!(D.stock||[]).length){toast("Add a product first","err");return;}
+    if(!(D.stock||[]).length){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}toast("Add a product first","err");return;}
     var opEl=el("op");pn=opEl?opEl.value:"";
-    if(!pn){toast("Please select a product","err");if(el("op-search"))el("op-search").focus();return;}
+    if(!pn){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}toast("Please select a product","err");if(el("op-search"))el("op-search").focus();return;}
     price=parseInt((opEl?opEl.getAttribute("data-p"):0)||0);
-    if(price<=0&&!isCat){if(!confirm("⚠️ Price Warning\n\nThis product has no sale price set (KSh 0).\n\nContinue with a zero-value order?"))return;}
+    if(price<=0&&!isCat){if(!confirm("⚠️ Price Warning\n\nThis product has no sale price set (KSh 0).\n\nContinue with a zero-value order?")){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}}
   }
 
   var qty=Math.max(1,parseInt(el("oq").value)||1); // floored at 1 - a negative value here would invert stock deduction
-  if(qty<1){toast("Quantity must be at least 1","err");return;}
+  if(qty<1){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}toast("Quantity must be at least 1","err");return;}
   // Auto-apply active offer discount — qty now defined for minqty check
   if(price>0&&!isCat){
     var _of=(D.offers||[]).find(function(o){
@@ -5328,7 +5364,7 @@ function saveOrd(){
     }
   }
   var delivDate=el("od")?el("od").value:"";
-  if(!delivDate){toast("Please set a delivery date","err");if(el("od"))el("od").focus();return;}
+  if(!delivDate){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}toast("Please set a delivery date","err");if(el("od"))el("od").focus();return;}
   var editId=el("o-edit-id").value;
   // CRITICAL FIX (2026-07-25): verified root cause of orders vanishing -
   // order creation was the ONE record type that never forced a pre-write
@@ -5357,7 +5393,7 @@ function saveOrd(){
         (orderTotal>0?"This order adds KSh "+orderTotal.toLocaleString()+" bringing total to KSh "+projectedDebt.toLocaleString()+".":"This is a category order — price confirmed at delivery.")+
         (creditLimit>0&&projectedDebt>creditLimit?"\n\n🚫 Credit limit of KSh "+creditLimit.toLocaleString()+" will be exceeded!":"")+
         "\n\nContinue placing this order?";
-      if(!confirm(debtMsg))return;
+      if(!confirm(debtMsg)){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}
     }
   }
 
@@ -5370,26 +5406,26 @@ function saveOrd(){
       }).length;
       if(driverPending>=5){
         var drvMsg="⚠️ Workload Alert\n\n"+driverName+" already has "+driverPending+" active order(s) pending.\n\nYou can still assign this order — just letting you know.\n\nContinue?";
-        if(!confirm(drvMsg))return;
+        if(!confirm(drvMsg)){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}
       }
     }
   }
 
   if(editId){
     var o=(D.orders||[]).find(function(x){return String(x.id)===String(editId);});
-    if(!o){toast("Order not found","err");return;}
-    if(o.status==="Delivered"||o.status==="Cancelled"){toast("This order can no longer be fully edited","err");return;}
+    if(!o){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}toast("Order not found","err");return;}
+    if(o.status==="Delivered"||o.status==="Cancelled"){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}toast("This order can no longer be fully edited","err");return;}
     var oldStock=(D.stock||[]).find(function(s){return (o.stockId&&s.id===o.stockId)||s.name===o.prod;});
     var newStock=(D.stock||[]).find(function(s){return s.name===pn;});
     if(oldStock===newStock){
       var netChange=qty-o.qty;
       if(netChange>0&&newStock&&newStock.qty<netChange){
-        if(!confirm("⚠️ Stock Alert\n\nOnly "+newStock.qty+" more unit(s) available for "+unescapeForEdit(pn)+".\n\nOrder will be updated but stock is insufficient. Please restock.\n\nContinue?"))return;
+        if(!confirm("⚠️ Stock Alert\n\nOnly "+newStock.qty+" more unit(s) available for "+unescapeForEdit(pn)+".\n\nOrder will be updated but stock is insufficient. Please restock.\n\nContinue?")){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}
       }
       if(newStock){newStock.qty=Math.max(0,newStock.qty-netChange);_recordStockDelta(newStock.id,-netChange,o.id);}
     }else{
       if(newStock&&newStock.qty<qty){
-        if(!confirm("⚠️ Stock Alert\n\nOnly "+newStock.qty+" unit(s) in stock for "+unescapeForEdit(pn)+".\n\nOrder will be updated. Please restock soon.\n\nContinue?"))return;
+        if(!confirm("⚠️ Stock Alert\n\nOnly "+newStock.qty+" unit(s) in stock for "+unescapeForEdit(pn)+".\n\nOrder will be updated. Please restock soon.\n\nContinue?")){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}
       }
       if(oldStock){oldStock.qty+=o.qty;_recordStockDelta(oldStock.id,o.qty,o.id);}
       if(newStock){newStock.qty=Math.max(0,newStock.qty-qty);_recordStockDelta(newStock.id,-qty,o.id);}
@@ -5490,9 +5526,9 @@ function saveOrd(){
   // creation) waits for a guaranteed-unique ID below.
   var st=(D.stock||[]).find(function(s){return s.name===pn;});
   if(st&&st.qty<=0){
-    if(!confirm("⚠️ Stock Alert\n\n"+unescapeForEdit(pn)+" is OUT OF STOCK (0 units).\n\nThe order will be recorded but cannot be fulfilled until restocked.\n\nContinue placing this order?")){window._savingOrder=false;return;}
+    if(!confirm("⚠️ Stock Alert\n\n"+unescapeForEdit(pn)+" is OUT OF STOCK (0 units).\n\nThe order will be recorded but cannot be fulfilled until restocked.\n\nContinue placing this order?")){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}
   }else if(st&&st.qty<qty){
-    if(!confirm("⚠️ Stock Alert\n\n"+unescapeForEdit(pn)+" has only "+st.qty+" unit(s) in stock but you are ordering "+qty+".\n\nThe order will be recorded. Please restock soon.\n\nContinue?")){window._savingOrder=false;return;}
+    if(!confirm("⚠️ Stock Alert\n\n"+unescapeForEdit(pn)+" has only "+st.qty+" unit(s) in stock but you are ordering "+qty+".\n\nThe order will be recorded. Please restock soon.\n\nContinue?")){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}
   }
   var total=price*qty;
   var amtPaid=can("mPaid")?_round2(parseFloat(el("oamt").value)||0):0;
