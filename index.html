@@ -555,17 +555,47 @@ function btl(v){if(!v||v==="Good")return "<span class=\"badge bg\">Good</span>";
 // making the whole function O(invoices x orders) per customer. At a few
 // hundred customers/invoices/orders this is tens of millions of operations
 // per render. A lazily-rebuilt order-by-id index turns that inner lookup
-// into O(1). Rebuilding only when the order COUNT changes is safe and
-// cheap: JavaScript objects are references, so an existing order having a
-// field mutated (status, driver, etc.) is already reflected in the cached
-// reference without needing a rebuild - only a genuine add or delete
-// changes the count and requires one.
-var _ordByIdCache=null,_ordByIdCacheLen=-1;
+// into O(1). JavaScript objects are references, so an existing order having
+// a field mutated (status, driver, etc.) is already reflected in the cached
+// reference without needing a rebuild - only a genuine add, delete, or swap
+// requires one.
+//
+// FIX (2026-07-27): "rebuild only when the order COUNT changes" (the
+// original version of this comment) is wrong - count is a coincidental
+// signal, not a causal one. A sync/merge cycle reassigning D.orders to an
+// entirely new array (routine, not an edge case - see e.g. the read-side
+// merge building D.orders=... fresh from a snapshot) can easily produce a
+// new array of the SAME length as before even though its actual contents
+// differ - one order genuinely deleted, a different one genuinely added.
+// The old length check saw "same length" and kept serving the stale index,
+// so a deleted order's id still resolved to its old (pre-deletion) object,
+// wrongly making its invoice look like real, uncancelled debt. Confirmed
+// live: a customer's debt read 300 when the correct figure was 0, entirely
+// because of this staleness, not any real money. Switched to reference
+// identity as the invalidation signal - the cache is valid exactly as long
+// as D.orders is still the very array it was built from.
+//
+// FIX #2 (2026-07-27): reference-identity ALONE traded one gap for another.
+// Order creation pushes a new order directly onto the existing D.orders
+// array (no reassignment - see saveOrd()) - so a brand-new order was
+// invisible to this index, and therefore to custDebt(), until the next
+// full reassignment happened to come along (routinely moments later on the
+// next sync cycle, but not immediately). Confirmed live: pushing a new
+// order onto the same reference and immediately calling custDebt() for
+// that customer undercounted - the new order's own debt was missing.
+// Reference identity and length are complementary, not redundant: identity
+// catches a wholesale reassignment (this file's original bug - same length,
+// different contents); length catches an in-place push (this gap - same
+// reference, different length). Neither alone covers both failure modes;
+// together they do, while a call with truly nothing changed (same
+// reference AND same length) still correctly skips the rebuild.
+var _ordByIdCache=null,_ordByIdCacheArr=null,_ordByIdCacheLen=-1;
 function _getOrdByIdIndex(){
   var orders=D.orders||[];
-  if(_ordByIdCache&&_ordByIdCacheLen===orders.length)return _ordByIdCache;
+  if(_ordByIdCache&&_ordByIdCacheArr===orders&&_ordByIdCacheLen===orders.length)return _ordByIdCache;
   _ordByIdCache={};
   orders.forEach(function(o){_ordByIdCache[o.id]=o;});
+  _ordByIdCacheArr=orders;
   _ordByIdCacheLen=orders.length;
   return _ordByIdCache;
 }
