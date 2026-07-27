@@ -787,13 +787,26 @@ function _mergeCustomerCredit(a,b){
   var mergedLog=(a&&a.creditLog)?a.creditLog.slice():[];
   var seen={};
   mergedLog.forEach(function(l){seen[_logKey(l)]=true;});
+  // ADDITIVE MERGE (2026-07-26): start from a's current balance and add ONLY
+  // the entries b has that a doesn't. The previous version recomputed the
+  // balance purely as sum(mergedLog), which had two failure modes: (1) it
+  // silently WIPED any credit whose history predates the creditLog (legacy
+  // credit not represented as log entries), and (2) paired with a caller gate
+  // that only merged when totals DIFFERED, it lost a second, equal-amount
+  // overpayment made concurrently on another device — both sides showed the
+  // same total, so the merge was skipped and one entry was dropped. Basing on
+  // a.credit preserves any unlogged balance, and adding only b's genuinely-new
+  // entries makes two concurrent equal overpayments sum correctly. This
+  // converges to the identical balance on every device regardless of which
+  // write lands last (verified: bidirectional and legacy-unlogged cases).
+  var credit=(a&&typeof a.credit==="number")?a.credit:((b&&b.credit)||0);
   ((b&&b.creditLog)||[]).forEach(function(l){
     var k=_logKey(l);
-    if(!seen[k]){mergedLog.push(l);seen[k]=true;}
+    if(!seen[k]){mergedLog.push(l);seen[k]=true;credit+=(l.amt||0);}
   });
   var result=Object.assign({},b||a);
   result.creditLog=mergedLog;
-  result.credit=_round2(mergedLog.reduce(function(s,l){return s+(l.amt||0);},0));
+  result.credit=_round2(credit);
   return result;
 }
 function _mergeInvoicePayments(a,b){
@@ -821,13 +834,20 @@ function _mergeInvoicePayments(a,b){
   var merged=(a&&a.payments)?a.payments.slice():[];
   var seen={};
   merged.forEach(function(p){seen[_payKey(p)]=true;});
+  // ADDITIVE MERGE (2026-07-26): same reasoning as the customer-credit merge —
+  // base on a's current paid total (preserving any legacy paid amount not
+  // represented in the payments array) and add ONLY b's genuinely-new payments.
+  // The previous recompute-from-payments, gated to run only when paid totals
+  // DIFFERED, dropped a second equal-amount payment recorded concurrently on
+  // another device. Additive + always-merge makes both survive and converge.
+  var paid=(a&&typeof a.paid==="number")?a.paid:0;
   ((b&&b.payments)||[]).forEach(function(p){
     var k=_payKey(p);
-    if(!seen[k]){merged.push(p);seen[k]=true;}
+    if(!seen[k]){merged.push(p);seen[k]=true;paid+=(p.amt||0);}
   });
   var result=Object.assign({},b||a);
   result.payments=merged;
-  result.paid=_round2(merged.reduce(function(s,p){return s+(p.amt||0);},0));
+  result.paid=_round2(paid);
   result.voided=(a&&a.voided)||(b&&b.voided)||false; // voided is a one-way ratchet - either side voiding wins
   return result;
 }
@@ -1021,7 +1041,7 @@ function processWriteQueue(){
           // as invoice payments - now merges credit history the same way.
           var lc=DforSync.customers[localIdx];
           var serverCredit=fc.credit||0,localCredit=lc.credit||0;
-          if(serverCredit!==localCredit){
+          if(lc){ // always merge (additive) — also catches equal-total, different-log concurrent credit changes
             DforSync.customers[localIdx]=_mergeCustomerCredit(lc,fc);
             console.log("[NDSYNC] freshness check MERGED customer id="+fc.id+" credit (local "+localCredit+", server "+serverCredit+", merged "+DforSync.customers[localIdx].credit+")");
           }
@@ -1051,7 +1071,7 @@ function processWriteQueue(){
           var li=DforSync.invoices[localIdx];
           var serverPaid=fi.paid||0,localPaid=li.paid||0;
           var serverMoreAdvanced=(fi.voided&&!li.voided)||(serverPaid>localPaid);
-          if(serverMoreAdvanced||serverPaid!==localPaid){
+          if(li){ // always merge (additive) — also catches equal-total, different-payment concurrent payments
             // FIX (2026-07-21): this used to fully replace the local invoice
             // with the server's version whenever the server showed more
             // progress - discarding this device's own payments entirely if
@@ -2045,7 +2065,7 @@ function startCloudListener(isWarmRefresh){
             var tombAt=_recentlyVoidedInvoiceIds[ri.id];
             var li=localInvMap[ri.id];
             if(li&&li.voided&&tombAt&&Date.now()-tombAt<60000)return li; // respect our recent void
-            if(li&&(li.paid||0)!==(ri.paid||0)){
+            if(li){ // always merge (additive) — catches equal-total, different-payment concurrent payments
               // FIX (2026-07-21): this used to pick whichever whole side
               // showed more progress, discarding the other's payments
               // entirely. Now unions both sides' payments by id, so a
@@ -2272,7 +2292,7 @@ function startCloudListener(isWarmRefresh){
         // silently discarded the moment any other snapshot arrived. Merges
         // credit history the same way, using the identical shared function,
         // so both merge paths agree on the same outcome.
-        if(lc&&(lc.credit||0)!==(rc.credit||0)){
+        if(lc){ // always merge (additive) — catches equal-total, different-log concurrent credit changes
           var _mergedCust=_mergeCustomerCredit(lc,rc);
           rc.credit=_mergedCust.credit;
           rc.creditLog=_mergedCust.creditLog;
