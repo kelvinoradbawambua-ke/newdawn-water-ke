@@ -241,6 +241,16 @@ var _recentlyDeletedComplaintIds={};
 // rescue logic already correctly respects them.
 var _recentlyDeletedStockIds={};
 var _recentlyDeletedOfferIds={};
+// FIX (2026-07-27): same landmine as stock/offers above, except delU()
+// (delete team member) already existed with zero tombstone - so this
+// wasn't preemptive plumbing, it was an active, live gap. Found while
+// auditing whether the system was ready for deployment: USERS' read-side
+// merge (below) was a pure wholesale replacement with no protection of any
+// kind - not just missing a deletion tombstone, but also silently
+// reverting a just-changed PIN or role the instant an unrelated snapshot
+// arrived before that write landed. Confirmed live via simulation. Fixed
+// alongside the merge itself.
+var _recentlyDeletedUserIds={};
 var _idleWarnEl=null;
 var FB_RECONNECT_TIMER=null;
 var FB_LAST_SNAPSHOT=0; // timestamp of last successful snapshot — for heartbeat
@@ -845,7 +855,25 @@ function _mergeCustomerCredit(a,b){
     var k=_logKey(l);
     if(!seen[k]){mergedLog.push(l);seen[k]=true;credit+=(l.amt||0);}
   });
-  var result=Object.assign({},b||a);
+  // FIX (2026-07-27): result=Object.assign({},b||a) took every field this
+  // function doesn't explicitly re-set (name, phone, phone2, idno, estate,
+  // court, house, htype, road, zone, ctype, creditLimit, notes, waterCycle,
+  // cycleHistory, followups...) unconditionally from b. credit/creditLog
+  // were protected by the explicit overwrites below; nothing else was. This
+  // function is called from the write-side freshness check as
+  // _mergeCustomerCredit(lc=just-edited-local, fc=fresh-but-not-yet-
+  // caught-up server read) - so a director correcting a customer's phone
+  // number, address, or credit limit had that edit silently reverted to the
+  // stale server value on the very same write meant to persist it. Same
+  // bug class, same root cause, as the invoice.amount fix made the same
+  // day - confirmed live via direct proof (a phone-number and creditLimit
+  // edit both reverted). Unlike invoice.amount, customers have many
+  // legitimately-editable fields (the whole saveCust() profile, plus
+  // waterCycle elsewhere), so patching one field at a time would only
+  // close this for whichever field gets reported next. Basing the merge on
+  // a instead of b closes it for all of them at once, consistent with how
+  // credit/creditLog already treat a as the trusted starting point above.
+  var result=Object.assign({},a||b);
   result.creditLog=mergedLog;
   result.credit=_round2(credit);
   return result;
@@ -886,9 +914,27 @@ function _mergeInvoicePayments(a,b){
     var k=_payKey(p);
     if(!seen[k]){merged.push(p);seen[k]=true;paid+=(p.amt||0);}
   });
+  // FIX (2026-07-27): result=Object.assign({},b||a) takes every field it
+  // doesn't explicitly overwrite from b - fine for fields that don't change
+  // after creation, but amount is NOT one of those. cancelO()'s write-off
+  // (inv.amount=inv.paid, forgiving the unpaid remainder of a cancelled
+  // order) and saveOrd()'s price-edit both legitimately change amount on a
+  // single device - and this function is called from the WRITE-side
+  // freshness check as _mergeInvoicePayments(li=just-corrected-local,
+  // fi=fresh-but-not-yet-caught-up server read), so b/fi still had the OLD
+  // amount at that exact moment. Object.assign silently took b's stale
+  // amount, reverting the correction on the very same write meant to
+  // persist it - confirmed live: cancelling an order with a prior partial
+  // payment left it permanently stuck (Delete kept refusing with "still has
+  // a balance owed" even though the order already showed Cancelled, because
+  // outstandingBal never actually reached zero). Same base-on-a-first
+  // pattern already used for paid two lines up and for credit in
+  // _mergeCustomerCredit - a is the side whose correction this call exists
+  // to protect.
   var result=Object.assign({},b||a);
   result.payments=merged;
   result.paid=_round2(paid);
+  result.amount=(a&&typeof a.amount==="number")?a.amount:(b&&b.amount);
   result.voided=(a&&a.voided)||(b&&b.voided)||false; // voided is a one-way ratchet - either side voiding wins
   return result;
 }
@@ -1165,19 +1211,38 @@ function processWriteQueue(){
           // the same already-scheduled freshness-check read, at zero extra
           // Firestore cost. This correctly combines both devices' real
           // changes instead of one silently overwriting the other.
+          // FIX (2026-07-27): mirror the read-side _stPreserveFields protection
+          // (see ~line 2269) here on the write side too. The old code took the
+          // server copy (fs) WHOLESALE whenever delta===0 — a field-only stock
+          // edit (price/cost/name/size/min/isWater with no restock records no
+          // qty delta) — silently DISCARDING that edit from the write payload.
+          // Because the read side re-preserves the same edit locally, the
+          // editing device kept SHOWING its new price/cost and believed the save
+          // worked, while the server and every other device permanently kept the
+          // stale value: an invisible, permanent cross-device divergence of a
+          // money field, on essentially every online write. The delta!==0 branch
+          // had the same gap (it took fs for every non-qty field). Both are now
+          // handled uniformly: start from the server copy, apply this device's
+          // qty delta if any, then preserve any locally-edited fields over the
+          // server value — exactly the rule the read side already uses, so the
+          // two merge paths finally agree. Uses a fresh object (not fs) so a
+          // transaction retry never mutates the freshD read (idempotency).
           var delta=_stockQtyDeltas[fs.id]||0;
+          var _fcLocalSt=DforSync.stock[idx];
+          var mergedItem=Object.assign({},fs);
           if(delta!==0){
-            var merged=Math.max(0,(fs.qty||0)+delta);
-            console.log("[NDSYNC] freshness check MERGED stock id="+fs.id+" ("+fs.name+") — server="+fs.qty+" + our delta="+delta+" = "+merged);
-            var mergedItem=fs;
-            mergedItem.qty=merged;
-            if(DforSync.stock[idx].history)mergedItem.history=DforSync.stock[idx].history;
-            DforSync.stock[idx]=mergedItem;
-          }else{
-            // No local change to this item this cycle — trust the server's
-            // current value rather than our own possibly-stale one
-            DforSync.stock[idx]=fs;
+            mergedItem.qty=Math.max(0,(fs.qty||0)+delta);
+            console.log("[NDSYNC] freshness check MERGED stock id="+fs.id+" ("+fs.name+") — server="+fs.qty+" + our delta="+delta+" = "+mergedItem.qty);
+            if(_fcLocalSt&&_fcLocalSt.history)mergedItem.history=_fcLocalSt.history;
           }
+          if(_fcLocalSt){
+            ["name","size","price","cost","min","isWater"].forEach(function(f){
+              var lv=_fcLocalSt[f],rv=mergedItem[f];
+              if(lv!=null&&rv==null)mergedItem[f]=lv; // local has a real value, server doesn't — keep local's
+              else if(lv!=null&&rv!=null&&lv!==rv)mergedItem[f]=lv; // both real and differing — prefer this device's own edit, same as the read side
+            });
+          }
+          DforSync.stock[idx]=mergedItem;
         });
       }
       if(freshD.complaints&&DforSync.complaints){
@@ -1945,11 +2010,50 @@ function startCloudListener(isWarmRefresh){
             // in-memory edit - not yet reflected in this remote snapshot -
             // is the one actually at risk of being silently overwritten
             // here. Every other field still takes remote as before.
-            var _preserveFields=["driver","notes","deliver"];
+            // FIX (2026-07-27): this list covered driver/notes/deliver but
+            // missed the fields saveOrd()'s edit path actually changes
+            // together as one edit - prod/stockId/qty/price/cost/date/
+            // prodConfirmed/bottle_before (see the single assignment line
+            // in saveOrd()'s editId branch). A director editing an order's
+            // price or quantity has that edit sit in memory, unsynced, for
+            // exactly as long as any other device's unrelated write takes
+            // to trigger a snapshot here - and until now, any such snapshot
+            // silently reverted the edit the same way driver/notes/deliver
+            // used to, except for money-determining fields instead of
+            // logistics ones. Confirmed live: a locally-edited price
+            // (500->600) reverted to the stale remote value (500) the
+            // moment an unrelated snapshot arrived. Extending the existing,
+            // already-proven list rather than inventing a different
+            // mechanism - same reasoning applies to every field on it.
+            // FIX #2 (2026-07-27): the lv&&!rv / lv&&rv truthy checks treat
+            // a deliberate, real 0/""/false as "no value" - so a price
+            // legitimately edited to 0 (the app has its own confirm-dialog
+            // for exactly this - a real, supported state, not a mistake), a
+            // notes field deliberately cleared to "", or a category order's
+            // prodConfirmed:false all failed to override a stale truthy
+            // remote value, the opposite of what this whole block exists to
+            // prevent. Confirmed live: all three silently reverted under
+            // the old check. Switched to null/undefined checks - the only
+            // states that actually mean "this field was never set" for
+            // every field on this list.
+            // FIX (2026-07-27): cId added. saveOrd()'s edit branch sets o.cId=cId
+            // unconditionally and the edit form's customer selector stays live in
+            // edit mode, so reassigning an order to the correct customer is a real
+            // supported edit — but cId was missing from this list, so exactly like
+            // price/qty before their 2026-07-27 fix, a just-made reassignment sat
+            // in memory unsynced and any unrelated incoming snapshot reverted it to
+            // the stale remote customer (then the next local write persisted the
+            // reverted value). Every order always has a cId, so this only ever
+            // takes effect in the "both sides have a real, differing value" case —
+            // preferring this device's own in-memory edit, same rule as the rest.
+            // (paid/amtPaid deliberately NOT added: syncPaymentStatuses() re-derives
+            // them from the linked invoice right after this merge, so they self-heal;
+            // invoiceId not added: every lookup falls back to notes "#<id>" matching.)
+            var _preserveFields=["cId","driver","notes","deliver","prod","stockId","qty","price","cost","date","prodConfirmed","bottle_before"];
             _preserveFields.forEach(function(f){
               var lv=lo[f],rv=ro[f];
-              if(lv&&!rv)ro[f]=lv; // local has a real value, remote doesn't - keep local's
-              else if(lv&&rv&&lv!==rv)ro[f]=lv; // both have real, differing values - prefer this device's own in-memory edit
+              if(lv!=null&&rv==null)ro[f]=lv; // local has a real value, remote doesn't - keep local's
+              else if(lv!=null&&rv!=null&&lv!==rv)ro[f]=lv; // both have real, differing values - prefer this device's own in-memory edit
             });
             Object.assign(lo,ro);
           }
@@ -2169,12 +2273,34 @@ function startCloudListener(isWarmRefresh){
         // read side, so this device's own tracked net change is applied on
         // top of whatever the incoming snapshot shows, every single time a
         // snapshot arrives, not just at this device's own next write.
+        // FIX (2026-07-27): that fix only ever protected qty. saveSt()'s
+        // edit branch changes name/size/price/cost/min/isWater together,
+        // and none of it was protected - worse than the other instances of
+        // this bug class found today, since when delta===0 (the common
+        // case: editing price without also restocking) the code returned
+        // the remote object without even looking at local, guaranteeing
+        // the edit was lost, not just racing to lose it. Confirmed live: a
+        // locally-edited price/cost (500/300 -> 600/350) was silently
+        // reverted every time, deterministically. Extended with the same
+        // field-preservation pattern as orders/complaints/offers, layered
+        // on top of the existing, unchanged qty-delta protection.
+        var _localStMap={};(D.stock||[]).forEach(function(s){_localStMap[s.id]=s;});
+        var _stPreserveFields=["name","size","price","cost","min","isWater"];
         var _mergedRemoteStock=data.D.stock.map(function(rs){
           var delta=_stockQtyDeltas[rs.id]||0;
-          if(delta===0)return rs;
           var merged=Object.assign({},rs);
-          merged.qty=Math.max(0,(rs.qty||0)+delta);
-          console.log("[NDSYNC] snapshot merge PRESERVED pending stock delta for id="+rs.id+" ("+rs.name+") — server="+rs.qty+" + our delta="+delta+" = "+merged.qty);
+          if(delta!==0){
+            merged.qty=Math.max(0,(rs.qty||0)+delta);
+            console.log("[NDSYNC] snapshot merge PRESERVED pending stock delta for id="+rs.id+" ("+rs.name+") — server="+rs.qty+" + our delta="+delta+" = "+merged.qty);
+          }
+          var ls=_localStMap[rs.id];
+          if(ls){
+            _stPreserveFields.forEach(function(f){
+              var lv=ls[f],rv=merged[f];
+              if(lv!=null&&rv==null)merged[f]=lv;
+              else if(lv!=null&&rv!=null&&lv!==rv)merged[f]=lv;
+            });
+          }
           return merged;
         });
         D.stock=_mergedRemoteStock.concat(_rescuedSt);
@@ -2241,28 +2367,84 @@ function startCloudListener(isWarmRefresh){
       }
       // Same fix as stock above - no delete-offer function exists, so
       // always rescue any local-only offer not yet in the remote snapshot.
+      // FIX (2026-07-27): this took data.D.offers wholesale for every offer
+      // that exists on both sides - same gap as complaints, found the same
+      // way (checking every remaining wholesale-merge collection). saveOff()
+      // 's edit branch changes title/disc/minqty/prod/start/end/desc
+      // together, and togOf() separately toggles active - none of it was
+      // protected. Confirmed live: a locally-edited discount (10%->25%) was
+      // silently reverted to the stale remote value. Offers have no
+      // Delivered/Resolved-equivalent terminal state, so no ratchet is
+      // needed here - straight field-merge, same as orders.
       if(data.D.offers){
-        var _remoteOffIds={};data.D.offers.forEach(function(o){_remoteOffIds[o.id]=true;});
+        var _localOffMap={};(D.offers||[]).forEach(function(o){_localOffMap[o.id]=o;});
+        var _remoteOffIds={};
+        var _offPreserveFields=["title","disc","minqty","prod","start","end","desc","active"];
+        var _mergedRemoteOff=data.D.offers.map(function(ro){
+          _remoteOffIds[ro.id]=true;
+          var lo=_localOffMap[ro.id];
+          if(!lo)return ro;
+          _offPreserveFields.forEach(function(f){
+            var lv=lo[f],rv=ro[f];
+            if(lv!=null&&rv==null)ro[f]=lv;
+            else if(lv!=null&&rv!=null&&lv!==rv)ro[f]=lv;
+          });
+          return ro;
+        });
         var _rescuedOff=(D.offers||[]).filter(function(o){
           if(_remoteOffIds[o.id])return false;
           var _offDelAt=(data.D.deletedOfferIds&&data.D.deletedOfferIds[o.id])||(D.deletedOfferIds&&D.deletedOfferIds[o.id])||_recentlyDeletedOfferIds[o.id];
           return !_offDelAt;
         });
-        D.offers=data.D.offers.concat(_rescuedOff);
+        D.offers=_mergedRemoteOff.concat(_rescuedOff);
         if(_rescuedOff.length){_anyRescueThisSync=true;console.log("[NDSYNC] snapshot merge RESCUED "+_rescuedOff.length+" local-only offer(s) not yet in remote");}
       }
       // Same fix as routes above - real tombstone (added to delCmp),
       // replacing the reintroduced 5-minute age-window vulnerability. For
       // a customer-service record, a silently-dropped complaint is both a
       // data-loss and a trust problem.
+      // FIX (2026-07-27): this used to take data.D.complaints wholesale for
+      // every complaint that exists on both sides - zero field-level
+      // protection at all, not even the driver/notes/deliver-equivalent
+      // orders already had. saveCmp()'s edit branch changes cId/type/
+      // details/action/status together in one edit (a manager resolving a
+      // complaint with resolution notes is exactly this). Confirmed live: a
+      // local resolution (status+action+details) was silently reverted to
+      // the stale pre-resolution state by an unrelated incoming snapshot,
+      // the same bug class already found and fixed for orders/customers/
+      // invoices this week. Resolved needs one-way-ratchet handling first,
+      // same principle as orders' Delivered status - once EITHER side shows
+      // Resolved, that side's full record wins outright, so a device
+      // catching up to another's genuine resolution can't un-resolve it.
+      // Everything else field-merges the same way orders now does.
       if(data.D.complaints){
-        var _remoteCmpIds={};data.D.complaints.forEach(function(c){_remoteCmpIds[c.id]=true;});
+        var _localCmpMap={};(D.complaints||[]).forEach(function(c){_localCmpMap[c.id]=c;});
+        var _remoteCmpIds={};
+        var _cmpPreserveFields=["cId","type","details","action","status"];
+        var _mergedRemoteCmp=data.D.complaints.map(function(rc){
+          _remoteCmpIds[rc.id]=true;
+          var lc=_localCmpMap[rc.id];
+          if(!lc)return rc;
+          // Resolved is checked first, as a one-way ratchet, before the
+          // general field merge below - status is ALSO in _cmpPreserveFields
+          // for the remaining case (e.g. Open -> In progress), so a
+          // non-Resolved status edit is protected the same way as the other
+          // fields once the Resolved-specific short-circuit doesn't apply.
+          if(lc.status==="Resolved"&&rc.status!=="Resolved")return lc;
+          if(rc.status==="Resolved"&&lc.status!=="Resolved")return rc;
+          _cmpPreserveFields.forEach(function(f){
+            var lv=lc[f],rv=rc[f];
+            if(lv!=null&&rv==null)rc[f]=lv;
+            else if(lv!=null&&rv!=null&&lv!==rv)rc[f]=lv;
+          });
+          return rc;
+        });
         var _rescuedCmp=(D.complaints||[]).filter(function(c){
           if(_remoteCmpIds[c.id])return false;
           var _cmpDelAt=(data.D.deletedComplaintIds&&data.D.deletedComplaintIds[c.id])||(D.deletedComplaintIds&&D.deletedComplaintIds[c.id])||_recentlyDeletedComplaintIds[c.id];
           return !_cmpDelAt;
         });
-        D.complaints=data.D.complaints.concat(_rescuedCmp);
+        D.complaints=_mergedRemoteCmp.concat(_rescuedCmp);
         if(_rescuedCmp.length){_anyRescueThisSync=true;console.log("[NDSYNC] snapshot merge RESCUED "+_rescuedCmp.length+" local-only complaint(s) not yet in remote");}
       }
       // Merge the new tombstones themselves - union of local and remote,
@@ -2288,6 +2470,12 @@ function startCloudListener(isWarmRefresh){
       if(data.D.deletedOfferIds){
         if(!D.deletedOfferIds)D.deletedOfferIds={};
         Object.keys(data.D.deletedOfferIds).forEach(function(k){D.deletedOfferIds[k]=data.D.deletedOfferIds[k];});
+      }
+      // Same tombstone-merging for deleted team members - see delU() and
+      // the USERS merge fix above.
+      if(data.D.deletedUserIds){
+        if(!D.deletedUserIds)D.deletedUserIds={};
+        Object.keys(data.D.deletedUserIds).forEach(function(k){D.deletedUserIds[k]=data.D.deletedUserIds[k];});
       }
       // FIX (2026-07-25): the actual reported bug - dismissedMissingOrders
       // had zero merge protection at all, a plain array with no id-level
@@ -2414,8 +2602,56 @@ function startCloudListener(isWarmRefresh){
     // no USERS (transient glitch, race, or corrupted read) — NEVER replace
     // the real local list with a fake default; that would falsely trigger
     // the "account removed" check below and lock out the real director.
+    // FIX (2026-07-27): "accept" used to mean a pure wholesale replacement
+    // (USERS=data.USERS) - the worst version of the field-loss bug found
+    // across this whole audit, because it discarded EVERYTHING about the
+    // local list at once, not just one field, and USERS holds PIN hashes
+    // and role assignments. savePin() mutates an existing user's pin
+    // in-memory with no forced-freshness protection at all (unlike
+    // order/customer/invoice creation, which sets _hasPendingCriticalEdit
+    // for exactly this reason) - so a director changing a PIN, then any
+    // unrelated snapshot arriving before that write landed, silently
+    // reverted the PIN back to its old value. Confirmed live via
+    // simulation. Also had no deletion tombstone at all (see delU() above)
+    // - a removed team member's access could resurrect the same way orders
+    // used to. Now field-merges by id (pin/name/role/ini/col - pin is the
+    // only one actually editable today via savePin(), the rest included
+    // for the same reason stock/offers got tombstones before they had an
+    // edit feature: cheap now, a landmine later if skipped), respects the
+    // deletion tombstone, and rescues a local-only just-created user not
+    // yet in the remote snapshot - same pattern as every other collection.
     var _usersFromRemote=false;
-    if(data.USERS&&data.USERS.length){USERS=data.USERS;_usersFromRemote=true;}
+    if(data.USERS&&data.USERS.length){
+      var _localUserMap={};(USERS||[]).forEach(function(u){_localUserMap[u.id]=u;});
+      var _remoteUserIds={};
+      var _userPreserveFields=["pin","name","role","ini","col"];
+      var _mergedRemoteUsers=data.USERS.filter(function(ru){
+        // A tombstoned user must not survive just because a stale remote
+        // snapshot still lists them - checked here too, not just in the
+        // rescue step below, or a still-live-on-remote deleted account
+        // would never actually leave USERS.
+        var _uDelAt=(data.D&&data.D.deletedUserIds&&data.D.deletedUserIds[ru.id])||(D.deletedUserIds&&D.deletedUserIds[ru.id]);
+        if(_uDelAt)return false;
+        _remoteUserIds[ru.id]=true;
+        return true;
+      }).map(function(ru){
+        var lu=_localUserMap[ru.id];
+        if(!lu)return ru;
+        _userPreserveFields.forEach(function(f){
+          var lv=lu[f],rv=ru[f];
+          if(lv!=null&&rv==null)ru[f]=lv;
+          else if(lv!=null&&rv!=null&&lv!==rv)ru[f]=lv;
+        });
+        return ru;
+      });
+      var _rescuedUsers=(USERS||[]).filter(function(u){
+        if(_remoteUserIds[u.id])return false;
+        var _uDelAt=(data.D&&data.D.deletedUserIds&&data.D.deletedUserIds[u.id])||(D.deletedUserIds&&D.deletedUserIds[u.id])||_recentlyDeletedUserIds[u.id];
+        return !_uDelAt;
+      });
+      USERS=_mergedRemoteUsers.concat(_rescuedUsers);
+      _usersFromRemote=true;
+    }
     else if(!USERS||!USERS.length){
       // Only fall back to the bootstrap default if we truly have NEVER had
       // any users this session (genuine brand-new setup) — not as a reaction
@@ -4030,9 +4266,28 @@ function rDash(){
   // director's and the staff member's) are scoped to a recent rolling
   // window; the manual reconciliation tool on the Data page still shows
   // the FULL history regardless, for the rare case a full sweep is wanted.
-  var _alertCutoffTs=Date.now()-(3*24*60*60*1000); // 3-day rolling window
+  var _alertCutoffTs=Date.now()-(3*24*60*60*1000); // 3-day rolling window (lower bound)
+  // FIX (2026-07-27): a brand-new order and its ORDER_PLACED audit entry are
+  // written together in the SAME Firestore snapshot, but the read-side audit-log
+  // merge is UNCONDITIONAL while the order/invoice/stock merge is GATED behind
+  // (!isOwnWrite||!weAreNewer). So on any device that has itself written anything
+  // in the last ~5s and is judged "newer", an incoming snapshot merges the
+  // ORDER_PLACED entry but skips the order row until a later, ungated snapshot —
+  // a brief, self-healing window in which _computeMissingOrders() correctly sees
+  // "audit entry present, no live order" and the dashboard raised "missing order
+  // — needs review" for an order placed seconds ago that simply hadn't finished
+  // syncing. Confirmed via simulation against this file's own extracted code as
+  // the cause of a real false alarm shown to a director (and, via the
+  // placedByUid branch below, to the staff member who placed it). Fix: hold the
+  // automatic alert back until an order is past a short settling grace. The
+  // manual reconciliation tool (showMissingOrders / findMissingOrders) is
+  // deliberately NOT graced — a director who opens it on demand still sees the
+  // full, immediate truth; only these passive dashboard alerts wait out the
+  // sync window. A genuinely-lost order still surfaces automatically well inside
+  // the 3-day window, just not in its first few minutes.
+  var _alertGraceTs=Date.now()-(10*60*1000); // 10-min settling grace (upper bound)
   if(can("rest")){
-    var _missingForAlert=(_computeMissingOrders()||[]).filter(function(m){return new Date(m.ts).getTime()>=_alertCutoffTs;});
+    var _missingForAlert=(_computeMissingOrders()||[]).filter(function(m){var _t=new Date(m.ts).getTime();return _t>=_alertCutoffTs&&_t<=_alertGraceTs;});
     if(_missingForAlert.length){
       alerts.push({t:"nr",i:"ti-file-alert",m:_missingForAlert.length+" recent order(s) in the audit log have no matching live order &mdash; needs your review",act:"nav(\'data\',null);showMissingOrders()"});
     }
@@ -4048,7 +4303,7 @@ function rDash(){
     // who never placed the order at all. Now requires both ids to actually
     // be present, not just equal, closing that gap regardless of its exact
     // cause.
-    var _missingMine=(_computeMissingOrders()||[]).filter(function(m){return new Date(m.ts).getTime()>=_alertCutoffTs;});
+    var _missingMine=(_computeMissingOrders()||[]).filter(function(m){var _t=new Date(m.ts).getTime();return _t>=_alertCutoffTs&&_t<=_alertGraceTs;}); // same settling grace as the director alert above
     var _mine=_missingMine.filter(function(m){return m.placedByUid&&CU.id&&m.placedByUid===CU.id;});
     if(_mine.length>0){
       alerts.push({t:"nw",i:"ti-alert-circle",m:"Order"+(_mine.length>1?"s":"")+" #"+_mine.map(function(m){return m.origId;}).join(", #")+" you placed need"+(_mine.length>1?"":"s")+" director review &mdash; please check with "+(CU.role==="director"?"":"your director")});
@@ -5819,12 +6074,51 @@ function saveOrd(){
         });
       }
     }else{
+      // FIX (2026-07-27): this "Paid" branch is the structural twin of the
+      // payStatus!=="Paid" branch above, and had the SAME two defects that
+      // branch was fixed for earlier the same day — but the fixes were applied
+      // only there and missed here (CLAUDE.md rule #14: check the sibling).
+      //   (1) INVARIANT BREAK — it set linkedInv.paid directly to price*qty with
+      //   NO entry pushed into linkedInv.payments, breaking the
+      //   paid===sum(payments) invariant every other path relies on.
+      //   reversePayment() recomputes paid=sum(payments) whenever any entry is
+      //   later reversed, so this direct set was silently erased by the next
+      //   unrelated reversal — real, collected cash reappearing as debt.
+      //   Confirmed via simulation driving the REAL reversePayment(): an
+      //   invoice paid 50+50=100, marked fully Paid via this branch, then one
+      //   original 50 reversed, dropped to paid=0 instead of the correct 50.
+      //   (2) NO-INVOICE REVENUE GAP — when no linkedInv existed (e.g. a
+      //   category order converted to exact and marked paid in one edit), the
+      //   old code created no invoice at all, leaving a fully-paid order with no
+      //   revenue record — the same silent-revenue-gap class the completeDlv
+      //   FINANCIAL ACCURACY fix closed. Both fixed by mirroring the sibling:
+      //   record the delta as a real payment entry, and create the invoice when
+      //   absent. paidTarget caps at the (possibly-edited) order total, exactly
+      //   as the old code's price*qty did — any overpayment handling is
+      //   unchanged/out of scope here.
+      var paidTarget=_round2(price*qty);
       if(linkedInv){
-        linkedInv.amount=_round2(price*qty);linkedInv.paid=_round2(price*qty);
+        linkedInv.amount=paidTarget;
+        var diffPaid=_round2(paidTarget-(linkedInv.paid||0));
+        if(diffPaid!==0){
+          if(!linkedInv.payments)linkedInv.payments=[];
+          linkedInv.payments.push({pid:uid(),date:tday(),amt:diffPaid,method:"Cash",ref:"Order edit "+(diffPaid>0?"adjustment":"correction")+" by "+CU.name});
+        }
+        linkedInv.paid=paidTarget;
+        if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
+        auditLog("ORDER_UPDATED","Order #"+o.id+" edited by "+CU.name+" ("+CU.role+")");
+        cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+o.id+" updated");
+      }else{
+        // No invoice yet — create one, same atomic-reservation path the
+        // payStatus!=="Paid" branch uses, so a Paid order always has a record.
+        reserveNextInvoiceId().then(function(newInvId){
+          (D.invoices||[]).push({id:newInvId,orderId:o.id,cId:cId,amount:paidTarget,paid:paidTarget,due:o.date,notes:"Order #"+o.id,date:tday(),payments:paidTarget>0?[{pid:uid(),date:tday(),amt:paidTarget,method:"Cash",ref:"Order edit"}]:[]});
+          o.invoiceId=newInvId;
+          if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
+          auditLog("ORDER_UPDATED","Order #"+o.id+" edited by "+CU.name+" ("+CU.role+")");
+          cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+o.id+" updated");
+        });
       }
-      if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
-      auditLog("ORDER_UPDATED","Order #"+o.id+" edited by "+CU.name+" ("+CU.role+")");
-      cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+o.id+" updated");
     }
     return;
   }
@@ -6171,7 +6465,18 @@ function delO(id){
   // restores stock and closes out the invoice for an unfulfilled order. Delete
   // is for pure data-entry correction and for writing off delivered orders
   // that genuinely went unpaid — not a shortcut around Cancel.
-  if(outstandingBal>0&&o.status!=="Delivered"){
+  // FIX (2026-07-27): this used to fire for an ALREADY-Cancelled order too
+  // (o.status!=="Delivered" is true for "Cancelled" just as much as for
+  // "Pending") - telling someone to "use Cancel instead" on an order they
+  // already cancelled is a dead end, not guidance, and it skipped RULE 2's
+  // void-then-delete path entirely for this case. Confirmed live: a
+  // cancelled order with a stale residual balance (itself caused by a
+  // separate bug in _mergeInvoicePayments, fixed the same day - see that
+  // function) was permanently stuck, since RULE 1 returned before RULE 2's
+  // "void the invoice, then retry" resolution could ever run. An
+  // already-cancelled order has no "cancel instead" to offer - it belongs
+  // in RULE 2's bucket like a delivered one, not RULE 1's.
+  if(outstandingBal>0&&o.status!=="Delivered"&&o.status!=="Cancelled"){
     toast("This order isn't delivered yet and still has a balance owed — use Cancel instead of Delete.","warn");
     return;
   }
@@ -6687,6 +6992,19 @@ function _computeMissingOrders(){
   Object.keys(placed).forEach(function(id){
     if(liveIds[id])return; // still exists — not missing
     if((D.dismissedMissingOrders||[]).indexOf(parseInt(id))!==-1)return; // already reviewed and marked resolved
+    // FIX (2026-07-27): a deliberately-DELETED order is tombstoned by delO()
+    // in D.deletedOrderIds (synced, cross-device) and _recentlyDeletedOrderIds
+    // (local), but its ORDER_PLACED audit entry stays behind forever — audit
+    // history is intentionally never pruned on deletion. Without this guard the
+    // detector read that lingering entry as evidence of a *lost* order and
+    // raised a false "missing order — needs review" alert for something a
+    // director had intentionally removed (for the whole 3-day alert window, and
+    // indefinitely in the manual tool until dismissed). A tombstoned id is not
+    // missing — it is gone on purpose. Uses the exact same pair of deletion
+    // markers the read-side order merge already trusts, so the two stay
+    // consistent. Note: a CANCELLED order is NOT affected — cancelO() leaves the
+    // order in D.orders (status "Cancelled"), so liveIds already covers it.
+    if((D.deletedOrderIds&&D.deletedOrderIds[id])||_recentlyDeletedOrderIds[id])return;
     var rec=placed[id];
     var cust=null,priceSource=null;
     if(rec.auditCId){
@@ -6970,6 +7288,22 @@ function recreateOrder(idx){
       newOrder.paid="Unpaid";
       D.orders.push(newOrder);
     }
+    // FIX (2026-07-27): the original lost order's id (orig) is now restored
+    // under a brand-new id (newId), so orig will never reappear in D.orders.
+    // But its original ORDER_PLACED audit entry lives on forever, and orig is
+    // NOT a deletion (no tombstone) — so _computeMissingOrders() kept flagging
+    // orig as "missing — needs review" on every dashboard render even after it
+    // had been fully recovered here, and the director would be nagged to
+    // recreate it again indefinitely (the _cid guard above blocks the actual
+    // duplicate, but the false alert never cleared). Mark orig resolved exactly
+    // the way dismissMissingOrder() does — the one and only mechanism the
+    // detector honors for "this gap has been dealt with." dismissedMissingOrders
+    // already has full read-side merge protection and _hasPendingCriticalEdit is
+    // set above, so this resolution syncs and survives cross-device like any
+    // other. Recreation IS a resolution of the missing-order gap, so recording
+    // it here closes the loop the reconciliation tool exists to close.
+    if(!D.dismissedMissingOrders)D.dismissedMissingOrders=[];
+    if(D.dismissedMissingOrders.indexOf(orig)===-1)D.dismissedMissingOrders.push(orig);
     auditLog("ORDER_PLACED","#"+newId+" "+prod+" x"+qty+" (recovered — originally #"+orig+(wasDelivered?", already delivered":"")+") — customer #"+cId+" "+(cust?unescapeForEdit(cust.name):"unknown")+" by "+CU.name);
     toast("Order recreated as #"+newId);
     rOrds(undefined,ORD_PAGE);rDel();
@@ -8446,7 +8780,16 @@ function savePin(){
     });
   });
 }
-function delU(id){if(!can("mUsers"))return;var toDel=(USERS||[]).find(function(u){return u.id===id;});if(!toDel)return;var msg="Remove team member: "+unescapeForEdit(toDel.name)+" ("+toDel.role+")?\n\nThey will lose all system access immediately.\n\nThis cannot be undone.";if(!confirm(msg))return;auditLog("USER_DELETED","Team member removed by "+CU.name+" ("+CU.role+"): "+(toDel?toDel.name:"unknown"));USERS=(USERS||[]).filter(function(u){return u.id!==id;});rUsers();dirty();}
+function delU(id){if(!can("mUsers"))return;var toDel=(USERS||[]).find(function(u){return u.id===id;});if(!toDel)return;var msg="Remove team member: "+unescapeForEdit(toDel.name)+" ("+toDel.role+")?\n\nThey will lose all system access immediately.\n\nThis cannot be undone.";if(!confirm(msg))return;auditLog("USER_DELETED","Team member removed by "+CU.name+" ("+CU.role+"): "+(toDel?toDel.name:"unknown"));
+  // FIX (2026-07-27): tombstone this deletion, same pattern as every other
+  // collection - without it, a stale device still holding this account
+  // locally could resurrect it on its next write, restoring access that was
+  // just explicitly revoked. Security-relevant, not just a data-integrity
+  // gap: removing a team member's access needs to actually stick.
+  if(!D.deletedUserIds)D.deletedUserIds={};
+  D.deletedUserIds[id]=Date.now();
+  _recentlyDeletedUserIds[id]=Date.now();
+  USERS=(USERS||[]).filter(function(u){return u.id!==id;});rUsers();dirty();}
 
 function buildBackupWB(){
   if(!can("exp"))return null;
