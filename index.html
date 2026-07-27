@@ -2640,7 +2640,27 @@ function startCloudListener(isWarmRefresh){
         _userPreserveFields.forEach(function(f){
           var lv=lu[f],rv=ru[f];
           if(lv!=null&&rv==null)ru[f]=lv;
-          else if(lv!=null&&rv!=null&&lv!==rv)ru[f]=lv;
+          else if(lv!=null&&rv!=null&&lv!==rv){
+            // CRITICAL GUARD (2026-07-27): never let a LOCAL pin of exactly the
+            // plaintext bootstrap default "1234" override a real remote PIN.
+            // On a cold/fresh load (cleared cache, new device, storage evicted —
+            // localOrders=0 in the sync log) local USERS is the bootstrap
+            // placeholder [{id:1,pin:"1234"}]. Without this guard, "prefer local
+            // when both differ" treated that placeholder as a genuine edit and
+            // reverted the FIRST director's (id:1) real server PIN back to 1234
+            // — then the write that fires right after this merge persisted 1234
+            // to Firestore, permanently resetting it for every device and
+            // defeating every attempted reset. Confirmed live: repeatedly reverts
+            // to 1234, first-director-only (no other user exists in the
+            // bootstrap). Real PINs are stored salted-HASHED (savePin →
+            // hashPinSalted), so a genuinely-set PIN is never literally "1234" —
+            // meaning this guard neutralizes ONLY the placeholder and never
+            // suppresses a real, deliberate PIN change (a real change is a hash,
+            // still preferred by the branch below, so the original
+            // revert-during-write-window protection is fully preserved).
+            if(f==="pin"&&lv==="1234")return;
+            ru[f]=lv;
+          }
         });
         return ru;
       });
