@@ -458,7 +458,7 @@ function unescapeForEdit(s){
   return String(s).replace(/&lt;/g,"<").replace(/&gt;/g,">").replace(/&quot;/g,"\"").replace(/&#39;/g,"'").replace(/&amp;/g,"&");
 }
 
-function can(p){return !!(CU&&R[CU.role]&&R[CU.role].p[p]);}
+function can(p){return !!(CU&&R[CU.role]&&Object.prototype.hasOwnProperty.call(R[CU.role].p,p)&&R[CU.role].p[p]);}
 function el(id){return document.getElementById(id);}
 function _ymd(d){
   // Local-timezone-safe YYYY-MM-DD — NEVER use toISOString() for this,
@@ -469,7 +469,18 @@ function _ymd(d){
 }
 function tday(){return _ymd(new Date());}
 function maskPhone(p){if(!p)return"";var s=String(p).replace(/\s/g,"");if(s.length<5)return"•••••";return s.slice(0,2)+"•".repeat(Math.max(0,s.length-4))+s.slice(-2);}
-function maskName(n){return "Customer";}
+function maskName(n){
+  // FIX (2026-07-27): some customers were historically registered with
+  // their house/plot number stored directly in the name field, not the
+  // address fields - masking these to a generic "Customer" made them
+  // impossible for staff/driver to identify or search for at all, since
+  // that "name" is functionally an address identifier, not a real,
+  // privacy-sensitive person's name. A genuine name essentially never
+  // contains a digit, so this heuristic reliably tells the two apart:
+  // shown as-is if it contains a digit, masked exactly as before otherwise.
+  if(n&&/\d/.test(n))return n;
+  return "Customer";
+}
 function vName(){return can("vPhone");}
 // FIX (2026-07-21): uid() was second-precision with a session-wide random
 // offset - two devices creating a customer, stock item, or route in the
@@ -4159,8 +4170,13 @@ function rCusts(q,pg,sort,type){
     if(type2&&c.ctype!==type2)return false;
     if(!q2)return true;
     var lq=sanitizeInput(q2).toLowerCase();
-    // vPhone gate: staff search by address only — not name or phone
-    var searchFields=can("vPhone")?[c.name,c.court,c.house,c.estate]:[c.court,c.house,c.estate];
+    // vPhone gate: staff search by address only — not name or phone.
+    // FIX (2026-07-27): same reasoning as ocSearch() - a customer whose
+    // house/plot number was historically stored in the name field itself
+    // is otherwise completely unfindable here too. Include name only when
+    // it contains a digit (address-like identifier, not a real name).
+    var _nameLooksLikeNumber2=c.name&&/\d/.test(c.name);
+    var searchFields=can("vPhone")?[c.name,c.court,c.house,c.estate]:[(_nameLooksLikeNumber2?c.name:null),c.court,c.house,c.estate];
     if(can("vPhone"))searchFields.push(c.phone,c.phone2);
     return searchFields.some(function(v){return v&&String(v).toLowerCase().indexOf(lq)!==-1;});
   });
@@ -4976,8 +4992,18 @@ function ocSearch(q){
         (c.estate&&c.estate.toLowerCase().indexOf(lq)!==-1)||
         (c.road&&c.road.toLowerCase().indexOf(lq)!==-1);
     }else{
-      // Staff/Driver: search by address only — court, house, estate, road
-      return (c.court&&c.court.toLowerCase().indexOf(lq)!==-1)||
+      // Staff/Driver: search by address only — court, house, estate, road.
+      // FIX (2026-07-27): some customers were historically registered with
+      // their house/plot number stored directly in the name field, not the
+      // address fields - address-only search made these customers
+      // completely unfindable once staff/driver search was restricted.
+      // Extends the match to the name field specifically when it contains
+      // a digit - the heuristic distinguishing an address-like identifier
+      // ("House 24", "Plot 15B") from a genuine person's name, which
+      // essentially never contains a digit and remains fully excluded here.
+      var _nameLooksLikeNumber=c.name&&/\d/.test(c.name);
+      return (_nameLooksLikeNumber&&c.name.toLowerCase().indexOf(lq)!==-1)||
+        (c.court&&c.court.toLowerCase().indexOf(lq)!==-1)||
         (c.house&&String(c.house).toLowerCase().indexOf(lq)!==-1)||
         (c.estate&&c.estate.toLowerCase().indexOf(lq)!==-1)||
         (c.road&&c.road.toLowerCase().indexOf(lq)!==-1)||
@@ -7349,7 +7375,7 @@ function rCmps(q,pg){
   var q2=CMP_Q||"";
   var pgEl=el("pg-complaints");if(!pgEl)return;
   var fil=[].concat(D.complaints).reverse();
-  if(q2){var lq=sanitizeInput(q2).toLowerCase();fil=fil.filter(function(c){var cu=(D.customers||[]).find(function(x){return x.id===c.cId;});return(cu&&cu.name&&cu.name.toLowerCase().indexOf(lq)!==-1)||(c.type&&c.type.toLowerCase().indexOf(lq)!==-1)||(c.details&&c.details.toLowerCase().indexOf(lq)!==-1);});}
+  if(q2){var lq=sanitizeInput(q2).toLowerCase();var _canSearchName=can("vPhone");fil=fil.filter(function(c){var cu=(D.customers||[]).find(function(x){return x.id===c.cId;});return(_canSearchName&&cu&&cu.name&&cu.name.toLowerCase().indexOf(lq)!==-1)||(c.type&&c.type.toLowerCase().indexOf(lq)!==-1)||(c.details&&c.details.toLowerCase().indexOf(lq)!==-1);});}
   var paged=paginate(fil,CMP_PAGE);
   if(!el("cmp-srch")){
     pgEl.innerHTML=
