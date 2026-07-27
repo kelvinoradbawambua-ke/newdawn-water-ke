@@ -469,7 +469,7 @@ function _ymd(d){
 }
 function tday(){return _ymd(new Date());}
 function maskPhone(p){if(!p)return"";var s=String(p).replace(/\s/g,"");if(s.length<5)return"•••••";return s.slice(0,2)+"•".repeat(Math.max(0,s.length-4))+s.slice(-2);}
-function maskName(n){if(!n)return"Customer";var parts=n.trim().split(" ");return parts[0].slice(0,1)+"••• "+(parts[1]?parts[1].slice(0,1)+"•••":"");}
+function maskName(n){return "Customer";}
 function vName(){return can("vPhone");}
 // FIX (2026-07-21): uid() was second-precision with a session-wide random
 // offset - two devices creating a customer, stock item, or route in the
@@ -2115,7 +2115,28 @@ function startCloudListener(isWarmRefresh){
           var _stDelAt=(data.D.deletedStockIds&&data.D.deletedStockIds[s.id])||(D.deletedStockIds&&D.deletedStockIds[s.id])||_recentlyDeletedStockIds[s.id];
           return !_stDelAt;
         });
-        D.stock=data.D.stock.concat(_rescuedSt);
+        // CRITICAL FIX (2026-07-26): this used to take data.D.stock wholesale
+        // for every EXISTING product, with zero awareness of a pending,
+        // not-yet-confirmed local quantity change - meaning any incoming
+        // snapshot, even one completely unrelated to stock, arriving before
+        // this device's own restock write had landed, silently reverted the
+        // local quantity back to the stale, pre-restock server value. This
+        // was the exact reported bug: a restock appearing to do nothing on
+        // the Stock tab and dashboard, despite the write itself genuinely
+        // succeeding moments later. The write-side freshness-check already
+        // had this exact protection (line ~1127) - mirrored here on the
+        // read side, so this device's own tracked net change is applied on
+        // top of whatever the incoming snapshot shows, every single time a
+        // snapshot arrives, not just at this device's own next write.
+        var _mergedRemoteStock=data.D.stock.map(function(rs){
+          var delta=_stockQtyDeltas[rs.id]||0;
+          if(delta===0)return rs;
+          var merged=Object.assign({},rs);
+          merged.qty=Math.max(0,(rs.qty||0)+delta);
+          console.log("[NDSYNC] snapshot merge PRESERVED pending stock delta for id="+rs.id+" ("+rs.name+") — server="+rs.qty+" + our delta="+delta+" = "+merged.qty);
+          return merged;
+        });
+        D.stock=_mergedRemoteStock.concat(_rescuedSt);
         if(_rescuedSt.length){_anyRescueThisSync=true;console.log("[NDSYNC] snapshot merge RESCUED "+_rescuedSt.length+" local-only stock item(s) not yet in remote");}
       }
       // Pending payments: take remote wholesale, same as stock/invoices/routes
@@ -3553,7 +3574,7 @@ function buildMods(){
       "<div class=\"fg2\">"+
         "<div class=\"fg\" style=\"position:relative\">"+
           "<label class=\"flabel\">Customer *</label>"+
-          "<input class=\"fi\" id=\"oc-search\" placeholder=\"Type name, phone or address...\" oninput=\"ocSearch(this.value)\" onblur=\"setTimeout(function(){el('oc-drop').style.display='none';},200)\" autocomplete=\"off\">"+
+          "<input class=\"fi\" id=\"oc-search\" placeholder=\""+(can("vPhone")?"Type name, phone or address...":"Type court or house number...")+"\" oninput=\"ocSearch(this.value)\" onblur=\"setTimeout(function(){el('oc-drop').style.display='none';},200)\" autocomplete=\"off\">"+
           "<div id=\"oc-drop\" style=\"display:none;position:absolute;top:100%;left:0;right:0;background:#fff;border:1.5px solid var(--gd);border-radius:0 0 8px 8px;max-height:200px;overflow-y:auto;z-index:999;box-shadow:0 4px 16px rgba(0,0,0,.15)\"></div>"+
           "<input type=\"hidden\" id=\"oc\">"+
           "<div id=\"oc-sel\" style=\"font-size:11px;color:var(--gd);font-weight:700;margin-top:4px;min-height:16px\"></div>"+
@@ -3945,7 +3966,7 @@ function rDash(){
     if(pendingPay.length){
       pendingPay.slice(0,3).forEach(function(p){
         var oc=(D.customers||[]).find(function(x){return x.id===p.cId;});
-        alerts.push({t:"nw",i:"ti-cash",m:"<strong>Cash to acknowledge:</strong> KSh "+p.amt.toLocaleString()+" from "+(oc?oc.name:"customer")+" — collected by "+p.collectedBy+
+        alerts.push({t:"nw",i:"ti-cash",m:"<strong>Cash to acknowledge:</strong> KSh "+p.amt.toLocaleString()+" from "+(oc?(can("vPhone")?oc.name:maskName(oc.name)):"customer")+" — collected by "+p.collectedBy+
           " <button onclick=\"ackPendingPay("+p.id+");event.stopPropagation()\" class=\"btn btn-xs btn-gold\" style=\"margin-left:8px\"><i class=\"ti ti-check\"></i> Acknowledge</button>"});
       });
       if(pendingPay.length>3)alerts.push({t:"nw",i:"ti-cash",m:(pendingPay.length-3)+" more pending cash collection(s) awaiting acknowledgement",dest:"invoices"});
@@ -6903,7 +6924,7 @@ function rInvs(q,pg){
           var oc=(D.customers||[]).find(function(x){return x.id===p.cId;});
           return "<div style=\"display:flex;align-items:center;justify-content:space-between;background:#fff;border-radius:8px;padding:10px 12px;margin-bottom:7px;border:1px solid #f39c12\">"+
             "<div>"+
-              "<div style=\"font-weight:700;font-size:13px\">KSh "+p.amt.toLocaleString()+" &bull; "+(oc?oc.name:"Customer")+"</div>"+
+              "<div style=\"font-weight:700;font-size:13px\">KSh "+p.amt.toLocaleString()+" &bull; "+(oc?(can("vPhone")?oc.name:maskName(oc.name)):"Customer")+"</div>"+
               "<div style=\"font-size:11px;color:var(--tx2)\">Collected by <strong>"+p.collectedBy+"</strong> ("+p.collectedRole+") on "+fmt(p.date)+" &bull; Method: "+p.method+"</div>"+
               "<div style=\"font-size:11px;color:var(--tx2)\">Order #"+p.ordId+"</div>"+
             "</div>"+
