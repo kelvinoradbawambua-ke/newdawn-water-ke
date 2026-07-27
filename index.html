@@ -4401,7 +4401,19 @@ function delC(id){
   // At this point every invoice for this customer either has zero balance
   // (fully paid) or was just explicitly voided above — safe to drop any that
   // never had a single payment (nothing lost), keep the rest for the books.
-  D.invoices=(D.invoices||[]).filter(function(i){if(i.cId!==id)return true;return i.paid>0;});
+  // FIX (2026-07-27): this removal had no corresponding entry in
+  // D.deletedInvoiceIds - same gap as delO()'s equivalent cleanup, and the
+  // same fix: without the tombstone, a stale second device still holding
+  // one of these zero-paid invoices could resurrect it right back into the
+  // shared document on its next sync (the merge engine only treats a
+  // removal as intentional when this tombstone is present).
+  D.invoices=(D.invoices||[]).filter(function(i){
+    if(i.cId!==id)return true;
+    if(i.paid>0)return true;
+    if(!D.deletedInvoiceIds)D.deletedInvoiceIds={};
+    D.deletedInvoiceIds[i.id]=Date.now();
+    return false;
+  });
   D.complaints=(D.complaints||[]).filter(function(x){return x.cId!==id;});
   D.customers=(D.customers||[]).filter(function(x){return x.id!==id;});
   // Tombstone the deletion so it can never be silently resurrected by another
@@ -4648,8 +4660,16 @@ function reversePayment(invId,pid,payIdx){
   var pay=pays[_t];
   // Remove the payment entry
   pays.splice(_t,1);
-  // Recalculate paid total from remaining payments — source of truth
-  inv.paid=_round2(pays.reduce(function(s,p){return s+(p.amt||0);},0));
+  // Recalculate paid total from remaining payments — source of truth.
+  // FIX (2026-07-27): clamped to never go negative - discovered while
+  // verifying the same day's paydown-correction fix (saveOrd edit path):
+  // reversing one of the specific original payment entries a downward
+  // correction was itself calibrated against can otherwise produce a
+  // negative total, which is nonsensical for money paid regardless of the
+  // deeper business question of what the "true" figure should be in that
+  // specific sequence - that ambiguity needs a director's judgment, not a
+  // formula, but a negative number is unambiguously wrong either way.
+  inv.paid=Math.max(0,_round2(pays.reduce(function(s,p){return s+(p.amt||0);},0)));
   inv.payments=pays;
   // Sync linked order payment status
   var o;
@@ -5733,6 +5753,26 @@ function saveOrd(){
           var diff=amtPaid-linkedInv.paid;
           if(!linkedInv.payments)linkedInv.payments=[];
           linkedInv.payments.push({pid:uid(),date:tday(),amt:diff,method:"Cash",ref:"Order edit adjustment"});
+        }else if(amtPaid<linkedInv.paid){
+          // FIX (2026-07-27): a downward correction here used to set
+          // linkedInv.paid directly without touching linkedInv.payments,
+          // breaking the paid===sum(payments) invariant every other path in
+          // this app relies on. reversePayment() treats payments as the
+          // source of truth and recomputes paid=sum(payments) whenever ANY
+          // entry on this invoice is later reversed - so a director's manual
+          // correction here would survive only until the next unrelated
+          // reversal, at which point it silently snapped back toward the
+          // old, higher total (confirmed live: a two-payment invoice
+          // corrected down from 100 to 30, then had one of the ORIGINAL
+          // entries reversed, jumped back to 60 - not 30). Recording the
+          // correction as a real, negative payment entry (same pattern as
+          // the increase branch above, just signed the other way) keeps
+          // payments as the genuine source of truth, so any future
+          // recompute-from-payments naturally preserves this correction
+          // instead of erasing it.
+          var diffDown=_round2(amtPaid-linkedInv.paid);
+          if(!linkedInv.payments)linkedInv.payments=[];
+          linkedInv.payments.push({pid:uid(),date:tday(),amt:diffDown,method:"Cash",ref:"Order edit correction by "+CU.name});
         }
         linkedInv.paid=_round2(amtPaid);
         if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
@@ -6152,7 +6192,20 @@ function delO(id){
   // payment history for the books, exactly as before.
   D.invoices=(D.invoices||[]).filter(function(i){
     var linked=i.notes&&i.notes.match(new RegExp("#"+id+"(\\D|$)"));
-    if(linked&&i.paid<=0)return false;
+    if(linked&&i.paid<=0){
+      // FIX (2026-07-27): this removal had no corresponding entry in
+      // D.deletedInvoiceIds - the exact same tombstone mechanism that
+      // already protects the order removal two lines above, and that the
+      // recon-duplicate dedup logic already applies to its own invoice
+      // removal (search D.deletedInvoiceIds[dup.invoiceId] above). Without
+      // it, a stale second device that still had this invoice cached could
+      // resurrect it right back into the shared document on its next sync,
+      // since the merge engine only treats a removal as intentional when
+      // this tombstone is present - same class of bug, same fix.
+      if(!D.deletedInvoiceIds)D.deletedInvoiceIds={};
+      D.deletedInvoiceIds[i.id]=Date.now();
+      return false;
+    }
     return true;
   });
   auditLog("ORDER_DELETED","Order #"+id+" deleted by "+CU.name+" ("+CU.role+"). Product: "+o.prod+", Qty: "+o.qty+", Status was: "+o.status+(o.status==="Delivered"?" \u2014 REVENUE IMPACT: KSh "+(o.qty*o.price).toLocaleString()+" removed from historical reports":""));
