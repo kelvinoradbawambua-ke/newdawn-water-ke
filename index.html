@@ -633,6 +633,25 @@ function custDebt(id){
   }).reduce(function(a,i){return a+(i.amount-i.paid);},0);
   return Math.max(0,gross-credit); // net debt after credit
 }
+// FIX (2026-07-27): shared collectable-debt predicate. custDebt() above already
+// excludes an invoice whose linked order was Cancelled or deleted (lines
+// ~620-631), but several payment and debt-display sites used a weaker filter
+// (cId + paid<amount + !voided) that did NOT — so a customer-level payment could
+// be applied to a cancelled order's stuck invoice (real cash misallocated to a
+// written-off balance the debtors page still showed as owed), and debt displays
+// could show money custDebt() reports as zero. This centralizes the exact same
+// linked-order check custDebt() uses so every site agrees with it — the
+// divergence between them was the defect. Uses the same O(1) order index.
+function _invoiceOrderActive(i){
+  if(!i)return false;
+  var _idx=_getOrdByIdIndex();
+  var _oid=null;
+  if(i.orderId)_oid=i.orderId;
+  else if(i.notes&&i.notes.indexOf("#")!==-1){var _m=i.notes.match(/#(\d+)/);if(_m)_oid=parseInt(_m[1]);}
+  if(_oid==null)return true; // no linked order (e.g. a manual invoice) — active, same as custDebt()
+  var _o=_idx[_oid];
+  return !(!_o||_o.status==="Cancelled");
+}
 function custName(id){var c=(D.customers||[]).find(function(x){return x.id===id;});if(!c)return"—";return can("vPhone")?c.name:maskName(c.name);}
 function cAddr(c){if(!c)return "";return [sanitizeInput(unescapeForEdit(c.estate)),sanitizeInput(unescapeForEdit(c.court)),c.house?"No."+sanitizeInput(unescapeForEdit(c.house)):""].filter(Boolean).join(", ");}
 function om(id){var e=el(id);if(e)e.classList.add("open");}
@@ -1151,6 +1170,17 @@ function processWriteQueue(){
         freshD.invoices.forEach(function(fi){
           var localIdx=localInvMap[fi.id];
           if(localIdx===undefined){
+            // FIX (2026-07-27): honor invoice deletion tombstones here too,
+            // matching the read-side merge (~line 2220). Without it a
+            // locally-removed-and-tombstoned invoice (the recovery-duplicate
+            // dedup, or delO's zero-payment cleanup) that is still present in
+            // this server read got pushed straight back into the payload,
+            // resurrecting it. It was MASKED (the same write also carries the
+            // never-pruned deletedInvoiceIds map and the read side drops it next
+            // snapshot), but relying on that is fragile — drop it at the source
+            // so both merge paths agree.
+            var _fiDel=(DforSync.deletedInvoiceIds&&DforSync.deletedInvoiceIds[fi.id])||(freshD.deletedInvoiceIds&&freshD.deletedInvoiceIds[fi.id]);
+            if(_fiDel)return;
             DforSync.invoices.push(fi);
             console.log("[NDSYNC] freshness check RESCUED invoice id="+fi.id+" that would otherwise have been dropped by this write");
             return;
@@ -1271,6 +1301,11 @@ function processWriteQueue(){
         var localRouteIds={};DforSync.routes.forEach(function(r,idx){localRouteIds[r.id]=idx;});
         freshD.routes.forEach(function(fr){
           if(localRouteIds[fr.id]===undefined){
+            // FIX (2026-07-27): honor route deletion tombstones, matching the
+            // read side (~line 2330) — same masked resurrection risk as the
+            // invoice rescue above (delRoute sets deletedRouteIds).
+            var _frDel=(DforSync.deletedRouteIds&&DforSync.deletedRouteIds[fr.id])||(freshD.deletedRouteIds&&freshD.deletedRouteIds[fr.id]);
+            if(_frDel)return;
             DforSync.routes.push(fr);
             console.log("[NDSYNC] freshness check RESCUED route id="+fr.id+" that would otherwise have been dropped by this write");
           }
@@ -4974,7 +5009,39 @@ function reversePayment(invId,pid,payIdx){
   // deeper business question of what the "true" figure should be in that
   // specific sequence - that ambiguity needs a director's judgment, not a
   // formula, but a negative number is unambiguously wrong either way.
-  inv.paid=Math.max(0,_round2(pays.reduce(function(s,p){return s+(p.amt||0);},0)));
+  //
+  // FIX (2026-07-28): the clamp above was ONE-SIDED and silently ate real
+  // cash later. It corrected inv.paid but left the negative sitting in
+  // inv.payments - and this is the ONLY one of five sites that recomputes
+  // paid from that array which clamps at all (recPay x2, completeDlv,
+  // ackPendingPay all do a plain sum). So the hidden negative survived, and
+  // the next genuine payment recomputed unclamped and absorbed part of it.
+  // Reproduced end-to-end (_proof_clamp_asymmetry.js): ledger [60,40,-70],
+  // reverse the 40 -> paid displayed 0 while the array summed to -10;
+  // customer then paid KSh 250 -> KSh 90 to the invoice, KSh 150 to credit,
+  // KSh 10 unaccounted for, and the invoice still showed KSh 10 outstanding
+  // immediately after a payment large enough to clear it in full.
+  //
+  // Fixed by keeping the LEDGER non-negative rather than just the total:
+  // if removing this entry would leave the array summing below zero, append
+  // a visible, explicitly-labelled balancing entry. That restores the
+  // paid===sum(payments) invariant this whole codebase depends on (so all
+  // five recompute sites now agree and nothing can be silently absorbed),
+  // and it makes the adjustment an auditable ledger line a director can
+  // actually see, instead of an invisible discrepancy. Deliberately does
+  // NOT guess the "true" figure - the comment above is right that only a
+  // director can decide that - so it flags for review rather than silently
+  // settling on a number and moving on.
+  var _rawSum=_round2(pays.reduce(function(s,p){return s+(p.amt||0);},0));
+  var _wasAdjusted=false;
+  if(_rawSum<0){
+    var _adj=_round2(-_rawSum);
+    pays.push({pid:uid(),date:tday(),amt:_adj,method:"Adjustment",
+      ref:"Auto-balance +"+_adj+" — reversing "+pay.method+" KSh "+pay.amt+" left this ledger at KSh "+_rawSum+" (an earlier downward correction had been calibrated against that payment). Ledger returned to 0. DIRECTOR REVIEW: confirm the true amount paid."});
+    auditLog("PAYMENT_RECORDED","AUTO-BALANCE: Invoice #"+invId+" payment ledger would have gone to KSh "+_rawSum+" after reversing KSh "+pay.amt+" — a KSh "+_adj+" balancing entry was added to hold it at 0. NEEDS DIRECTOR REVIEW: the true amount paid may not be 0.");
+    _wasAdjusted=true;
+  }
+  inv.paid=_round2(pays.reduce(function(s,p){return s+(p.amt||0);},0));
   inv.payments=pays;
   // Sync linked order payment status
   var o;
@@ -4994,7 +5061,14 @@ function reversePayment(invId,pid,payIdx){
   if(el("pg-invoices")&&el("pg-invoices").classList.contains("act"))rInvs(undefined,INV_PAGE);
   if(el("pg-orders")&&el("pg-orders").classList.contains("act"))rOrds(undefined,ORD_PAGE);
   if(el("pg-debts")&&el("pg-debts").classList.contains("act"))rDebts();
-  toast("Payment reversed — Invoice #"+invId+" updated","ok");
+  // FIX (2026-07-28): when a balancing entry was needed, say so in the UI too -
+  // the audit line alone is not enough, because the person who needs to make
+  // the judgment call is the director standing there right now.
+  if(_wasAdjusted){
+    toast("Invoice #"+invId+" needed a balancing entry — an earlier correction was tied to the payment you just reversed. Paid now shows KSh 0. Please review the payment history and confirm the true amount.","warn");
+  }else{
+    toast("Payment reversed — Invoice #"+invId+" updated","ok");
+  }
 }
 var _voidOnComplete=null;
 function voidInvoice(invId,onComplete){
@@ -5144,7 +5218,7 @@ function recPay(){
   // ── CUSTOMER-LEVEL PAYMENT — distribute oldest-first ─────────────────
     var cu2=(D.customers||[]).find(function(x){return x.id===cId;});
     var existingCredit=(cu2&&cu2.credit>0)?cu2.credit:0;
-    var totalDebt=(D.invoices||[]).filter(function(i){return i.cId===cId&&i.paid<i.amount&&!i.voided;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
+    var totalDebt=(D.invoices||[]).filter(function(i){return i.cId===cId&&i.paid<i.amount&&!i.voided&&_invoiceOrderActive(i);}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
     // Apply any existing credit balance first
     if(existingCredit>0&&totalDebt>0){
       var useCredit=Math.min(existingCredit,totalDebt);
@@ -5166,7 +5240,7 @@ function recPay(){
       amt=totalDebt;
     }
     var rem=amt;
-    (D.invoices||[]).filter(function(i){return i.cId===cId&&i.paid<i.amount&&!i.voided;})
+    (D.invoices||[]).filter(function(i){return i.cId===cId&&i.paid<i.amount&&!i.voided&&_invoiceOrderActive(i);})
       .sort(function(a,b){return a.date>b.date?1:-1;})
       .forEach(function(inv){
         if(rem<=0)return;
@@ -7306,6 +7380,24 @@ function recreateOrder(idx){
       newOrder.status="Pending";
       newOrder.driver="";
       newOrder.paid="Unpaid";
+      // FIX (2026-07-27): deduct stock for a recovered PENDING order, exactly as
+      // normal order creation does (saveOrd ~line 6203). Without this, the
+      // recovered order was the ONLY Pending exact order in the app that had not
+      // been deducted at creation — and since delivery (completeDlv) never
+      // re-deducts an exact order (it assumes creation already did), the order
+      // could be placed AND delivered with its stock never once removed, leaving
+      // stock permanently overstated. prodConfirmed:true keeps it on the same
+      // "exact order, deducted once" path every other function assumes. (The
+      // wasDelivered branch above deliberately does NOT deduct — that order was
+      // physically handed over the first time it was delivered.)
+      newOrder.prodConfirmed=true;
+      if(_stMatch){
+        _stMatch.qty=Math.max(0,_stMatch.qty-qty);_recordStockDelta(_stMatch.id,-qty,newId);
+        if(!_stMatch.history)_stMatch.history=[];
+        _stMatch.history.push({ts:tday(),type:"sale",qty:-qty,by:CU.name+" (recovery)",ordId:newId,bal:_stMatch.qty});
+        if(_stMatch.history.length>50)_stMatch.history=_stMatch.history.slice(-50);
+        updateStockBadge();
+      }
       D.orders.push(newOrder);
     }
     // FIX (2026-07-27): the original lost order's id (orig) is now restored
@@ -7341,21 +7433,27 @@ function recreateOrder(idx){
 
 function doRS(){if(!can("aSt")){toast("Permission denied","err");return;}var id=parseInt(el("rp").value);var q=parseInt(el("rq").value)||0;if(q<=0){toast("Enter quantity to add","err");return;}var p=(D.stock||[]).find(function(s){return s.id===id;});if(p){p.qty+=q;_recordStockDelta(p.id,q);
   if(!p.history)p.history=[];p.history.push({ts:tday(),type:"restock",qty:q,by:CU.name,bal:p.qty});if(p.history.length>50)p.history=p.history.slice(-50);
-  // Auto-fulfil pending orders for this product
-  var _pending=(D.orders||[]).filter(function(o){
-    return o.status==="Pending"&&o.prod===p.name&&o.prodConfirmed!==false;
-  }).sort(function(a,b){return (a.id||0)-(b.id||0);}); // oldest first
-  var _fulfilled=0;
-  _pending.forEach(function(o){
-    if(p.qty>=o.qty){
-      p.qty-=o.qty;_recordStockDelta(p.id,-o.qty);
-      p.history.push({ts:tday(),type:"sale",qty:-o.qty,by:"Auto (restock)",ordId:o.id,bal:p.qty});
-      auditLog("STOCK_UPDATED","Auto-deducted "+o.qty+" "+p.name+" for Order #"+o.id+" (pending fulfilment after restock by "+CU.name+")");
-      _fulfilled++;
-    }
-  });
-  var _fmsg=_fulfilled>0?" — auto-deducted for "+_fulfilled+" pending order"+(+(_fulfilled>1)?"s":""):"";
-  auditLog("STOCK_RESTOCKED","+"+q+" units of "+p.name+" by "+CU.name+" ("+CU.role+"). Now: "+p.qty+(_fulfilled>0?". Fulfilled "+_fulfilled+" pending order(s)":""));toast(p.name+" restocked +"+q+" — now "+p.qty+" in stock"+_fmsg);}el("rq").value="";cm("m-rs");rStock(undefined,STK_PAGE);rDel();if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();updateStockBadge();dirty();}
+  // FIX (2026-07-27): the "auto-fulfil pending orders" loop that used to live
+  // here deducted each still-Pending order's FULL quantity from stock AGAIN on
+  // every restock. But an exact order already deducts its stock at creation
+  // (saveOrd, ~line 6203) and stays Pending until delivery, and
+  // delO()/cancelO()/delC() all treat a Pending exact order as ALREADY-deducted
+  // (they RESTORE its stock on removal). So this loop was a straight double
+  // deduction: every restock silently understated stock by the sum of all
+  // currently-Pending orders for that product, which could then read falsely
+  // low or even "out of stock". Confirmed by tracing creation→restock against
+  // the app's own delete/cancel restore logic. Removed — a restock now simply
+  // adds the received units and never re-deducts any order, preserving the one
+  // consistent invariant: "an exact order is deducted exactly once, at
+  // creation."
+  // KNOWN LIMITATION (documented, not silently fixed): an order placed while
+  // genuinely out of stock has its creation-time deduction floored at 0
+  // (Math.max(0,...)), so its shortfall is not auto-recovered on a later
+  // restock — stock then reads slightly HIGH for that rare case, the SAFE
+  // direction (it never falsely blocks a sale). Fully closing that needs a
+  // backorder / allow-negative-stock decision from the business; flagged for
+  // that decision rather than papered over with the double-counting loop.
+  auditLog("STOCK_RESTOCKED","+"+q+" units of "+p.name+" by "+CU.name+" ("+CU.role+"). Now: "+p.qty);toast(p.name+" restocked +"+q+" — now "+p.qty+" in stock");}el("rq").value="";cm("m-rs");rStock(undefined,STK_PAGE);rDel();if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();updateStockBadge();dirty();}
 function delS(id){
   if(!can("dSt"))return;
   var s=(D.stock||[]).find(function(x){return x.id===id;});if(!s)return;
@@ -7546,7 +7644,7 @@ function ackPendingPay(id){
   // director-recorded payments.
   var inv=(D.invoices||[]).find(function(i){return i.cId===pp.cId&&i.notes&&i.notes.match(new RegExp("#"+pp.ordId+"(\\D|$)"));});
   if(!inv){
-    inv=(D.invoices||[]).filter(function(i){return i.cId===pp.cId&&i.paid<i.amount&&!i.voided;})
+    inv=(D.invoices||[]).filter(function(i){return i.cId===pp.cId&&i.paid<i.amount&&!i.voided&&_invoiceOrderActive(i);})
       .sort(function(a,b){return a.date>b.date?1:-1;})[0];
   }
   var remaining=pp.amt;
@@ -7620,7 +7718,7 @@ function payCalc(){
   }else{
     var cu3=(D.customers||[]).find(function(x){return x.id===cId;});
     var existCr=(cu3&&cu3.credit>0)?cu3.credit:0;
-    var debt=(D.invoices||[]).filter(function(i){return i.cId===cId&&i.paid<i.amount&&!i.voided;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
+    var debt=(D.invoices||[]).filter(function(i){return i.cId===cId&&i.paid<i.amount&&!i.voided&&_invoiceOrderActive(i);}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
     var effectiveAmt=amt+existCr; // credit applied first
     var after2=Math.max(0,debt-effectiveAmt);
     var over2=effectiveAmt>debt;
@@ -7668,7 +7766,7 @@ function openPayInv(id){
 function ageing(cId){
   var td=tday();
   var tdMs=new Date(td+"T12:00:00").getTime();
-  var invs=(D.invoices||[]).filter(function(i){return i.cId===cId&&i.paid<i.amount&&i.due;});
+  var invs=(D.invoices||[]).filter(function(i){return i.cId===cId&&i.paid<i.amount&&i.due&&!i.voided&&_invoiceOrderActive(i);});
   var d30=invs.filter(function(i){var dMs=new Date(i.due+"T12:00:00").getTime();return dMs>=tdMs||(tdMs-dMs)<=30*86400000;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
   var d60=invs.filter(function(i){var dMs=new Date(i.due+"T12:00:00").getTime();var diff=tdMs-dMs;return diff>30*86400000&&diff<=60*86400000;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
   var d90=invs.filter(function(i){var dMs=new Date(i.due+"T12:00:00").getTime();var diff=tdMs-dMs;return diff>60*86400000&&diff<=90*86400000;}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
@@ -7694,7 +7792,7 @@ function rDebts(q,pg){
   var _dmo=_dnow.getFullYear()+"-"+String(_dnow.getMonth()+1).padStart(2,"0");
   var debtors=(D.customers||[]).map(function(c){
     // Period-scoped debt: find orders in this period and their unpaid invoices
-    var allInvs=(D.invoices||[]).filter(function(i){return i.cId===c.id&&i.paid<i.amount&&!i.voided;});
+    var allInvs=(D.invoices||[]).filter(function(i){return i.cId===c.id&&i.paid<i.amount&&!i.voided&&_invoiceOrderActive(i);});
     var periodInvs=(DEBT_PERIOD==="all")?allInvs:allInvs.filter(function(i){
       // Use the linked order's date — the actual date the debt was created
       var ordDate="";
