@@ -664,6 +664,139 @@ function toast(msg,type){
   setTimeout(function(){if(t.parentNode)t.parentNode.removeChild(t);},2800);
 }
 
+/* ── IN-APP CONFIRM / ALERT DIALOGS ────────────────────────────────────
+   UI/UX (2026-07-28): the app still fell back to the browser's native
+   confirm()/alert() in ~34 places. Those are visually foreign to the rest
+   of the interface (unstyled OS chrome, "localhost says", no branding, no
+   iconography), they truncate and mangle multi-line messages on mobile,
+   and they cannot be dismissed or styled. Worse, this app has already had
+   ONE REAL PRODUCTION BUG caused by native confirm() specifically: the
+   #1290/#1291 duplicate-order incident, where the blocking dialog stayed
+   open longer than a fixed-duration safety-net timer (see the long comment
+   in saveOrd). These promise-based dialogs reuse the app's own modal
+   language (.ov/.modal/.mhd/.mbdy/.mft/.btn) so confirmation looks and
+   behaves like the rest of the system.
+
+   Deliberately built as a SEPARATE overlay (#m-confirm, z-index above the
+   normal 200) rather than reusing #m-generic: several existing flows
+   (voidInvoice, cancelO disposition) already occupy #m-generic and can be
+   the very thing asking for confirmation, so sharing it would let a
+   confirmation destroy the modal that opened it.
+
+   Contract: uiConfirm() ALWAYS resolves exactly once - true only if the
+   user positively confirms; false for cancel, backdrop click, Escape, or
+   being superseded by another dialog. It never rejects and never hangs,
+   because a caller left awaiting a dead promise would silently strand a
+   half-finished money operation. */
+var _uiConfirmResolve=null;
+var _uiConfirmKeyHandler=null;
+function _uiConfirmSettle(result){
+  if(!_uiConfirmResolve)return;
+  var _r=_uiConfirmResolve;_uiConfirmResolve=null;
+  if(_uiConfirmKeyHandler){try{document.removeEventListener("keydown",_uiConfirmKeyHandler,true);}catch(_){}_uiConfirmKeyHandler=null;}
+  var ov=document.getElementById("m-confirm");if(ov)ov.classList.remove("open");
+  try{_r(result);}catch(_){}
+}
+function _uiConfirmShell(){
+  var ov=document.getElementById("m-confirm");
+  if(ov)return ov;
+  ov=document.createElement("div");
+  ov.className="ov";ov.id="m-confirm";ov.style.zIndex="400";
+  ov.innerHTML="<div class=\"modal\" id=\"m-confirm-box\" style=\"max-width:470px\">"
+    +"<div class=\"mhd\"><div class=\"mttl\" id=\"m-confirm-title\"></div></div>"
+    +"<div class=\"mbdy\" id=\"m-confirm-body\" style=\"font-size:13px;line-height:1.75;color:var(--tx)\"></div>"
+    +"<div class=\"mft\">"
+    +"<button class=\"btn\" id=\"m-confirm-no\" type=\"button\"></button>"
+    +"<button class=\"btn\" id=\"m-confirm-yes\" type=\"button\"></button>"
+    +"</div></div>";
+  document.body.appendChild(ov);
+  // Backdrop click = cancel (never confirm - a stray tap must not be able to
+  // approve a deletion or a write-off).
+  ov.addEventListener("click",function(e){if(e.target===ov)_uiConfirmSettle(false);});
+  return ov;
+}
+function uiConfirm(opts){
+  opts=opts||{};
+  // A dialog already open means its caller is still awaiting an answer it
+  // can no longer get - settle it false so nothing is left hanging.
+  if(_uiConfirmResolve)_uiConfirmSettle(false);
+  var variant=opts.variant||"danger";
+  var theme=variant==="info"?{c:"var(--nv)",ic:"ti-info-circle",btn:"btn-navy"}
+    :variant==="warn"?{c:"#e67e22",ic:"ti-alert-circle",btn:"btn-gold"}
+    :{c:"#c0392b",ic:"ti-alert-triangle",btn:"btn-red"};
+  var ov=_uiConfirmShell();
+  var box=document.getElementById("m-confirm-box");
+  if(box)box.style.borderTop="4px solid "+theme.c;
+  var t=document.getElementById("m-confirm-title");
+  if(t)t.innerHTML="<i class=\"ti "+theme.ic+"\" style=\"color:"+theme.c+";margin-right:8px\"></i>"+sanitizeInput(opts.title||"Please confirm");
+  var b=document.getElementById("m-confirm-body");
+  // sanitizeInput first, THEN turn newlines into <br> - the existing call
+  // sites all compose plain-text messages with \n, and several interpolate
+  // customer-supplied names, so escaping before rendering is required.
+  if(b)b.innerHTML=sanitizeInput(String(opts.message||"")).replace(/\n/g,"<br>");
+  var no=document.getElementById("m-confirm-no");
+  var yes=document.getElementById("m-confirm-yes");
+  // cancelText===null is the explicit "acknowledge-only" mode used by
+  // uiAlert(): hide the cancel button entirely rather than falling back to
+  // the default label, so an informational dialog does not offer a
+  // meaningless second choice.
+  var _noCancel=(opts.cancelText===null||opts.cancelText===false);
+  if(no){
+    no.style.display=_noCancel?"none":"";
+    no.textContent=_noCancel?"":(opts.cancelText||"Cancel");
+    no.className="btn";
+    no.onclick=function(){_uiConfirmSettle(false);};
+  }
+  if(yes){
+    yes.innerHTML="<i class=\"ti "+(variant==="info"?"ti-check":"ti-alert-triangle")+"\"></i> "+sanitizeInput(opts.confirmText||"Confirm");
+    yes.className="btn "+theme.btn;
+    yes.onclick=function(){_uiConfirmSettle(true);};
+  }
+  ov.classList.add("open");
+  return new Promise(function(resolve){
+    _uiConfirmResolve=resolve;
+    _uiConfirmKeyHandler=function(e){
+      if(e.key==="Escape"){e.preventDefault();e.stopPropagation();_uiConfirmSettle(false);}
+      else if(e.key==="Enter"){
+        e.preventDefault();e.stopPropagation();
+        // FIX (2026-07-28): Enter must NOT auto-confirm a destructive (danger)
+        // dialog. This handler used to settle(true) unconditionally, silently
+        // defeating the "focus the safe No button so a stray Enter cancels"
+        // intent documented just below (and the matching backdrop-tap guard at
+        // line 715) — a reflexive Enter would confirm a deletion, or worst case
+        // the cloud-overwriting restoreSpecificBackup. Now a danger dialog
+        // treats Enter as Cancel (consistent with its focused No button);
+        // warn/info and acknowledge-only (uiAlert) dialogs — whose focused/
+        // default action IS the confirm button — still confirm on Enter. A
+        // keyboard user can still confirm a danger dialog by activating its
+        // Confirm button directly (Space/click); only the ambiguous Enter is
+        // made safe. variant is captured from the enclosing uiConfirm() call.
+        _uiConfirmSettle(variant!=="danger");
+      }
+    };
+    // Capture phase so Escape is handled here BEFORE the global shortcut
+    // handler closes every .ov on screen - that would hide this dialog
+    // without ever settling the promise.
+    document.addEventListener("keydown",_uiConfirmKeyHandler,true);
+    // Focus the SAFE choice on destructive prompts so a stray Enter/tap
+    // cancels rather than confirms.
+    setTimeout(function(){try{(variant==="danger"?no:yes).focus();}catch(_){}},30);
+  });
+}
+/* Informational dialog - replaces alert(). Resolves when acknowledged. */
+function uiAlert(opts){
+  opts=opts||{};
+  return uiConfirm({
+    title:opts.title||"Notice",
+    message:opts.message||"",
+    variant:opts.variant||"info",
+    confirmText:opts.confirmText||"OK",
+    cancelText:null
+  }).then(function(r){
+    return r;
+  });
+}
+
 function dirty(){
   var e=el("sts");if(e){e.className="sts dirty";e.innerHTML="<i class=\"ti ti-point-filled\"></i> Syncing...";}
   scheduleCloudSync();
@@ -1261,7 +1394,7 @@ function processWriteQueue(){
           var _fcLocalSt=DforSync.stock[idx];
           var mergedItem=Object.assign({},fs);
           if(delta!==0){
-            mergedItem.qty=Math.max(0,(fs.qty||0)+delta);
+            mergedItem.qty=(fs.qty||0)+delta; // negative-stock policy (2026-07-28): no floor, or a legitimate backorder (-7) would be clamped to 0 on this write and the shortfall lost across devices
             console.log("[NDSYNC] freshness check MERGED stock id="+fs.id+" ("+fs.name+") — server="+fs.qty+" + our delta="+delta+" = "+mergedItem.qty);
             if(_fcLocalSt&&_fcLocalSt.history)mergedItem.history=_fcLocalSt.history;
           }
@@ -1280,6 +1413,11 @@ function processWriteQueue(){
         freshD.complaints.forEach(function(fc){
           var idx=localCmpIds[fc.id];
           if(idx===undefined){
+            // FIX (2026-07-28): honor complaint deletion tombstones, matching the
+            // invoice/route write-side rescues — a tombstoned complaint still in
+            // the server read must not be pushed back into the payload.
+            var _fcDel=(DforSync.deletedComplaintIds&&DforSync.deletedComplaintIds[fc.id])||(freshD.deletedComplaintIds&&freshD.deletedComplaintIds[fc.id]);
+            if(_fcDel)return;
             DforSync.complaints.push(fc);
             console.log("[NDSYNC] freshness check RESCUED complaint id="+fc.id+" that would otherwise have been dropped by this write");
           }else if(fc.status==="Resolved"&&DforSync.complaints[idx].status!=="Resolved"){
@@ -2018,7 +2156,7 @@ function startCloudListener(isWarmRefresh){
                 var pendingDelta=_stockDeltasByOrder[lo.id][stockId];
                 var st=(D.stock||[]).find(function(x){return String(x.id)===String(stockId);});
                 if(st&&pendingDelta){
-                  st.qty=Math.max(0,st.qty-pendingDelta); // reverse: undo exactly what the discarded edit did
+                  st.qty=st.qty-pendingDelta; // reverse: undo exactly what the discarded edit did (negative-stock policy: no floor, so the reversal stays exact)
                   _stockQtyDeltas[stockId]=(_stockQtyDeltas[stockId]||0)-pendingDelta; // keep the aggregate consistent too
                   console.log("[NDSYNC] reversed discarded-edit stock delta for order #"+lo.id+" on stock id="+stockId+" (was "+pendingDelta+")");
                 }
@@ -2325,7 +2463,7 @@ function startCloudListener(isWarmRefresh){
           var delta=_stockQtyDeltas[rs.id]||0;
           var merged=Object.assign({},rs);
           if(delta!==0){
-            merged.qty=Math.max(0,(rs.qty||0)+delta);
+            merged.qty=(rs.qty||0)+delta; // negative-stock policy (2026-07-28): no floor, so a backorder (-7) applied on top of an incoming snapshot stays negative and converges instead of being clamped to 0
             console.log("[NDSYNC] snapshot merge PRESERVED pending stock delta for id="+rs.id+" ("+rs.name+") — server="+rs.qty+" + our delta="+delta+" = "+merged.qty);
           }
           var ls=_localStMap[rs.id];
@@ -2397,7 +2535,16 @@ function startCloudListener(isWarmRefresh){
           var _rtDelAt=(data.D.deletedRouteIds&&data.D.deletedRouteIds[r.id])||(D.deletedRouteIds&&D.deletedRouteIds[r.id])||_recentlyDeletedRouteIds[r.id];
           return !_rtDelAt;
         });
-        D.routes=data.D.routes.concat(_rescuedRt);
+        // FIX (2026-07-28): drop a tombstoned route still present in the remote
+        // snapshot. The rescue above only checked the tombstone for local-only
+        // routes; a tombstoned route still in the remote doc was taken wholesale
+        // by the concat below and resurrected (deletion never converged). Mirrors
+        // orders/invoices. delRoute sets deletedRouteIds + the local set.
+        var _keptRemoteRt=data.D.routes.filter(function(r){
+          var _rtDelAt2=(data.D.deletedRouteIds&&data.D.deletedRouteIds[r.id])||(D.deletedRouteIds&&D.deletedRouteIds[r.id])||_recentlyDeletedRouteIds[r.id];
+          return !_rtDelAt2;
+        });
+        D.routes=_keptRemoteRt.concat(_rescuedRt);
         if(_rescuedRt.length){_anyRescueThisSync=true;console.log("[NDSYNC] snapshot merge RESCUED "+_rescuedRt.length+" local-only route(s) not yet in remote");}
       }
       // Same fix as stock above - no delete-offer function exists, so
@@ -2456,7 +2603,17 @@ function startCloudListener(isWarmRefresh){
         var _localCmpMap={};(D.complaints||[]).forEach(function(c){_localCmpMap[c.id]=c;});
         var _remoteCmpIds={};
         var _cmpPreserveFields=["cId","type","details","action","status"];
-        var _mergedRemoteCmp=data.D.complaints.map(function(rc){
+        var _mergedRemoteCmp=data.D.complaints.filter(function(rc){
+          // FIX (2026-07-28): drop a tombstoned complaint that is still present in
+          // the remote snapshot. The local-only rescue step below already honored
+          // deletedComplaintIds, but a tombstoned complaint still in the remote doc
+          // was taken wholesale here and re-added — so a deleted complaint kept
+          // resurrecting and the deletion never converged across devices. Mirrors
+          // the orders/invoices read side, which drop tombstoned remote records
+          // before re-adding. (delCmp sets deletedComplaintIds + the local set.)
+          var _cmpDelAt=(data.D.deletedComplaintIds&&data.D.deletedComplaintIds[rc.id])||(D.deletedComplaintIds&&D.deletedComplaintIds[rc.id])||_recentlyDeletedComplaintIds[rc.id];
+          return !_cmpDelAt;
+        }).map(function(rc){
           _remoteCmpIds[rc.id]=true;
           var lc=_localCmpMap[rc.id];
           if(!lc)return rc;
@@ -2581,6 +2738,23 @@ function startCloudListener(isWarmRefresh){
           var _mergedCust=_mergeCustomerCredit(lc,rc);
           rc.credit=_mergedCust.credit;
           rc.creditLog=_mergedCust.creditLog;
+          // FIX (2026-07-28): preserve locally-edited PROFILE fields, the read-side
+          // twin of the write-side protection. The write side already prefers local
+          // for these (via _mergeCustomerCredit basing its result on a=local), but
+          // this read path pushed the remote record `rc` wholesale for every field
+          // except credit/creditLog/waterCycle — so a just-made edit to a phone,
+          // address, or creditLimit sitting unsynced during the debounce window was
+          // silently reverted to the stale remote value the moment any unrelated
+          // snapshot arrived (then the next write persisted the reverted value).
+          // Exact same class as the order-price (~2205) and stock-field (~2441)
+          // read-side reverts fixed earlier; customers' read path was missed.
+          // creditLimit is money-adjacent. Same "prefer this device's own in-memory
+          // edit when both sides hold a real, differing value" rule as those.
+          ["name","phone","phone2","idno","estate","court","house","htype","road","zone","ctype","creditLimit","notes"].forEach(function(f){
+            var lv=lc[f],rv=rc[f];
+            if(lv!=null&&rv==null)rc[f]=lv;
+            else if(lv!=null&&rv!=null&&lv!==rv)rc[f]=lv;
+          });
         }
         if(!lc)addedCount++;
         mergedCustomers.push(rc);
@@ -2672,30 +2846,30 @@ function startCloudListener(isWarmRefresh){
       }).map(function(ru){
         var lu=_localUserMap[ru.id];
         if(!lu)return ru;
+        // CRITICAL GUARD (2026-07-27, broadened 2026-07-28): if the LOCAL user
+        // record is the unmodified bootstrap PLACEHOLDER, do not prefer ANY of
+        // its fields over the real server record — take remote wholesale for it.
+        // On a cold/fresh load (cleared cache, new device, storage evicted —
+        // localOrders=0 in the sync log) local USERS is the placeholder
+        // [{id:1,name:"Director",role:"director",pin:"1234",ini:"DR",col:"#1a1560"}].
+        // The "prefer local when both differ" loop below would otherwise treat
+        // that placeholder as a genuine edit and revert the FIRST director's
+        // (id:1) REAL server pin/name/initials to "1234"/"Director"/"DR", then
+        // the write that fires right after this merge would persist those
+        // placeholder values to Firestore for every device — defeating setup and
+        // every PIN reset. Originally this guarded the `pin` field alone; but
+        // name and ini have the identical hazard (wizSavePin writes the real
+        // name/ini/pin onto id:1 at setup), so the guard is now per-USER. A real
+        // PIN is stored salted-HASHED (savePin/wizSavePin → hashPinSalted), so a
+        // local pin of literally "1234" can ONLY be the untouched placeholder,
+        // never a genuine edit — making this a precise, safe signal that also
+        // fully preserves the original revert-during-write-window protection for
+        // any real (hashed) local edit, which still flows through the loop below.
+        if(lu.pin==="1234")return ru; // local is the bootstrap placeholder — trust the server record
         _userPreserveFields.forEach(function(f){
           var lv=lu[f],rv=ru[f];
           if(lv!=null&&rv==null)ru[f]=lv;
-          else if(lv!=null&&rv!=null&&lv!==rv){
-            // CRITICAL GUARD (2026-07-27): never let a LOCAL pin of exactly the
-            // plaintext bootstrap default "1234" override a real remote PIN.
-            // On a cold/fresh load (cleared cache, new device, storage evicted —
-            // localOrders=0 in the sync log) local USERS is the bootstrap
-            // placeholder [{id:1,pin:"1234"}]. Without this guard, "prefer local
-            // when both differ" treated that placeholder as a genuine edit and
-            // reverted the FIRST director's (id:1) real server PIN back to 1234
-            // — then the write that fires right after this merge persisted 1234
-            // to Firestore, permanently resetting it for every device and
-            // defeating every attempted reset. Confirmed live: repeatedly reverts
-            // to 1234, first-director-only (no other user exists in the
-            // bootstrap). Real PINs are stored salted-HASHED (savePin →
-            // hashPinSalted), so a genuinely-set PIN is never literally "1234" —
-            // meaning this guard neutralizes ONLY the placeholder and never
-            // suppresses a real, deliberate PIN change (a real change is a hash,
-            // still preferred by the branch below, so the original
-            // revert-during-write-window protection is fully preserved).
-            if(f==="pin"&&lv==="1234")return;
-            ru[f]=lv;
-          }
+          else if(lv!=null&&rv!=null&&lv!==rv)ru[f]=lv;
         });
         return ru;
       });
@@ -2705,6 +2879,17 @@ function startCloudListener(isWarmRefresh){
         return !_uDelAt;
       });
       USERS=_mergedRemoteUsers.concat(_rescuedUsers);
+      // FIX (2026-07-28): USERS was the ONLY collection whose local-only rescue
+      // did not set _anyRescueThisSync — so a rescued user (e.g. one just created
+      // here, or one another device's wholesale USERS write transiently dropped)
+      // was kept in memory but NEVER re-persisted to the cloud. If this device
+      // reloaded before any unrelated write, the rescued user was permanently
+      // lost. Setting the flag makes USERS self-heal exactly like orders/
+      // customers/invoices/stock/etc.: any user present on either side survives
+      // and re-converges. This is what makes concurrent user-adds (two directors
+      // adding a member at once, where one wholesale write would otherwise clobber
+      // the other) recover on the next sync instead of silently dropping one.
+      if(_rescuedUsers.length){_anyRescueThisSync=true;console.log("[NDSYNC] snapshot merge RESCUED "+_rescuedUsers.length+" local-only user(s) not yet in remote — scheduling re-persist");}
       _usersFromRemote=true;
     }
     else if(!USERS||!USERS.length){
@@ -4473,7 +4658,7 @@ return "<div class=\"notif "+a.t+"\" style=\""+style+"\"><i class=\"ti "+a.i+"\"
             var isCrit=s.qty<=s.min;
             var isWarn=!isCrit&&s.qty<=s.min*1.5;
             var col=isCrit?"#e74c3c":isWarn?"#f39c12":"var(--nv2)";
-            var pct=Math.min(100,Math.round(s.qty/Math.max(s.min*3,1)*100));
+            var pct=Math.max(0,Math.min(100,Math.round(s.qty/Math.max(s.min*3,1)*100))); // clamp >=0 so a negative (backordered) qty can't produce a negative CSS bar width
             var statusIcon=isCrit?"<i class=\"ti ti-alert-triangle\" style=\"color:#e74c3c;font-size:13px;margin-left:5px\"></i>":isWarn?"<i class=\"ti ti-alert-circle\" style=\"color:#f39c12;font-size:13px;margin-left:5px\"></i>":"";
             return "<div style=\"padding:8px 0;border-bottom:1px solid var(--bd);cursor:pointer\" onclick=\"nav('stock',null)\" title=\""+(isCrit?"Critical — restock now":isWarn?"Low stock":"OK")+"\">"+
               "<div style=\"display:flex;align-items:center;gap:8px;margin-bottom:5px\">"+
@@ -5229,7 +5414,21 @@ function recPay(){
       toast("KSh "+useCredit.toLocaleString()+" credit applied from balance","ok");
     }
     var credit2=0;
-    if(amt>totalDebt&&totalDebt>0){
+    // FIX (2026-07-28): the `&&totalDebt>0` guard here silently LOST an entire
+    // payment whenever the customer had no current collectable debt — all their
+    // invoices already paid, OR their only unpaid invoices linked to cancelled
+    // orders (which _invoiceOrderActive correctly filters out of totalDebt). With
+    // totalDebt===0 this overpayment→credit branch was skipped AND the
+    // oldest-first distribution loop below matched zero invoices, so `rem` (the
+    // whole amount) was neither applied to an invoice nor added to credit: real
+    // cash gone, while the toast still said "Payment recorded". Directly
+    // reachable — openPay()/recPay() have no debt-level guard (a prepayment is a
+    // legitimate action and payCalc() even previews "will become credit").
+    // Confirmed by simulation (KSh 500 prepayment → customer credit stayed 0).
+    // Dropping the guard routes a pure prepayment to credit through this same
+    // proven path (amt reduces to totalDebt=0, the loop then distributes
+    // nothing); the post-loop safety net below additionally catches any residue.
+    if(amt>totalDebt){
       credit2=amt-totalDebt;
       if(cu2){
         cu2.credit=_round2((cu2.credit||0)+credit2);
@@ -5256,6 +5455,19 @@ function recPay(){
             o2.amtPaid=inv.paid;
           }
       });
+    // FIX (2026-07-28): safety net — any amount that could not be applied to an
+    // invoice becomes customer credit, never silently lost. With the guard fix
+    // above this is 0 in every normal path; it exists so a rounding residue or
+    // any unforeseen distribution gap can never make real cash vanish (mirrors
+    // ackPendingPay's proven leftover-to-credit handling). Cannot double-count:
+    // when the overpayment branch above already routed the excess to credit it
+    // set amt=totalDebt, so the loop consumes it all and rem is 0 here.
+    if(rem>0&&cu2){
+      cu2.credit=_round2((cu2.credit||0)+rem);
+      if(!cu2.creditLog)cu2.creditLog=[];
+      cu2.creditLog.push({cid:uid(),date:payDate,amt:rem,type:"overpayment",method:method,ref:ref,by:CU.name,role:CU.role,note:"Unapplied balance stored as credit"});
+      rem=0;
+    }
     auditLog("PAYMENT_RECORDED","KSh "+amt.toLocaleString()+" by "+CU.name+" ("+CU.role+") for customer #"+cId+". Method: "+method+(ref?" Ref: "+ref:"")+". Distributed oldest-first.");
   }
   cm("m-pay");
@@ -6090,13 +6302,22 @@ function saveOrd(){
       if(netChange>0&&newStock&&newStock.qty<netChange){
         if(!confirm("⚠️ Stock Alert\n\nOnly "+newStock.qty+" more unit(s) available for "+unescapeForEdit(pn)+".\n\nOrder will be updated but stock is insufficient. Please restock.\n\nContinue?")){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}
       }
-      if(newStock){newStock.qty=Math.max(0,newStock.qty-netChange);_recordStockDelta(newStock.id,-netChange,o.id);}
+      if(newStock){newStock.qty=newStock.qty-netChange;_recordStockDelta(newStock.id,-netChange,o.id);} // negative-stock policy: no floor
     }else{
       if(newStock&&newStock.qty<qty){
         if(!confirm("⚠️ Stock Alert\n\nOnly "+newStock.qty+" unit(s) in stock for "+unescapeForEdit(pn)+".\n\nOrder will be updated. Please restock soon.\n\nContinue?")){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}
       }
-      if(oldStock){oldStock.qty+=o.qty;_recordStockDelta(oldStock.id,o.qty,o.id);}
-      if(newStock){newStock.qty=Math.max(0,newStock.qty-qty);_recordStockDelta(newStock.id,-qty,o.id);}
+      // FIX (2026-07-28): restore the OLD product's stock only if this order had
+      // actually deducted it — i.e. it was an exact order (prodConfirmed!==false).
+      // Every other restore site (delO, _finishCancelO, delC) already guards on
+      // prodConfirmed; this edit-branch restore was guarded only on "oldStock
+      // found", making it the one inconsistent site. A category order
+      // (prodConfirmed===false) never deducted, so restoring o.qty would phantom-
+      // credit stock (reads HIGH — the unsafe direction, can mask a shortage). At
+      // this point o.prodConfirmed still holds the PRE-edit value (it is reassigned
+      // just below), so this correctly reflects whether stock was ever taken.
+      if(oldStock&&o.prodConfirmed!==false){oldStock.qty+=o.qty;_recordStockDelta(oldStock.id,o.qty,o.id);}
+      if(newStock){newStock.qty=newStock.qty-qty;_recordStockDelta(newStock.id,-qty,o.id);} // negative-stock policy: no floor
     }
     var stCostE=(D.stock||[]).find(function(s){return s.name===pn;});
     o.cId=cId;o.prod=pn;o.stockId=stCostE?stCostE.id:null;o.qty=qty;o.price=_round2(price);o.cost=stCostE?_round2(stCostE.cost):0;o.date=el("od").value;
@@ -6274,7 +6495,20 @@ function saveOrd(){
   reserveNextOrderAndInvoiceIds().then(function(reserved){
     var newOrdId=reserved.orderId,newInvId=reserved.invoiceId;
     if(st){
-      st.qty=Math.max(0,st.qty-qty);_recordStockDelta(st.id,-qty);
+      // NEGATIVE-STOCK POLICY (2026-07-28, business decision — Option A): order
+      // creation is never blocked by low stock (only warned above), and the
+      // deduction is no longer floored at 0. Selling 10 when 3 are in stock now
+      // takes qty to -7, which reads as "7 owed / backordered." A later restock
+      // is a plain addition (+20 -> 13), so the count RECONCILES on its own with
+      // no special catch-up logic — that is exactly what "streamline after
+      // restock" needs. The old Math.max(0,...) floor discarded the shortfall,
+      // leaving stock permanently overstated after a restock. Every stock
+      // deduction, and the read/write sync qty-merge, drop the floor together so
+      // a negative balance persists correctly across devices; low-stock badges
+      // and the Stock page already flag a negative as critical/Low and show the
+      // raw number. _recordStockDelta always logged the full -qty regardless of
+      // the floor, so removing it makes the visible balance match the ledger.
+      st.qty=st.qty-qty;_recordStockDelta(st.id,-qty);
       if(!st.history)st.history=[];
       st.history.push({ts:tday(),type:"sale",qty:-qty,by:CU.name,ordId:newOrdId,bal:st.qty});
       if(st.history.length>50)st.history=st.history.slice(-50);
@@ -6412,7 +6646,7 @@ function completeDlv(){
       if(st.qty<o.qty){
         if(!confirm("⚠️ Only "+st.qty+" in stock but delivering "+o.qty+".\n\nStock will go to 0. Continue?"))return;
       }
-      st.qty=Math.max(0,st.qty-o.qty);_recordStockDelta(st.id,-o.qty);
+      st.qty=st.qty-o.qty;_recordStockDelta(st.id,-o.qty); // negative-stock policy (see order-creation note): no floor, so a short delivery reconciles on restock
       if(!st.history)st.history=[];
       st.history.push({ts:tday(),type:"sale",qty:-o.qty,by:CU.name,ordId:o.id,bal:st.qty});
       if(st.history.length>50)st.history=st.history.slice(-50);
@@ -6969,7 +7203,7 @@ function rStock(q,pg){
     "<tbody>"+
       (paged.items.length?paged.items.map(function(s){
         var low=s.qty<=s.min;var mg=s.price>0?Math.round((s.price-s.cost)/s.price*100):0;
-        var pct=Math.min(100,Math.round(s.qty/Math.max(s.min*3,1)*100));
+        var pct=Math.max(0,Math.min(100,Math.round(s.qty/Math.max(s.min*3,1)*100))); // clamp >=0 so a negative (backordered) qty can't produce a negative CSS bar width
         var col=low?"#e74c3c":s.qty<=s.min*1.5?"#f39c12":"var(--nv2)";
         return "<tr><td style=\"font-weight:800\">"+s.name+"</td><td style=\"color:var(--tx2)\">"+s.size+"</td>"+
           "<td>"+(can("ePrice")?"KSh "+s.price:"KSh &bull;&bull;&bull;&bull;")+"</td>"+
@@ -7293,23 +7527,31 @@ function reconCustSelect(idx,cId,e){
 }
 function dismissMissingOrder(origId){
   if(!can("rest")){toast("Only directors can resolve reconciliation items","err");return;}
-  if(!confirm("Mark order #"+origId+" as resolved without recreating it?\n\nUse this only if you're confident it genuinely cannot or shouldn't be recreated — e.g. the customer could not be identified after asking around. This will stop it appearing in future reconciliation checks.\n\nThis does not delete anything — it only stops flagging this specific gap."))return;
-  // FIX (2026-07-25): dismissedMissingOrders had zero sync protection at
-  // all - no merge logic on the read side, and this write never forced a
-  // freshness check. A device with a stale, not-yet-synced copy of this
-  // array could silently overwrite another device's more recent
-  // dismissal, exactly what happened live: Director dismissed an order,
-  // then ICT's device - which hadn't yet received that update - dismissed
-  // it again, and the alert never actually cleared because each write was
-  // stepping on the other's addition to this list. Same fix already
-  // proven for order creation.
-  _hasPendingCriticalEdit=true;
-  if(!D.dismissedMissingOrders)D.dismissedMissingOrders=[];
-  if(D.dismissedMissingOrders.indexOf(origId)===-1)D.dismissedMissingOrders.push(origId);
-  auditLog("ORDER_UPDATED","Missing order #"+origId+" marked resolved without recreating, by "+CU.name+" ("+CU.role+")");
-  dirty();
-  toast("Order #"+origId+" marked as resolved");
-  showMissingOrders(); // refresh the list, now excluding this one
+  // UI/UX (2026-07-28): native confirm() -> in-app dialog; body unchanged.
+  uiConfirm({
+    title:"Resolve without recreating",
+    message:"Mark order #"+origId+" as resolved without recreating it?\n\nUse this only if you're confident it genuinely cannot or shouldn't be recreated — e.g. the customer could not be identified after asking around. This will stop it appearing in future reconciliation checks.\n\nThis does not delete anything — it only stops flagging this specific gap.",
+    variant:"warn",
+    confirmText:"Mark resolved"
+  }).then(function(_ok){
+    if(!_ok)return;
+    // FIX (2026-07-25): dismissedMissingOrders had zero sync protection at
+    // all - no merge logic on the read side, and this write never forced a
+    // freshness check. A device with a stale, not-yet-synced copy of this
+    // array could silently overwrite another device's more recent
+    // dismissal, exactly what happened live: Director dismissed an order,
+    // then ICT's device - which hadn't yet received that update - dismissed
+    // it again, and the alert never actually cleared because each write was
+    // stepping on the other's addition to this list. Same fix already
+    // proven for order creation.
+    _hasPendingCriticalEdit=true;
+    if(!D.dismissedMissingOrders)D.dismissedMissingOrders=[];
+    if(D.dismissedMissingOrders.indexOf(origId)===-1)D.dismissedMissingOrders.push(origId);
+    auditLog("ORDER_UPDATED","Missing order #"+origId+" marked resolved without recreating, by "+CU.name+" ("+CU.role+")");
+    dirty();
+    toast("Order #"+origId+" marked as resolved");
+    showMissingOrders(); // refresh the list, now excluding this one
+  });
 }
 function recreateOrder(idx){
   var row=document.querySelector("[data-idx=\'"+idx+"\']");if(!row)return;
@@ -7392,7 +7634,7 @@ function recreateOrder(idx){
       // physically handed over the first time it was delivered.)
       newOrder.prodConfirmed=true;
       if(_stMatch){
-        _stMatch.qty=Math.max(0,_stMatch.qty-qty);_recordStockDelta(_stMatch.id,-qty,newId);
+        _stMatch.qty=_stMatch.qty-qty;_recordStockDelta(_stMatch.id,-qty,newId); // negative-stock policy: no floor
         if(!_stMatch.history)_stMatch.history=[];
         _stMatch.history.push({ts:tday(),type:"sale",qty:-qty,by:CU.name+" (recovery)",ordId:newId,bal:_stMatch.qty});
         if(_stMatch.history.length>50)_stMatch.history=_stMatch.history.slice(-50);
@@ -7461,8 +7703,11 @@ function delS(id){
   var msg="Remove "+unescapeForEdit(s.name)+"?";
   if(activeOrds.length)msg+="\n\n⚠ "+activeOrds.length+" active order(s) reference this product.";
   msg+="\n\nThis cannot be undone.";
-  if(!confirm(msg))return;
-  D.stock=(D.stock||[]).filter(function(x){return x.id!==id;});rStock();dirty();toast(unescapeForEdit(s.name)+" removed from stock");
+  // UI/UX (2026-07-28): native confirm() -> in-app dialog; body unchanged.
+  uiConfirm({title:"Remove product",message:msg,variant:"danger",confirmText:"Remove product"}).then(function(_ok){
+    if(!_ok)return;
+    D.stock=(D.stock||[]).filter(function(x){return x.id!==id;});rStock();dirty();toast(unescapeForEdit(s.name)+" removed from stock");
+  });
 }
 
 function rInvs(q,pg){
@@ -8083,17 +8328,22 @@ function editCmp(id){
   om("m-cmp");
 }
 function resolveCmp(id){if(!can("mCmp")){toast("Only managers can resolve complaints","err");return;}var c=(D.complaints||[]).find(function(x){return x.id===id;});if(c)c.status="Resolved";rCmps(undefined,CMP_PAGE);if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();dirty();toast("Complaint resolved");}
-function delCmp(id){if(!can("dCmp")){toast("Only managers can delete complaints","err");return;}var cmp=(D.complaints||[]).find(function(x){return x.id===id;});if(!cmp)return;var cu=(D.customers||[]).find(function(x){return x.id===cmp.cId;});var cmpText=unescapeForEdit(cmp.details||"");var msg="Delete complaint from "+(cu?(can("vPhone")?unescapeForEdit(cu.name):"this customer"):"unknown")+"?\n\n\""+cmpText.slice(0,80)+(cmpText.length>80?"…":"")+"\"\n\nThis cannot be undone.";if(!confirm(msg))return;
-  // FIX (2026-07-25): complaints had no deletion tombstone at all, which is
-  // exactly why the merge logic fell back to the same 5-minute age window
-  // already proven to cause orders to silently vanish. A complaint logged
-  // in the field with a real sync delay - lost signal, app backgrounded -
-  // is not a deletion and should never be treated as one. Adding a real
-  // tombstone here means the rescue logic can drop the age guess entirely.
-  if(!D.deletedComplaintIds)D.deletedComplaintIds={};
-  D.deletedComplaintIds[id]=Date.now();
-  _recentlyDeletedComplaintIds[id]=Date.now();
-  D.complaints=(D.complaints||[]).filter(function(c){return c.id!==id;});rCmps(undefined,CMP_PAGE);if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();dirty();}
+function delCmp(id){if(!can("dCmp")){toast("Only managers can delete complaints","err");return;}var cmp=(D.complaints||[]).find(function(x){return x.id===id;});if(!cmp)return;var cu=(D.customers||[]).find(function(x){return x.id===cmp.cId;});var cmpText=unescapeForEdit(cmp.details||"");var msg="Delete complaint from "+(cu?(can("vPhone")?unescapeForEdit(cu.name):"this customer"):"unknown")+"?\n\n\""+cmpText.slice(0,80)+(cmpText.length>80?"…":"")+"\"\n\nThis cannot be undone.";
+  // UI/UX (2026-07-28): native confirm() -> in-app dialog; body unchanged.
+  uiConfirm({title:"Delete complaint",message:msg,variant:"danger",confirmText:"Delete complaint"}).then(function(_ok){
+    if(!_ok)return;
+    // FIX (2026-07-25): complaints had no deletion tombstone at all, which is
+    // exactly why the merge logic fell back to the same 5-minute age window
+    // already proven to cause orders to silently vanish. A complaint logged
+    // in the field with a real sync delay - lost signal, app backgrounded -
+    // is not a deletion and should never be treated as one. Adding a real
+    // tombstone here means the rescue logic can drop the age guess entirely.
+    if(!D.deletedComplaintIds)D.deletedComplaintIds={};
+    D.deletedComplaintIds[id]=Date.now();
+    _recentlyDeletedComplaintIds[id]=Date.now();
+    D.complaints=(D.complaints||[]).filter(function(c){return c.id!==id;});rCmps(undefined,CMP_PAGE);if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();dirty();
+  });
+}
 
 function addRoute(){
   if(!can("eOrd")){toast("Managers only","err");return;}
@@ -8131,16 +8381,21 @@ function delRoute(id){
   var rt=(D.routes||[]).find(function(r){return r.id===id;});if(!rt)return;
   var areas=(rt.estates||[]).slice(0,3).join(", ")+((rt.estates||[]).length>3?" +"+((rt.estates||[]).length-3)+" more":"");
   var msg="Remove route: \""+unescapeForEdit(rt.name)+"\"?"+(areas?"\nCovers: "+areas:"")+"\n\nThis cannot be undone.";
-  if(!confirm(msg))return;
-  // Same fix as delCmp above - a real tombstone here, matching the
-  // already-proven order pattern.
-  if(!D.deletedRouteIds)D.deletedRouteIds={};
-  D.deletedRouteIds[id]=Date.now();
-  _recentlyDeletedRouteIds[id]=Date.now();
-  D.routes=(D.routes||[]).filter(function(r){return r.id!==id;});
-  if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
-  dirty();rOffers();
-  toast("Route \""+rt.name+"\" removed");
+  // UI/UX (2026-07-28): native confirm() -> in-app dialog. Everything that
+  // followed the old synchronous guard now runs inside the resolve callback,
+  // unchanged and in the same order.
+  uiConfirm({title:"Remove delivery route",message:msg,variant:"danger",confirmText:"Remove route"}).then(function(_ok){
+    if(!_ok)return;
+    // Same fix as delCmp above - a real tombstone here, matching the
+    // already-proven order pattern.
+    if(!D.deletedRouteIds)D.deletedRouteIds={};
+    D.deletedRouteIds[id]=Date.now();
+    _recentlyDeletedRouteIds[id]=Date.now();
+    D.routes=(D.routes||[]).filter(function(r){return r.id!==id;});
+    if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
+    dirty();rOffers();
+    toast("Route \""+rt.name+"\" removed");
+  });
 }
 function rOffers(){
   var pg=el("pg-offers");if(!pg)return;
@@ -8209,7 +8464,13 @@ function editOf(id){
   el("m-of-save").innerHTML="<i class=\"ti ti-check\"></i> Update";
   om("m-of");
 }
-function delOf(id){if(!can("dOff"))return;var of=(D.offers||[]).find(function(x){return x.id===id;});if(!of)return;var msg="Delete offer: \""+unescapeForEdit(of.prod)+" — "+of.disc+"% off\"?\n\nThis cannot be undone.";if(!confirm(msg))return;D.offers=(D.offers||[]).filter(function(o){return o.id!==id;});auditLog("DATA_EXPORTED","Offer deleted by "+CU.name+" ("+CU.role+"): "+of.prod+" "+of.disc+"%");rOffers();dirty();toast("Offer removed");}
+function delOf(id){if(!can("dOff"))return;var of=(D.offers||[]).find(function(x){return x.id===id;});if(!of)return;var msg="Delete offer: \""+unescapeForEdit(of.prod)+" — "+of.disc+"% off\"?\n\nThis cannot be undone.";
+  // UI/UX (2026-07-28): native confirm() -> in-app dialog; body unchanged.
+  uiConfirm({title:"Delete promotion",message:msg,variant:"danger",confirmText:"Delete offer"}).then(function(_ok){
+    if(!_ok)return;
+    D.offers=(D.offers||[]).filter(function(o){return o.id!==id;});auditLog("DATA_EXPORTED","Offer deleted by "+CU.name+" ("+CU.role+"): "+of.prod+" "+of.disc+"%");rOffers();dirty();toast("Offer removed");
+  });
+}
 
 var RPT_FROM="";var RPT_TO="";
 function exportReportXL(){
@@ -8521,7 +8782,7 @@ function rAuditLog(pg){
         "<button class=\"btn btn-xs\" onclick=\"AUDIT_Q='';AUDIT_TYPE='';AUDIT_PAGE=0;rAuditLog()\" style=\"white-space:nowrap\"><i class=\"ti ti-x\"></i> Clear</button>"+
         "<button class=\"btn btn-xs\" onclick=\"rAuditLogWithArchives(event)\" style=\"background:#7c3aed;color:#fff;white-space:nowrap\"><i class=\"ti ti-archive\"></i> Archives</button>"+
         "<button class=\"btn btn-xs\" onclick=\"exportAuditCSV()\" style=\"background:#27ae60;color:#fff;white-space:nowrap\"><i class=\"ti ti-download\"></i> CSV</button>"+
-        "<button class=\"btn btn-xs\" onclick=\"if(confirm('Purge entries older than 30 days?'))manualPurgeAuditLog(30)\" style=\"background:#e67e22;color:#fff;white-space:nowrap\"><i class=\"ti ti-trash\"></i> Purge 30d</button>"+
+        "<button class=\"btn btn-xs\" onclick=\"uiConfirm({title:'Purge audit log',message:'Purge audit entries older than 30 days?\\n\\nArchived entries are not affected — this only trims the live log.',variant:'warn',confirmText:'Purge 30d'}).then(function(k){if(k)manualPurgeAuditLog(30);})\" style=\"background:#e67e22;color:#fff;white-space:nowrap\"><i class=\"ti ti-trash\"></i> Purge 30d</button>"+
       "</div>"+
       "<div id=\"audit-stats\"></div>"+
       "<div id=\"audit-results\"></div>";
@@ -8898,16 +9159,22 @@ function savePin(){
     });
   });
 }
-function delU(id){if(!can("mUsers"))return;var toDel=(USERS||[]).find(function(u){return u.id===id;});if(!toDel)return;var msg="Remove team member: "+unescapeForEdit(toDel.name)+" ("+toDel.role+")?\n\nThey will lose all system access immediately.\n\nThis cannot be undone.";if(!confirm(msg))return;auditLog("USER_DELETED","Team member removed by "+CU.name+" ("+CU.role+"): "+(toDel?toDel.name:"unknown"));
-  // FIX (2026-07-27): tombstone this deletion, same pattern as every other
-  // collection - without it, a stale device still holding this account
-  // locally could resurrect it on its next write, restoring access that was
-  // just explicitly revoked. Security-relevant, not just a data-integrity
-  // gap: removing a team member's access needs to actually stick.
-  if(!D.deletedUserIds)D.deletedUserIds={};
-  D.deletedUserIds[id]=Date.now();
-  _recentlyDeletedUserIds[id]=Date.now();
-  USERS=(USERS||[]).filter(function(u){return u.id!==id;});rUsers();dirty();}
+function delU(id){if(!can("mUsers"))return;var toDel=(USERS||[]).find(function(u){return u.id===id;});if(!toDel)return;var msg="Remove team member: "+unescapeForEdit(toDel.name)+" ("+toDel.role+")?\n\nThey will lose all system access immediately.\n\nThis cannot be undone.";
+  // UI/UX (2026-07-28): native confirm() -> in-app dialog; body unchanged.
+  uiConfirm({title:"Remove team member",message:msg,variant:"danger",confirmText:"Remove access"}).then(function(_ok){
+    if(!_ok)return;
+    auditLog("USER_DELETED","Team member removed by "+CU.name+" ("+CU.role+"): "+(toDel?toDel.name:"unknown"));
+    // FIX (2026-07-27): tombstone this deletion, same pattern as every other
+    // collection - without it, a stale device still holding this account
+    // locally could resurrect it on its next write, restoring access that was
+    // just explicitly revoked. Security-relevant, not just a data-integrity
+    // gap: removing a team member's access needs to actually stick.
+    if(!D.deletedUserIds)D.deletedUserIds={};
+    D.deletedUserIds[id]=Date.now();
+    _recentlyDeletedUserIds[id]=Date.now();
+    USERS=(USERS||[]).filter(function(u){return u.id!==id;});rUsers();dirty();
+  });
+}
 
 function buildBackupWB(){
   if(!can("exp"))return null;
@@ -9092,7 +9359,24 @@ function showBackupHistory(){
 function restoreSpecificBackup(docId){
   if(!can("rest")){toast("Only directors can restore backups","err");return;}
   if(!FB_BACKUP_COL)return;
-  if(!confirm("Restore from backup '"+docId+"'?\n\nThis will REPLACE your current data with this backup. Current data will be overwritten.\n\nMake sure you want to do this."))return;
+  // UI/UX (2026-07-28): native confirm() -> in-app dialog. This is the most
+  // destructive action in the app, so it gets the danger variant and an
+  // explicit confirm label rather than a generic "OK".
+  uiConfirm({
+    title:"Restore from backup",
+    message:"Restore from backup '"+docId+"'?\n\nThis will REPLACE your current data with this backup. Current data will be overwritten.\n\nMake sure you want to do this.",
+    variant:"danger",
+    confirmText:"Replace my data"
+  }).then(function(_ok){
+    if(!_ok)return;
+    _restoreSpecificBackupConfirmed(docId);
+  });
+}
+/* Split out so the confirmation above stays a thin gate and the restore body
+   below is unchanged from what it was when it ran inline. */
+function _restoreSpecificBackupConfirmed(docId){
+  if(!can("rest")){toast("Only directors can restore backups","err");return;}
+  if(!FB_BACKUP_COL)return;
   FB_BACKUP_COL.doc(docId).get().then(function(doc){
     if(!doc.exists){toast("Backup not found","err");return;}
     var data=doc.data();
