@@ -813,6 +813,27 @@ function _orderSnapshotFor(ordId){
     return JSON.parse(JSON.stringify({order:o,invoice:inv||null}));
   }catch(_){return null;}
 }
+/* Customer equivalent of _orderSnapshotFor (2026-07-28). Closes the SAME
+   durability gap for customer creation that the order snapshot closed for
+   orders: CUSTOMER_ADDED is written immediately as its own tiny Firestore
+   event doc and virtually always lands, but the customer record itself only
+   reaches Firestore via D -> dirty() -> the 800ms-debounced ~330KB whole-doc
+   transaction, which on a flaky device is routinely interrupted. Before this,
+   a customer lost in that window was recoverable only to id+name from the
+   audit DETAILS string — not phone, address, credit limit or ID number.
+   Riding a deep copy on the event that already lands makes the full record
+   durable with NO new collection, NO extra write and NO quota cost (identical
+   pattern and rationale as _orderSnapshotFor). Deep-copied because the live
+   customer object keeps being mutated (edits, credit, water cycle) after this
+   returns; returns null rather than throwing so a snapshot failure can never
+   abort the audit write that is the customer's only durable trace. */
+function _customerSnapshotFor(custId){
+  try{
+    var c=(D.customers||[]).find(function(x){return x.id===custId;});
+    if(!c)return null;
+    return JSON.parse(JSON.stringify({customer:c}));
+  }catch(_){return null;}
+}
 function dirty(){
   var e=el("sts");if(e){e.className="sts dirty";e.innerHTML="<i class=\"ti ti-point-filled\"></i> Syncing...";}
   scheduleCloudSync();
@@ -860,6 +881,10 @@ function auditLog(action,details,extra){
   // trail is more important than the extra, and a malformed/oversized extra
   // must not take the whole entry down with it.
   if(entry.ordSnapshot&&typeof entry.ordSnapshot!=="object")delete entry.ordSnapshot;
+  // FIX (2026-07-28): same guard for the customer recovery snapshot added the
+  // same day (see _customerSnapshotFor / CUSTOMER_ADDED) — a malformed or
+  // oversized snapshot must never take the whole audit entry down with it.
+  if(entry.custSnapshot&&typeof entry.custSnapshot!=="object")delete entry.custSnapshot;
   // Write to Firestore subcollection — queue if not yet ready
   if(FB_EVENTS_COL&&FB_READY){
     FB_EVENTS_COL.doc(_clientId).set(entry).catch(function(err){
@@ -978,6 +1003,28 @@ function saved(){var e=el("sts");if(e){e.className="sts saved";e.innerHTML="<i c
 function scheduleCloudSync(){
   if(!FB_READY)return;
   if(FB_SYNC_TIMER)clearTimeout(FB_SYNC_TIMER);
+  // FIX (2026-07-28): ROOT-CAUSE fix for records going missing — and deliberately
+  // NOT orders-only. Customers, payments and every other must-land change ride
+  // this exact same single whole-document write, and every one of them already
+  // sets _hasPendingCriticalEdit (saveOrd/saveCust/recPay/recon paths). The
+  // verified cause of a "missing" record is timing, not a merge bug: the record's
+  // only path into Firestore is this write, and the old UNCONDITIONAL 800ms
+  // debounce meant the write had not even STARTED for 800ms after a critical
+  // creation. On a delivery phone that window routinely ends in a screen-lock /
+  // app-background / signal-drop before the write ever fires — so the record is
+  // absent from the shared document even though its tiny, immediate audit event
+  // (ORDER_PLACED etc.) already landed. Firing the write IMMEDIATELY whenever a
+  // critical edit is pending starts it while the app is still foregrounded,
+  // shrinking the loss window to just the transaction itself. Ordinary,
+  // non-critical edits (typing, field tweaks, toggles) keep the 800ms debounce so
+  // rapid bursts still coalesce into one write (free-tier quota). One change at
+  // the shared layer covers every critical record type at once. pushToCloud() is
+  // idempotent — it queues behind any in-flight write and still waits on
+  // _cloudDataConfirmed — so firing early is safe, never a duplicate or a
+  // clobber. NOTE: reduces the window, does not eliminate loss if the phone dies
+  // mid-transaction; confirm the real-world drop by watching the [NDSYNC] logs on
+  // a live phone (PROJECT_CONTEXT §5.1 — never yet done).
+  if(_hasPendingCriticalEdit){pushToCloud();return;}
   FB_SYNC_TIMER=setTimeout(pushToCloud,800);
 }
 var FB_WRITE_RETRY_TIMER=null; // QUOTA GUARD: only one pending write-retry may exist at a time
@@ -4889,7 +4936,11 @@ cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer updated");
   // type in this app. Matches the exact pattern that made order recovery
   // possible after the #1255 incident - without this, a customer that ever
   // needed recovery would have nothing to recover from.
-  auditLog("CUSTOMER_ADDED","#"+_newCustId+" "+n+" added by "+CU.name+" ("+CU.role+")");
+  // FIX (2026-07-28): ride the durable recovery snapshot on this already-
+  // immediate, already-landing audit write (see _customerSnapshotFor) so a
+  // customer created on a flaky device survives even if the main-document
+  // write never lands — the same durability parity orders got after #1255.
+  auditLog("CUSTOMER_ADDED","#"+_newCustId+" "+n+" added by "+CU.name+" ("+CU.role+")",{custSnapshot:_customerSnapshotFor(_newCustId)});
   ["cn","cph","cph2","cid","cestate","ccourt","chouse","croad","czone","cnotes"].forEach(function(id){el(id).value="";});el("ccl").value="0";
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
 cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer added");
@@ -6813,7 +6864,16 @@ function completeDlv(){
   dirty();
   toast(isCat?"Delivery completed — "+o.prod+" confirmed!":"Delivery completed!");
   }
-  if(isCat&&!inv&&total>0){
+  // FIX (2026-07-28): create the invoice when ABSENT for ANY order type, not
+  // only category orders. An exact order normally creates its invoice at
+  // placement, but if that invoice was ever lost — e.g. the order was recovered
+  // without it, or a sync gap dropped it — the old `isCat&&!inv` guard skipped
+  // creation, so delivering it set o.amtPaid with NO invoice or payment entry
+  // behind it: the exact silent revenue-trail gap the category branch was
+  // originally fixed for, just for exact orders instead. total>0 still gates it
+  // (a genuine zero-value order needs no invoice), matching the prior condition;
+  // an existing invoice still takes the else-branch, so nothing double-creates.
+  if(!inv&&total>0){
     reserveNextInvoiceId().then(function(newInvId){
       inv={id:newInvId,orderId:oid,cId:o.cId,amount:total,paid:0,due:tday(),notes:"Order #"+oid,date:tday(),payments:[]};
       (D.invoices||[]).push(inv);
