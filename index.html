@@ -4905,6 +4905,13 @@ function saveCust(){
   // write. Harmless but wasteful; fixed once flagged by review.
   _hasPendingCriticalEdit=true;
   var editId=el("c-edit-id").value;
+  // FIX (2026-07-28): re-verify the SPECIFIC right for the action being taken,
+  // not just the top gate's "aCust OR eCust". The mutation itself must enforce
+  // the add/edit distinction — the same rule delC()/voidInvoice._confirm()
+  // follow — so a role with aCust but not eCust can never reach the edit branch.
+  // Not reachable via the shipped UI today (editCust gates eCust) but closed at
+  // the source. Reset the just-set critical flag on this early return (ITEM 3).
+  if(editId?!can("eCust"):!can("aCust")){_hasPendingCriticalEdit=false;toast(editId?"No permission to edit customers":"No permission to add customers","err");return;}
   if(editId){
     var c=(D.customers||[]).find(function(x){return String(x.id)===String(editId);});
     if(c){
@@ -4967,7 +4974,11 @@ function delC(id){
   // and an audit trail — before deletion, exactly like Order deletion now
   // requires. This used to silently discard every unpaid invoice with no
   // reason logged and no way to see it happened later.
-  var outstandingInvs=(D.invoices||[]).filter(function(i){return i.cId===id&&!i.voided&&i.paid<i.amount;});
+  // FIX (2026-07-28): add _invoiceOrderActive so this deletion guard agrees with
+  // custDebt — an unpaid invoice on a CANCELLED order is not collectable debt, so
+  // it must not block deletion (custDebt reports 0) nor force a pointless void of
+  // a dead invoice. Same collectable predicate recPay/ackPendingPay already use.
+  var outstandingInvs=(D.invoices||[]).filter(function(i){return i.cId===id&&!i.voided&&i.paid<i.amount&&_invoiceOrderActive(i);});
   if(outstandingInvs.length){
     var totalOwed=outstandingInvs.reduce(function(s,i){return s+(i.amount-i.paid);},0);
     toast("This customer has KSh "+totalOwed.toLocaleString()+" outstanding across "+outstandingInvs.length+" invoice(s). Void "+(outstandingInvs.length>1?"each one":"it")+" first (reason required) — then delete.","warn");
@@ -8116,7 +8127,17 @@ function ackPendingPay(id){
   // invoice only if no order-specific invoice exists, and route any leftover
   // to customer credit — exactly like recPay()/completeDlv() already do for
   // director-recorded payments.
-  var inv=(D.invoices||[]).find(function(i){return i.cId===pp.cId&&i.notes&&i.notes.match(new RegExp("#"+pp.ordId+"(\\D|$)"));});
+  // FIX (2026-07-28): the order-specific match must skip a VOIDED/written-off
+  // invoice (and one whose order was cancelled), exactly as the fallback just
+  // below and recPay()'s invoice branch already do. Without `!i.voided &&
+  // _invoiceOrderActive(i)` here, staff cash acknowledged AFTER its invoice was
+  // voided landed straight onto that dead, debt-excluded invoice — real cash
+  // misallocated to a written-off balance (custDebt() excludes voided invoices,
+  // so it neither clears real debt nor shows anywhere useful), and the exact
+  // contradiction recPay's own voided-guard exists to prevent. When the
+  // order-specific invoice isn't collectable, fall through to the customer's
+  // oldest ACTIVE invoice, or to credit below — never onto a written-off one.
+  var inv=(D.invoices||[]).find(function(i){return i.cId===pp.cId&&i.notes&&i.notes.match(new RegExp("#"+pp.ordId+"(\\D|$)"))&&!i.voided&&_invoiceOrderActive(i);});
   if(!inv){
     inv=(D.invoices||[]).filter(function(i){return i.cId===pp.cId&&i.paid<i.amount&&!i.voided&&_invoiceOrderActive(i);})
       .sort(function(a,b){return a.date>b.date?1:-1;})[0];
@@ -8344,7 +8365,7 @@ function rDebts(q,pg){
   var _dcards=el("debt-cards");
   if(_dcards)_dcards.innerHTML=
     "<div class=\"stat sr\"><div class=\"sl\">Total outstanding</div><div class=\"sv\" style=\"color:#c0392b\">KSh "+total.toLocaleString()+"</div><div class=\"ss\">"+debtors.length+" customers</div></div>"+
-    "<div class=\"stat sa\"><div class=\"sl\">Overdue invoices</div><div class=\"sv\">"+(D.invoices||[]).filter(function(i){return i.paid<i.amount&&i.due<td;}).length+"</div></div>"+
+    "<div class=\"stat sa\"><div class=\"sl\">Overdue invoices</div><div class=\"sv\">"+(D.invoices||[]).filter(function(i){return i.paid<i.amount&&i.due<td&&!i.voided&&_invoiceOrderActive(i);}).length+"</div></div>"+
     "<div class=\"stat sn\"><div class=\"sl\">Largest debt</div><div class=\"sv\">"+(debtors.length?"KSh "+debtors[0].debt.toLocaleString():"KSh 0")+"</div><div class=\"ss\">"+(debtors.length?(can("vPhone")?debtors[0].c.name:maskName(debtors[0].c.name)):"")+"</div></div>";
   var _dsort=el("debt-sort");
   if(_dsort)_dsort.innerHTML=
@@ -8785,6 +8806,10 @@ function rReports(){
   // Aging respects the selected date period
   (D.invoices||[]).filter(function(i){
     if(i.paid>=i.amount||i.voided)return false;
+    // FIX (2026-07-28): exclude cancelled/deleted-order invoices, matching
+    // custDebt/_invoiceOrderActive — an unpaid invoice on a Cancelled order was
+    // inflating the AR-aging buckets the directors act on (chasing dead debt).
+    if(!_invoiceOrderActive(i))return false;
     if(!RPT_FROM&&!RPT_TO)return true;
     var ordMatch=i.notes&&i.notes.match(/#(\d+)/);
     var _ao=i.orderId?(D.orders||[]).find(function(x){return x.id===i.orderId;}):(ordMatch?(D.orders||[]).find(function(x){return String(x.id)===ordMatch[1];}):null);
@@ -9486,9 +9511,21 @@ function printInvoice(invId){
 }
 function printStatement(cId){
   var cu=(D.customers||[]).find(function(x){return x.id===cId;});if(!cu){toast("Customer not found","err");return;}
-  var invs=(D.invoices||[]).filter(function(i){return i.cId===cId;}).sort(function(a,b){return a.date>b.date?1:-1;});
+  // FIX (2026-07-28): a customer statement must NOT bill voided (written-off) or
+  // cancelled/deleted-order invoices. voidInvoice's own dialog promises the
+  // invoice is "excluded from all debt calculations," and custDebt()/
+  // _invoiceOrderActive() exclude both classes everywhere else — but the old
+  // filter was cId-only, so a formally forgiven balance was printed TO THE
+  // CUSTOMER as "Unpaid / Balance Due," demanding money the business already
+  // wrote off. Standing invoices only (fully-paid ones remain as legitimate
+  // payment history); Balance Due is taken straight from custDebt() so the
+  // customer-facing figure matches the debtors page and dashboard exactly,
+  // including store-credit netting.
+  var invs=(D.invoices||[]).filter(function(i){return i.cId===cId&&!i.voided&&_invoiceOrderActive(i);}).sort(function(a,b){return a.date>b.date?1:-1;});
   var totalAmt=invs.reduce(function(s,i){return s+i.amount;},0);
   var totalPaid=invs.reduce(function(s,i){return s+i.paid;},0);
+  var storeCredit=(cu.credit>0)?_round2(cu.credit):0;
+  var balanceDue=custDebt(cId); // canonical net debt — matches every other screen
   var rows=invs.map(function(i){
     var bal=i.amount-i.paid;
     var status=i.paid>=i.amount?"Paid":i.paid>0?"Partial":"Unpaid";
@@ -9521,7 +9558,8 @@ function printStatement(cId){
     "<div class='summary'>"+
       "<div class='sm'><div class='sl'>Total Invoiced</div><div class='sv'>KSh "+totalAmt.toLocaleString()+"</div></div>"+
       "<div class='sm'><div class='sl'>Total Paid</div><div class='sv' style='color:#27ae60'>KSh "+totalPaid.toLocaleString()+"</div></div>"+
-      "<div class='sm'><div class='sl'>Balance Due</div><div class='sv' style='color:#c0392b'>KSh "+(totalAmt-totalPaid).toLocaleString()+"</div></div>"+
+      (storeCredit>0?"<div class='sm'><div class='sl'>Store Credit</div><div class='sv' style='color:#27ae60'>KSh "+storeCredit.toLocaleString()+"</div></div>":"")+
+      "<div class='sm'><div class='sl'>Balance Due</div><div class='sv' style='color:#c0392b'>KSh "+balanceDue.toLocaleString()+"</div></div>"+
     "</div>"+
     "<table><thead><tr><th>Date</th><th>Invoice</th><th>Description</th><th>Amount</th><th>Paid</th><th>Balance</th><th>Status</th></tr></thead>"+
     "<tbody>"+rows+"</tbody></table>"+
@@ -9730,7 +9768,10 @@ function sendEmailBackup(manual){
     orders:(D.orders||[]).length,
     pending:(D.orders||[]).filter(function(o){return o.status==="Pending"||o.status==="Processing";}).length,
     revenue:"KSh "+((D.orders||[]).filter(function(o){return o.status==="Delivered";}).reduce(function(s,o){return s+o.qty*o.price;},0)).toLocaleString(),
-    debt:"KSh "+((D.invoices||[]).reduce(function(s,i){return s+Math.max(0,i.amount-i.paid);},0)).toLocaleString(),
+    // FIX (2026-07-28): match custDebt's collectable set — exclude fully-paid,
+    // voided (written-off) and cancelled/deleted-order invoices — so the emailed
+    // "total debt" agrees with the debtors page instead of overstating it.
+    debt:"KSh "+((D.invoices||[]).filter(function(i){return i.paid<i.amount&&!i.voided&&_invoiceOrderActive(i);}).reduce(function(s,i){return s+(i.amount-i.paid);},0)).toLocaleString(),
     stock:(D.stock||[]).length,
     complaints:(D.complaints||[]).filter(function(c){return c.status!=="Resolved";}).length
   };
