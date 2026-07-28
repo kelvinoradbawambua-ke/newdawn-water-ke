@@ -797,6 +797,22 @@ function uiAlert(opts){
   });
 }
 
+/* Builds the durable recovery payload carried on an ORDER_PLACED audit event
+   (see the long note in auditLog). Deep-copied on purpose: the entry is
+   handed to Firestore asynchronously, and the live order/invoice objects keep
+   being mutated afterwards (delivery, payments, edits) - a reference would
+   capture whatever they had become by write time, not the order as placed.
+   Returns null rather than throwing: a missing snapshot degrades recovery
+   back to today's manual re-entry, which is survivable; a thrown error here
+   would abort the audit write and lose the ONLY durable trace of the order. */
+function _orderSnapshotFor(ordId){
+  try{
+    var o=(D.orders||[]).find(function(x){return x.id===ordId;});
+    if(!o)return null;
+    var inv=(D.invoices||[]).find(function(i){return i.orderId===ordId;});
+    return JSON.parse(JSON.stringify({order:o,invoice:inv||null}));
+  }catch(_){return null;}
+}
 function dirty(){
   var e=el("sts");if(e){e.className="sts dirty";e.innerHTML="<i class=\"ti ti-point-filled\"></i> Syncing...";}
   scheduleCloudSync();
@@ -804,7 +820,7 @@ function dirty(){
 }
 var AUDIT_HOT_MAX=200; // entries kept live in main Firestore doc
 var AUDIT_ARCHIVE_THRESHOLD=180; // archive when hot log hits this
-function auditLog(action,details){
+function auditLog(action,details,extra){
   // Use CU (logged-in user) or SU (selected but not yet verified) for pre-login events
   var actor=CU||SU;
   if(!actor)return;
@@ -818,6 +834,32 @@ function auditLog(action,details){
     action:action,
     details:details||""
   };
+  // CRITICAL FIX (2026-07-28): optional `extra` payload, merged into the entry.
+  // This exists to close the long-running "orders go missing" class, whose real
+  // cause is a DURABILITY ORDERING problem, not a merge bug:
+  //   - this audit event is written IMMEDIATELY, as its own tiny Firestore doc
+  //     (FB_EVENTS_COL.doc().set below), so it almost always lands;
+  //   - the order itself only reaches Firestore via D -> dirty() -> an 800ms
+  //     debounce -> a ~330KB whole-document transaction, which on a delivery
+  //     phone is routinely interrupted (screen lock, backgrounding, signal
+  //     drop, tab eviction).
+  // So there is a multi-second window where the EVIDENCE of an order is
+  // durable while the order itself exists only in that phone's RAM. Lose the
+  // phone's state in that window and every device computes "ORDER_PLACED #N
+  // exists, no order row" — the exact missing-order alert reported for weeks.
+  // Riding the full order payload along on this already-immediate, already-
+  // durable write means the order's own data survives even when the main
+  // document write never lands: no new collection, no extra write, no quota
+  // cost. _mergeAuditEvents() feeds it back to every device through the
+  // existing bounded listener, so recovery is possible from ANY device rather
+  // than only the phone that happened to create it.
+  if(extra&&typeof extra==="object"){
+    Object.keys(extra).forEach(function(k){if(entry[k]===undefined)entry[k]=extra[k];});
+  }
+  // Never let a snapshot payload break the audit write itself - the audit
+  // trail is more important than the extra, and a malformed/oversized extra
+  // must not take the whole entry down with it.
+  if(entry.ordSnapshot&&typeof entry.ordSnapshot!=="object")delete entry.ordSnapshot;
   // Write to Firestore subcollection — queue if not yet ready
   if(FB_EVENTS_COL&&FB_READY){
     FB_EVENTS_COL.doc(_clientId).set(entry).catch(function(err){
@@ -6455,7 +6497,7 @@ function saveOrd(){
     if(_orderCid)_pendingOrderLedgerAdd(_orderCid,_custForLedgerC?_custForLedgerC.name:"customer #"+cId,pn,qty);
     reserveNextOrderId().then(function(newOrdId){
       (D.orders||[]).push({id:newOrdId,cId:cId,prod:pn,stockId:stCost?stCost.id:null,qty:qty,price:0,cost:0,date:el("od").value,status:"Pending",paid:"Unpaid",amtPaid:0,driver:el("odrv").value,deliver:sanitizeInput(el("odlvr").value),bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?sanitizeInput(el("onotes").value):"",prodConfirmed:false,_ts:Date.now(),_cid:_orderCid});
-      auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty+" (category/TBC) — customer #"+cId+" "+(function(){var _c=(D.customers||[]).find(function(x){return x.id===cId;});return _c?unescapeForEdit(_c.name):"unknown";})());
+      auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty+" (category/TBC) — customer #"+cId+" "+(function(){var _c=(D.customers||[]).find(function(x){return x.id===cId;});return _c?unescapeForEdit(_c.name):"unknown";})(),{ordSnapshot:_orderSnapshotFor(newOrdId)});
       if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
       rDel();
       cm("m-o");rOrds(undefined,ORD_PAGE);dirty();
@@ -6520,7 +6562,7 @@ function saveOrd(){
     // FIX (2026-07-21): both IDs now reserved together in ONE transaction -
     // see reserveNextOrderAndInvoiceIds - instead of two sequential ones.
     (D.invoices||[]).push({id:newInvId,orderId:newOrdId,cId:cId,amount:total,paid:amtPaid,due:(function(){var dd=new Date((el("od").value||tday())+"T12:00:00");dd.setDate(dd.getDate()+7);return dd.toISOString().split("T")[0];})(),notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{pid:uid(),date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
-    auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty+" — customer #"+cId+" "+(function(){var _c=(D.customers||[]).find(function(x){return x.id===cId;});return _c?unescapeForEdit(_c.name):"unknown";})());
+    auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty+" — customer #"+cId+" "+(function(){var _c=(D.customers||[]).find(function(x){return x.id===cId;});return _c?unescapeForEdit(_c.name):"unknown";})(),{ordSnapshot:_orderSnapshotFor(newOrdId)});
     if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
     rDel();
     cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+newOrdId+" placed");
@@ -6555,7 +6597,7 @@ function openDlv(oid){
     // Order notes (from order placement)
     (o.notes?"<div style=\"margin-top:6px;padding:7px 9px;background:#f0fdf4;border-radius:6px;border-left:3px solid #27ae60;font-size:11px\"><i class=\"ti ti-note\" style=\"color:#27ae60;margin-right:4px\"></i><strong>Order notes:</strong> "+sanitizeInput(unescapeForEdit(o.notes))+"</div>":"")+
     // Customer notes (from customer profile)
-    (c&&c.notes?"<div style=\"margin-top:6px;padding:7px 9px;background:#fff8e1;border-radius:6px;border-left:3px solid #f39c12;font-size:11px\"><i class=\"ti ti-user\" style=\"color:#f39c12;margin-right:4px\"></i><strong>Customer note:</strong> "+c.notes+"</div>":"");
+    (c&&c.notes?"<div style=\"margin-top:6px;padding:7px 9px;background:#fff8e1;border-radius:6px;border-left:3px solid #f39c12;font-size:11px\"><i class=\"ti ti-user\" style=\"color:#f39c12;margin-right:4px\"></i><strong>Customer note:</strong> "+sanitizeInput(unescapeForEdit(c.notes))+"</div>":"");
   // Show product confirmation row for category orders
   var prodConfRow=el("dlv-prod-row");
   if(prodConfRow){
@@ -7296,7 +7338,14 @@ function _computeMissingOrders(){
     // source - it comes from the exact moment of order placement, not a
     // separate record that can be lost in the same event as the order.
     var cm=e.details.match(/customer #(\d+)/);
-    placed[m[1]]={id:parseInt(m[1]),prod:m[2],qty:parseInt(m[3]),ts:e.ts,auditCId:cm?parseInt(cm[1]):null,placedByUid:e.uid,placedByName:e.user};
+    // FIX (2026-07-28): carry the durable order snapshot (see auditLog) so a
+    // lost order can be restored EXACTLY - original id, price, driver, date,
+    // invoice and all - instead of being re-keyed by hand under a brand-new
+    // id. Restoring under the ORIGINAL id is what makes this safe: the
+    // read-side order merge is keyed by o.id, so if the "lost" order was only
+    // ever delayed and later syncs in, it collapses onto the restored row
+    // instead of becoming a second order for one real transaction.
+    placed[m[1]]={id:parseInt(m[1]),prod:m[2],qty:parseInt(m[3]),ts:e.ts,auditCId:cm?parseInt(cm[1]):null,placedByUid:e.uid,placedByName:e.user,snapshot:(e.ordSnapshot&&e.ordSnapshot.order)?e.ordSnapshot:null};
   });
   // ENHANCEMENT (2026-07-25): also check whether the missing order was
   // already completed before it went missing - a real, recurring pattern
@@ -7369,8 +7418,14 @@ function _computeMissingOrders(){
       origId:rec.id,prod:rec.prod,qty:rec.qty,ts:rec.ts,nearby:nearby,placedByUid:rec.placedByUid,placedByName:rec.placedByName,
       wasDelivered:!!delivered[id],deliveredBy:delivered[id]?delivered[id].driver:null,cashCollected:delivered[id]?delivered[id].cash:0,
       cId:cust?cust.id:null,cName:cust?cust.name:"Unknown — select manually",
-      price:inv?(inv.amount/rec.qty):null,
-      source:(rec.auditCId&&cust)?"audit trail (most reliable)":(inv?"invoice":(viaCycle?"cycle history (price unknown — enter manually)":"none found"))
+      // FIX (2026-07-28): carry the durable snapshot through to the caller.
+      // It was being captured in `placed` above but dropped here, so the
+      // recovery UI could never see it. When present it is strictly the best
+      // source available - it IS the order as placed, not a reconstruction -
+      // so price and the source label defer to it.
+      snapshot:rec.snapshot||null,
+      price:(rec.snapshot&&rec.snapshot.order&&rec.snapshot.order.price)?rec.snapshot.order.price:(inv?(inv.amount/rec.qty):null),
+      source:(rec.snapshot&&rec.snapshot.order)?"saved copy (exact)":((rec.auditCId&&cust)?"audit trail (most reliable)":(inv?"invoice":(viaCycle?"cycle history (price unknown — enter manually)":"none found")))
     });
   });
   return missing;
@@ -7439,7 +7494,13 @@ function showMissingOrders(){
           "<span style=\"background:"+srcBg+";color:"+srcColor+";font-size:10px;font-weight:700;padding:3px 10px;border-radius:20px;text-transform:uppercase;letter-spacing:.03em\">"+m.source+"</span>"+
         "</div>"+
         "<div style=\"display:flex;gap:8px\">"+
-          "<button class=\"btn btn-xs btn-navy\" onclick=\"recreateOrder("+i+")\"><i class=\"ti ti-check\"></i> Recreate</button>"+
+          // FIX (2026-07-28): when a durable snapshot exists, offer exact
+          // restore FIRST and make it the primary (gold) action - it keeps the
+          // original order number, needs no retyping, and cannot duplicate a
+          // late-arriving original. Manual Recreate stays available for older
+          // orders placed before snapshots existed, demoted to secondary.
+          (m.snapshot&&m.snapshot.order?"<button class=\"btn btn-xs btn-gold\" onclick=\"restoreMissingOrderExact("+i+")\" title=\"Restore exactly as placed, keeping order #"+m.origId+"\"><i class=\"ti ti-history\"></i> Restore exact</button>":"")+
+          "<button class=\"btn btn-xs "+(m.snapshot&&m.snapshot.order?"":"btn-navy")+"\" onclick=\"recreateOrder("+i+")\"><i class=\"ti ti-check\"></i> Recreate</button>"+
           "<button class=\"btn btn-xs\" style=\"background:#6b7280;color:#fff\" onclick=\"dismissMissingOrder("+m.origId+")\" title=\"Mark as resolved without recreating - e.g. if the customer genuinely cannot be identified\">Dismiss</button>"+
         "</div>"+
       "</div>"+
@@ -7553,6 +7614,75 @@ function dismissMissingOrder(origId){
     showMissingOrders(); // refresh the list, now excluding this one
   });
 }
+/* FIX (2026-07-28): exact restore of a lost order from its durable audit
+   snapshot (see auditLog / _orderSnapshotFor).
+
+   This is the real answer to the long-running "orders go missing" problem.
+   recreateOrder() below re-keys the order BY HAND under a BRAND-NEW id, which
+   (a) relies on a human retyping product/qty/price correctly, and (b) means
+   that if the order was only ever delayed rather than lost, the original
+   later syncs in and you end up with TWO orders for one transaction.
+
+   Restoring under the ORIGINAL id fixes both: the data is byte-identical to
+   what was placed, and because the read-side order merge is keyed by o.id, a
+   late-arriving original collapses onto this row instead of duplicating it.
+   Same for the invoice, which is matched by its own id.
+
+   Guarded, in order: director-only; snapshot must exist; must not be
+   tombstoned (a deliberately-deleted order is gone on purpose); and must not
+   already be live (nothing to restore). */
+function restoreMissingOrderExact(idx){
+  if(!can("rest")){toast("Only directors can restore orders","err");return;}
+  var missingInfo=window._reconMissing&&window._reconMissing[idx];
+  if(!missingInfo){toast("Could not read that row — reopen the reconciliation tool","err");return;}
+  var snap=missingInfo.snapshot;
+  if(!snap||!snap.order){toast("No saved copy for this order — use Recreate to re-enter it manually","warn");return;}
+  var orig=missingInfo.origId;
+  var _delAt=(D.deletedOrderIds&&D.deletedOrderIds[orig])||_recentlyDeletedOrderIds[orig];
+  if(_delAt){toast("Order #"+orig+" was deliberately deleted — not restoring.","warn");return;}
+  if((D.orders||[]).some(function(o){return String(o.id)===String(orig);})){
+    toast("Order #"+orig+" is already live — nothing to restore.","ok");
+    showMissingOrders();return;
+  }
+  uiConfirm({
+    title:"Restore order #"+orig,
+    message:"Restore this order exactly as it was originally placed?\n\n"
+      +snap.order.prod+" x"+snap.order.qty+(snap.order.price?" @ KSh "+snap.order.price:"")
+      +"\nStatus: "+(snap.order.status||"Pending")
+      +(snap.invoice?"\nIts invoice (#"+snap.invoice.id+", KSh "+snap.invoice.amount+") will be restored too.":"")
+      +"\n\nIt keeps its original order number, so if the original was only delayed and arrives later it will merge back into this same row rather than creating a duplicate.",
+    variant:"warn",
+    confirmText:"Restore order #"+orig
+  }).then(function(_ok){
+    if(!_ok)return;
+    // Re-check at click time - the tool can sit open while the order arrives.
+    if((D.orders||[]).some(function(o){return String(o.id)===String(orig);})){
+      toast("Order #"+orig+" synced in while this was open — nothing to restore.","ok");
+      showMissingOrders();return;
+    }
+    _hasPendingCriticalEdit=true; // genuine record creation - force a fresh conflict check
+    var _o=JSON.parse(JSON.stringify(snap.order));
+    (D.orders||[]).push(_o);
+    var _invNote="";
+    if(snap.invoice&&snap.invoice.id&&!(D.invoices||[]).some(function(i){return i.id===snap.invoice.id;})){
+      (D.invoices||[]).push(JSON.parse(JSON.stringify(snap.invoice)));
+      _invNote=" and invoice #"+snap.invoice.id;
+    }
+    // Recreation IS a resolution of the missing-order gap - close the loop so
+    // the detector stops flagging it (same mechanism dismissMissingOrder uses).
+    if(!D.dismissedMissingOrders)D.dismissedMissingOrders=[];
+    if(D.dismissedMissingOrders.indexOf(orig)===-1)D.dismissedMissingOrders.push(orig);
+    // NOTE: stock is deliberately NOT re-deducted. The snapshot is of the
+    // order as placed, and creation already deducted then - this restores the
+    // record, it does not re-run the transaction.
+    auditLog("ORDER_PLACED","#"+orig+" restored EXACTLY from its saved copy by "+CU.name+" ("+CU.role+")"+_invNote+" — original id preserved, stock not re-deducted.");
+    dirty();
+    toast("Order #"+orig+_invNote+" restored exactly as placed");
+    rOrds(undefined,ORD_PAGE);rDel();
+    if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
+    showMissingOrders();
+  });
+}
 function recreateOrder(idx){
   var row=document.querySelector("[data-idx=\'"+idx+"\']");if(!row)return;
   var cId=parseInt(row.querySelector(".recon-cust-search").value)||0;
@@ -7568,6 +7698,30 @@ function recreateOrder(idx){
   var wasDelivered=missingInfo.wasDelivered;
   var deliveredBy=missingInfo.deliveredBy||"";
   var cashCollected=missingInfo.cashCollected||0;
+  // CRITICAL FIX (2026-07-28): the recon tool is deliberately NOT settling-
+  // graced (unlike the dashboard alert) so a director sees "immediate truth".
+  // Fine for DISPLAY - but the row also carries an armed Recreate button, and
+  // an order that is merely still-syncing is indistinguishable here from one
+  // genuinely lost. Recreating it minted a SECOND order for one real
+  // transaction: the recreation gets a fresh id + _cid "recon-<orig>", the
+  // original keeps its own random _cid, so the recon-duplicate dedup (which
+  // only ever groups two recon-* orders sharing a token) could never collapse
+  // them. The original then synced in normally moments later and BOTH
+  // survived - two orders, two invoices, doubled revenue and a double stock
+  // deduction, with the original also now silently in dismissedMissingOrders
+  // so the detector stopped mentioning it. This is the most likely cause of
+  // the long-running "orders keep going missing" reports: the order was never
+  // lost, and recreating it is what actually created the damage.
+  // Re-check at the moment of the click, not when the list was rendered - the
+  // tool can sit open for minutes while the order quietly arrives.
+  if((D.orders||[]).some(function(o){return String(o.id)===String(orig);})){
+    toast("Order #"+orig+" has now synced in and is live — nothing to recreate. Closing this row.","ok");
+    if(!D.dismissedMissingOrders)D.dismissedMissingOrders=[];
+    if(D.dismissedMissingOrders.indexOf(orig)===-1){D.dismissedMissingOrders.push(orig);_hasPendingCriticalEdit=true;dirty();}
+    auditLog("ORDER_UPDATED","Recreate of #"+orig+" blocked by "+CU.name+" ("+CU.role+") — the original had already synced in, so recreating would have produced a duplicate order.");
+    showMissingOrders();
+    return;
+  }
   if(window._recreatingOrder)return;
   window._recreatingOrder=true;
   var _recreateBtn=row.querySelector("button.btn-navy");
@@ -7846,7 +8000,22 @@ function saveInv(){
           +CU.name+" from KSh "+i.amount+" to KSh "+a+". Previous paid: KSh "+i.paid);
       }
       // Update safe fields always
-      i.cId=cId;i.amount=_round2(a);i.due=el("ivd").value;i.notes=el("ivn").value;
+      // SECURITY FIX (2026-07-28): this EDIT path stored the notes field raw
+      // while the CREATE path four lines below already wrapped the identical
+      // input in sanitizeInput() - an asymmetry inside one function, so
+      // clearly an oversight rather than a decision. invoice.notes is
+      // interpolated straight into innerHTML by the invoice print view and by
+      // the customer statement generator, neither of which escaped it, giving
+      // a complete stored-XSS chain: edit an invoice's notes to contain a
+      // script payload -> it is written to the SHARED Firestore document ->
+      // it executes in whichever OTHER user's browser next prints that
+      // invoice or generates that customer's statement. Editing invoices is
+      // manager+ ("eInv"), so this is a privilege-escalation path (a manager
+      // landing script inside a director's session, which can change PINs and
+      // restore backups) rather than an anyone-can-exploit hole - still a
+      // real one. Sanitising here matches the create path exactly; the two
+      // render sinks are hardened separately as defence in depth.
+      i.cId=cId;i.amount=_round2(a);i.due=el("ivd").value;i.notes=sanitizeInput(el("ivn").value);
       // Only touch paid/payments if no real payments exist yet
       if(!i.payments||!i.payments.length){
         i.paid=_round2(p);
@@ -9239,7 +9408,11 @@ function printInvoice(invId){
     "<div class='val'><strong>"+(cu?cu.name:"Customer")+"</strong><br>"+
       (cu?cAddr(cu):"")+"</div>"+
     "<table><thead><tr><th>Description</th><th style='text-align:right'>Amount</th></tr></thead>"+
-    "<tbody><tr><td>"+(i.notes||"Services")+"</td><td style='text-align:right'>KSh "+i.amount.toLocaleString()+"</td></tr></tbody></table>"+
+    // SECURITY FIX (2026-07-28): invoice.notes was interpolated raw into this
+    // printed invoice. Escaping at the sink as well as at the write (see
+    // saveInv) means a legacy row stored before that write fix - or any
+    // future write path that forgets - still cannot inject script here.
+    "<tbody><tr><td>"+sanitizeInput(i.notes||"Services")+"</td><td style='text-align:right'>KSh "+i.amount.toLocaleString()+"</td></tr></tbody></table>"+
     (pays?"<div class='lbl' style='margin-top:16px'>PAYMENTS RECEIVED</div>"+
     "<table><thead><tr><th>Date</th><th>Method</th><th>Reference</th><th style='text-align:right'>Amount</th></tr></thead>"+
     "<tbody>"+pays+"</tbody></table>":"")+
@@ -9260,7 +9433,9 @@ function printStatement(cId){
     var bal=i.amount-i.paid;
     var status=i.paid>=i.amount?"Paid":i.paid>0?"Partial":"Unpaid";
     var color=i.paid>=i.amount?"#27ae60":i.paid>0?"#f0c040":"#c0392b";
-    return "<tr><td>"+fmt(i.date)+"</td><td>#"+i.id+"</td><td>"+(i.notes||"")+"</td>"+
+    // SECURITY FIX (2026-07-28): same raw-notes sink as the printed invoice
+    // above, on the customer statement. Escaped here too.
+    return "<tr><td>"+fmt(i.date)+"</td><td>#"+i.id+"</td><td>"+sanitizeInput(i.notes||"")+"</td>"+
       "<td style='text-align:right'>KSh "+i.amount.toLocaleString()+"</td>"+
       "<td style='text-align:right'>KSh "+i.paid.toLocaleString()+"</td>"+
       "<td style='text-align:right;color:"+color+";font-weight:700'>KSh "+bal.toLocaleString()+"</td>"+
