@@ -1071,8 +1071,23 @@ var _syncInFlight=null;
    Deliberately conservative: it only fires when there is genuinely UNSTARTED
    work, so a write already in flight is never duplicated and the free-tier
    write budget is untouched in the normal case. */
-function _flushPendingWritesNow(reason){
+function _flushPendingWritesNow(reason,force){
   if(!FB_READY||!FB_DOC_REF)return false;
+  // QUOTA GUARD (2026-07-29): do NOT bypass the write-failure backoff.
+  // pushToCloud() deliberately cancels FB_WRITE_RETRY_TIMER and writes at once,
+  // which is right for a genuine user action but wrong here: _onWriteFailure()
+  // sets _pendingLocalWrite=true, so during an outage or an exhausted daily
+  // quota EVERY background/foreground cycle would fire another doomed write and
+  // defeat the capped exponential backoff that exists precisely to stop that
+  // self-inflicted hammering. The pending retry already owns this work and will
+  // carry it, so a backgrounded phone loses nothing by waiting for it.
+  // EXCEPTION — force: at logout the teardown is about to cancel that retry and
+  // wipe D, so the choice there is one last attempt versus certain loss. One
+  // extra write per logout is a fair price; the visibility paths never force.
+  if(FB_WRITE_RETRY_TIMER&&!force){
+    console.log("[NDSYNC] flush-now ("+reason+") SKIPPED — a write-failure backoff retry is already pending; not bypassing it");
+    return false;
+  }
   if(!_pendingLocalWrite&&!FB_WRITE_QUEUE.length)return false; // nothing unstarted — do not spend a write
   if(FB_SYNC_TIMER){clearTimeout(FB_SYNC_TIMER);FB_SYNC_TIMER=null;} // superseded by the immediate flush
   console.log("[NDSYNC] flush-now ("+reason+") — pendingLocal="+_pendingLocalWrite+" queued="+FB_WRITE_QUEUE.length+" writing="+FB_WRITING);
@@ -1716,7 +1731,13 @@ function processWriteQueue(){
     FB_WRITE_RETRY_TIMER=setTimeout(function(){FB_WRITE_RETRY_TIMER=null;pushToCloud();},delay);
     // After a few consecutive failures this is not a blip — tell the team plainly
     // so they don't keep working assuming other devices see their changes.
-    if(FB_WRITE_RETRY_ATTEMPTS>=3)_showCloudOfflineBanner(isQuota);
+    // The banner above is only visible ON the failing device. On a staff phone the
+    // director never sees it, so the same threshold also reports to the shared
+    // audit stream — once per session, see _reportDeviceSyncHealth.
+    if(FB_WRITE_RETRY_ATTEMPTS>=3){
+      _showCloudOfflineBanner(isQuota);
+      _reportDeviceSyncHealth("WRITES_FAILING",(isQuota?"daily Firebase limit reached":"cloud writes failing")+" — "+FB_WRITE_RETRY_ATTEMPTS+" consecutive failures (last error: "+errMsg+"). Changes on this device are NOT reaching other devices");
+    }
   }
 
   function _sendWritePayload(DforSync){
@@ -1811,6 +1832,80 @@ function _showCloudOfflineBanner(isQuota){
     "⚠️ Firebase daily free limit reached — changes are saved on THIS device only until it resets (usually ~10am EAT). Other devices will not see new orders/edits until then.":
     "⚠️ Cloud sync is down — changes are saved on THIS device only. Other devices will not see new orders/edits until sync recovers.";
   document.body.insertBefore(b,document.body.firstChild);
+}
+/* FIX (2026-07-29): remote sync-health reporting — because the console on a
+   staff phone is not reachable.
+
+   Every diagnostic added for the missing-order work so far ([NDSYNC] console
+   lines, the offline banner, the persistence toast) is visible ONLY on the device
+   with the problem. In this business that device is a delivery phone the director
+   does not have in their hand, so in practice those diagnostics could never be
+   read by the person who needs them — which is exactly why the same issue kept
+   being re-diagnosed from guesswork for weeks.
+
+   This routes the three conditions that actually predict data loss into the audit
+   event channel instead: already immediate, already durable, already streamed to
+   every device by the existing 50-event listener, and already rendered in the
+   Data/Audit view a director can open on their own phone. No new collection, no
+   new UI, no extra read.
+
+   QUOTA/WINDOW DISCIPLINE: strictly ONCE PER SESSION PER CONDITION. These events
+   share the same bounded 50-event window the event self-heal depends on, so a
+   chatty health reporter would push real ORDER_PLACED snapshots out of that window
+   and actively cause the loss it is meant to reveal. All three conditions are rare
+   in healthy operation, so the steady-state cost is zero events per day. */
+var _syncHealthReported={};
+function _reportDeviceSyncHealth(kind,detail){
+  try{
+    if(_syncHealthReported[kind])return; // once per session per condition — see QUOTA note above
+    _syncHealthReported[kind]=true;
+    var dev="unknown";
+    try{
+      var ua=(navigator&&navigator.userAgent)||"";
+      dev=/Android/i.test(ua)?"Android":/iPhone|iPad|iPod/i.test(ua)?"iOS":
+          /Windows/i.test(ua)?"Windows":/Mac/i.test(ua)?"Mac":"other";
+    }catch(_){}
+    // auditLog stamps the actor (name + role), so the director sees WHICH phone.
+    // Must be called while CU is still set — after logout clears it, auditLog no-ops.
+    auditLog("SYNC_HEALTH",kind+" — "+detail+" [device: "+dev+", app v"+APP_VERSION+"]");
+  }catch(e){/* a health report must never break the thing it is reporting on */}
+}
+/* FIX (2026-07-29): surface a failed offline-persistence init instead of
+   swallowing it. Without IndexedDB persistence Firestore cannot queue a write
+   durably across a reload or a tunnel, so an unsent change lives only in RAM and
+   this app's own localStorage auto-save. That is a materially weaker device and
+   the team deserves to know which phone is in that state. Deliberately a toast,
+   not a permanent red banner: this is a device capability problem, not an active
+   data-loss event, and the local auto-save plus both self-heals still apply.
+   Deferred so it can never run before the UI exists, and fully guarded so a
+   warning about fragility can never itself break startup. */
+function _warnNoOfflinePersistence(err){
+  try{
+    var code=(err&&err.code)||"unknown";
+    setTimeout(function(){
+      try{
+        if(typeof toast!=="function")return;
+        toast(code==="failed-precondition"
+          ? "This device has no offline safety queue because the app is open in more than one tab here. Close the extra tabs and reload — until then, changes made offline are held only on this device."
+          : "This device cannot store changes offline (browser storage unavailable). Changes still save locally, but avoid working with no signal on this phone — tell your tech contact.","warn");
+      }catch(_){}
+    },4000);
+    // Report it to the DIRECTOR's screen too, not just to the phone that has the
+    // problem. Persistence is decided at startup, long before anyone has entered a
+    // PIN, and auditLog() no-ops without an actor (CU/SU) — so wait for a real
+    // session before reporting, then report once. Bounded to ~2 minutes so a phone
+    // parked on the login screen never retries forever.
+    (function _reportWhenLoggedIn(tries){
+      try{
+        if(CU){
+          _reportDeviceSyncHealth("NO_OFFLINE_QUEUE","this device cannot queue writes while offline (reason: "+code+") — unsent changes are held only in its own storage, so a dead zone or a closed tab can strand them");
+          return;
+        }
+        if(tries>60)return;
+        setTimeout(function(){_reportWhenLoggedIn(tries+1);},2000);
+      }catch(_){}
+    })(0);
+  }catch(_){}
 }
 function _hideCloudOfflineBanner(){
   _cloudOfflineBannerShown=false;
@@ -2141,6 +2236,13 @@ function startAuditListener(){
       var remote=[];
       snap.forEach(function(d){remote.push(d.data());});
       _mergeAuditEvents(remote);
+      // ROOT-CAUSE CLOSURE (2026-07-29): the events just merged may carry a full
+      // ORDER_PLACED snapshot for an order that never reached the main document —
+      // possibly created on a completely different device. This is the moment that
+      // durable copy is guaranteed to be in memory, so this is where the gap gets
+      // closed. Costs nothing extra: it reads D.auditLog, which the line above has
+      // already populated from the existing bounded 50-event listener.
+      _selfHealFromEventSnapshots();
       // If listener returned empty but we expect data, also do unordered get as safety.
       // QUOTA GUARD: this used to be able to refire on every snapshot as long as the
       // condition stayed true, which on a genuinely-empty collection meant repeated
@@ -2167,6 +2269,7 @@ function startAuditListener(){
           var remote=[];
           snap.forEach(function(d){remote.push(d.data());});
           _mergeAuditEvents(remote);
+          _selfHealFromEventSnapshots(); // same closure as the live listener above
         }).catch(function(e2){
           if(s)s.innerHTML="<span style=\"color:#e74c3c\">Audit read failed: "+(e2&&e2.code?e2.code:"")+"</span>";
         });
@@ -3793,6 +3896,215 @@ function pk(k){
    resurrect an old intentionally-removed record. Same principle already proven
    in the sync merge: absence is never evidence of deletion — only a tombstone is.
    Runs for EVERY role, which is the actual fix. */
+/* ── HEAL SAFETY RAILS (2026-07-29, added the same day, after a REAL LIVE INCIDENT) ──
+   WHAT HAPPENED: on one device _selfHealUnsyncedLocalRecords() re-inserted 277
+   orders and 287 invoices from that device's localStorage auto-save in a single
+   pass, then force-flushed them into the shared document. Owner's report: those
+   were real orders that had ALREADY been reconciled by hand, so recreating them
+   corrupted the books (double debt / double revenue against the hand-keyed
+   replacements) and spent one large, unwanted write on a free-tier project.
+
+   ROOT CAUSE — traced directly against this file, not inferred. The only gate
+   this heal had for "has live data actually arrived?" is _cloudDataConfirmed. But
+   that flag is set true at the TOP of the onSnapshot handler (see the "snapshot
+   arrived" console line), BEFORE any remote data is merged into D. At least two
+   reachable paths then leave D.orders EMPTY while the flag already reads true:
+     1. `if(!data.D)return;` — the doc exists but carries no D. Returns with the
+        flag true and D still the empty startup skeleton.
+     2. `if(!isOwnWrite||!weAreNewer){ ...merge remote orders... }` — when BOTH
+        are true the entire remote merge is skipped for that snapshot, and
+        weAreNewer is `FB_MY_LAST_WRITE_SERVER_TS>=serverTime`, i.e. 0>=0 → TRUE
+        whenever updatedAt is null — which is exactly this device's own optimistic
+        local echo of a write it just sent.
+   With D.orders empty, the question "which of my local orders is the cloud
+   missing?" answers EVERY order in the 14-day window. At this business's ~20
+   orders/day that is ~280 records — precisely the 277 observed. The mechanism was
+   designed for the one-lost-order case and had no upper bound whatsoever, so it
+   scaled silently all the way to "recreate two weeks of history".
+
+   THREE INDEPENDENT RAILS, so no single one has to be perfect:
+     RAIL 1 — HEAL_EPOCH_MS: a hard floor. No record created before this instant
+       can EVER be auto-restored again, by either heal. This is the owner's
+       explicit instruction: handle it going forward, never re-create history.
+     RAIL 2 — _healLiveStateLooksLoaded(): refuse to judge "what is missing" when
+       the live state does not look like a loaded dataset. This is the read-side
+       twin of the existing _dLooksEmpty() write guard, and it is the exact hole
+       the incident fell through.
+     RAIL 3 — HEAL_MAX_AUTO: a circuit breaker. A gap of 1-3 records is a lost
+       write; a gap of hundreds is a load failure, and the two must never be
+       treated the same. Above the cap NOTHING is restored and one SYNC_HEALTH
+       event is emitted so the director decides — which is this app's own
+       established convention for recovery ("never auto-resubmitted silently",
+       see _pendingOrderLedgerCheck).
+   None of these widens any read window and none costs a write in normal use. */
+/* RAIL 1's floor: 2026-07-29 12:00 EAT (09:00 UTC), the day these rails shipped.
+   Every one of the 277 records in the incident was CREATED before this instant
+   (they spanned the preceding 14 days), so none of them — nor anything else from
+   this system's history — can ever be auto-restored again.
+   Why the exact hour is deliberately NOT load-bearing: for any historical record
+   to be re-healed it would ALSO have to be absent from a fully-loaded D.orders
+   (RAIL 2), carry no tombstone and no dismissal, and be one of at most 3 such
+   records (RAIL 3). The epoch is the plain-English expression of the owner's
+   instruction — "going forward, not history" — not the only thing enforcing it.
+   Known, accepted cost: an order created earlier on 2026-07-29 and genuinely lost
+   cannot be auto-healed. It is still found by the missing-order detector and the
+   restored-order review tool, and the owner explicitly preferred that over any
+   further automatic re-creation of past records. */
+var HEAL_EPOCH_MS=Date.UTC(2026,6,29,9,0,0);
+var HEAL_MAX_AUTO=3;                          // more than this looks missing => restore NOTHING, report instead
+var _healSuppressReported={};                 // condition -> true; report once per session (bounded event window)
+/* RAIL 1b — THE WINDOW. This is the rail that matters most in day-to-day use, and
+   it is set from the owner's explicit instruction (2026-07-29):
+
+     "make auto heal be in first 5 mins if not now let the missing orders flag and
+      alert on both director and involved staff. then now they can choose to
+      recreate or dismiss and manually recreate. because i need the missing order
+      root cause fixed not focus on auto healing. auto heal in first 5mins only."
+
+   So auto-heal is a NARROW SAFETY NET, not the strategy. It covers only the first
+   FIVE MINUTES after a record was created. Past that the order is not touched
+   automatically at all: it stays missing on purpose so that
+     - the DIRECTOR is alerted ("N recent order(s) ... needs your review"), and
+     - the STAFF MEMBER WHO PLACED IT is alerted too (matched by their user id
+       from the audit entry, not by name — see rDash's placedByUid branch),
+   and a human then chooses Recreate or Dismiss-and-re-enter. That handoff is
+   exact, not approximate: rDash's settling grace is derived from THIS SAME
+   constant, so the auto window [0, 5min) and the alert window [5min, 3 days] meet
+   with no gap and cannot drift apart.
+
+   FIVE MINUTES, down from one hour (and from 14 days before the incident). Why
+   this is the right shape:
+     - The 277-record restore happened because auto-heal reached into history the
+       owner had already reconciled by hand. Five minutes cannot reach history.
+     - At ~20 orders/day, five minutes holds at most one order in practice, so the
+       realistic gap sits far under HEAL_MAX_AUTO=3.
+     - It is deep inside the 90-day tombstone retention that makes "no tombstone
+       means not deleted" trustworthy here at all.
+     - The remaining loss is meant to be solved by PREVENTION, not recovery. See
+       §5 of PROJECT_CONTEXT.md for what is already fixed at the source (logout
+       destroying pending writes, the 800ms debounce on critical edits, no flush on
+       backgrounding, clear-after-async) and what is still open.
+   NOTE the effect on the event heal: its floor is EVENT_HEAL_GRACE_MS (2 min, so
+   it never races the creating device's own in-flight write), which leaves it a
+   2-to-5-minute window. That is deliberately narrow — it is a last-chance
+   cross-device catch, nothing more.
+   HEAL_EPOCH_MS above remains a second, independent floor. */
+var HEAL_RECENT_MS=5*60*1000;                 // 5 minutes — auto-heal a still-fresh loss ONLY
+/* AUTO-HEAL DUPLICATE-SALE GUARD (2026-07-29). restoreMissingOrderExact() already
+   has this check, but as a LOUD CONFIRMATION naming the suspect — it can ask a
+   human, because a human clicked it. The self-heals cannot ask anyone, and the
+   1-hour window is exactly the interval in which a staff member notices their
+   order vanished and re-keys the SAME physical sale under a NEW id. Restoring in
+   that state produces two orders for one real transaction: double revenue, double
+   customer debt, and a stock movement that never physically happened — the
+   incident's damage pattern in miniature, and it would arrive automatically.
+   For an unattended action the only safe answer is to DECLINE and leave it to the
+   human: the record stays missing, so Data ▸ Find missing orders still lists it
+   with its duplicate warning, and the owner's note ▸ dismiss ▸ recreate flow takes
+   over.
+   Console-only: no audit event, so it cannot crowd the bounded 50-event window.
+
+   THE MATCHING RULE, and why it is NOT the review tool's looser one.
+   Asked directly by the owner: "if a customer makes same order everyday" — and a
+   ±3-day window (which is what this guard first shipped with, and what the review
+   tool still uses) matches a DAILY customer every single time. That would have
+   silently disabled auto-heal for exactly the most regular, highest-volume
+   customers, forever, with nothing in the UI to say why. A real defect, caught by
+   that question before it could do any damage.
+   A hand re-entry of a lost sale has two signatures a daily repeat order does not:
+     1. it is for the SAME DELIVERY DATE — a daily customer's orders are on
+        DIFFERENT dates; and
+     2. it is created MINUTES later, not ~24 hours later (the real case: #1355
+        lost, re-entered as #1357 minutes afterwards).
+   So: same customer, product and quantity, AND the same `date`, AND both records
+   created within HEAL_TWIN_NEAR_MS of each other. A daily order fails (1) and (2);
+   a genuine re-entry passes both.
+   Deliberate asymmetry with the review tool: THIS runs unattended, so it must be
+   precise or it silently breaks recovery. The review tool is read by a human, so it
+   keeps the wider net and instead LABELS a same-date match as strong and a
+   different-date lookalike as weak (and warns when a customer orders on repeat).
+   THE PROXIMITY THRESHOLD IS 30 MINUTES, set from the owner's correction:
+
+     "it should actually allow same order after 30 mis to 1hr because so even make
+      same orders 3 times a day"
+
+   A customer can legitimately place the SAME order three times in one day, so
+   "same day" on its own must never mean duplicate — only "same day AND within
+   half an hour" does. Two identical orders 30+ minutes apart are treated as two
+   genuine sales and the heal proceeds. This is comfortably safe in practice: the
+   heal only ever looks at records from the last HEAL_RECENT_MS (5 minutes), and a
+   re-entry follows its original by a minute or two, so the real re-entry case sits
+   far inside 30 minutes while a spaced-out repeat order sits well outside it.
+   Residual, accepted: identical orders placed within the same half hour block the
+   auto-heal. That is the safe direction — the order stays missing, both the
+   director and the staff member who placed it are alerted, and a human decides. */
+var HEAL_TWIN_NEAR_MS=30*60*1000;             // 30 min — closer than this is a re-entry; further apart is a real repeat order
+function _healTwinOf(rec){
+  try{
+    if(!rec||rec.cId==null)return null;
+    var twin=(D.orders||[]).filter(function(s){
+      if(!s||String(s.id)===String(rec.id))return false;
+      if(s.cId!==rec.cId)return false;
+      if(_hrProd(s.prod)!==_hrProd(rec.prod))return false;
+      if(Number(s.qty)!==Number(rec.qty))return false;
+      if(s.status==="Cancelled")return false;   // a cancelled twin is not a competing sale
+      // SAME delivery date — not "within 3 days". This is what excludes a daily
+      // repeat customer, whose identical orders sit on consecutive DIFFERENT dates.
+      var dd=_hrDayDiff(s.date,rec.date);
+      if(dd!==0)return false;
+      // ...and created close together. Without this, two genuine same-day
+      // deliveries hours apart would also read as a re-entry. A missing _ts on
+      // either side cannot confirm proximity, so it counts as a match: declining
+      // leaves the order to a human, which is the safe failure direction.
+      if(typeof s._ts==="number"&&typeof rec._ts==="number"){
+        return Math.abs(s._ts-rec._ts)<=HEAL_TWIN_NEAR_MS;
+      }
+      return true;
+    })[0]||null;
+    if(twin)console.log("[NDSYNC] HEAL DECLINED for #"+rec.id+" — live order #"+twin.id+" already records the same sale (same customer/product/qty, same date, minutes apart). Left for manual review.");
+    return twin;
+  }catch(_){return null;}
+}
+/* RAIL 2. A dataset that has genuinely loaded has BOTH customers and orders —
+   this business has run for months. Either one being empty means the merge has
+   not happened (or was skipped for this snapshot), NOT that the data is gone.
+   Same principle as the absolute rule on doc.metadata.fromCache: absence of data
+   is never evidence that data does not exist. */
+function _healLiveStateLooksLoaded(which){
+  var _c=(D&&D.customers)?(D.customers||[]).length:0;
+  var _o=(D&&D.orders)?(D.orders||[]).length:0;
+  if(_c>0&&_o>0)return true;
+  // Console only, NO audit event: this condition can be transient (the next
+  // snapshot may load fine), and a chatty reporter would push real ordSnapshot
+  // events out of the bounded 50-event window the event heal depends on —
+  // causing the very loss it is meant to reveal. Steady-state cost stays zero.
+  _reportHealSuppressed(which,"LIVE_STATE_EMPTY","live data not loaded (customers="+_c+", orders="+_o+") — refusing to treat every local record as lost",false);
+  return false;
+}
+function _reportHealSuppressed(which,cond,detail,emitEvent){
+  try{
+    var k=which+":"+cond;
+    if(_healSuppressReported[k])return; // once per session per condition
+    _healSuppressReported[k]=true;
+    console.log("[NDSYNC] HEAL SUPPRESSED ("+which+"/"+cond+"): "+detail);
+    if(emitEvent&&typeof _reportDeviceSyncHealth==="function"&&CU){
+      _reportDeviceSyncHealth("HEAL_SUPPRESSED_"+cond,which+" self-heal suppressed — "+detail);
+    }
+  }catch(_){/* a suppression report must never break the thing it is reporting on */}
+}
+/* The heal's own audit text claims these records were "created here" by this
+   user. autoSaveCheckLocal() falls back to the SHARED slot, which ANY user of
+   this browser may have written — so a director could heal from a snapshot that
+   was never theirs, while the log said otherwise. For HEALING (unlike display,
+   which legitimately wants any available copy) require the user-keyed slot. */
+function _healSourceSnapshot(){
+  try{
+    if(!CU)return null;
+    var raw=localStorage.getItem(lsKey());
+    if(!raw)return null;
+    return JSON.parse(raw);
+  }catch(_){return null;}
+}
 function _selfHealUnsyncedLocalRecords(){
   try{
     // Never judge "what does live data look like" before live data has arrived —
@@ -3805,34 +4117,50 @@ function _selfHealUnsyncedLocalRecords(){
     }
     if(window._selfHealDone)return; // once per session
     window._selfHealDone=true;
-    var snap=autoSaveCheckLocal();
+    if(!_healLiveStateLooksLoaded("LOCAL"))return;                 // RAIL 2
+    var snap=_healSourceSnapshot();
     if(!snap||!snap.D)return;
-    // Recency bound: tombstones are pruned at 90 days (pruneOldTombstones), so a
-    // record created within this window is guaranteed to still have its deletion
-    // tombstone if it was ever deleted — which is what makes "no tombstone" a
-    // trustworthy signal here. Anything older is left alone.
-    var _healCutoff=Date.now()-14*24*60*60*1000;
+    // RAIL 1b: the window is ONE HOUR (HEAL_RECENT_MS) — auto-heal only a loss
+    // that is still fresh; anything older belongs to the owner's manual
+    // note ▸ dismiss ▸ recreate flow. See the HEAL_RECENT_MS comment.
+    // RAIL 1: and never earlier than HEAL_EPOCH_MS, whatever the window says.
+    // (This is also comfortably inside the 90-day tombstone retention that makes
+    // "no tombstone" a trustworthy signal here at all.)
+    var _healCutoff=Math.max(Date.now()-HEAL_RECENT_MS,HEAL_EPOCH_MS);
     function _recent(r){
-      if(r&&typeof r._ts==="number")return r._ts>=_healCutoff;
-      var d=r&&(r.date||r.deliveredAt);
-      if(!d)return false; // no usable timestamp — do not touch
-      var t=new Date(d+"T12:00:00").getTime();
-      return !isNaN(t)&&t>=_healCutoff;
+      // Numeric _ts ONLY. The old fallback read r.date/r.deliveredAt — a
+      // USER-CHOSEN, freely back-datable delivery date, which is not evidence of
+      // when a record was CREATED and so cannot support the epoch guarantee
+      // above. Every order this app creates carries a real numeric _ts
+      // (see saveOrd), so nothing legitimate is lost by requiring it.
+      return !!(r&&typeof r._ts==="number"&&r._ts>=_healCutoff);
     }
     var _dismissed={};(D.dismissedMissingOrders||[]).forEach(function(id){_dismissed[id]=true;});
     var _liveOrd={};(D.orders||[]).forEach(function(o){_liveOrd[o.id]=true;});
-    var _healedOrds=[];
+    // PASS 1 — COLLECT candidates without mutating D. The old code pushed each
+    // record as it iterated, which is precisely why there was never any point at
+    // which "how many are we about to restore?" could be asked. That question is
+    // the whole circuit breaker.
+    var _candOrds=[];
     (snap.D.orders||[]).forEach(function(so){
       if(!so||so.id==null)return;
       if(_liveOrd[so.id])return;                                   // already present
       if((D.deletedOrderIds&&D.deletedOrderIds[so.id])||_recentlyDeletedOrderIds[so.id])return; // deliberately deleted
       if(_dismissed[so.id])return;                                 // a director already resolved this gap by hand
-      if(!_recent(so))return;                                      // too old to trust
-      (D.orders||[]).push(JSON.parse(JSON.stringify(so)));
-      _healedOrds.push(so.id);
+      if(!_recent(so))return;                                      // outside the 1-hour window / before the epoch
+      if(_healTwinOf(so))return;                                   // the same sale is already live under another id — leave it to a human
+      _candOrds.push(so);
     });
+    // Projected order set = live + candidates, so an invoice can still be judged
+    // against an order that is about to be restored in the same pass (what the
+    // old in-place `D.orders.some(...)` check did, without the mutation).
+    // Holds the RECORD, not just true, because the invoice recency test below
+    // needs the order's _ts — see the comment there.
+    var _projOrd={};
+    (D.orders||[]).forEach(function(o){_projOrd[o.id]=o;});
+    _candOrds.forEach(function(o){_projOrd[o.id]=o;});
     var _liveInv={};(D.invoices||[]).forEach(function(i){_liveInv[i.id]=true;});
-    var _healedInvs=[];
+    var _candInvs=[];
     (snap.D.invoices||[]).forEach(function(si){
       if(!si||si.id==null)return;
       if(_liveInv[si.id])return;
@@ -3841,9 +4169,54 @@ function _selfHealUnsyncedLocalRecords(){
       // Only heal an invoice whose order is (or is now) live — never a floating one.
       var _oid=si.orderId!=null?si.orderId:(si.notes&&si.notes.match(/#(\d+)/)?parseInt(si.notes.match(/#(\d+)/)[1]):null);
       if(_oid==null)return;
-      if(!(D.orders||[]).some(function(o){return String(o.id)===String(_oid);}))return;
-      if(!_recent(si))return;
-      (D.invoices||[]).push(JSON.parse(JSON.stringify(si)));
+      var _oRec=_projOrd[_oid];
+      if(!_oRec)return;
+      // RECENCY VIA THE ORDER, not the invoice. Verified directly against all six
+      // invoice-creation sites in this file (saveOrd x3, completeDlv, manual
+      // invoice, Excel merge): an invoice NEVER carries a _ts — only a `date`
+      // string, which is user-chosen and back-datable. Testing _recent(si) here
+      // would therefore refuse EVERY invoice forever, and a healed order whose
+      // invoice was refused is an order restored with its money missing — silently
+      // wrong in the most dangerous direction. The linked order's _ts is the
+      // authoritative creation time, and an invoice's fate should follow its order
+      // in any case. (Caught by _proof_selfheal_lost_order.js's invoice assertion,
+      // which is exactly what that proof is for.)
+      if(!_recent(_oRec))return;
+      _candInvs.push(si);
+    });
+    if(!_candOrds.length&&!_candInvs.length)return;
+    // RAIL 3 — CIRCUIT BREAKER. This is the rail that would have stopped the
+    // 277-record incident on its own, regardless of cause.
+    if(_candOrds.length>HEAL_MAX_AUTO||_candInvs.length>HEAL_MAX_AUTO){
+      _reportHealSuppressed("LOCAL","BULK_GAP",_candOrds.length+" order(s) and "+_candInvs.length+" invoice(s) looked missing (cap "+HEAL_MAX_AUTO+") — a gap this size is a load failure, not lost writes. NOTHING restored; review it with the Restored-order review tool on the Data page.",true);
+      // Kept in memory only (never written) so the review tool can offer the list
+      // for inspection in this same session without anyone retyping it.
+      window._healSuppressedBatch={which:"LOCAL",orders:_candOrds.map(function(o){return o.id;}),invoices:_candInvs.map(function(i){return i.id;}),at:Date.now()};
+      return;
+    }
+    // PASS 2 — APPLY.
+    var _healedOrds=[],_healedInvs=[];
+    _candOrds.forEach(function(so){
+      var _copy=JSON.parse(JSON.stringify(so));
+      // FIX (2026-07-29): tag it — exactly as _selfHealFromEventSnapshots and
+      // restoreMissingOrderExact already do, and as this function's own audit
+      // text has always CLAIMED. The premise of this heal is that the order's
+      // write never reached the cloud, so its stock deduction did not either.
+      // Without the tag, delO() and _finishCancelO() credit stock back for a
+      // deduction that never happened. The old code pushed a raw, untagged copy
+      // while logging "stock not re-deducted" — so nothing downstream could
+      // honour the claim. This is the same bug pattern in a second location
+      // (CLAUDE.md item 14), the first being the event heal which had it right.
+      _copy._stockNotDeducted=true;
+      _copy._healedFrom="local-autosave"; // provenance — makes a restored record identifiable afterwards
+      _copy._healedAt=Date.now();
+      (D.orders||[]).push(_copy);
+      _healedOrds.push(so.id);
+    });
+    _candInvs.forEach(function(si){
+      var _ci=JSON.parse(JSON.stringify(si));
+      _ci._healedFrom="local-autosave";_ci._healedAt=Date.now();
+      (D.invoices||[]).push(_ci);
       _healedInvs.push(si.id);
     });
     if(!_healedOrds.length&&!_healedInvs.length)return;
@@ -3859,6 +4232,154 @@ function _selfHealUnsyncedLocalRecords(){
       refreshCurrentPage();
     }catch(_){}
   }catch(e){/* best-effort — never block startup on this */}
+}
+/* ROOT-CAUSE CLOSURE (2026-07-29): the missing final step of the durability design.
+
+   The pieces were all already here and all already proven:
+     - every ORDER_PLACED event carries a FULL order+invoice snapshot
+       (_orderSnapshotFor, added 2026-07-28) and is written IMMEDIATELY as its own
+       tiny Firestore doc, so it virtually always lands even when the ~330KB
+       whole-document write does not;
+     - startAuditListener() already streams the 50 most recent events into
+       D.auditLog on EVERY device, live, at zero additional read cost.
+   That existing comment even states the goal outright — "recovery is possible from
+   ANY device rather than only the phone that happened to create it" — but nothing
+   ever actually performed that recovery. The durable copy was arriving in memory on
+   every device and simply never being compared against D.orders. A director's phone
+   was holding the proof of a staff phone's lost order and doing nothing with it.
+
+   This closes it. Deliberately cheap and deliberately narrow:
+     - ZERO extra reads: it only reads D.auditLog, which the existing bounded
+       listener already populates. It does NOT widen the 50-event window (owner's
+       explicit standing instruction) and issues no query of its own.
+     - Covers what _selfHealUnsyncedLocalRecords() structurally cannot: an order lost
+       from a DIFFERENT device. Local self-heal only works if the same person logs
+       back in on the same phone; this works from any device, unattended.
+     - GRACE PERIOD: an order is only healed once its event is EVENT_HEAL_GRACE_MS
+       old. Without this, every device would "heal" every brand-new order in the
+       seconds before the creating device's normal write lands — a pointless write
+       storm racing the real write. Two minutes is the same figure _pendingOrder-
+       LedgerCheck uses for "had a fair chance to sync".
+     - ADD-ONLY, and tombstone / dismissal / recency guarded exactly like the local
+       self-heal. Absence is never evidence of deletion — only a tombstone is.
+     - Stock is NOT re-deducted, and the healed order is tagged _stockNotDeducted so
+       a later delete/cancel cannot phantom-credit inventory that was never taken
+       (the order's original deduction died in the same lost write). Same rule the
+       restore path already follows. */
+var EVENT_HEAL_GRACE_MS=120000; // 2 min — let the creating device's own write land first
+var _eventHealAttempted={};     // order id -> true; never heal the same id twice in a session
+function _selfHealFromEventSnapshots(){
+  try{
+    if(!_cloudDataConfirmed)return;              // never judge "what is missing" before live data arrived
+    if(!D||!Array.isArray(D.auditLog))return;
+    // RAILS 1-3 (2026-07-29, after the 277-record incident): the same three
+    // guards added to _selfHealUnsyncedLocalRecords, applied here too. This path
+    // is bounded by the 50-event listener window rather than 14 days of local
+    // storage, so its worst case is ~50 records instead of ~280 — smaller, but
+    // the same class of failure and the same wrong answer ("everything is
+    // missing") from the same cause (an empty D behind a true
+    // _cloudDataConfirmed). Fixing one instance of a pattern and leaving the
+    // structurally identical second one is exactly what CLAUDE.md item 14 exists
+    // to prevent.
+    if(!_healLiveStateLooksLoaded("EVENT"))return;                      // RAIL 2
+    var now=Date.now();
+    // RAIL 1b: ONE HOUR (HEAL_RECENT_MS), floored at the epoch by RAIL 1. Note the
+    // effective window here is EVENT_HEAL_GRACE_MS..HEAL_RECENT_MS, i.e. 2 minutes
+    // to 1 hour: fresh enough that the creating device's own write has had a fair
+    // chance to land, recent enough that the owner has not yet reconciled it by hand.
+    var _healCutoff=Math.max(now-HEAL_RECENT_MS,HEAL_EPOCH_MS);
+    var _dismissed={};(D.dismissedMissingOrders||[]).forEach(function(id){_dismissed[id]=true;});
+    var _liveOrd={};(D.orders||[]).forEach(function(o){_liveOrd[o.id]=true;});
+    var _healedOrds=[],_healedInvs=[];
+    // PASS 1 — pick the LATEST snapshot per order id.
+    // FIX (2026-07-29, second look): this originally only read ORDER_PLACED, which
+    // meant it healed an order back to its CREATION state — Pending and Unpaid —
+    // even when it had since been delivered and paid for on that same lost device.
+    // DELIVERY_COMPLETE and PAYMENT_RECORDED now carry an ordSnapshot too, so any
+    // event carrying one is a valid source and the most recent one wins. Keyed off
+    // the snapshot's own id (not the map key) so the numeric/string types of the
+    // downstream tombstone and dismissal lookups stay exactly as they were.
+    var _latestSnap={};
+    (D.auditLog||[]).forEach(function(e){
+      if(!e||!e.ordSnapshot||!e.ordSnapshot.order)return;
+      var so=e.ordSnapshot.order;
+      if(so.id==null)return;
+      var ets=Date.parse(e.ts);
+      if(isNaN(ets))return;                      // no usable timestamp — do not touch
+      var cur=_latestSnap[so.id];
+      if(!cur||ets>cur.ts)_latestSnap[so.id]={ts:ets,snap:e.ordSnapshot,id:so.id};
+    });
+    // PASS 2 — COLLECT what is genuinely missing, without mutating D, so the
+    // circuit breaker below can refuse the whole batch (same restructure as the
+    // local heal, for the same reason).
+    var _evCand=[];
+    Object.keys(_latestSnap).forEach(function(k){
+      var rec=_latestSnap[k],so=rec.snap.order,ets=rec.ts,oid=rec.id;
+      if(_liveOrd[oid])return;                   // already present — nothing to do
+      if(_eventHealAttempted[oid])return;        // tried once this session already
+      if(now-ets<EVENT_HEAL_GRACE_MS)return;     // too fresh — the real write may still be in flight
+      if(ets<_healCutoff)return;                 // older than the window where "no tombstone" is trustworthy
+      // RAIL 1, on the RECORD rather than the event. The event bound above is not
+      // sufficient on its own: an order CREATED long before the epoch but
+      // delivered today carries a post-epoch DELIVERY_COMPLETE event, and would
+      // otherwise slip through as "recent". The owner's instruction is about when
+      // the record was created, so that is what gets checked. Requiring a numeric
+      // _ts also matches _recent() in the local heal exactly — every order this
+      // app creates has one, and _orderSnapshotFor copies the order verbatim.
+      // Checked against the FULL cutoff (1-hour window AND the epoch), not just the
+      // epoch: an order created three days ago but delivered ten minutes ago carries
+      // a recent DELIVERY_COMPLETE event, and only the record's own creation time
+      // can tell that apart from a genuinely fresh loss.
+      if(!(so&&typeof so._ts==="number"&&so._ts>=_healCutoff))return;
+      if((D.deletedOrderIds&&D.deletedOrderIds[oid])||_recentlyDeletedOrderIds[oid])return; // deliberately deleted
+      if(_dismissed[oid])return;                 // a director already resolved this gap by hand
+      if(_healTwinOf(so))return;                 // the same sale is already live under another id — leave it to a human
+      _evCand.push(rec);
+    });
+    if(!_evCand.length)return;
+    // RAIL 3 — CIRCUIT BREAKER.
+    if(_evCand.length>HEAL_MAX_AUTO){
+      _reportHealSuppressed("EVENT","BULK_GAP",_evCand.length+" order(s) looked missing from their own event snapshots (cap "+HEAL_MAX_AUTO+") — a gap this size is a load failure, not lost writes. NOTHING restored; review it with the Restored-order review tool on the Data page.",true);
+      window._healSuppressedBatch={which:"EVENT",orders:_evCand.map(function(r){return r.id;}),invoices:[],at:Date.now()};
+      // Deliberately does NOT mark _eventHealAttempted: this batch was refused
+      // because the live state looked wrong, not because these ids were judged
+      // and rejected. A later snapshot that loads properly must still be free to
+      // heal a genuinely lost order among them.
+      return;
+    }
+    // PASS 3 — APPLY.
+    _evCand.forEach(function(rec){
+      var so=rec.snap.order,oid=rec.id;
+      _eventHealAttempted[oid]=true;
+      var _copy=JSON.parse(JSON.stringify(so));
+      _copy._stockNotDeducted=true;              // its original deduction died with the lost write
+      _copy._healedFrom="event-snapshot";        // provenance — makes a restored record identifiable afterwards
+      _copy._healedAt=Date.now();
+      (D.orders||[]).push(_copy);
+      _liveOrd[oid]=true;
+      _healedOrds.push(oid);
+      var si=rec.snap.invoice;
+      if(si&&si.id!=null&&
+         !(D.invoices||[]).some(function(x){return x.id===si.id;})&&
+         !(D.deletedInvoiceIds&&D.deletedInvoiceIds[si.id])&&
+         !(_recentlyVoidedInvoiceIds&&_recentlyVoidedInvoiceIds[si.id])){
+        var _ci=JSON.parse(JSON.stringify(si));
+        _ci._healedFrom="event-snapshot";_ci._healedAt=Date.now();
+        (D.invoices||[]).push(_ci);
+        _healedInvs.push(si.id);
+      }
+    });
+    if(!_healedOrds.length)return;
+    console.log("[NDSYNC] EVENT SELF-HEAL restored order(s) from their ORDER_PLACED snapshots — orders=["+_healedOrds.join(",")+"] invoices=["+_healedInvs.join(",")+"]");
+    // Genuine record recovery — force a fresh conflict check and flush at once.
+    _hasPendingCriticalEdit=true;
+    auditLog("ORDER_PLACED","EVENT SELF-HEAL: restored "+_healedOrds.length+" order(s) ["+_healedOrds.join(", ")+"] and "+_healedInvs.length+" invoice(s) from their own ORDER_PLACED event snapshots — created on some device but never reached the main document. Original ids preserved; stock NOT re-deducted.");
+    dirty();
+    try{
+      toast("Recovered "+_healedOrds.length+" order(s) that never reached the cloud: #"+_healedOrds.join(", #"),"warn");
+      refreshCurrentPage();
+    }catch(_){}
+  }catch(e){/* best-effort — never let recovery break the app */}
 }
 async function checkAutoSaveRecovery(){
   // Always restore auditLog from localStorage first (it is never in Firestore)
@@ -3884,6 +4405,7 @@ async function checkAutoSaveRecovery(){
   if(!CU||( CU.role!=="director"&&CU.role!=="manager")){
     buildApp();
     _selfHealUnsyncedLocalRecords();
+    _selfHealFromEventSnapshots(); // and from any ORDER_PLACED snapshot already in the restored audit log
     return;
   }
   // ROOT-CAUSE FIX (2026-07-20): everything below this line compares a local
@@ -3913,6 +4435,7 @@ async function checkAutoSaveRecovery(){
   // heuristic sees the already-corrected counts, making the far riskier
   // wholesale-restore prompt less likely to be needed at all.
   _selfHealUnsyncedLocalRecords();
+  _selfHealFromEventSnapshots(); // and from any ORDER_PLACED snapshot already in the restored audit log
   var snap=autoSaveCheckLocal();
   var hasCurrentData=(D.customers||[]).length||(D.orders||[]).length||(D.invoices||[]).length;
   if(snap&&snap.D){
@@ -4379,6 +4902,15 @@ function logout(){
      elapses. Reproduced and proven in _proof_missing_order_prevention.js §1. */
   var _unsyncedAtLogout=FB_READY&&FB_DOC_REF&&D&&typeof D==="object"&&
     (_pendingLocalWrite||FB_WRITE_QUEUE.length>0||FB_WRITING);
+  // Report BEFORE anything below clears CU — auditLog() no-ops without an actor,
+  // and this must also land before the audit-queue flush a few lines down so it
+  // rides out with it. This is the signal that says "this phone reached logout
+  // still holding unsent work", i.e. the exact condition that used to silently
+  // destroy orders. If a director ever sees this repeatedly for one staff member,
+  // that phone is the problem — which is knowable now without touching it.
+  if(_unsyncedAtLogout){
+    _reportDeviceSyncHealth("UNSYNCED_AT_LOGOUT","this device still had unsent changes when the session ended (idle timeout or sign-out); a rescue write was attempted before teardown");
+  }
   // Cancel the pending debounce timer — the explicit flush below supersedes it.
   if(FB_SYNC_TIMER){clearTimeout(FB_SYNC_TIMER);FB_SYNC_TIMER=null;}
   // NOTE: the write queue is deliberately NOT cleared here any more. That wipe
@@ -4416,7 +4948,16 @@ function logout(){
   // that can silently destroy other people's work is worse than no net.
   var _snapshotIsFresh=_cloudDataConfirmed&&FB_LAST_SNAPSHOT&&(Date.now()-FB_LAST_SNAPSHOT<15000);
   try{
-    if(FB_READY&&FB_DOC_REF&&typeof D==="object"&&_snapshotIsFresh){
+    // FIX (2026-07-29): when there IS unsynced work, the atomic reconciling flush
+    // further down supersedes this raw push entirely — and is strictly safer,
+    // because it re-reads the document and merges, whereas this blind
+    // set({merge:true}) replaces array fields wholesale. Running both spent two
+    // Firestore writes (free tier) to do one job, with the weaker one going
+    // first. Skipping it here is both cheaper and safer; when there is nothing
+    // unsynced this "just in case" net behaves exactly as it always has.
+    if(_unsyncedAtLogout){
+      console.log("[NDSYNC] logout skipping the legacy raw push — the atomic reconciling flush supersedes it (re-reads and merges; the raw set does not)");
+    }else if(FB_READY&&FB_DOC_REF&&typeof D==="object"&&_snapshotIsFresh){
       var snap=JSON.parse(JSON.stringify({D:D}));
       delete snap.D.auditLog;
       FB_DOC_REF.set(snap,{merge:true});
@@ -4432,7 +4973,7 @@ function logout(){
   CU=null;SU=null;PE="";
   if(_unsyncedAtLogout){
     console.log("[NDSYNC] logout — unsynced local work detected, flushing BEFORE teardown (this used to be discarded)");
-    _flushPendingWritesNow("logout");
+    _flushPendingWritesNow("logout",true); // force: see the QUOTA GUARD note in _flushPendingWritesNow
     var _waited=0;
     function _awaitLogoutFlush(){
       var _settled=!FB_WRITING&&!FB_WRITE_QUEUE.length&&!FB_PENDING_CONFIRM_RETRY;
@@ -4820,7 +5361,16 @@ function buildMods(){
     +"<button class=\"mcls\" onclick=\"cm('m-generic')\"><i class=\"ti ti-x\"></i></button></div>"
     +"<div id=\"m-generic-body\"></div>"
     +"</div></div>";
-  el("mods").innerHTML=mC+mO+mOE+mDlv+mS+mRS+mOf+mIv+mPay+mCmp+mU+mSetup+mPin+mAssign+mFollowUp+mGeneric+mRecon;
+  // Restored-order review (2026-07-29). Its own modal rather than m-generic:
+  // m-generic is the shared uiConfirm/uiAlert surface (max-width 560px) and this
+  // report is a wide, long-lived list that a confirm dialog would fight with —
+  // including the confirm this very report opens when cancelling a duplicate.
+  var mHealReview="<div class=\"ov\" id=\"m-heal-review\"><div class=\"modal\" style=\"max-width:1000px\">"+
+    "<div class=\"mhd\"><div class=\"mttl\"><i class=\"ti ti-file-search\" style=\"color:var(--gd);margin-right:7px\"></i>Restored Order Review</div><button class=\"mcls\" onclick=\"cm('m-heal-review')\"><i class=\"ti ti-x\"></i></button></div>"+
+    "<div class=\"mbdy\" id=\"m-heal-review-body\"></div>"+
+    "<div class=\"mft\"><button class=\"btn\" onclick=\"cm('m-heal-review')\">Close</button></div>"+
+  "</div></div>";
+  el("mods").innerHTML=mC+mO+mOE+mDlv+mS+mRS+mOf+mIv+mPay+mCmp+mU+mSetup+mPin+mAssign+mFollowUp+mGeneric+mRecon+mHealReview;
 }
 
 function rDash(){
@@ -4977,7 +5527,20 @@ function rDash(){
   // full, immediate truth; only these passive dashboard alerts wait out the
   // sync window. A genuinely-lost order still surfaces automatically well inside
   // the 3-day window, just not in its first few minutes.
-  var _alertGraceTs=Date.now()-(10*60*1000); // 10-min settling grace (upper bound)
+  // CHANGED (2026-07-29, owner's instruction): derived from HEAL_RECENT_MS instead
+  // of a hard-coded 10 minutes, so the two windows MEET EXACTLY and can never drift
+  // apart as either is tuned:
+  //   [0 .. HEAL_RECENT_MS)      auto-heal's territory — the silent safety net
+  //   [HEAL_RECENT_MS .. 3 days] this alert's territory — director AND the staff
+  //                              member who placed it are told, and a human then
+  //                              chooses Recreate or Dismiss-and-re-enter.
+  // Previously the auto window was 1h while this grace was 10min, so an order lost
+  // between 10 and 60 minutes ago could be alerted about AND auto-healed; and with
+  // the window now at 5 minutes a fixed 10-minute grace would instead leave a
+  // 5-to-10-minute dead zone where neither acted. One constant removes both.
+  // The settling risk this grace exists for is unaffected: it guards the brief
+  // ~5s (!isOwnWrite||!weAreNewer) sync window, and 5 minutes is still ~60x that.
+  var _alertGraceTs=Date.now()-HEAL_RECENT_MS; // settling grace == the auto-heal window (see above)
   if(can("rest")){
     var _missingForAlert=(_computeMissingOrders()||[]).filter(function(m){var _t=new Date(m.ts).getTime();return _t>=_alertCutoffTs&&_t<=_alertGraceTs;});
     if(_missingForAlert.length){
@@ -5894,7 +6457,13 @@ function recPay(){
       if(inv.paid>=inv.amount){o.paid="Paid";}else if(inv.paid>0){o.paid="Partial";}else{o.paid="Unpaid";}
       o.amtPaid=inv.paid;
     }
-    auditLog("PAYMENT_RECORDED","KSh "+amt.toLocaleString()+" on Invoice #"+invId+" by "+CU.name+" ("+CU.role+"). Method: "+method+(ref?" Ref: "+ref:"")+(credit>0?" | KSh "+credit.toLocaleString()+" overpayment added to credit":"")+". Balance: KSh "+(inv.amount-inv.paid).toLocaleString());
+    // DURABILITY (2026-07-29): same reasoning as DELIVERY_COMPLETE — ride the
+    // now-paid order+invoice state on this already-immediate event write so a
+    // payment made on a device whose whole-document write never lands is not healed
+    // back to Unpaid. Placed after the order's paid/amtPaid are updated (just
+    // above). Only attached when a linked order actually exists; _orderSnapshotFor
+    // returns the matching invoice alongside it, so the money survives with it.
+    auditLog("PAYMENT_RECORDED","KSh "+amt.toLocaleString()+" on Invoice #"+invId+" by "+CU.name+" ("+CU.role+"). Method: "+method+(ref?" Ref: "+ref:"")+(credit>0?" | KSh "+credit.toLocaleString()+" overpayment added to credit":"")+". Balance: KSh "+(inv.amount-inv.paid).toLocaleString(),o?{ordSnapshot:_orderSnapshotFor(o.id)}:undefined);
   }else{
   // ── CUSTOMER-LEVEL PAYMENT — distribute oldest-first ─────────────────
     var cu2=(D.customers||[]).find(function(x){return x.id===cId;});
@@ -7281,7 +7850,16 @@ async function completeDlv(){
   }
   if(el("dlv-notes").value)o.notes=sanitizeInput(el("dlv-notes").value); // FIX (2026-07-28): sanitize at entry like every other note field — closes the one raw o.notes writer (driver-writable), a latent stored-XSS.
   var assignedStr=o.driver&&o.driver!==CU.name?" (assigned to "+o.driver+")":" (self-assigned)";
-  auditLog("DELIVERY_COMPLETE","Order #"+o.id+" completed by "+CU.name+" ("+CU.role+")"+assignedStr+". Product: "+o.prod+", Qty: "+o.qty+". Cash collected: "+(el("dlv-amt")&&el("dlv-amt").value>0?"KSh "+el("dlv-amt").value:"none"));
+  // DURABILITY (2026-07-29): ride the CURRENT order state on this already-immediate,
+  // already-durable event write — the same trick ORDER_PLACED has used since
+  // 2026-07-28, extended to the rest of the order's life. Without this, an order
+  // placed, delivered AND paid for on a device whose whole-document writes never
+  // landed would be healed back to its CREATION state — Pending and Unpaid — losing
+  // the delivery and the money. Deliberately placed AFTER every mutation above
+  // (status, paid, amtPaid, bottle_after, product confirmation, notes) so the
+  // snapshot is the finished delivered state, not a half-updated one. Costs no
+  // extra write and no extra read: this event doc is being written either way.
+  auditLog("DELIVERY_COMPLETE","Order #"+o.id+" completed by "+CU.name+" ("+CU.role+")"+assignedStr+". Product: "+o.prod+", Qty: "+o.qty+". Cash collected: "+(el("dlv-amt")&&el("dlv-amt").value>0?"KSh "+el("dlv-amt").value:"none"),{ordSnapshot:_orderSnapshotFor(o.id)});
   // Water delivery cycle counter
   var _isWater=is20ltr(o.prod);
   if(_isWater){
@@ -9444,6 +10022,380 @@ function rReports(){
 }
 
 
+/* ── RESTORED-ORDER REVIEW (2026-07-29) ──────────────────────────────────────
+   Built for the aftermath of the 277-record bulk-heal incident (see the HEAL
+   SAFETY RAILS comment above _selfHealUnsyncedLocalRecords). The rails stop it
+   recurring; this answers the question the owner actually has about the records
+   ALREADY written: "these are all real orders — so which of them is now wrong?"
+
+   THE FRAMING, and why a bulk delete would be the worst possible response.
+   A restored record keeps its ORIGINAL id, and the sync merge is keyed on id.
+   So a restored order can only damage the books in one of three ways, and each
+   needs a DIFFERENT action:
+     DUPLICATE   the id was genuinely absent from the cloud, and the same
+                 physical sale had already been re-keyed by hand under a NEW id.
+                 Two records, one delivery => double debt and double revenue.
+                 Action: CANCEL the restored one, never delete. _finishCancelO
+                 keeps the record and its whole audit trail, drops it out of
+                 every debt figure via custDebt/_invoiceOrderActive, rewrites no
+                 historical revenue, honours _stockNotDeducted so no phantom
+                 stock is credited, and leaves the id LIVE — which means no
+                 self-heal can ever resurrect it (unlike a delete, whose
+                 tombstone is the only thing standing between the id and a
+                 stale device).
+     REVERTED    the id was already in the cloud and the heal pushed this
+                 device's OLDER copy over it, so a delivered/paid order can now
+                 read Pending/Unpaid. Removing it would destroy a real sale; the
+                 correction is to re-apply the delivery/payment.
+     REAL        no counterpart anywhere => the heal did its job, keep it. And
+                 if it also never got delivered, that is genuinely unrecorded
+                 work — the most valuable thing this report can surface.
+
+   Deliberately READ-ONLY apart from one action. It builds a report, exports CSV,
+   and offers exactly one mutation — Cancel — routed through the existing,
+   already-proven cancelO(). Nothing here deletes anything, and nothing acts in
+   bulk: the whole incident was caused by a mechanism that acted on hundreds of
+   records without a human looking at one of them.
+   A Delivered duplicate is shown WITHOUT an action button on purpose: cancelO
+   refuses delivered orders, and the correct route (void the invoice with a
+   reason, then delete) involves a money write-off decision that is the owner's
+   to make in the Orders page, not a shortcut this report should take. */
+/* `x||[]` is not enough for these: a caller passing a non-array (or the harness
+   probing with a positional 1) turns `.forEach` into a TypeError inside a
+   read-only report. Normalising instead keeps the report's failure mode "shows
+   nothing" rather than "throws mid-render". */
+function _hrArr(v){return Array.isArray(v)?v:[];}
+function _hrProd(p){return String(p==null?"":p).trim().toLowerCase();}
+function _hrDayDiff(a,b){
+  if(!a||!b)return null;
+  var ta=new Date(String(a)+"T12:00:00").getTime(),tb=new Date(String(b)+"T12:00:00").getTime();
+  if(isNaN(ta)||isNaN(tb))return null;
+  return Math.abs(Math.round((ta-tb)/86400000));
+}
+/* Both heals log their id list in brackets — that log line is the ONLY
+   authoritative record of which records were restored, because (before today's
+   provenance tags) a restored row is field-for-field indistinguishable from a
+   normally-placed one. Parses every such entry found in the supplied history. */
+function _healReviewParseIds(entries){
+  var ids={},src=[];
+  _hrArr(entries).forEach(function(e){
+    var d=(e&&e.details)||"";
+    if(d.indexOf("SELF-HEAL: restored")===-1)return; // covers "SELF-HEAL:" and "EVENT SELF-HEAL:"
+    var m=d.match(/\[([\d,\s]+)\]/);
+    if(!m)return;
+    m[1].split(",").forEach(function(x){var n=parseInt(String(x).trim(),10);if(!isNaN(n))ids[n]=true;});
+    var cm=d.match(/restored (\d+) order/);
+    src.push({ts:e.ts,user:(e.user||""),n:cm?cm[1]:"?",kind:d.indexOf("EVENT SELF-HEAL")===0?"event snapshots":"local auto-save"});
+  });
+  return {ids:Object.keys(ids).map(function(k){return parseInt(k,10);}).sort(function(a,b){return a-b;}),sources:src};
+}
+function _healReviewRows(ids,allLog){
+  var _ordIdx=_getOrdByIdIndex();
+  var restoredSet={};_hrArr(ids).forEach(function(i){restoredSet[i]=true;});
+  // Independent completion evidence, from the audit history rather than from the
+  // order row itself — the whole point is that the order row may have been
+  // overwritten, so it cannot be its own witness.
+  var delivered={},invPaid={};
+  _hrArr(allLog).forEach(function(e){
+    var d=(e&&e.details)||"";
+    if(e.action==="DELIVERY_COMPLETE"){
+      var dm=d.match(/^Order #(\d+) completed/);
+      if(dm&&!delivered[dm[1]])delivered[dm[1]]={ts:e.ts,by:(e.user||"")};
+    }else if(e.action==="PAYMENT_RECORDED"){
+      // PAYMENT_RECORDED names the INVOICE, not the order (verified at every
+      // emit site), so it is matched through the invoice below.
+      var pm=d.match(/Invoice #(\d+)/);
+      if(pm&&!invPaid[pm[1]])invPaid[pm[1]]={ts:e.ts,by:(e.user||"")};
+    }
+  });
+  var cycleRef={};
+  (D.customers||[]).forEach(function(c){(c.cycleHistory||[]).forEach(function(h){if(h&&h.ordId!=null)cycleRef[h.ordId]=true;});});
+  var pendRef={};
+  (D.pendingPayments||[]).forEach(function(p){if(p&&p.ordId!=null)pendRef[p.ordId]=true;});
+  return _hrArr(ids).map(function(id){
+    var o=_ordIdx[id];
+    if(!o)return {id:id,gone:true,verdict:"GONE",cName:"—",outstanding:0,cands:[],
+      why:"Not in the system now — either already removed, or it was never applied on this device."};
+    var inv=(D.invoices||[]).find(function(i){
+      if(i.orderId!=null)return String(i.orderId)===String(id);
+      return !!(i.notes&&String(i.notes).match(new RegExp("#"+id+"(\\D|$)")));
+    });
+    // Outstanding uses EXACTLY the custDebt()/_invoiceOrderActive predicate, so
+    // this figure can never disagree with the debt shown anywhere else in the app.
+    var outstanding=0;
+    if(inv&&!inv.voided&&inv.paid<inv.amount&&_invoiceOrderActive(inv))outstanding=_round2(inv.amount-inv.paid);
+    var ownDelivery=(o.status==="Delivered")||!!delivered[id]||!!cycleRef[id];
+    var ownPayment=(o.amtPaid>0)||!!(inv&&inv.paid>0)||!!pendRef[id]||!!(inv&&invPaid[inv.id]);
+    // A counterpart = the SAME physical sale keyed under a different id: same
+    // customer, same product, same quantity, within 3 days. Restored ids are
+    // excluded so two restored rows never "explain" each other.
+    var cands=(D.orders||[]).filter(function(s){
+      if(s.id===o.id||restoredSet[s.id])return false;
+      if(s.cId!==o.cId)return false;
+      if(_hrProd(s.prod)!==_hrProd(o.prod))return false;
+      if(Number(s.qty)!==Number(o.qty))return false;
+      var dd=_hrDayDiff(s.date,o.date);
+      return dd!==null&&dd<=3;
+    }).sort(function(a,b){
+      var da=_hrDayDiff(a.date,o.date),db=_hrDayDiff(b.date,o.date);
+      return (da==null?99:da)-(db==null?99:db);
+    });
+    // A hand re-entry is always created AFTER the order it replaces.
+    var later=cands.filter(function(s){return typeof s._ts==="number"&&typeof o._ts==="number"&&s._ts>o._ts;});
+    // SAME-DATE vs OTHER-DATE, and the repeat-order pattern. Asked directly by the
+    // owner: "if a customer makes same order everyday". For such a customer the
+    // ±3-day net ALWAYS finds a lookalike, so calling that a duplicate would be
+    // wrong on every one of their orders — and acting on it would cancel a real
+    // sale. A re-entry of a lost order is for the SAME delivery date; a daily
+    // repeat sits on a DIFFERENT date. So the two are now separated and reported
+    // with different strength, and a customer who orders on repeat is called out
+    // explicitly. (The unattended _healTwinOf() guard uses the strict same-date
+    // rule instead — it has no human to warn.)
+    // STRONG = same delivery date AND keyed within HEAL_TWIN_NEAR_MS (30 min) —
+    // the re-entry signature, and the only case that offers a Cancel button.
+    // WEAK = everything else the net caught: a different day, or the same day but
+    // spaced out. Per the owner, a customer may place the same order up to three
+    // times a day, so spacing is normal business, not evidence of a duplicate.
+    // Same threshold as the unattended _healTwinOf() guard, so the report and the
+    // auto-heal can never disagree about what "the same sale" means.
+    function _hrNear(s){
+      if(_hrDayDiff(s.date,o.date)!==0)return false;
+      if(typeof s._ts==="number"&&typeof o._ts==="number")return Math.abs(s._ts-o._ts)<=HEAL_TWIN_NEAR_MS;
+      return true; // no timestamps to compare — treat same-day as near, and let the human read the note
+    }
+    var strong=cands.filter(_hrNear);
+    var weak=cands.filter(function(s){return !_hrNear(s);});
+    var _repDates={};
+    (D.orders||[]).forEach(function(s){
+      if(!s||String(s.id)===String(o.id))return;
+      if(s.cId!==o.cId)return;
+      if(_hrProd(s.prod)!==_hrProd(o.prod))return;
+      if(Number(s.qty)!==Number(o.qty))return;
+      if(s.status==="Cancelled")return;
+      var dd=_hrDayDiff(s.date,o.date);
+      if(dd===null||dd===0||dd>14)return;   // distinct OTHER dates within a fortnight
+      _repDates[s.date]=true;
+    });
+    var repeatDates=Object.keys(_repDates).length;
+    var repeatNote=repeatDates>=2
+      ? " NOTE: this customer has the identical order on "+repeatDates+" other dates in the last fortnight — they order this regularly, so a lookalike on a different day is expected and is NOT evidence of a duplicate."
+      : "";
+    var verdict,why;
+    if(delivered[id]&&o.status!=="Delivered"){
+      verdict="REVERTED";
+      why="The audit trail records a COMPLETED DELIVERY for #"+id+" (by "+(delivered[id].by||"?")+"), but this record now reads \""+o.status+"\". The restore overwrote the live row with an older copy. RE-APPLY the delivery and any payment — do not remove it.";
+    }else if(strong.length&&!ownDelivery&&!ownPayment){
+      verdict="DUPLICATE?";
+      why="Order #"+strong[0].id+" is the same customer, product and quantity on the SAME DAY ("+strong[0].date+", "+strong[0].status+" / "+strong[0].paid+") and was keyed within half an hour of this one"+(later.length?" — created LATER, the signature of a re-entry by hand":"")+". #"+id+" has no delivery and no payment of its own, so this looks like one sale recorded twice."+repeatNote;
+    }else if(strong.length&&ownDelivery){
+      verdict="BOTH REAL";
+      why="Resembles #"+strong[0].id+" from the same half hour, but #"+id+" has its own delivery record — two genuine sales. Keep both."+repeatNote;
+    }else if(weak.length&&!ownDelivery&&!ownPayment){
+      // Weak on purpose. A different day, or the same day but spaced apart, is
+      // exactly what a regular customer's normal ordering looks like — this
+      // business has customers who place the same order up to three times a day.
+      // No action button is offered for this verdict.
+      verdict="LOOKALIKE";
+      var _wd=_hrDayDiff(weak[0].date,o.date);
+      why="#"+weak[0].id+" is the same customer, product and quantity but "+
+        (_wd===0?"was keyed more than half an hour apart on the same day ("+o.date+")":"is on a DIFFERENT day ("+weak[0].date+" vs "+o.date+")")+
+        ", which is weak evidence — this customer may simply order the same thing more than once. Open both before concluding anything. #"+id+" has no delivery or payment of its own."+(repeatNote||" If the re-entry was keyed on a later date than the original, this could still be the duplicate.");
+    }else if(!ownDelivery){
+      verdict="UNRECORDED";
+      why="No counterpart anywhere, and no delivery on record. Either work that fell through the cracks and still needs handling, or an order settled on paper. Worth checking against your own records.";
+    }else{
+      verdict="REAL";
+      why="No counterpart, and it carries its own delivery/payment record. The restore recovered a genuinely lost order — keep it."+repeatNote;
+    }
+    return {id:id,o:o,inv:inv,outstanding:outstanding,verdict:verdict,why:why,cands:cands,
+      strong:strong,weak:weak,repeatDates:repeatDates,
+      cName:custName(o.cId),ownDelivery:ownDelivery,ownPayment:ownPayment,
+      healed:(o._healedFrom||"")};
+  });
+}
+var HR_VERDICT_STYLE={
+  "REVERTED":{c:"#c0392b",b:"#fdecea",t:"Reverted — re-apply, do NOT remove"},
+  "DUPLICATE?":{c:"#b9770e",b:"#fff8e1",t:"Duplicate within the half hour — consider cancelling"},
+  "LOOKALIKE":{c:"#7f8c8d",b:"#f4f6f6",t:"Lookalike, spaced apart — weak, check both"},
+  "BOTH REAL":{c:"#27ae60",b:"#eafaf1",t:"Both real — keep both"},
+  "UNRECORDED":{c:"#7c3aed",b:"#f3eaff",t:"Unrecorded work — check it"},
+  "REAL":{c:"#27ae60",b:"#eafaf1",t:"Real — keep"},
+  "GONE":{c:"#7f8c8d",b:"#f4f6f6",t:"No longer present"}
+};
+function showHealReview(){
+  if(!can("rest")){toast("Director only","err");return;}
+  var body=el("m-heal-review-body");if(!body)return;
+  body.innerHTML="<div style=\"padding:24px;text-align:center;color:var(--tx2)\"><i class=\"ti ti-loader\"></i> Reading the full audit history (live log + 90-day archive)…</div>";
+  om("m-heal-review");
+  loadAuditArchives(function(archived){
+    var seen={},all=[];
+    [].concat(D.auditLog||[],archived||[]).forEach(function(e){
+      var k=e&&(e._cid||e.ts);if(k&&!seen[k]){seen[k]=true;all.push(e);}
+    });
+    window._hrLogCache=all;
+    var parsed=_healReviewParseIds(all);
+    _healReviewRender(parsed.ids,parsed.sources,all);
+  });
+}
+function healReviewManual(){
+  var raw=(el("hr-ids")&&el("hr-ids").value)||"";
+  var ids=[];
+  raw.split(/[^0-9]+/).forEach(function(x){var n=parseInt(x,10);if(!isNaN(n)&&ids.indexOf(n)===-1)ids.push(n);});
+  if(!ids.length){toast("Paste the order numbers from the restore log first","warn");return;}
+  _healReviewRender(ids.sort(function(a,b){return a-b;}),[{ts:"(entered by hand)",user:CU?CU.name:"",n:String(ids.length),kind:"pasted list"}],window._hrLogCache||(D.auditLog||[]));
+}
+function _healReviewRender(ids,sources,allLog){
+  var body=el("m-heal-review-body");if(!body)return;
+  var rows=_healReviewRows(ids,allLog);
+  // NAMED _hrRowsCache, NOT _healReviewRows. A top-level `function foo(){}` IS
+  // window.foo in a browser, so caching the result as window._healReviewRows
+  // would overwrite the _healReviewRows FUNCTION with an array — and the tool
+  // would then break on its SECOND render, i.e. immediately after cancelling a
+  // duplicate, which re-renders. Caught by the harness (healReviewCancel threw
+  // because `window._healReviewRows.length` was the function's arity, 2, so the
+  // loop indexed a non-existent row). Swept the rest of the file: no other
+  // window.X= assignment collides with a function name. Keep it that way.
+  window._hrRowsCache=rows;
+  var counts={};rows.forEach(function(r){counts[r.verdict]=(counts[r.verdict]||0)+1;});
+  var idBox="<div style=\"display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:14px\">"+
+    "<input class=\"fi\" id=\"hr-ids\" placeholder=\"Or paste order numbers from the restore log, e.g. 1338, 1339, 1340…\" style=\"flex:1;min-width:240px\">"+
+    "<button class=\"btn btn-xs btn-navy\" onclick=\"healReviewManual()\"><i class=\"ti ti-search\"></i> Analyse these</button>"+
+    (rows.length?"<button class=\"btn btn-xs\" style=\"background:#27ae60;color:#fff\" onclick=\"healReviewCSV()\"><i class=\"ti ti-download\"></i> CSV</button>":"")+
+    "</div>";
+  if(!ids.length){
+    var note="";
+    if(window._healSuppressedBatch&&(window._healSuppressedBatch.orders||[]).length){
+      note="<div class=\"notif nr\" style=\"margin-top:12px\"><i class=\"ti ti-shield-check\"></i><div>"+
+        "<strong>This session refused a bulk restore of "+window._healSuppressedBatch.orders.length+" order(s).</strong>"+
+        "<div style=\"margin-top:3px;font-size:12px\">Nothing was written. The safety rails caught it — see the Device sync problem entry in the audit log.</div></div></div>";
+    }
+    body.innerHTML="<div class=\"mbdy\">"+idBox+
+      "<div style=\"padding:18px;text-align:center;color:var(--tx2)\">No bulk-restore entries found in the audit history.<br><span style=\"font-size:12px\">If the restore is older than the 90-day archive, paste the order numbers above.</span></div>"+
+      note+"</div>";
+    return;
+  }
+  var srcHtml=_hrArr(sources).map(function(s){
+    return "<div style=\"font-size:12px;color:var(--tx2)\">• "+s.n+" order(s) restored from "+s.kind+(s.user?" on "+s.user+"'s device":"")+" — "+s.ts+"</div>";
+  }).join("");
+  // Per-customer money impact, computed with the same predicate as every other
+  // debt figure in the app, so the owner can compare it against what they know.
+  var byCust={};
+  rows.forEach(function(r){
+    if(!r.o)return;
+    var k=r.o.cId;
+    if(!byCust[k])byCust[k]={name:r.cName,n:0,out:0};
+    byCust[k].n++;byCust[k].out=_round2(byCust[k].out+r.outstanding);
+  });
+  var custList=Object.keys(byCust).map(function(k){return byCust[k];})
+    .sort(function(a,b){return b.out-a.out;}).slice(0,12);
+  var totalOut=rows.reduce(function(a,r){return a+r.outstanding;},0);
+  var chips=Object.keys(counts).map(function(v){
+    var st=HR_VERDICT_STYLE[v]||{c:"#555",b:"#eee",t:v};
+    return "<span style=\"background:"+st.b+";color:"+st.c+";border:1px solid "+st.c+"33;border-radius:20px;padding:4px 10px;font-size:11px;font-weight:700\">"+counts[v]+" &middot; "+st.t+"</span>";
+  }).join(" ");
+  /* RENDER CAP (2026-07-29). The incident restored 277 records, and every one of
+     them would otherwise become a card in a single innerHTML assignment — several
+     hundred KB of nested DOM built in one synchronous go. On a mid-range delivery
+     phone that is exactly the kind of spike that produces a hung, white screen,
+     which is the failure the owner is most wary of. The verdicts, the money totals
+     and the per-customer breakdown above are all computed from the FULL set, so
+     nothing is hidden from the summary; only the cards are limited, and the CSV
+     always contains every row. Stated on screen rather than truncating silently —
+     a cap nobody is told about reads as "that is all there is". */
+  var HR_RENDER_MAX=60;
+  var _shown=rows.slice(0,HR_RENDER_MAX);
+  var capNote=rows.length>HR_RENDER_MAX
+    ? "<div class=\"notif nw\" style=\"margin-bottom:12px\"><i class=\"ti ti-list-details\"></i><div>"+
+      "<strong>Showing the first "+HR_RENDER_MAX+" of "+rows.length+" rows.</strong>"+
+      "<div style=\"margin-top:3px;font-size:12px\">The counts and money totals above cover all "+rows.length+
+      ". Use <strong>CSV</strong> for the complete list — that is also the easier way to work through a long list, "+
+      "and it avoids loading hundreds of rows onto a phone.</div></div></div>"
+    : "";
+  var cards=_shown.map(function(r){
+    var st=HR_VERDICT_STYLE[r.verdict]||{c:"#555",b:"#eee",t:r.verdict};
+    var o=r.o||{};
+    var head="<div style=\"display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap\">"+
+      "<div><strong style=\"font-size:14px\">Order #"+r.id+"</strong>"+
+        "<span style=\"color:var(--tx2);font-size:12px\"> &middot; "+sanitizeInput(unescapeForEdit(String(r.cName)))+"</span>"+
+        (r.healed?"<span style=\"font-size:10px;color:var(--tx2)\"> &middot; restored from "+r.healed+"</span>":"")+
+      "</div>"+
+      "<span style=\"background:"+st.b+";color:"+st.c+";border-radius:6px;padding:3px 9px;font-size:11px;font-weight:700;white-space:nowrap\">"+st.t+"</span>"+
+    "</div>";
+    if(r.gone)return "<div style=\"border:1px solid var(--bd);border-radius:10px;padding:12px;margin-bottom:10px;opacity:.7\">"+head+
+      "<div style=\"font-size:12px;color:var(--tx2);margin-top:6px\">"+r.why+"</div></div>";
+    var facts="<div style=\"font-size:12px;color:var(--tx2);margin-top:6px;display:flex;gap:14px;flex-wrap:wrap\">"+
+      "<span>"+sanitizeInput(unescapeForEdit(String(o.prod||"")))+" &times;"+o.qty+"</span>"+
+      "<span>"+(o.date||"")+"</span>"+
+      "<span>"+(o.status||"")+" / "+(o.paid||"")+"</span>"+
+      "<span>KSh "+((Number(o.qty)||0)*(Number(o.price)||0)).toLocaleString()+"</span>"+
+      (r.outstanding>0?"<span style=\"color:#c0392b;font-weight:700\">Still owed: KSh "+r.outstanding.toLocaleString()+"</span>":"")+
+      "<span>delivery on record: "+(r.ownDelivery?"yes":"no")+"</span>"+
+      "<span>payment on record: "+(r.ownPayment?"yes":"no")+"</span>"+
+      (r.repeatDates>=2?"<span style=\"color:#7c3aed;font-weight:700\">orders this on "+r.repeatDates+" other days — regular</span>":"")+
+    "</div>";
+    var act="";
+    if(r.verdict==="DUPLICATE?"){
+      if(o.status==="Delivered"){
+        act="<div style=\"margin-top:9px;font-size:11px;color:#b9770e\"><i class=\"ti ti-info-circle\"></i> Marked Delivered, so it cannot be cancelled. If you confirm it is a duplicate: void its invoice with a reason, then delete it from the Orders page — that keeps the write-off on record.</div>";
+      }else{
+        act="<div style=\"margin-top:9px\"><button class=\"btn btn-xs\" style=\"background:#b9770e;color:#fff\" onclick=\"healReviewCancel("+r.id+")\"><i class=\"ti ti-x\"></i> Cancel #"+r.id+" (keeps the record)</button></div>";
+      }
+    }
+    return "<div style=\"border:1px solid var(--bd);border-left:3px solid "+st.c+";border-radius:10px;padding:12px;margin-bottom:10px\">"+
+      head+facts+"<div style=\"font-size:12px;margin-top:8px\">"+r.why+"</div>"+act+"</div>";
+  }).join("");
+  body.innerHTML="<div class=\"mbdy\">"+idBox+
+    "<div class=\"notif nr\" style=\"margin-bottom:14px\"><i class=\"ti ti-alert-circle\"></i><div>"+
+      "<strong>Nothing here is deleted.</strong>"+
+      "<div style=\"margin-top:3px;font-size:12px\">These are all real orders. The only question per row is whether the SAME sale is also recorded somewhere else. Cancelling keeps the order, its audit trail and its history — it just stops it counting towards a customer's balance. Stock is never credited back for a restored record.</div>"+
+    "</div></div>"+
+    "<div style=\"background:var(--bg2);border-radius:10px;padding:12px;margin-bottom:14px\">"+
+      "<div style=\"font-weight:700;font-size:13px;margin-bottom:6px\">"+rows.length+" restored order(s) reviewed</div>"+
+      srcHtml+
+      "<div style=\"margin-top:9px;display:flex;gap:6px;flex-wrap:wrap\">"+chips+"</div>"+
+      "<div style=\"margin-top:10px;font-size:12px\">Debt these records currently add: <strong>KSh "+_round2(totalOut).toLocaleString()+"</strong></div>"+
+      (custList.length?"<div style=\"margin-top:6px;font-size:11px;color:var(--tx2)\">"+custList.map(function(c){
+        return sanitizeInput(unescapeForEdit(String(c.name)))+" ("+c.n+"): KSh "+c.out.toLocaleString();
+      }).join(" &nbsp;|&nbsp; ")+"</div>":"")+
+    "</div>"+capNote+cards+"</div>";
+}
+function healReviewCancel(id){
+  var rows=window._hrRowsCache||[];
+  var r=null;for(var i=0;i<rows.length;i++){if(rows[i].id===id){r=rows[i];break;}}
+  if(!r||!r.o){toast("Order #"+id+" is no longer in the system");return;}
+  var dupOf=(r.cands&&r.cands[0])?r.cands[0].id:null;
+  uiConfirm({title:"Cancel order #"+id+"?",
+    message:"This does NOT delete anything.\n\n#"+id+" stays in the system marked Cancelled, keeps its full history and audit trail, and stops counting towards "+r.cName+"'s balance"+(r.outstanding>0?" (KSh "+r.outstanding.toLocaleString()+" comes off it)":"")+".\n\n"+
+      (dupOf?"Reason: it appears to duplicate order #"+dupOf+", which records the same sale.\n\n":"")+
+      "Stock is not credited back — a restored record never took stock in the first place.\n\nIf money was already paid against it you will be asked what happened to that money next.",
+    variant:"warn",confirmText:"Cancel #"+id}).then(function(ok){
+      if(!ok)return;
+      cancelO(id); // existing proven path — handles paid money via _openCancelDisposition
+      setTimeout(function(){ if(el("m-heal-review")&&el("m-heal-review").classList.contains("open"))
+        _healReviewRender((window._hrRowsCache||[]).map(function(x){return x.id;}),[],window._hrLogCache||(D.auditLog||[])); },400);
+    });
+}
+function healReviewCSV(){
+  if(!can("exp")){toast("Director only","err");return;}
+  var rows=window._hrRowsCache||[];
+  if(!rows.length){toast("Nothing to export");return;}
+  var out=["Order,Customer,Product,Qty,Date,Status,Paid,Amount,StillOwed,Verdict,SameHalfHourCounterpart,WeakLookalike,OrdersThisOnOtherDays,DeliveryOnRecord,PaymentOnRecord,Notes"];
+  rows.forEach(function(r){
+    var o=r.o||{};
+    function q(v){return '"'+String(v==null?"":v).replace(/"/g,"'").replace(/\r?\n/g," ")+'"';}
+    out.push([q(r.id),q(unescapeForEdit(String(r.cName))),q(unescapeForEdit(String(o.prod||""))),q(o.qty||""),
+      q(o.date||""),q(o.status||""),q(o.paid||""),q((Number(o.qty)||0)*(Number(o.price)||0)),q(r.outstanding),
+      q(r.verdict),q((r.strong&&r.strong[0])?("#"+r.strong[0].id):""),
+      q((r.weak&&r.weak[0])?("#"+r.weak[0].id):""),q(r.repeatDates||0),q(r.ownDelivery?"yes":"no"),
+      q(r.ownPayment?"yes":"no"),q(r.why)].join(","));
+  });
+  var blob=new Blob([out.join("\n")],{type:"text/csv"});
+  var a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);
+  a.download="restored-order-review-"+tday()+".csv";
+  a.click();
+  toast("Review exported");
+}
 function exportAuditCSV(){
   if(!can("exp")){toast("Director only","err");return;}
   var logs=[].concat(D.auditLog||[]).reverse();
@@ -9489,6 +10441,12 @@ function rAuditLog(pg){
     "UNAUTHORISED_DLV_ATTEMPT":{ic:"ti-shield-x",col:"#e74c3c",bg:"#fff0f0",label:"Unauthorised attempt"},
     "SECURITY_VIOLATION":{ic:"ti-shield-exclamation",col:"#c0392b",bg:"#fff0f0",label:"Security block"},
     "DATA_EXPORTED":    {ic:"ti-download",col:"#27ae60",bg:"#f0fdf4",label:"Data exported"},
+    // ADDED (2026-07-29): device sync-health reports. Without an entry here these
+    // still render (there is a fallback below) but as generic grey "SYNC HEALTH",
+    // and they would not appear in the type filter. They are the one signal a
+    // director can use to spot a failing STAFF phone without physically having it,
+    // so they get warning styling and their own filter option.
+    "SYNC_HEALTH":      {ic:"ti-cloud-exclamation",col:"#c0392b",bg:"#fff0f0",label:"Device sync problem"},
   };
   var allTypes=Object.keys(typeMap);
   var allLogs=[].concat(D.auditLog||[]).reverse();
@@ -9659,6 +10617,7 @@ function rExcel(){
       "<div style=\"display:flex;gap:10px;flex-wrap:wrap\">"+
         "<button class=\"btn btn-navy\" onclick=\"showBackupHistory()\"><i class=\"ti ti-history\"></i> View backup history</button>"+
         "<button class=\"btn\" style=\"background:#c0392b;color:#fff\" onclick=\"showMissingOrders()\" title=\"Find orders in the audit log with no matching live order\"><i class=\"ti ti-search\"></i> Find missing orders</button>"+
+        "<button class=\"btn\" style=\"background:#b9770e;color:#fff\" onclick=\"showHealReview()\" title=\"Review orders that a self-heal restored: which are duplicates of a hand re-entry, which were reverted, which are genuinely recovered\"><i class=\"ti ti-file-search\"></i> Review restored orders</button>"+
         "<button class=\"btn\" style=\"background:#7c3aed;color:#fff\" onclick=\"runAutoBackup();toast('Backup snapshot saved to cloud')\"><i class=\"ti ti-device-floppy\"></i> Snapshot now</button>"+
       "</div>"+
       "<div id=\"backup-history\" style=\"margin-top:14px\"></div>"+
@@ -9958,7 +10917,13 @@ function saveXL(){
   var ts=new Date().toISOString().replace(/[:.]/g,"-").slice(0,16);
   XLSX.writeFile(wb,"NewDawn_Backup_"+ts+".xlsx");
   localStorage.setItem("nd_last_backup",tday());
-  saved();var l=el("lsl");if(l)l.innerHTML="Saved at "+new Date().toLocaleTimeString();
+  // FIX (2026-07-29): this used to also call saved(), which flips the CLOUD-SYNC
+  // pill to a green "Saved HH:MM". Downloading an Excel file says nothing about
+  // whether pending changes reached Firestore, so that overwrote a truthful
+  // "Syncing..." with false reassurance — the same class of problem as the
+  // missing-order work: the app must never claim durability it has not confirmed.
+  // The dedicated backup label below is the correct place to report this action.
+  var l=el("lsl");if(l)l.innerHTML="Saved at "+new Date().toLocaleTimeString();
   auditLog("DATA_EXPORTED","Excel backup downloaded by "+CU.name+" ("+CU.role+")");
   updateBackupBadge();
   toast("Backup saved — keep this file safe!");
@@ -11035,9 +12000,38 @@ window.addEventListener("load",function(){
       firebase.initializeApp(firebaseConfig);
       fbAuth=firebase.auth();
       fbDb=firebase.firestore();
-      fbDb.enableMultiTabIndexedDbPersistence&&fbDb.enableMultiTabIndexedDbPersistence().catch(function(){
-        fbDb.enableIndexedDbPersistence&&fbDb.enableIndexedDbPersistence().catch(function(){});
-      });
+      // FIX (2026-07-29): both failure paths used to be swallowed by empty
+      // .catch(){} handlers. Offline persistence is what lets Firestore queue a
+      // write durably in IndexedDB and replay it on reconnect — on a delivery
+      // phone that is the difference between "the write survives a tunnel" and
+      // "the write only exists in RAM". It genuinely can fail (several tabs open,
+      // private browsing, storage pressure), and when it did, the app lost its
+      // offline write queue silently, with nobody told and no way to know. Now the
+      // outcome is recorded and surfaced, so a phone in that state is visible
+      // instead of quietly fragile. Never throws: persistence failing must not
+      // stop the app from starting.
+      window._ndPersistence="pending";
+      try{
+        if(fbDb.enableMultiTabIndexedDbPersistence){
+          fbDb.enableMultiTabIndexedDbPersistence().then(function(){
+            window._ndPersistence="multi-tab";
+            console.log("[NDSYNC] offline persistence ENABLED (multi-tab) — writes survive a reload/tunnel");
+          }).catch(function(e1){
+            if(!fbDb.enableIndexedDbPersistence){window._ndPersistence="unavailable";console.log("[NDSYNC] offline persistence UNAVAILABLE: "+(e1&&e1.code));return;}
+            fbDb.enableIndexedDbPersistence().then(function(){
+              window._ndPersistence="single-tab";
+              console.log("[NDSYNC] offline persistence ENABLED (single-tab) — writes survive a reload/tunnel");
+            }).catch(function(e2){
+              window._ndPersistence="failed:"+((e2&&e2.code)||"unknown");
+              console.log("[NDSYNC] offline persistence FAILED ("+((e2&&e2.code)||"unknown")+") — this device has NO durable offline write queue; unsent changes live only in RAM + localStorage");
+              _warnNoOfflinePersistence(e2);
+            });
+          });
+        }else{
+          window._ndPersistence="unsupported";
+          console.log("[NDSYNC] offline persistence UNSUPPORTED by this Firestore build");
+        }
+      }catch(_e){window._ndPersistence="threw";}
       FB_DOC_REF=fbDb.collection("newdawn").doc("main");
       FB_BACKUP_COL=fbDb.collection("newdawn_backups");
       FB_EVENTS_COL=fbDb.collection("newdawn_events");
