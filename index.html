@@ -2667,7 +2667,17 @@ function startCloudListener(isWarmRefresh){
           var _offDelAt=(data.D.deletedOfferIds&&data.D.deletedOfferIds[o.id])||(D.deletedOfferIds&&D.deletedOfferIds[o.id])||_recentlyDeletedOfferIds[o.id];
           return !_offDelAt;
         });
-        D.offers=_mergedRemoteOff.concat(_rescuedOff);
+        // FIX (2026-07-28): drop a tombstoned offer still present in the remote
+        // snapshot (mirrors routes' _keptRemoteRt). The rescue above only checked
+        // the tombstone for LOCAL-only offers; a tombstoned offer still in the
+        // remote doc was taken wholesale by the concat and resurrected — its
+        // discount then re-applied to new orders. delOf now sets the tombstone
+        // (deletedOfferIds + the local set), so both sides converge on deletion.
+        var _keptRemoteOff=_mergedRemoteOff.filter(function(ro){
+          var _offDelAt2=(data.D.deletedOfferIds&&data.D.deletedOfferIds[ro.id])||(D.deletedOfferIds&&D.deletedOfferIds[ro.id])||_recentlyDeletedOfferIds[ro.id];
+          return !_offDelAt2;
+        });
+        D.offers=_keptRemoteOff.concat(_rescuedOff);
         if(_rescuedOff.length){_anyRescueThisSync=true;console.log("[NDSYNC] snapshot merge RESCUED "+_rescuedOff.length+" local-only offer(s) not yet in remote");}
       }
       // Same fix as routes above - real tombstone (added to delCmp),
@@ -3593,7 +3603,7 @@ function pk(k){
     });
   }
 }
-function checkAutoSaveRecovery(){
+async function checkAutoSaveRecovery(){
   // Always restore auditLog from localStorage first (it is never in Firestore)
   var _localSnap=autoSaveCheckLocal();
   if(_localSnap&&_localSnap.D&&_localSnap.D.auditLog&&(_localSnap.D.auditLog||[]).length){
@@ -3663,7 +3673,7 @@ function checkAutoSaveRecovery(){
       if(hasCurrentData)msg+="\n\nLive cloud data currently has "+currCusts+" customers and "+currOrds+" orders.";
       msg+="\n\n\u26a0\ufe0f Restoring will REPLACE the live cloud data with this local snapshot.";
       msg+="\n\nRestore this data now?";
-      if(confirm(msg)){
+      if(await uiConfirm({title:"Restore auto-saved session?",message:msg,variant:"danger",confirmText:"Restore & replace"})){
         D=snap.D;
         if(!D.routes)D.routes=[];
         if(!D.complaints)D.complaints=[];
@@ -4894,7 +4904,7 @@ function prepCustAdd(){
   el("m-c-save").innerHTML="<i class=\"ti ti-check\"></i> Save";
   om("m-c");
 }
-function saveCust(){
+async function saveCust(){
   if(!can("aCust")&&!can("eCust"))return;
   var n=sanitizeInput(el("cn").value.trim()),ph=el("cph").value.trim();
   if(!n||!ph){toast("Name and phone required","err");return;}
@@ -4932,8 +4942,8 @@ cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer updated");
       return String(x.house).trim()===house2&&String(x.court).trim()===court2;
     });
     if(dupAddr){
-      if(!confirm("⚠️ Possible duplicate\n\nA customer at Court "+court2+", No."+house2+" already exists:\n"
-        +(can("vPhone")?unescapeForEdit(dupAddr.name):maskName(unescapeForEdit(dupAddr.name)))+"\n\nContinue adding a new customer?"))return;
+      if(!(await uiConfirm({title:"Possible duplicate",variant:"warn",confirmText:"Add anyway",message:"A customer at Court "+court2+", No."+house2+" already exists:\n"
+        +(can("vPhone")?unescapeForEdit(dupAddr.name):maskName(unescapeForEdit(dupAddr.name)))+"\n\nContinue adding a new customer?"})))return;
     }
   }
   var _newCustId=uid();
@@ -4966,7 +4976,7 @@ function editCust(id){
   el("m-c-save").innerHTML="<i class=\"ti ti-check\"></i> Update";
   om("m-c");
 }
-function delC(id){
+async function delC(id){
   if(!can("dCust"))return;
   var c=(D.customers||[]).find(function(x){return x.id===id;});if(!c)return;
   // ENTERPRISE RULE 1: never let a customer disappear while they still owe
@@ -4990,7 +5000,7 @@ function delC(id){
   // can't just vanish with the customer record either. Require an explicit,
   // logged decision on what happened to it.
   if(c.credit>0){
-    if(!confirm("This customer has KSh "+c.credit.toLocaleString()+" in store credit — money the business owes them.\n\nConfirm this has been refunded or otherwise settled outside the system. This will be logged.\n\nContinue deleting?"))return;
+    if(!(await uiConfirm({title:"Store credit owed",message:"This customer has KSh "+c.credit.toLocaleString()+" in store credit — money the business owes them.\n\nConfirm this has been refunded or otherwise settled outside the system. This will be logged.\n\nContinue deleting?",variant:"danger",confirmText:"Continue deleting"})))return;
     auditLog("CUSTOMER_UPDATED","KSh "+c.credit+" store credit for "+(can("vPhone")?c.name:"[masked]")+" cleared on deletion by "+CU.name+" ("+CU.role+") — confirmed settled outside the system.");
   }
   var paidInvs=(D.invoices||[]).filter(function(i){return i.cId===id&&i.paid>0;});
@@ -4999,7 +5009,7 @@ function delC(id){
   if(deliveredOrds.length)msg+=deliveredOrds.length+" delivered order(s) will be KEPT for revenue/history records (customer will show as removed on them).\n\n";
   if(paidInvs.length)msg+=paidInvs.length+" paid invoice(s) will be kept for financial records.\n\n";
   msg+="Their pending/unfulfilled orders will be removed and any deducted stock restored. Cannot be undone.";
-  if(!confirm(msg))return;
+  if(!(await uiConfirm({title:"Remove customer",message:msg,variant:"danger",confirmText:"Remove customer"})))return;
   // Restore stock for pending/unfulfilled orders before removing them
   (D.orders||[]).filter(function(o){return o.cId===id&&o.status!=="Delivered"&&o.status!=="Cancelled"&&o.prodConfirmed!==false;}).forEach(function(o){
     var st=(D.stock||[]).find(function(s){return (o.stockId&&s.id===o.stockId)||s.name===o.prod;});
@@ -6253,7 +6263,16 @@ function reserveNextComplaintId(){
     return Date.now()*1000+Math.floor(Math.random()*1000);
   });
 }
-function saveOrd(){
+async function saveOrd(){
+  // UI/UX (2026-07-28): converted to async so the 7 native confirm() gates below
+  // become in-app uiConfirm() dialogs (no more "localhost says"). SAFE against the
+  // #1290/#1291 duplicate-order race precisely because each uiConfirm overlay
+  // (z-index 400) sits ABOVE the order modal, so the Place-order button is
+  // un-clickable while any gate is open — no second submission can originate
+  // during an awaited gate. The synchronous button-disable + _savingOrder guard +
+  // _orderCid idempotency token all remain, and every cancel path still clears
+  // them exactly as before. Proven by _proof_saveord_dialogs.js (guard state at
+  // every cancel path, idempotency, happy path, double-invoke).
   // Prevent duplicate orders from rapid double-tap on slow devices/networks.
   // FIX (2026-07-20): the guard now uses a SHORT safety net (2.5s) by
   // default — long enough to cover any purely synchronous validation
@@ -6331,7 +6350,7 @@ function saveOrd(){
     var opEl=el("op");pn=opEl?opEl.value:"";
     if(!pn){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}toast("Please select a product","err");if(el("op-search"))el("op-search").focus();return;}
     price=parseInt((opEl?opEl.getAttribute("data-p"):0)||0);
-    if(price<=0&&!isCat){if(!confirm("⚠️ Price Warning\n\nThis product has no sale price set (KSh 0).\n\nContinue with a zero-value order?")){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}}
+    if(price<=0&&!isCat){if(!(await uiConfirm({title:"Zero-value order",message:"This product has no sale price set (KSh 0).\n\nContinue with a zero-value order?",variant:"warn",confirmText:"Place anyway"}))){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}}
   }
 
   var qty=Math.max(1,parseInt(el("oq").value)||1); // floored at 1 - a negative value here would invert stock deduction
@@ -6343,8 +6362,13 @@ function saveOrd(){
     });
     if(_of){
       var _origPrice=price;
-      price=Math.round(price*(1-_of.disc/100));
-      toast(_of.disc+"% offer applied — "+pn+": KSh "+_origPrice+"→KSh "+price+"/unit","ok");
+      // FIX (2026-07-28): clamp the discount defensively at the point of use too,
+      // not only at saveOff. Any offer already stored with an out-of-range disc
+      // (legacy data, or an import) must never produce a negative order price
+      // (which would credit the customer) or an inflated one. Clamped to [0,100].
+      var _disc=Math.max(0,Math.min(100,_of.disc||0));
+      price=Math.max(0,Math.round(price*(1-_disc/100)));
+      toast(_disc+"% offer applied — "+pn+": KSh "+_origPrice+"→KSh "+price+"/unit","ok");
     }
   }
   var delivDate=el("od")?el("od").value:"";
@@ -6377,7 +6401,7 @@ function saveOrd(){
         (orderTotal>0?"This order adds KSh "+orderTotal.toLocaleString()+" bringing total to KSh "+projectedDebt.toLocaleString()+".":"This is a category order — price confirmed at delivery.")+
         (creditLimit>0&&projectedDebt>creditLimit?"\n\n🚫 Credit limit of KSh "+creditLimit.toLocaleString()+" will be exceeded!":"")+
         "\n\nContinue placing this order?";
-      if(!confirm(debtMsg)){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}
+      if(!(await uiConfirm({title:"Debt alert",message:debtMsg,variant:"warn",confirmText:"Continue placing order"}))){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}
     }
   }
 
@@ -6390,7 +6414,7 @@ function saveOrd(){
       }).length;
       if(driverPending>=5){
         var drvMsg="⚠️ Workload Alert\n\n"+driverName+" already has "+driverPending+" active order(s) pending.\n\nYou can still assign this order — just letting you know.\n\nContinue?";
-        if(!confirm(drvMsg)){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}
+        if(!(await uiConfirm({title:"Driver workload",message:drvMsg,variant:"warn",confirmText:"Assign anyway"}))){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}
       }
     }
   }
@@ -6404,12 +6428,12 @@ function saveOrd(){
     if(oldStock===newStock){
       var netChange=qty-o.qty;
       if(netChange>0&&newStock&&newStock.qty<netChange){
-        if(!confirm("⚠️ Stock Alert\n\nOnly "+newStock.qty+" more unit(s) available for "+unescapeForEdit(pn)+".\n\nOrder will be updated but stock is insufficient. Please restock.\n\nContinue?")){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}
+        if(!(await uiConfirm({title:"Stock alert",message:"Only "+newStock.qty+" more unit(s) available for "+unescapeForEdit(pn)+".\n\nOrder will be updated but stock is insufficient. Please restock.\n\nContinue?",variant:"warn",confirmText:"Continue"}))){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}
       }
       if(newStock){newStock.qty=newStock.qty-netChange;_recordStockDelta(newStock.id,-netChange,o.id);} // negative-stock policy: no floor
     }else{
       if(newStock&&newStock.qty<qty){
-        if(!confirm("⚠️ Stock Alert\n\nOnly "+newStock.qty+" unit(s) in stock for "+unescapeForEdit(pn)+".\n\nOrder will be updated. Please restock soon.\n\nContinue?")){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}
+        if(!(await uiConfirm({title:"Stock alert",message:"Only "+newStock.qty+" unit(s) in stock for "+unescapeForEdit(pn)+".\n\nOrder will be updated. Please restock soon.\n\nContinue?",variant:"warn",confirmText:"Continue"}))){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}
       }
       // FIX (2026-07-28): restore the OLD product's stock only if this order had
       // actually deducted it — i.e. it was an exact order (prodConfirmed!==false).
@@ -6580,9 +6604,9 @@ function saveOrd(){
   // creation) waits for a guaranteed-unique ID below.
   var st=(D.stock||[]).find(function(s){return s.name===pn;});
   if(st&&st.qty<=0){
-    if(!confirm("⚠️ Stock Alert\n\n"+unescapeForEdit(pn)+" is OUT OF STOCK (0 units).\n\nThe order will be recorded but cannot be fulfilled until restocked.\n\nContinue placing this order?")){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}
+    if(!(await uiConfirm({title:"Out of stock",message:unescapeForEdit(pn)+" is OUT OF STOCK (0 units).\n\nThe order will be recorded but cannot be fulfilled until restocked.\n\nContinue placing this order?",variant:"warn",confirmText:"Place anyway"}))){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}
   }else if(st&&st.qty<qty){
-    if(!confirm("⚠️ Stock Alert\n\n"+unescapeForEdit(pn)+" has only "+st.qty+" unit(s) in stock but you are ordering "+qty+".\n\nThe order will be recorded. Please restock soon.\n\nContinue?")){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}
+    if(!(await uiConfirm({title:"Low stock",message:unescapeForEdit(pn)+" has only "+st.qty+" unit(s) in stock but you are ordering "+qty+".\n\nThe order will be recorded. Please restock soon.\n\nContinue?",variant:"warn",confirmText:"Place anyway"}))){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}
   }
   var total=_round2(price*qty);
   var amtPaid=can("mPaid")?_round2(parseFloat(el("oamt").value)||0):0;
@@ -6713,7 +6737,7 @@ function openDlv(oid){
   var oi=el("dlv-other-prod");if(oi)oi.value="";
   om("m-dlv");
 }
-function completeDlv(){
+async function completeDlv(){
   var oid=parseInt(el("dlv-oid").value);
   var o=(D.orders||[]).find(function(x){return x.id===oid;});if(!o)return;
   // Triple-enforced ownership check — cannot be bypassed
@@ -6736,7 +6760,15 @@ function completeDlv(){
     if(!selVal){toast("Please select the exact brand being delivered","err");return;}
     if(selVal==="__other__"){
       var otherInput=el("dlv-other-prod");
-      var customProd=otherInput?otherInput.value.trim():"";
+      // SECURITY FIX (2026-07-28): this "Other / not listed" brand name was the
+      // ONE path writing free text into o.prod WITHOUT sanitizeInput (every other
+      // o.prod writer uses a stock/category dropdown or sanitizes). o.prod is
+      // interpolated raw into innerHTML on the Reports "product performance" and
+      // the Delivery board — so a driver typing an <img onerror> brand name landed
+      // a stored-XSS that executes in the DIRECTOR's browser (full privileges:
+      // change PINs, restore backups). Sanitised at entry, matching the invoice-
+      // notes fix and the app's stated "neutralise at entry" model.
+      var customProd=otherInput?sanitizeInput(otherInput.value.trim()):"";
       if(!customProd){toast("Please type the exact product name","err");return;}
       selVal=customProd+"|0";
     }
@@ -6748,7 +6780,7 @@ function completeDlv(){
     var stCost=st; // read cost BEFORE stock deduction
     if(st){
       if(st.qty<o.qty){
-        if(!confirm("⚠️ Only "+st.qty+" in stock but delivering "+o.qty+".\n\nStock will go to 0. Continue?"))return;
+        if(!(await uiConfirm({title:"Low stock",message:"Only "+st.qty+" in stock but delivering "+o.qty+".\n\nStock will go negative. Continue?",variant:"warn",confirmText:"Continue delivery"})))return;
       }
       st.qty=st.qty-o.qty;_recordStockDelta(st.id,-o.qty); // negative-stock policy (see order-creation note): no floor, so a short delivery reconciles on restock
       if(!st.history)st.history=[];
@@ -6841,7 +6873,7 @@ function completeDlv(){
       toast("KSh "+staffCash.toLocaleString()+" cash recorded — awaiting director confirmation","warn");
     }
   }
-  if(el("dlv-notes").value)o.notes=el("dlv-notes").value;
+  if(el("dlv-notes").value)o.notes=sanitizeInput(el("dlv-notes").value); // FIX (2026-07-28): sanitize at entry like every other note field — closes the one raw o.notes writer (driver-writable), a latent stored-XSS.
   var assignedStr=o.driver&&o.driver!==CU.name?" (assigned to "+o.driver+")":" (self-assigned)";
   auditLog("DELIVERY_COMPLETE","Order #"+o.id+" completed by "+CU.name+" ("+CU.role+")"+assignedStr+". Product: "+o.prod+", Qty: "+o.qty+". Cash collected: "+(el("dlv-amt")&&el("dlv-amt").value>0?"KSh "+el("dlv-amt").value:"none"));
   // Water delivery cycle counter
@@ -6895,7 +6927,7 @@ function completeDlv(){
     _finishCompleteDlv();
   }
 }
-function delO(id){
+async function delO(id){
   if(!can("dOrd"))return;
   var o=(D.orders||[]).find(function(x){return x.id===id;});if(!o)return;
   var linkedInv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.match(new RegExp("#"+id+"(\\D|$)"));});
@@ -6940,9 +6972,9 @@ function delO(id){
   // revenue impact yet), so it gets its own explicit, informative warning
   // instead of the same generic confirm() used for an ordinary delete.
   if(o.status==="Delivered"){
-    if(!confirm("⚠️ REVENUE IMPACT\n\nOrder #"+id+" was DELIVERED — deleting it removes KSh "+(o.qty*o.price).toLocaleString()+" from historical revenue reports for "+(o.deliveredAt||o.date)+".\n\nThis changes past financial reports and cannot be undone.\n\nDelete anyway?"))return;
+    if(!(await uiConfirm({title:"Revenue impact",message:"Order #"+id+" was DELIVERED — deleting it removes KSh "+(o.qty*o.price).toLocaleString()+" from historical revenue reports for "+(o.deliveredAt||o.date)+".\n\nThis changes past financial reports and cannot be undone.\n\nDelete anyway?",variant:"danger",confirmText:"Delete anyway"})))return;
   }else{
-    if(!confirm("Delete order #"+id+"?"+(linkedInv?" The linked invoice will also be removed.":"")))return;
+    if(!(await uiConfirm({title:"Delete order",message:"Delete order #"+id+"?"+(linkedInv?" The linked invoice will also be removed.":""),variant:"danger",confirmText:"Delete order"})))return;
   }
   // Restore stock — skip for category orders (prodConfirmed===false means no stock was deducted)
   var st=(D.stock||[]).find(function(s){return (o.stockId&&s.id===o.stockId)||s.name===o.prod;});
@@ -7348,7 +7380,15 @@ function saveSt(){
   if(editId){
     var s=(D.stock||[]).find(function(x){return String(x.id)===String(editId);});
     if(s){
-      s.name=n;s.size=sanitizeInput(el("ss").value);s.price=_round2(parseFloat(el("sp").value)||0);
+      s.name=n;s.size=sanitizeInput(el("ss").value);
+      // FIX (2026-07-28): the sale price is director-only. Manager has eSt:1 but
+      // ePrice:0 — the two permissions exist precisely so price changes are more
+      // restricted than general stock edits. This write only checked the top eSt
+      // gate, so a manager could silently change an established price (which feeds
+      // every future order). Only apply the price change for an ePrice holder;
+      // preserve the existing price otherwise (name/size/min stay editable). A
+      // manager can't route around this via delete+recreate — managers have dSt:0.
+      if(can("ePrice"))s.price=_round2(parseFloat(el("sp").value)||0);
       s.cost=_round2(parseFloat(el("sc").value)||0);s.min=parseInt(el("sm").value)||10;
       // FIX (2026-07-21): this used to also set s.qty=parseInt(el("sq").value)
       // here - meaning editing a product's name, price, or any other detail
@@ -7754,7 +7794,7 @@ function restoreMissingOrderExact(idx){
     showMissingOrders();
   });
 }
-function recreateOrder(idx){
+async function recreateOrder(idx){
   var row=document.querySelector("[data-idx=\'"+idx+"\']");if(!row)return;
   var cId=parseInt(row.querySelector(".recon-cust-search").value)||0;
   var prod=sanitizeInput(row.querySelector(".recon-prod").value.trim());
@@ -7814,7 +7854,7 @@ function recreateOrder(idx){
   }else{
     confirmMsg+="\n\nThis creates a NEW order (Pending status) — you can then process/deliver it normally.";
   }
-  if(!confirm(confirmMsg)){
+  if(!(await uiConfirm({title:"Recreate order #"+orig,message:confirmMsg,variant:"warn",confirmText:"Recreate order"}))){
     window._recreatingOrder=false;
     if(_recreateBtn){_recreateBtn.disabled=false;_recreateBtn.innerHTML="<i class=\"ti ti-check\"></i> Recreate";}
     return;
@@ -7977,7 +8017,7 @@ function rInvs(q,pg){
       "<div id=\"inv-results\"></div>";
   }
   var _is=el("inv-stats");
-  if(_is)_is.innerHTML=(D.invoices||[]).length+" total &middot; "+(D.invoices||[]).filter(function(i){return i.paid>=i.amount;}).length+" paid &middot; "+(D.invoices||[]).filter(function(i){return i.paid<i.amount&&i.due&&i.due<td&&!i.voided;}).length+" overdue"+((D.invoices||[]).filter(function(i){return i.voided;}).length?" &middot; "+(D.invoices||[]).filter(function(i){return i.voided;}).length+" voided":"");
+  if(_is)_is.innerHTML=(D.invoices||[]).length+" total &middot; "+(D.invoices||[]).filter(function(i){return i.paid>=i.amount;}).length+" paid &middot; "+(D.invoices||[]).filter(function(i){return i.paid<i.amount&&i.due&&i.due<td&&!i.voided&&_invoiceOrderActive(i);}).length+" overdue"+((D.invoices||[]).filter(function(i){return i.voided;}).length?" &middot; "+(D.invoices||[]).filter(function(i){return i.voided;}).length+" voided":"");
   var _ip=el("inv-pending");if(_ip)_ip.innerHTML=pendingBanner;
   var _ir=el("inv-results");
   if(_ir)_ir.innerHTML=
@@ -8013,7 +8053,7 @@ function filterInvs(f){
   var fil=[].concat(D.invoices).reverse();
   if(f==="Paid")fil=fil.filter(function(i){return i.paid>=i.amount;});
   else if(f==="Unpaid")fil=fil.filter(function(i){return i.paid<i.amount&&(!i.due||i.due>=td);});
-  else if(f==="Overdue")fil=fil.filter(function(i){return i.paid<i.amount&&i.due&&i.due<td;});
+  else if(f==="Overdue")fil=fil.filter(function(i){return i.paid<i.amount&&i.due&&i.due<td&&!i.voided&&_invoiceOrderActive(i);}); // FIX (2026-07-28): "overdue" means collectable + past due — exclude voided (written-off) and cancelled/deleted-order invoices, matching the debtors-page KPI and custDebt.
   var paged=paginate(fil,0);
   var tb=el("itbody");if(tb)tb.innerHTML=invRows(paged.items);
 }
@@ -8688,13 +8728,18 @@ function saveOff(){
   if(editId){
     var o=(D.offers||[]).find(function(x){return String(x.id)===String(editId);});
     if(o){
-      o.title=t;o.disc=parseInt(el("ofd").value)||0;o.minqty=parseInt(el("ofmq").value)||1;
-      o.prod=el("ofp").value;o.start=el("ofs").value;o.end=el("ofe").value;o.desc=sanitizeInput(el("ofdesc").value);
+      // FIX (2026-07-28): clamp discount to [0,100] and sanitize prod (the one
+      // offer field that skipped sanitizeInput). An unclamped disc fed saveOrd's
+      // auto-apply price=round(price*(1-disc/100)): a typo'd 150 produced a
+      // NEGATIVE order price (crediting the customer), a negative disc
+      // OVERCHARGED, and prod was a raw stored-XSS sink in rOffers.
+      o.title=t;o.disc=Math.max(0,Math.min(100,parseInt(el("ofd").value)||0));o.minqty=parseInt(el("ofmq").value)||1;
+      o.prod=sanitizeInput(el("ofp").value);o.start=el("ofs").value;o.end=el("ofe").value;o.desc=sanitizeInput(el("ofdesc").value);
       cm("m-of");rOffers();dirty();toast("Offer updated");
       return;
     }
   }
-  (D.offers||[]).push({id:uid(),title:t,disc:parseInt(el("ofd").value)||0,minqty:parseInt(el("ofmq").value)||1,prod:el("ofp").value,start:el("ofs").value,end:el("ofe").value,desc:sanitizeInput(el("ofdesc").value),active:true});
+  (D.offers||[]).push({id:uid(),title:t,disc:Math.max(0,Math.min(100,parseInt(el("ofd").value)||0)),minqty:parseInt(el("ofmq").value)||1,prod:sanitizeInput(el("ofp").value),start:el("ofs").value,end:el("ofe").value,desc:sanitizeInput(el("ofdesc").value),active:true});
   el("oft").value="";el("ofd").value="";el("ofmq").value="1";el("ofdesc").value="";cm("m-of");rOffers();dirty();toast("Offer created");
 }
 function togOf(id){if(!can("aOff"))return;var o=(D.offers||[]).find(function(x){return x.id===id;});if(o)o.active=!o.active;rOffers();dirty();}
@@ -8718,6 +8763,14 @@ function delOf(id){if(!can("dOff"))return;var of=(D.offers||[]).find(function(x)
   // UI/UX (2026-07-28): native confirm() -> in-app dialog; body unchanged.
   uiConfirm({title:"Delete promotion",message:msg,variant:"danger",confirmText:"Delete offer"}).then(function(_ok){
     if(!_ok)return;
+    // FIX (2026-07-28): tombstone the deletion (like delRoute/delCmp) so it
+    // CONVERGES across devices. Without it, a stale device rescued the offer back
+    // on its next sync (the rescue was already tombstone-aware, but nothing set
+    // the tombstone) and its discount re-applied to new orders — the deletion
+    // never stuck. Paired with the remote-drop added to the offers sync merge.
+    if(!D.deletedOfferIds)D.deletedOfferIds={};
+    D.deletedOfferIds[id]=Date.now();
+    _recentlyDeletedOfferIds[id]=Date.now();
     D.offers=(D.offers||[]).filter(function(o){return o.id!==id;});auditLog("DATA_EXPORTED","Offer deleted by "+CU.name+" ("+CU.role+"): "+of.prod+" "+of.disc+"%");rOffers();dirty();toast("Offer removed");
   });
 }
@@ -9605,7 +9658,15 @@ function showBackupHistory(){
   if(!can("rest")){toast("Only directors can view backup history","err");return;}
   var el2=el("backup-history");if(!el2||!FB_BACKUP_COL)return;
   el2.innerHTML="<div style=\"font-size:12px;color:var(--tx2)\">Loading backup history...</div>";
-  FB_BACKUP_COL.orderBy(firebase.firestore.FieldPath.documentId(),"desc").limit(20).get({source:"server"}).then(function(snap){
+  // FIX (2026-07-28): order by the real backedUpAt TIMESTAMP, not document-ID
+  // TEXT. IDs are prefixed sod-/eod-/daily-/periodic-/hourly-, so a desc text sort
+  // put every sod-/periodic- doc ahead of the rest and the top-20 never included
+  // the eod-/daily- backups — they were invisible and unselectable for a
+  // point-in-time restore. This is the same order-by-text bug already fixed in the
+  // emergency path (restoreFromLatestBackup). backedUpAt is a single-field index
+  // (auto-created — no manual index needed) and naturally drops the auditlog-
+  // archive docs, which carry archivedAt, not backedUpAt.
+  FB_BACKUP_COL.orderBy("backedUpAt","desc").limit(20).get({source:"server"}).then(function(snap){
     _renderBackupHistoryRows(el2,snap);
   }).catch(function(e){
     // RESILIENCE: an ordered query can fail for reasons that have nothing to
@@ -9697,7 +9758,7 @@ function checkBackupReminder(){
       var msg="⚠️ No backup in "+(daysSince===999?"a while":daysSince+" days")+".";
       msg+="\n\nCloud backups run automatically, but downloading a local copy is extra protection.";
       msg+="\n\nDownload a backup now?";
-      if(confirm(msg)){saveXL();}
+      uiConfirm({title:"Backup reminder",message:msg,variant:"info",confirmText:"Download backup"}).then(function(_ok){if(_ok)saveXL();});
     },3000);
   }
 }
@@ -9917,12 +9978,11 @@ function _pendingOrderLedgerCheck(){
       "\n\nThis can happen if the app closed or lost connection right after placing it. "+
       "Re-check the Orders list first — it may already be there under a different number. "+
       "If it's genuinely missing, place it again now.";
-    if(confirm(msg)){
-      _pendingOrderLedgerConfirm(unresolved[0]); // don't ask again regardless of what they do next
-      nav("orders",null);
-    }else{
+    // don't ask again regardless of the answer; navigate to Orders only on "yes".
+    uiConfirm({title:"Unsaved order?",message:msg,variant:"warn",confirmText:"Go to Orders"}).then(function(_ok){
       _pendingOrderLedgerConfirm(unresolved[0]);
-    }
+      if(_ok)nav("orders",null);
+    });
   }catch(e){/* best-effort - never block app startup on this */}
 }
 function autoSaveCheckLocal(){
@@ -10026,8 +10086,17 @@ function xSheet(name){
 function restoreXL(input){
   if(!can("rest")){toast("Only Directors can restore data","err");return;}
   var file=input.files[0];if(!file)return;
-  var reader=new FileReader();
-  reader.onload=function(e){
+  // SAFETY FIX (2026-07-28): a spreadsheet restore REPLACES all live data on every
+  // device and pushes it to the shared cloud (pushToCloud below) — the most
+  // destructive action in the app — yet it fired straight from the file picker
+  // with NO confirmation. Its sibling restoreSpecificBackup was deliberately given
+  // a danger uiConfirm the same day; this path was missed. Gate it the same way.
+  // Adds a guard; weakens none. On cancel, nothing is read or written.
+  uiConfirm({title:"Restore from spreadsheet",variant:"danger",confirmText:"Replace ALL data",
+    message:"This REPLACES every customer, order, invoice, stock item, offer and team member — on this device AND everyone else's, immediately — with the contents of this file. The current live data cannot be recovered afterward unless you have another backup.\n\nOnly continue if you picked the right file and intend a full replace."}).then(function(_ok){
+    if(!_ok){try{input.value="";}catch(_){}toast("Restore cancelled — live data unchanged","warn");return;}
+    var reader=new FileReader();
+    reader.onload=function(e){
     try{
       var wb=XLSX.read(new Uint8Array(e.target.result),{type:"array"});
       function get(n){return wb.SheetNames.indexOf(n)!==-1?XLSX.utils.sheet_to_json(wb.Sheets[n]):null;}
@@ -10094,7 +10163,8 @@ function restoreXL(input){
     var rm=el("rmsg");if(rm)rm.innerHTML="<span style=\"color:#c0392b\"><i class=\"ti ti-x\"></i> Could not read file</span>";
     toast("File read error","err");
   };
-  reader.readAsArrayBuffer(file);input.value="";
+    reader.readAsArrayBuffer(file);input.value="";
+  });
 }
 function syncWaterCycles(){
   // Lightweight water-only resync — no credit migration, no stock fixes
