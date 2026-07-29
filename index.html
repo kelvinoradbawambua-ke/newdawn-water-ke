@@ -263,6 +263,30 @@ var FB_READY=false;
 // ever set true inside the real onSnapshot callback, i.e. only once the app
 // has genuine, authoritative knowledge of what's really in the cloud.
 var _cloudDataConfirmed=false;
+/* SERVER-CONFIRMED, as distinct from merely CONFIRMED (2026-07-29).
+   REGRESSION THIS CLOSES: _cloudDataConfirmed's own contract, stated above, is
+   "genuine, authoritative knowledge of what's really in the cloud". That was true
+   while this app had NO offline persistence, because then every snapshot came from
+   the server. Enabling IndexedDB persistence earlier today made it FALSE: Firestore
+   now serves snapshots from its local cache, and the handler set the flag on those
+   too. A live staff-session log showed five consecutive fromCache=true snapshots
+   after a background pause, with no server-confirmed read following.
+   WHY IT MATTERS: the flag gates the two self-heals, whose entire question is "which
+   of my local records is the CLOUD missing?" Answering that from this device's own
+   cache is meaningless — the cache is a copy of what this device already had, so a
+   record absent from it proves nothing about the server.
+   THE SPLIT, deliberately narrow:
+     _cloudDataConfirmed   — "we have data and may WRITE". Cache reads count, and
+                             that is correct: with a durable queue, writing while
+                             offline is exactly what persistence is for. Unchanged.
+     _cloudServerConfirmed — "the SERVER has told us what it holds". Only ever set
+                             by a snapshot with metadata.fromCache === false. Gates
+                             any decision of the form "the cloud is missing X".
+   If a device never gets a server-confirmed read, the heals simply never run there.
+   That is strictly safer than the alternative and it is the honest semantics.
+   Composes with RAIL 2 (_healLiveStateLooksLoaded) rather than replacing it: that
+   one catches an EMPTY D, this one catches a D that is populated but unverified. */
+var _cloudServerConfirmed=false;
 var _APP_READY=false; // true after first Firestore snapshot received
 var FB_RECONNECT_ATTEMPTS=0; // for exponential backoff
 var _idleWarnTimer=null;
@@ -2350,6 +2374,10 @@ function startCloudListener(isWarmRefresh){
   if(!isWarmRefresh){
     console.log("[NDSYNC] startCloudListener called (cold) — _cloudDataConfirmed reset to false");
     _cloudDataConfirmed=false;
+    // Also invalidated: after a cold reconnect the first snapshot is very often
+    // fromCache=true (observed five times in a row in a real staff session), and
+    // whatever the server held then is no longer something we can claim to know.
+    _cloudServerConfirmed=false;
   }else{
     console.log("[NDSYNC] startCloudListener called (warm refresh) — _cloudDataConfirmed left as-is ("+_cloudDataConfirmed+")");
   }
@@ -2363,7 +2391,13 @@ function startCloudListener(isWarmRefresh){
     // auto-healing every collection at once, not just orders.
     var _anyRescueThisSync=false;
     FB_LAST_SNAPSHOT=Date.now();FB_RECONNECT_ATTEMPTS=0; // reset backoff on success
-    _cloudDataConfirmed=true; // we now have authoritative knowledge of real state — safe to write from here on
+    _cloudDataConfirmed=true; // we have data and may write (cache reads included — that is what the durable queue is for)
+    // Only a server-confirmed read tells us what the CLOUD actually holds. See the
+    // _cloudServerConfirmed declaration for why this distinction had to be made.
+    if(doc.metadata&&doc.metadata.fromCache===false){
+      if(!_cloudServerConfirmed)console.log("[NDSYNC] server-confirmed snapshot — cloud-state decisions (self-heal) are now allowed");
+      _cloudServerConfirmed=true;
+    }
     console.log("[NDSYNC] snapshot arrived — _cloudDataConfirmed=true, doc.exists="+doc.exists+", doc.metadata.fromCache="+(doc.metadata&&doc.metadata.fromCache));
     if(!doc.exists){
       // CRITICAL FIX (2026-07-26): "document doesn't exist" must NEVER be
@@ -4154,7 +4188,9 @@ function _selfHealUnsyncedLocalRecords(){
   try{
     // Never judge "what does live data look like" before live data has arrived —
     // the same rule checkAutoSaveRecovery itself follows below.
-    if(!_cloudDataConfirmed){
+    // Needs SERVER confirmation, not merely data: this function's whole question is
+    // "which of my local records is the cloud missing?" — unanswerable from cache.
+    if(!_cloudDataConfirmed||!_cloudServerConfirmed){
       if(!window._selfHealWaits)window._selfHealWaits=0;
       if(window._selfHealWaits++>40)return; // ~20s cap, then give up quietly
       setTimeout(_selfHealUnsyncedLocalRecords,500);
@@ -4316,6 +4352,9 @@ var _eventHealAttempted={};     // order id -> true; never heal the same id twic
 function _selfHealFromEventSnapshots(){
   try{
     if(!_cloudDataConfirmed)return;              // never judge "what is missing" before live data arrived
+    // ...and never from a cache-only view: "the cloud is missing this order" cannot
+    // be concluded from this device's own IndexedDB copy. See _cloudServerConfirmed.
+    if(!_cloudServerConfirmed){_reportHealSuppressed("EVENT","NO_SERVER_READ","snapshots so far are cache-only (fromCache=true) — cannot judge what the cloud is missing",false);return;}
     if(!D||!Array.isArray(D.auditLog))return;
     // RAILS 1-3 (2026-07-29, after the 277-record incident): the same three
     // guards added to _selfHealUnsyncedLocalRecords, applied here too. This path
@@ -12095,7 +12134,41 @@ window.addEventListener("load",function(){
           console.log("[NDSYNC] offline persistence FAILED at "+where+" ("+((err&&err.code)||"unknown")+") — this device has NO durable offline write queue; unsent changes live only in RAM + localStorage");
           _warnNoOfflinePersistence(err);
         };
-        if(typeof fbDb.enablePersistence==="function"){
+        /* WEBKIT (iPad / iPhone / desktop Safari): go STRAIGHT to single-tab.
+           REGRESSION FIX (2026-07-29, same day, from owner feedback within hours of
+           the deploy): enabling persistence closed the missing-order root cause, but
+           it was enabled as MULTI-TAB, and on WebKit that path uses shared Web Locks
+           plus cross-tab coordination — the weakest of the three implementations.
+           Immediately after the deploy the owner reported a NEW symptom on the iPad:
+           **the login page itself hanging**, which had never happened before. The
+           mid-session button freezes (dashboard filter changes, tab switches) PREDATE
+           this change by about a week and are a separate, still-open problem — but the
+           login-page hang is new, and the only thing this change added before login is
+           persistence. So attribute it here rather than assume the change is innocent.
+           Single-tab gives the IDENTICAL durability benefit — a real IndexedDB write
+           queue that survives a reload, tunnel or screen-lock, which is the entire
+           point of the fix — without any of that machinery. Multi-tab's ONLY advantage
+           is several tabs of this app open at once, which is neither expected nor
+           desirable on a delivery phone or a tablet.
+           iPadOS 13+ reports itself as "Macintosh", so a touch-capable Mac is treated
+           as an iPad. Whole detection is inside try/catch: a failure to identify the
+           browser must never stop persistence being attempted at all. */
+        var _isWebKit=false;
+        try{
+          var _ua=(typeof navigator!=="undefined"&&navigator.userAgent)||"";
+          var _iOS=/iPad|iPhone|iPod/i.test(_ua)||
+                   (/Macintosh/i.test(_ua)&&typeof document!=="undefined"&&"ontouchend" in document);
+          var _safari=/Safari/i.test(_ua)&&!/Chrome|Chromium|CriOS|Edg|FxiOS|OPR/i.test(_ua);
+          _isWebKit=!!(_iOS||_safari);
+        }catch(_){}
+        if(typeof fbDb.enablePersistence==="function"&&_isWebKit){
+          console.log("[NDSYNC] WebKit/iOS detected — using single-tab persistence (avoids Safari's shared-lock multi-tab path)");
+          fbDb.enablePersistence().then(function(){
+            _persistOk("single-tab");
+          }).catch(function(e){
+            _persistFail(e,"single-tab (WebKit)");
+          });
+        }else if(typeof fbDb.enablePersistence==="function"){
           // COMPAT build (what this app actually loads).
           fbDb.enablePersistence({synchronizeTabs:true}).then(function(){
             _persistOk("multi-tab");
