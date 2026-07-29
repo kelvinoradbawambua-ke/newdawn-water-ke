@@ -9574,7 +9574,7 @@ function rDebts(q,pg){
     var lastOrd=[].concat(D.orders).filter(function(o){return o.cId===c.id;}).sort(function(a,b){return b.date>a.date?1:-1;})[0];
     var ov=periodInvs.filter(function(i){return i.due&&i.due<td;}).length;
     var old2=periodInvs.length?periodInvs.map(function(i){return i.due;}).filter(Boolean).sort()[0]:null;
-    return{c:c,debt:debt,lastOrd:lastOrd,invCount:periodInvs.length,ov:ov,oldest:old2};
+    return{c:c,debt:debt,gross:_grossDebt,credit:_cr,lastOrd:lastOrd,invCount:periodInvs.length,ov:ov,oldest:old2};
   });
   var q2=DEBT_Q||"";
   // Credit filter mode: show all customers with a credit balance
@@ -9587,7 +9587,22 @@ function rDebts(q,pg){
       })
       .sort(function(a,b){return b.credit-a.credit;});
   }else{
-  debtors=debtors.filter(function(x){return x.debt>0;});
+  /* VISIBILITY FIX (2026-07-29). Netting credit (the fix directly above) is correct
+     arithmetic, but on its own it made customers DISAPPEAR from this page: anyone
+     whose credit covers their invoices netted to 0 and was filtered out entirely.
+     Reported immediately in real use — a customer holding KSh 6,752 of questionable
+     credit against KSh 750 of real delivered water vanished from the debt list, and
+     with him the only route to the credit-correction form (which hangs off the credit
+     badge on these rows). Three live customers were affected: Samson omondi, M706,
+     88/16.
+     Nothing collectable must be shown as collectable — but nothing UNRESOLVED should
+     be hidden either. A row whose gross debt is real and is only cancelled out by
+     store credit is kept, displaying KSh 0 with its credit badge, so the money stays
+     on screen and reachable. Genuinely clear customers (no invoices outstanding at
+     all) are still filtered out, so this does not turn the debt list into a customer
+     list. The header count and total above still use debt>0, so the collectable
+     figures are unchanged by this. */
+  debtors=debtors.filter(function(x){return x.debt>0||(x.gross>0&&x.credit>0);});
   if(q2){var lq=sanitizeInput(q2).toLowerCase();debtors=debtors.filter(function(x){return (can("vPhone")&&x.c.name&&x.c.name.toLowerCase().indexOf(lq)!==-1)||cAddr(x.c).toLowerCase().indexOf(lq)!==-1||(can("vPhone")&&x.c.phone&&x.c.phone.indexOf(q2)!==-1);});}
   }
   var total=debtors.reduce(function(a,x){return a+x.debt;},0);
@@ -9657,7 +9672,7 @@ function rDebts(q,pg){
             (can("vRev")?"<div style=\"margin-top:4px\"><button onclick=\"addFollowUp("+x.c.id+")\" class=\"btn btn-xs\" style=\"font-size:10px;padding:2px 6px;background:#0891b2;color:#fff;border:none\"><i class=\"ti ti-phone-plus\" style=\"font-size:10px\"></i> Follow up</button></div>":"")+
           "</td>"+
           "<td><div>"+(can("vPhone")?x.c.phone:maskPhone(x.c.phone))+"</div><div class=\"ca\">"+cAddr(x.c)+"</div></td>"+
-          "<td><div style=\"font-size:18px;font-weight:900;color:#c0392b\">KSh "+x.debt.toLocaleString()+"</div></td>"+ageing(x.c.id)+
+          "<td><div style=\"font-size:18px;font-weight:900;color:"+(x.debt>0?"#c0392b":"#27ae60")+"\">KSh "+x.debt.toLocaleString()+"</div>"+(x.debt<=0&&x.gross>0?"<div style=\"font-size:10px;color:#3498db;font-weight:700\">KSh "+x.gross.toLocaleString()+" covered by credit</div>":"")+"</td>"+ageing(x.c.id)+
           "<td>"+x.invCount+"</td>"+
           "<td>"+(x.ov>0?"<span class=\"badge br\">"+x.ov+" overdue</span>":"<span class=\"badge bg\">None</span>")+"</td>"+
           "<td style=\"font-weight:700;color:"+(x.oldest&&x.oldest<td?"#c0392b":"var(--tx)")+"\">"+fmt(x.oldest)+"</td>"+
