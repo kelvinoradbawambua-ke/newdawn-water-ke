@@ -1001,6 +1001,12 @@ function saved(){var e=el("sts");if(e){e.className="sts saved";e.innerHTML="<i c
 
 /* ── LIVE CLOUD SYNC ENGINE ── */
 function scheduleCloudSync(){
+  // PREVENTION FIX (2026-07-29): set BEFORE the FB_READY gate on purpose. This
+  // flag is the single honest answer to "does D hold a change that has not yet
+  // been handed to a Firestore write?" — and that has to stay true even when
+  // this call bails out below because the connection isn't ready, which is
+  // exactly the moment the old code forgot the change existed entirely.
+  _pendingLocalWrite=true;
   if(!FB_READY)return;
   if(FB_SYNC_TIMER)clearTimeout(FB_SYNC_TIMER);
   // FIX (2026-07-28): ROOT-CAUSE fix for records going missing — and deliberately
@@ -1024,8 +1030,54 @@ function scheduleCloudSync(){
   // clobber. NOTE: reduces the window, does not eliminate loss if the phone dies
   // mid-transaction; confirm the real-world drop by watching the [NDSYNC] logs on
   // a live phone (PROJECT_CONTEXT §5.1 — never yet done).
-  if(_hasPendingCriticalEdit){pushToCloud();return;}
-  FB_SYNC_TIMER=setTimeout(pushToCloud,800);
+  if(_hasPendingCriticalEdit){FB_SYNC_TIMER=null;pushToCloud();return;}
+  // FIX (2026-07-29): the clearTimeout above never NULLED FB_SYNC_TIMER, and
+  // neither did the timer's own callback — so after the very first debounced
+  // write of a session FB_SYNC_TIMER held a stale, already-fired timer id
+  // forever. Anything trying to answer "is a debounced write still pending?"
+  // from it would have been told "yes" permanently. Nulling it on fire (and on
+  // the immediate-critical path above) makes it truthful, which is what
+  // _flushPendingWritesNow() below depends on.
+  FB_SYNC_TIMER=setTimeout(function(){FB_SYNC_TIMER=null;pushToCloud();},800);
+}
+// PREVENTION FIX (2026-07-29) — see the block comment on _flushPendingWritesNow().
+var _pendingLocalWrite=false; // true = D holds at least one change no Firestore write has carried yet
+// What the currently-in-flight write actually carries — set in _buildWritePayload(),
+// consumed in _onWriteSuccess(). MUST be declared (not just assigned), or reading it
+// before the session's first write would throw a ReferenceError.
+var _syncInFlight=null;
+/* ROOT-CAUSE FIX (2026-07-29): "orders go missing" — the PREVENTION half.
+   Everything already in this file for this problem is RECOVERY (self-heal at
+   login, the pending-order ledger, the missing-order audit reconciler). The
+   owner's standing instruction is to stop the loss instead. Two moments were
+   destroying a completed-but-unwritten record before it could ever reach the
+   shared document, and this helper is what both now call:
+
+     1. THE PHONE GOING IN THE POCKET. visibilitychange->hidden was the last
+        guaranteed moment of JavaScript before a mobile tab is frozen or
+        discarded, and it did nothing but arm a 2-minute pause timer. A write
+        still sitting on the 800ms debounce — which is EVERY order edit, since
+        saveOrd() only sets _hasPendingCriticalEdit for creation, not edits —
+        simply never started. A frozen timer does not fire, and a discarded tab
+        never resumes; the self-heal cannot rescue it either, because that is
+        deliberately add-only and an edit changes a record that already exists
+        in the cloud. Flushing here starts the write while the app is still
+        alive, instead of leaving it to a timer that may never run.
+
+     2. LOGOUT. See logout() — staff idle timeout is 60 SECONDS, so a pocketed
+        delivery phone logs itself out roughly a minute after an order is
+        placed, and logout() used to discard the write queue outright.
+
+   Deliberately conservative: it only fires when there is genuinely UNSTARTED
+   work, so a write already in flight is never duplicated and the free-tier
+   write budget is untouched in the normal case. */
+function _flushPendingWritesNow(reason){
+  if(!FB_READY||!FB_DOC_REF)return false;
+  if(!_pendingLocalWrite&&!FB_WRITE_QUEUE.length)return false; // nothing unstarted — do not spend a write
+  if(FB_SYNC_TIMER){clearTimeout(FB_SYNC_TIMER);FB_SYNC_TIMER=null;} // superseded by the immediate flush
+  console.log("[NDSYNC] flush-now ("+reason+") — pendingLocal="+_pendingLocalWrite+" queued="+FB_WRITE_QUEUE.length+" writing="+FB_WRITING);
+  pushToCloud();
+  return true;
 }
 var FB_WRITE_RETRY_TIMER=null; // QUOTA GUARD: only one pending write-retry may exist at a time
 var FB_WRITE_RETRY_ATTEMPTS=0; // QUOTA GUARD: drives backoff instead of a fixed 5s-forever hammer
@@ -1570,6 +1622,29 @@ function processWriteQueue(){
     _sizeKB=Math.round(_payloadStr.length/1024);
     if(_sizeKB>800){toast("⚠️ Data near Firestore limit ("+_sizeKB+"KB/1000KB). Export a backup and ask your tech team to archive old orders.","warn");}
   }catch(e){}
+  // ROOT-CAUSE FIX (2026-07-29): record exactly WHAT this payload carries, at the
+  // one instant it is finalised. _onWriteSuccess() used to wipe _stockQtyDeltas,
+  // _stockDeltasByOrder, _hasPendingCriticalEdit and the pending-order ledger
+  // WHOLESALE — but the payload it was confirming had been snapshotted when the
+  // transaction STARTED, and a Firestore round trip is easily long enough for a
+  // staff member to place an order inside it. That order is not in the committed
+  // payload, yet every one of those wipes marked it as confirmed. The concrete,
+  // reproduced loss (_proof_missing_order_prevention.js, scenario 3): the new
+  // order's stock delta of -3 is wiped, so the NEXT write's reconcile computes
+  // mergedItem.qty = (server qty) + 0 and assigns it over the local value —
+  // silently reverting the deduction. The ledger wipe separately disarmed that
+  // order's crash safety net while it was still genuinely unwritten. Capturing
+  // here (rather than at queue time) is deliberate: a transaction callback may
+  // run several times, and each retry rebuilds the payload, so the LAST capture
+  // is always the one that actually commits.
+  _syncInFlight={
+    deltas:JSON.parse(JSON.stringify(_stockQtyDeltas||{})),
+    deltasByOrder:JSON.parse(JSON.stringify(_stockDeltasByOrder||{})),
+    orderCids:(DforSync.orders||[]).reduce(function(m,o){if(o&&o._cid)m[o._cid]=true;return m;},{})
+  };
+  // Everything in D as of this moment is now the responsibility of this write.
+  // If it fails, _onWriteFailure() re-arms this flag.
+  _pendingLocalWrite=false;
   console.log("[NDSYNC] processWriteQueue SENDING to Firestore — orders="+(DforSync.orders?DforSync.orders.length:0)+" customers="+(DforSync.customers?DforSync.customers.length:0)+" sizeKB="+_sizeKB);
   return JSON.parse(JSON.stringify(payload));
   }
@@ -1577,10 +1652,31 @@ function processWriteQueue(){
   function _onWriteSuccess(){
     console.log("[NDSYNC] processWriteQueue SUCCESS — write confirmed by Firestore at "+new Date().toISOString());
     FB_WRITING=false;
-    _stockQtyDeltas={}; // deltas are now reflected in the confirmed write — must not be re-applied next cycle
-    _stockDeltasByOrder={}; // same reasoning - once confirmed, no longer pending/reversible, no need to keep tracking
-    _hasPendingCriticalEdit=false; // same reasoning - this write's critical edits are now confirmed
-    _clearConfirmedLedgerEntries(); // any pending-order token now present in D.orders genuinely made it - stop tracking it
+    // ROOT-CAUSE FIX (2026-07-29): retire ONLY what this write actually carried.
+    // These four lines used to clear everything unconditionally, which marked
+    // work created DURING the round trip as confirmed when it had never been
+    // sent — see the _syncInFlight capture in _buildWritePayload() for the full
+    // reasoning and the reproduced stock-reversion failure.
+    var _sent=_syncInFlight||{deltas:{},deltasByOrder:{},orderCids:{}};
+    // Subtract the deltas this write carried; anything accumulated since stays
+    // pending so the next write's reconcile still applies it.
+    Object.keys(_sent.deltas||{}).forEach(function(sid){
+      var remaining=(_stockQtyDeltas[sid]||0)-_sent.deltas[sid];
+      if(remaining===0)delete _stockQtyDeltas[sid];else _stockQtyDeltas[sid]=remaining;
+    });
+    Object.keys(_sent.deltasByOrder||{}).forEach(function(oid){
+      if(!_stockDeltasByOrder[oid])return;
+      Object.keys(_sent.deltasByOrder[oid]).forEach(function(sid){
+        var rem=(_stockDeltasByOrder[oid][sid]||0)-_sent.deltasByOrder[oid][sid];
+        if(rem===0)delete _stockDeltasByOrder[oid][sid];else _stockDeltasByOrder[oid][sid]=rem;
+      });
+      if(!Object.keys(_stockDeltasByOrder[oid]).length)delete _stockDeltasByOrder[oid];
+    });
+    // A write queued while this one was in flight means genuinely new critical
+    // work exists — keep the flag so that write still takes the immediate path.
+    if(!FB_WRITE_QUEUE.length)_hasPendingCriticalEdit=false;
+    _clearConfirmedLedgerEntries(_sent.orderCids); // only tokens this write genuinely committed
+    _syncInFlight=null;
     FB_WRITE_RETRY_ATTEMPTS=0; // a successful write means the connection/quota is healthy again
     _hideCloudOfflineBanner();
     var e=el("sts");if(e){e.className="sts saved";e.innerHTML="<i class=\"ti ti-cloud-check\"></i> Synced "+new Date().toLocaleTimeString();}
@@ -1594,6 +1690,15 @@ function processWriteQueue(){
   function _onWriteFailure(err){
     console.log("[NDSYNC] processWriteQueue FAILED — code="+(err&&err.code)+" message="+(err&&err.message));
     FB_WRITING=false;
+    // FIX (2026-07-29): this write did NOT land, so the changes it was carrying
+    // are unflushed again. _buildWritePayload() optimistically cleared the flag
+    // when it handed them over; re-arm it so _flushPendingWritesNow() (on
+    // background/pocket and on logout) still knows there is work to rescue,
+    // instead of concluding everything is safely synced. The backoff retry below
+    // is the normal path — this flag is what covers the case where the app is
+    // backgrounded or logged out before that retry ever gets to run.
+    _pendingLocalWrite=true;
+    _syncInFlight=null;
     var errMsg=err&&err.message?err.message:(err&&err.code?err.code:"unknown");
     var isQuota=err&&(err.code==="resource-exhausted"||/quota/i.test(errMsg));
     var e=el("sts");
@@ -1631,13 +1736,35 @@ function processWriteQueue(){
   // offline the server get() rejects and we still issue a plain set() so the
   // write is queued locally by Firestore and syncs on reconnect - preserving
   // field-device offline behavior exactly.
+  /* SAFETY GUARD (2026-07-29): the payload is built INSIDE the async callbacks
+     below, not when the write was queued — and a Firestore transaction callback
+     may additionally be re-run by the SDK. Both mean _buildDforSync() can read D
+     at a moment well after this write started, including after a logout teardown
+     has emptied D. Committing that payload would overwrite the live shared
+     document with a clean slate: the exact catastrophe the doc.metadata.fromCache
+     guard exists to prevent on the read side, arriving instead through the write
+     side. pushToCloud()'s isEmpty check cannot catch it, because that runs at
+     queue time when D was still full. Same test as that guard, applied at the
+     only instant that actually matters — immediately before the payload is sent. */
+  function _dLooksEmpty(src){
+    if(!src||typeof src!=="object")return true;
+    return (!src.customers||(src.customers||[]).length===0)&&
+           (!src.orders||(src.orders||[]).length===0)&&
+           (!src.stock||(src.stock||[]).length===0);
+  }
+  var ND_ABORT_EMPTY="ND_ABORT_EMPTY_D";
+
   function _fallbackWrite(){
     var DforSync=_buildDforSync();
     FB_DOC_REF.get({source:"server"}).then(function(freshDoc){
       _lastFreshnessCheckTime=Date.now();
       if(freshDoc.exists&&freshDoc.data()&&freshDoc.data().D)_reconcileDforSync(DforSync,freshDoc.data().D);
+      if(_dLooksEmpty(DforSync)&&FB_SETUP_DONE){console.log("[NDSYNC] fallback write ABORTED — D is empty (teardown raced this write); refusing to clean-slate the shared document");FB_WRITING=false;return;}
       _sendWritePayload(DforSync);
-    }).catch(function(){ _sendWritePayload(DforSync); });
+    }).catch(function(){
+      if(_dLooksEmpty(DforSync)&&FB_SETUP_DONE){console.log("[NDSYNC] fallback write ABORTED — D is empty (teardown raced this write); refusing to clean-slate the shared document");FB_WRITING=false;return;}
+      _sendWritePayload(DforSync);
+    });
   }
 
   // PRIMARY atomic path.
@@ -1647,6 +1774,7 @@ function processWriteQueue(){
       return txn.get(FB_DOC_REF).then(function(freshDoc){
         var DforSync=_buildDforSync(); // FRESH each attempt - idempotent under retry
         if(freshDoc.exists&&freshDoc.data()&&freshDoc.data().D)_reconcileDforSync(DforSync,freshDoc.data().D);
+        if(_dLooksEmpty(DforSync)&&FB_SETUP_DONE)throw new Error(ND_ABORT_EMPTY); // see _dLooksEmpty
         txn.set(FB_DOC_REF,_buildWritePayload(DforSync),{merge:true});
       });
     }).then(function(){
@@ -1654,6 +1782,13 @@ function processWriteQueue(){
       console.log("[NDSYNC] processWriteQueue atomic transaction COMMITTED at "+new Date().toISOString());
       _onWriteSuccess();
     }).catch(function(err){
+      if(err&&err.message===ND_ABORT_EMPTY){
+        // Deliberate abort, not a failure: no banner, no retry hammer. The data
+        // still lives in localStorage and the login self-heal remains the net.
+        console.log("[NDSYNC] atomic write ABORTED — D is empty (teardown raced this write); refusing to clean-slate the shared document");
+        FB_WRITING=false;_syncInFlight=null;
+        return;
+      }
       if(_isTransientOffline(err)){
         console.log("[NDSYNC] atomic write unavailable (offline?) - falling back to a queued write: "+(err&&err.code));
         _fallbackWrite();
@@ -3128,7 +3263,25 @@ function _initVisibilityRecovery(){
         startCloudListener(true);
       }
       var c=el("cloud-status");if(c)c.innerHTML="<i class=\"ti ti-refresh\"></i> Refreshing\u2026";
+      // ROOT-CAUSE FIX (2026-07-29): coming back is also a rescue point. If the
+      // tab was frozen with unstarted work (or a write failed while we were away
+      // and its backoff retry was frozen along with everything else), start it
+      // now rather than waiting for the next unrelated user action to happen to
+      // call dirty(). No-ops when there is nothing unstarted.
+      _flushPendingWritesNow("visibility-visible");
     }else if(document.visibilityState==="hidden"){
+      // ROOT-CAUSE FIX (2026-07-29): this is the LAST guaranteed moment of
+      // JavaScript before a mobile tab may be frozen or discarded outright, and
+      // until now nothing was flushed here — the handler only armed the pause
+      // timer below. Any write still sitting on the 800ms debounce therefore
+      // never started: a frozen timer does not fire, and a discarded tab never
+      // resumes. That covers EVERY order edit, because saveOrd() sets
+      // _hasPendingCriticalEdit for creation only (see `if(!editId)` there), and
+      // a lost edit is invisible to the self-heal too, since that is
+      // deliberately add-only and the order already exists in the cloud.
+      // Starting the write here — while the app is still alive — is the
+      // prevention this problem needed. No-ops when nothing is unstarted.
+      _flushPendingWritesNow("visibility-hidden");
       // TIER 3 (2026-07-20): don't tear down immediately on every brief
       // switch-away — only pause the connection if it stays hidden for the
       // full threshold. This is the change with the most direct effect on
@@ -3149,6 +3302,17 @@ function _initVisibilityRecovery(){
         }
       },BACKGROUND_PAUSE_MS);
     }
+  });
+  // ROOT-CAUSE FIX (2026-07-29): belt-and-braces alongside visibilitychange.
+  // On mobile there are real teardown paths where "hidden" is not delivered but
+  // pagehide is — the tab being evicted under memory pressure, the browser being
+  // swiped away, an OS-level kill. pagehide is the last event the page ever sees
+  // in those cases, so it gets the same flush. Both are no-ops when there is
+  // nothing unstarted, so the common case costs nothing and the free-tier write
+  // budget is unaffected. Deliberately NOT "beforeunload": that does not fire
+  // reliably on mobile at all, which is the platform this whole fix is about.
+  window.addEventListener("pagehide",function(){
+    _flushPendingWritesNow("pagehide");
   });
 }
 function _updateSyncAge(){
@@ -3603,6 +3767,99 @@ function pk(k){
     });
   }
 }
+/* ROOT-CAUSE FIX (2026-07-29): SELF-HEAL this device's own unsynced records.
+   Diagnosed from a real incident (order #1355, placed by staff Antony, lost;
+   re-entered minutes later as #1357). Chain of events:
+     1. saveOrd() creates the order in RAM and calls dirty(), which runs
+        autoSaveLocal() SYNCHRONOUSLY — so the order is durable in localStorage
+        immediately — and schedules the cloud write.
+     2. The cloud write is the ONLY path into the shared document, and on a
+        delivery phone it routinely does not complete (screen lock, app
+        backgrounded, signal drop, tab evicted, or the _cloudDataConfirmed gate
+        holding the write after a background/resume).
+     3. The app reloads. Firestore has no such order.
+     4. checkAutoSaveRecovery() — the one thing that reads that localStorage copy
+        — RETURNED EARLY FOR STAFF/DRIVER ("trust Firestore"), and for a
+        director its count heuristic (snapOrds > currOrds+10) never fires for a
+        one-order gap. So the copy holding the order was never even looked at.
+     5. Net effect: the order existed durably on the phone AND as an ORDER_PLACED
+        audit snapshot in Firestore, yet the system treated it as gone. Staff
+        place most orders here, so step 4 is the common case, not an edge.
+   This heals it at the source: re-insert records this device saved locally that
+   the confirmed cloud state is missing. Deliberately narrow and safe —
+   ADD-ONLY (never removes or overwrites anything, so it cannot repeat the
+   dangerous wholesale-replace this file removed on 2026-07-25), tombstone-
+   respecting, dismissal-respecting, and recency-bounded so it can never
+   resurrect an old intentionally-removed record. Same principle already proven
+   in the sync merge: absence is never evidence of deletion — only a tombstone is.
+   Runs for EVERY role, which is the actual fix. */
+function _selfHealUnsyncedLocalRecords(){
+  try{
+    // Never judge "what does live data look like" before live data has arrived —
+    // the same rule checkAutoSaveRecovery itself follows below.
+    if(!_cloudDataConfirmed){
+      if(!window._selfHealWaits)window._selfHealWaits=0;
+      if(window._selfHealWaits++>40)return; // ~20s cap, then give up quietly
+      setTimeout(_selfHealUnsyncedLocalRecords,500);
+      return;
+    }
+    if(window._selfHealDone)return; // once per session
+    window._selfHealDone=true;
+    var snap=autoSaveCheckLocal();
+    if(!snap||!snap.D)return;
+    // Recency bound: tombstones are pruned at 90 days (pruneOldTombstones), so a
+    // record created within this window is guaranteed to still have its deletion
+    // tombstone if it was ever deleted — which is what makes "no tombstone" a
+    // trustworthy signal here. Anything older is left alone.
+    var _healCutoff=Date.now()-14*24*60*60*1000;
+    function _recent(r){
+      if(r&&typeof r._ts==="number")return r._ts>=_healCutoff;
+      var d=r&&(r.date||r.deliveredAt);
+      if(!d)return false; // no usable timestamp — do not touch
+      var t=new Date(d+"T12:00:00").getTime();
+      return !isNaN(t)&&t>=_healCutoff;
+    }
+    var _dismissed={};(D.dismissedMissingOrders||[]).forEach(function(id){_dismissed[id]=true;});
+    var _liveOrd={};(D.orders||[]).forEach(function(o){_liveOrd[o.id]=true;});
+    var _healedOrds=[];
+    (snap.D.orders||[]).forEach(function(so){
+      if(!so||so.id==null)return;
+      if(_liveOrd[so.id])return;                                   // already present
+      if((D.deletedOrderIds&&D.deletedOrderIds[so.id])||_recentlyDeletedOrderIds[so.id])return; // deliberately deleted
+      if(_dismissed[so.id])return;                                 // a director already resolved this gap by hand
+      if(!_recent(so))return;                                      // too old to trust
+      (D.orders||[]).push(JSON.parse(JSON.stringify(so)));
+      _healedOrds.push(so.id);
+    });
+    var _liveInv={};(D.invoices||[]).forEach(function(i){_liveInv[i.id]=true;});
+    var _healedInvs=[];
+    (snap.D.invoices||[]).forEach(function(si){
+      if(!si||si.id==null)return;
+      if(_liveInv[si.id])return;
+      if(D.deletedInvoiceIds&&D.deletedInvoiceIds[si.id])return;
+      if(_recentlyVoidedInvoiceIds&&_recentlyVoidedInvoiceIds[si.id])return;
+      // Only heal an invoice whose order is (or is now) live — never a floating one.
+      var _oid=si.orderId!=null?si.orderId:(si.notes&&si.notes.match(/#(\d+)/)?parseInt(si.notes.match(/#(\d+)/)[1]):null);
+      if(_oid==null)return;
+      if(!(D.orders||[]).some(function(o){return String(o.id)===String(_oid);}))return;
+      if(!_recent(si))return;
+      (D.invoices||[]).push(JSON.parse(JSON.stringify(si)));
+      _healedInvs.push(si.id);
+    });
+    if(!_healedOrds.length&&!_healedInvs.length)return;
+    console.log("[NDSYNC] SELF-HEAL restored unsynced local record(s) — orders=["+_healedOrds.join(",")+"] invoices=["+_healedInvs.join(",")+"]");
+    // Genuine record creation from this device's own durable local copy — force a
+    // fresh conflict check and flush immediately (scheduleCloudSync fires at once
+    // when this flag is set), so the heal itself cannot sit unwritten.
+    _hasPendingCriticalEdit=true;
+    auditLog("ORDER_PLACED","SELF-HEAL: restored "+_healedOrds.length+" order(s) ["+_healedOrds.join(", ")+"] and "+_healedInvs.length+" invoice(s) from this device's local auto-save — they were created here but never reached the cloud. Original ids preserved; stock not re-deducted.");
+    dirty();
+    try{
+      if(_healedOrds.length)toast("Recovered "+_healedOrds.length+" order(s) saved on this device that had not reached the cloud: #"+_healedOrds.join(", #"),"warn");
+      refreshCurrentPage();
+    }catch(_){}
+  }catch(e){/* best-effort — never block startup on this */}
+}
 async function checkAutoSaveRecovery(){
   // Always restore auditLog from localStorage first (it is never in Firestore)
   var _localSnap=autoSaveCheckLocal();
@@ -3617,9 +3874,16 @@ async function checkAutoSaveRecovery(){
     (D.auditLog||[]).sort(function(a,b){return a.ts>b.ts?1:-1;});
     if((D.auditLog||[]).length>AUDIT_HOT_MAX)D.auditLog=(D.auditLog||[]).slice(-AUDIT_HOT_MAX);
   }
-  // Non-director/manager roles: skip localStorage restore — trust Firestore
+  // Non-director/manager roles: skip the COUNT-HEURISTIC restore below (it can
+  // wholesale-replace live data and is deliberately director-only) — but still
+  // self-heal this device's own unsynced records. FIX (2026-07-29): this early
+  // return used to skip localStorage entirely for staff/driver ("trust
+  // Firestore"), which is exactly how staff-placed order #1355 was lost: it sat
+  // complete in this phone's localStorage while the app never looked. Staff place
+  // most orders here, so this was the common loss path, not an edge case.
   if(!CU||( CU.role!=="director"&&CU.role!=="manager")){
     buildApp();
+    _selfHealUnsyncedLocalRecords();
     return;
   }
   // ROOT-CAUSE FIX (2026-07-20): everything below this line compares a local
@@ -3642,6 +3906,13 @@ async function checkAutoSaveRecovery(){
     setTimeout(checkAutoSaveRecovery,500);
     return;
   }
+  // FIX (2026-07-29): heal this device's own unsynced records FIRST, add-only.
+  // The count heuristic below only ever fires for a large divergence (>5 customers
+  // or >10 orders), so a one- or two-order gap — the realistic loss — was invisible
+  // to a director too. Running the precise add-only heal first also means the
+  // heuristic sees the already-corrected counts, making the far riskier
+  // wholesale-restore prompt less likely to be needed at all.
+  _selfHealUnsyncedLocalRecords();
   var snap=autoSaveCheckLocal();
   var hasCurrentData=(D.customers||[]).length||(D.orders||[]).length||(D.invoices||[]).length;
   if(snap&&snap.D){
@@ -4075,14 +4346,44 @@ function _wizFinishWrite(finalUsers){
     setTimeout(wizFinish,3000);
   });
 }
+var LOGOUT_FLUSH_MAX_MS=6000; // hard cap on how long teardown waits for a rescue write; the UI has already returned to the login screen, so this is never felt
 function logout(){
   stopAutoSaveLoop();
   // Stop idle timer for ALL roles immediately
   stopIdleWatcher();
-  // Cancel any pending cloud sync timer
+  /* ROOT-CAUSE FIX (2026-07-29): THE main "orders go missing" path, and the
+     reason this kept happening despite every recovery net already in the file.
+
+     Staff — who place most orders — have a SIXTY SECOND idle timeout
+     (resetIdleTimer: `CU.role==="staff"?60000:...`), and resetIdleTimer only
+     listens for click/keydown/touchstart/mousemove. A delivery phone that is
+     pocketed straight after an order is placed generates none of those, so this
+     function runs, automatically, about a minute later — while the screen-locked
+     tab's Firestore transaction is frozen and unfinished.
+
+     What logout() then did:
+       - cancelled the pending debounce timer,
+       - `FB_WRITE_QUEUE=[]; FB_WRITING=false;` — discarded the queued write
+         outright,
+       - skipped the final push, because _snapshotIsFresh requires a snapshot
+         within 15s and the phone had been backgrounded far longer,
+       - set FB_READY=false, FB_DOC_REF=null and wiped D.
+     So the one path the order had into the shared document was destroyed by the
+     app itself, which is exactly why the tiny ORDER_PLACED audit event always
+     survived while the order did not.
+
+     Now: detect unsynced work FIRST (before any of the lines below can destroy
+     the evidence of it), flush it through the normal atomic + reconciling write
+     path — the safe one, which re-reads and merges, unlike the raw set() below
+     — and defer the teardown until that write settles or LOGOUT_FLUSH_MAX_MS
+     elapses. Reproduced and proven in _proof_missing_order_prevention.js §1. */
+  var _unsyncedAtLogout=FB_READY&&FB_DOC_REF&&D&&typeof D==="object"&&
+    (_pendingLocalWrite||FB_WRITE_QUEUE.length>0||FB_WRITING);
+  // Cancel the pending debounce timer — the explicit flush below supersedes it.
   if(FB_SYNC_TIMER){clearTimeout(FB_SYNC_TIMER);FB_SYNC_TIMER=null;}
-  // Clear write queue to prevent post-logout writes
-  FB_WRITE_QUEUE=[];FB_WRITING=false;
+  // NOTE: the write queue is deliberately NOT cleared here any more. That wipe
+  // moved into _finishLogoutTeardown(), which runs only after the flush above
+  // has had its chance.
   // Flush queued audit events before disconnecting
   if(FB_EVENTS_COL&&FB_READY){
     var aq=(window._auditQueue||[]).concat(window._auditFailQ||[]);
@@ -4123,6 +4424,51 @@ function logout(){
       console.log("[NDSYNC] logout SKIPPED final push — snapshot not confirmed fresh (avoids clobbering other devices' data)");
     }
   }catch(e){}
+  // Session identity is cleared IMMEDIATELY, before any deferred teardown. The
+  // security requirement is that the next person at this phone cannot see or act
+  // as this user, and that is satisfied by clearing CU/SU/PE and showing the
+  // login screen — not by the exact timing of the D wipe. Clearing CU here is
+  // also what makes the guard at the top of _finishLogoutTeardown() meaningful.
+  CU=null;SU=null;PE="";
+  if(_unsyncedAtLogout){
+    console.log("[NDSYNC] logout — unsynced local work detected, flushing BEFORE teardown (this used to be discarded)");
+    _flushPendingWritesNow("logout");
+    var _waited=0;
+    function _awaitLogoutFlush(){
+      var _settled=!FB_WRITING&&!FB_WRITE_QUEUE.length&&!FB_PENDING_CONFIRM_RETRY;
+      if(_settled||_waited>=LOGOUT_FLUSH_MAX_MS){
+        if(!_settled)console.log("[NDSYNC] logout flush did not settle within "+LOGOUT_FLUSH_MAX_MS+"ms — tearing down anyway; the synchronous localStorage auto-save plus the login self-heal remain as the backstop");
+        else console.log("[NDSYNC] logout flush settled — safe to tear down");
+        _finishLogoutTeardown();
+        return;
+      }
+      _waited+=250;setTimeout(_awaitLogoutFlush,250);
+    }
+    // Deliberately deferred by one tick rather than checked inline. Checking
+    // synchronously here would ask "has the write settled?" in the same turn the
+    // flush was requested, and would only ever get the right answer because
+    // pushToCloud() happens to set FB_WRITING synchronously via processWriteQueue().
+    // Any future change to that path — a write that registers itself in a promise,
+    // a queue that defers — would silently turn this back into "tear down
+    // immediately and discard the order", which is the exact bug being fixed here.
+    // One tick costs nothing (the login screen is already showing) and makes the
+    // guarantee independent of pushToCloud()'s internal timing.
+    setTimeout(_awaitLogoutFlush,250);
+  }else{
+    _finishLogoutTeardown();
+  }
+  renderLogin();
+}
+/* ROOT-CAUSE FIX (2026-07-29): the destructive half of logout(), split out so it
+   can be DEFERRED until a rescue write has actually landed. Everything here was
+   previously inline in logout() and ran unconditionally, synchronously, which is
+   what destroyed unwritten orders — see the block comment in logout(). */
+function _finishLogoutTeardown(){
+  // If someone has logged in again during the (bounded) wait, this teardown
+  // belongs to a session that no longer exists — running it would rip the
+  // connection and D out from under the NEW session. CU is the definitive
+  // "a session is live" signal, and logout() clears it synchronously above.
+  if(CU)return;
   if(FB_HEARTBEAT_TIMER){clearInterval(FB_HEARTBEAT_TIMER);FB_HEARTBEAT_TIMER=null;}
   if(window._syncAgeTicker){clearInterval(window._syncAgeTicker);window._syncAgeTicker=null;}
   if(FB_RECONNECT_TIMER){clearTimeout(FB_RECONNECT_TIMER);FB_RECONNECT_TIMER=null;}
@@ -4130,11 +4476,18 @@ function logout(){
   if(FB_UNSUB){try{FB_UNSUB();}catch(e){}FB_UNSUB=null;}
   if(FB_AUDIT_UNSUB){try{FB_AUDIT_UNSUB();}catch(e){}FB_AUDIT_UNSUB=null;}
   FB_READY=false;FB_DOC_REF=null;_APP_READY=false;
+  // Now — and only now — stop accepting writes. Moved here from the top of
+  // logout(); clearing it there is precisely what discarded pending orders.
+  FB_WRITE_QUEUE=[];FB_WRITING=false;
+  // Cancel retries so nothing fires against the now-null FB_DOC_REF.
+  if(FB_WRITE_RETRY_TIMER){clearTimeout(FB_WRITE_RETRY_TIMER);FB_WRITE_RETRY_TIMER=null;}
+  if(FB_PENDING_CONFIRM_RETRY){clearTimeout(FB_PENDING_CONFIRM_RETRY);FB_PENDING_CONFIRM_RETRY=null;}
+  // D is about to be emptied, so there is genuinely nothing left in memory to
+  // flush — leaving these set would make them lie to the next session.
+  _pendingLocalWrite=false;_syncInFlight=null;
   // Clear all session data — security: prevent data leak to next user
   D={customers:[],stock:[],orders:[],offers:[],invoices:[],routes:[],
      complaints:[],pendingPayments:[],auditLog:[]};
-  CU=null;SU=null;PE="";
-  renderLogin();
 }
 function nav(p,btn){
   if(!can(p))return;
@@ -5011,7 +5364,9 @@ async function delC(id){
   msg+="Their pending/unfulfilled orders will be removed and any deducted stock restored. Cannot be undone.";
   if(!(await uiConfirm({title:"Remove customer",message:msg,variant:"danger",confirmText:"Remove customer"})))return;
   // Restore stock for pending/unfulfilled orders before removing them
-  (D.orders||[]).filter(function(o){return o.cId===id&&o.status!=="Delivered"&&o.status!=="Cancelled"&&o.prodConfirmed!==false;}).forEach(function(o){
+  // FIX (2026-07-29): _stockNotDeducted added — a restored record never took stock, so
+  // this cascade must not give it back either (same guard as delO/_finishCancelO).
+  (D.orders||[]).filter(function(o){return o.cId===id&&o.status!=="Delivered"&&o.status!=="Cancelled"&&o.prodConfirmed!==false&&o._stockNotDeducted!==true;}).forEach(function(o){
     var st=(D.stock||[]).find(function(s){return (o.stockId&&s.id===o.stockId)||s.name===o.prod;});
     if(st){st.qty+=o.qty;_recordStockDelta(st.id,o.qty);}
   });
@@ -5354,7 +5709,28 @@ function reversePayment(invId,pid,payIdx){
     if(inv.paid>=inv.amount){o.paid="Paid";}else if(inv.paid>0){o.paid="Partial";}else{o.paid="Unpaid";}
     o.amtPaid=inv.paid;
   }
-  auditLog("PAYMENT_RECORDED","REVERSAL: KSh "+pay.amt+" removed from Invoice #"+invId+" by "+CU.name+". Method: "+pay.method+". New paid total: KSh "+inv.paid);
+  // FIX (2026-07-29): an overpayment records TWO things from ONE cash event — the
+  // invoice payment AND a separate customer-credit entry tagged with that payment's
+  // pid (srcPid, set by recPay/completeDlv). Reversing the payment used to remove
+  // only the invoice portion, leaving the credit standing — a fabricated liability
+  // from a payment the director just undid. Reverse the linked credit too: reduce
+  // cu.credit and append a matching negative creditLog entry (same reduce-and-log
+  // pattern recPay's "applied" credit uses), so the whole cash event is cleanly
+  // undone. Clamped ≥0 (if the customer already spent the credit we can't claw back
+  // more than remains). A second reverse of the same payment is a no-op — the
+  // payment is already gone, so this never double-reverses.
+  var _revCredit=0;
+  if(pay&&pay.pid!=null){
+    var _revCu=(D.customers||[]).find(function(x){return x.id===inv.cId;});
+    if(_revCu&&_revCu.creditLog){
+      _revCu.creditLog.filter(function(l){return l.srcPid===pay.pid&&l.type==="overpayment"&&(l.amt||0)>0;}).forEach(function(l){
+        _revCredit=_round2(_revCredit+(l.amt||0));
+        _revCu.creditLog.push({cid:uid(),date:tday(),amt:-_round2(l.amt||0),type:"reversal",invId:invId,by:CU.name,role:CU.role,note:"Overpayment credit reversed together with its payment on Invoice #"+invId});
+      });
+      if(_revCredit>0)_revCu.credit=_round2(Math.max(0,(_revCu.credit||0)-_revCredit));
+    }
+  }
+  auditLog("PAYMENT_RECORDED","REVERSAL: KSh "+pay.amt+" removed from Invoice #"+invId+" by "+CU.name+". Method: "+pay.method+". New paid total: KSh "+inv.paid+(_revCredit>0?" | KSh "+_revCredit+" linked overpayment credit also reversed":""));
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
   dirty();
   if(el("pg-invoices")&&el("pg-invoices").classList.contains("act"))rInvs(undefined,INV_PAGE);
@@ -5493,7 +5869,13 @@ function recPay(){
       amt=bal;        // invoice gets exactly what it needs
     }
     if(!inv.payments)inv.payments=[];
-    inv.payments.push({pid:uid(),date:payDate,amt:amt,method:method,ref:ref});
+    // FIX (2026-07-29): capture this payment's pid so an overpayment credit born
+    // from the SAME cash event can be tagged with it (srcPid). reversePayment then
+    // reverses that credit alongside the payment instead of orphaning it (an
+    // overpaid-then-reversed payment used to leave the credit standing — a
+    // fabricated liability the business would later honour as real goods).
+    var _ovPayPid=uid();
+    inv.payments.push({pid:_ovPayPid,date:payDate,amt:amt,method:method,ref:ref});
     inv.paid=_round2(inv.payments.reduce(function(s,p){return s+(p.amt||0);},0));
     // Store overpayment as customer credit balance
     if(credit>0){
@@ -5501,7 +5883,7 @@ function recPay(){
       if(cu){
         cu.credit=_round2((cu.credit||0)+credit);
         if(!cu.creditLog)cu.creditLog=[];
-        cu.creditLog.push({cid:uid(),date:payDate,amt:credit,type:"overpayment",invId:invId,method:method,ref:ref,by:CU.name,role:CU.role,note:"Overpayment on Invoice #"+invId});
+        cu.creditLog.push({cid:uid(),srcPid:_ovPayPid,date:payDate,amt:credit,type:"overpayment",invId:invId,method:method,ref:ref,by:CU.name,role:CU.role,note:"Overpayment on Invoice #"+invId});
         toast("KSh "+credit.toLocaleString()+" overpayment stored as credit for "+(can("vPhone")?cu.name:maskName(cu.name)),"ok");
       }
     }
@@ -6473,12 +6855,24 @@ async function saveOrd(){
     else if(amtPaid>0){payStatus="Partial";}
     else{payStatus="Unpaid";}
     o.paid=payStatus;o.amtPaid=amtPaid;
-    var linkedInv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&((o.invoiceId&&i.id===o.invoiceId)||(!o.invoiceId&&i.notes&&i.notes.match(new RegExp("#"+o.id+"(\\D|$)"))));});
+    // FIX (2026-07-29): match the linked invoice by its AUTHORITATIVE id / order-
+    // unique notes tag, NOT gated on i.cId. When a director reassigns the order to
+    // a different customer, o.cId is already the NEW id by this point, so the old
+    // `i.cId===o.cId` gate returned null even though o.invoiceId points straight at
+    // the invoice — the code then created a SECOND invoice for the new customer and
+    // left the old one charging the OLD customer forever (the order's amount
+    // double-counted across two customers, an orphan debt no UI could clear, and
+    // delO's later cId-gated guard couldn't even see it to write it off). Order id
+    // and invoice id are both unique, so dropping the cId gate is safe; then migrate
+    // the invoice's cId so the invoice FOLLOWS the order (and its payments) to the
+    // new customer. For the common no-reassignment edit this is a no-op (same cId).
+    var linkedInv=(D.invoices||[]).find(function(i){return (o.invoiceId&&i.id===o.invoiceId)||(!o.invoiceId&&i.notes&&i.notes.match(new RegExp("#"+o.id+"(\\D|$)")));});
+    if(linkedInv)linkedInv.cId=cId;
     if(payStatus!=="Paid"){
       if(linkedInv){
         linkedInv.amount=_round2(price*qty);
         if(amtPaid>linkedInv.paid){
-          var diff=amtPaid-linkedInv.paid;
+          var diff=_round2(amtPaid-linkedInv.paid); // FIX (2026-07-29): _round2-wrap like the two sibling correction branches, so a decimal price can't push a sub-cent residue into the payments ledger.
           if(!linkedInv.payments)linkedInv.payments=[];
           linkedInv.payments.push({pid:uid(),date:tday(),amt:diff,method:"Cash",ref:"Order edit adjustment"});
         }else if(amtPaid<linkedInv.paid){
@@ -6825,19 +7219,31 @@ async function completeDlv(){
     if(amt>0&&inv){
       if(!inv.payments)inv.payments=[];
       var dlvMethod=el("dlv-method")?el("dlv-method").value:"Cash";
-      var dlvAmt=Math.min(amt,inv.amount-inv.paid); // never overpay invoice
+      // FIX (2026-07-29): route the overpayment to credit even when the invoice is
+      // ALREADY fully paid at delivery time. The credit block used to be nested
+      // inside `if(dlvAmt>0)`, so when inv.amount-inv.paid<=0 the whole entered
+      // amount was silently discarded — real cash collected at the door with no
+      // payment row, no credit, no trail. dlvAmt is now floored at 0 (a pre-overpaid
+      // invoice can't make it negative and over-credit); the invoice takes only the
+      // portion that fits, and the remainder — up to and including the full amount —
+      // becomes customer credit, exactly like recPay's invoice branch already does.
+      var _dlvPayPid=null;
+      var dlvAmt=Math.min(amt,Math.max(0,inv.amount-inv.paid)); // portion that fits on the invoice
       if(dlvAmt>0){
-        inv.payments.push({pid:uid(),date:tday(),amt:dlvAmt,method:dlvMethod,ref:"Delivery #"+oid});
+        _dlvPayPid=uid();
+        inv.payments.push({pid:_dlvPayPid,date:tday(),amt:dlvAmt,method:dlvMethod,ref:"Delivery #"+oid});
         inv.paid=_round2(inv.payments.reduce(function(s,p){return s+(p.amt||0);},0)); // source of truth
-        // Overpayment → customer credit
-        var dlvOver=amt-dlvAmt;
-        if(dlvOver>0){
-          var dlvCu=(D.customers||[]).find(function(x){return x.id===o.cId;});
-          if(dlvCu){
-            dlvCu.credit=_round2((dlvCu.credit||0)+dlvOver);
-            if(!dlvCu.creditLog)dlvCu.creditLog=[];
-            dlvCu.creditLog.push({cid:uid(),date:tday(),amt:dlvOver,type:"overpayment",ordId:o.id,method:dlvMethod,by:CU.name,role:CU.role,note:"Overpayment at delivery of Order #"+o.id});
-          }
+      }
+      var dlvOver=_round2(amt-dlvAmt);
+      if(dlvOver>0){
+        var dlvCu=(D.customers||[]).find(function(x){return x.id===o.cId;});
+        if(dlvCu){
+          dlvCu.credit=_round2((dlvCu.credit||0)+dlvOver);
+          if(!dlvCu.creditLog)dlvCu.creditLog=[];
+          // srcPid links this credit to the delivery payment (when one was made) so
+          // reversePayment reverses both together; null when the invoice was already
+          // fully paid (a standalone delivery overpayment, no payment to reverse).
+          dlvCu.creditLog.push({cid:uid(),srcPid:_dlvPayPid,date:tday(),amt:dlvOver,type:"overpayment",ordId:o.id,method:dlvMethod,by:CU.name,role:CU.role,note:"Overpayment at delivery of Order #"+o.id});
         }
       }
     }
@@ -6978,7 +7384,9 @@ async function delO(id){
   }
   // Restore stock — skip for category orders (prodConfirmed===false means no stock was deducted)
   var st=(D.stock||[]).find(function(s){return (o.stockId&&s.id===o.stockId)||s.name===o.prod;});
-  var wasStockDeducted=(o.prodConfirmed!==false);
+  // FIX (2026-07-29): also honour _stockNotDeducted (set by restoreMissingOrderExact)
+  // — a restored record never took stock, so deleting it must not give stock back.
+  var wasStockDeducted=(o.prodConfirmed!==false&&o._stockNotDeducted!==true);
   if(st&&o.status!=="Delivered"&&o.status!=="Cancelled"&&wasStockDeducted){
     st.qty+=o.qty;_recordStockDelta(st.id,o.qty);
     if(!st.history)st.history=[];
@@ -7098,7 +7506,9 @@ function _finishCancelO(id,disposition){
   var inv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.match(new RegExp("#"+id+"(\\D|$)"));});
   var hasPaid=inv&&inv.paid>0;
   var isCatOrder=(o.prodConfirmed===false);
-  var skipStockRestore=isCatOrder;
+  // FIX (2026-07-29): a restored record (_stockNotDeducted) never took stock either,
+  // so cancelling it must not give stock back. Same reasoning as delO's guard.
+  var skipStockRestore=isCatOrder||o._stockNotDeducted===true;
   var st=(D.stock||[]).find(function(s){return (o.stockId&&s.id===o.stockId)||s.name===o.prod;});
   if(st&&!skipStockRestore){
     st.qty+=o.qty;_recordStockDelta(st.id,o.qty);
@@ -7755,15 +8165,39 @@ function restoreMissingOrderExact(idx){
     toast("Order #"+orig+" is already live — nothing to restore.","ok");
     showMissingOrders();return;
   }
+  // FIX (2026-07-29): DUPLICATE-SALE GUARD — found from a real incident. Order
+  // #1355 was lost, the staff member re-entered the SAME physical sale minutes
+  // later as #1357, and #1357 is live and correct. The modal already computed and
+  // DISPLAYED that duplicate warning to the human, but this function — the primary
+  // gold action — never consulted it: its only "already recorded" check is by the
+  // SAME id, which by definition can't catch a re-entry under a NEW id. Restoring
+  // in that state creates a second order for one real transaction: double revenue,
+  // double customer debt, and a stock movement that never physically happened.
+  // Deliberately a loud danger confirmation naming the suspect rather than a hard
+  // refusal — two genuinely separate identical orders on one day are possible for a
+  // water business, so only a human can decide. The danger variant focuses the safe
+  // choice and treats Enter as Cancel, so the risky path needs a deliberate click.
+  // Reuses the exact same nearby-order signal the modal showed, so the dialog and
+  // the screen can never disagree.
+  var _dupLive=null;
+  if(missingInfo.nearby&&missingInfo.cId!=null){
+    _dupLive=missingInfo.nearby.find(function(n){
+      return n.cId===missingInfo.cId
+        &&String(n.prod||"").trim().toLowerCase()===String(missingInfo.prod||"").trim().toLowerCase()
+        &&Number(n.qty)===Number(missingInfo.qty);
+    })||null;
+  }
   uiConfirm({
-    title:"Restore order #"+orig,
-    message:"Restore this order exactly as it was originally placed?\n\n"
+    title:_dupLive?"Likely duplicate — read this first":"Restore order #"+orig,
+    message:(_dupLive
+        ?"This sale looks like it is ALREADY RECORDED as Order #"+_dupLive.id+" ("+_dupLive.cName+" — "+_dupLive.prod+" x"+_dupLive.qty+").\n\nThat usually means order #"+orig+" was lost and then re-entered by hand under a new number. If so, the money and stock are already in your books, and restoring #"+orig+" would record the SAME sale TWICE — double revenue, double debt for this customer, and stock that never actually moved.\n\nIf #"+_dupLive.id+" is the same physical sale, press Cancel and use Dismiss on this row instead.\n\nOnly restore if #"+orig+" was a genuinely SEPARATE sale.\n\n——\n"
+        :"Restore this order exactly as it was originally placed?\n\n")
       +snap.order.prod+" x"+snap.order.qty+(snap.order.price?" @ KSh "+snap.order.price:"")
       +"\nStatus: "+(snap.order.status||"Pending")
       +(snap.invoice?"\nIts invoice (#"+snap.invoice.id+", KSh "+snap.invoice.amount+") will be restored too.":"")
       +"\n\nIt keeps its original order number, so if the original was only delayed and arrives later it will merge back into this same row rather than creating a duplicate.",
-    variant:"warn",
-    confirmText:"Restore order #"+orig
+    variant:_dupLive?"danger":"warn",
+    confirmText:_dupLive?"Restore anyway — separate sale":"Restore order #"+orig
   }).then(function(_ok){
     if(!_ok)return;
     // Re-check at click time - the tool can sit open while the order arrives.
@@ -7773,6 +8207,15 @@ function restoreMissingOrderExact(idx){
     }
     _hasPendingCriticalEdit=true; // genuine record creation - force a fresh conflict check
     var _o=JSON.parse(JSON.stringify(snap.order));
+    // FIX (2026-07-29): mark that NO stock was deducted for this restored record, so
+    // a later Delete/Cancel does not "restore" stock that never left. The original
+    // creation's deduction lived in the very same whole-document write that was lost,
+    // so the cloud's stock count never saw it — the order is being restored into a
+    // world where its stock was never taken. Without this flag, delO/_finishCancelO/
+    // delC all see prodConfirmed!==false and add the quantity BACK, phantom-crediting
+    // inventory (reads HIGH — the unsafe direction, it can mask a real shortage).
+    // Mirrors the existing prodConfirmed convention rather than inventing a new one.
+    _o._stockNotDeducted=true;
     (D.orders||[]).push(_o);
     var _invNote="";
     if(snap.invoice&&snap.invoice.id&&!(D.invoices||[]).some(function(i){return i.id===snap.invoice.id;})){
@@ -8027,7 +8470,7 @@ function rInvs(q,pg){
 }function invRows(fil){
   var td=tday();if(!fil.length)return "<tr><td colspan=\"9\"><div class=\"te\"><i class=\"ti ti-receipt\"></i><p>No invoices found</p></div></td></tr>";
   return fil.map(function(i){
-    var c=(D.customers||[]).find(function(x){return x.id===i.cId;});var bal=i.amount-i.paid;var ov=bal>0&&i.due&&i.due<td&&!i.voided;
+    var c=(D.customers||[]).find(function(x){return x.id===i.cId;});var bal=i.amount-i.paid;var ov=bal>0&&i.due&&i.due<td&&!i.voided&&_invoiceOrderActive(i); // FIX (2026-07-29): the per-row "overdue" badge now also excludes cancelled/deleted-order invoices, matching the overdue count/filter and the debtors KPI.
     var st=i.voided?"<span class=\"badge\" style=\"background:#f0f0f0;color:#999;border:1px solid #ddd\"><i class=\"ti ti-ban\"></i>Voided</span>":bal<=0?"<span class=\"badge bg\"><i class=\"ti ti-check\"></i>Paid</span>":ov?"<span class=\"badge br\"><i class=\"ti ti-alert-circle\"></i>Overdue</span>":"<span class=\"badge ba\">Unpaid</span>";
     var lp=(i.payments||[]).slice().sort(function(a,b){return b.date>a.date?1:-1;})[0];
     var iph=c?(can("vPhone")?c.phone:maskPhone(c.phone)):"";
@@ -8829,13 +9272,20 @@ function rReports(){
   // different "Revenue" numbers for the same period, a new confusion. The
   // separate "Written off" card below still shows the figure on its own, so
   // nothing is hidden — it's just no longer counted twice as if uncollected.
+  // FIX (2026-07-29): only subtract write-offs for invoices whose order is in the
+  // DELIVERED set (`del`) that `rev` is computed from — mirroring the Dashboard's
+  // _writtenOffFor. The old filter summed EVERY voided invoice in the period,
+  // including those on undelivered/pending orders (e.g. voided by delC before
+  // deleting a customer), whose amount was NEVER added to `rev` — so subtracting it
+  // understated revenue and made Reports disagree with the Dashboard for the same
+  // period. Restricting to delivered-order ids aligns the two: revenue is recognised
+  // at delivery and reduced only by write-offs of that same recognised revenue.
+  var _delIds={};del.forEach(function(o){_delIds[o.id]=true;});
   var writtenOff=(D.invoices||[]).filter(function(i){
     if(!i.voided)return false;
-    if(!RPT_FROM&&!RPT_TO)return true;
-    var vd=i.voidedAt||i.date;
-    if(RPT_FROM&&vd<RPT_FROM)return false;
-    if(RPT_TO&&vd>RPT_TO)return false;
-    return true;
+    if(i.orderId)return !!_delIds[i.orderId];
+    var _wm=i.notes&&i.notes.match(/#(\d+)/);
+    return !!(_wm&&_delIds[parseInt(_wm[1])]);
   }).reduce(function(a,i){return a+(i.amount-i.paid);},0);
   var rev=del.reduce(function(a,o){return a+o.qty*o.price;},0)-writtenOff;
   var cost=del.reduce(function(a,o){return a+o.qty*(o.cost||0);},0);
@@ -9832,7 +10282,12 @@ function sendEmailBackup(manual){
     // FIX (2026-07-28): match custDebt's collectable set — exclude fully-paid,
     // voided (written-off) and cancelled/deleted-order invoices — so the emailed
     // "total debt" agrees with the debtors page instead of overstating it.
-    debt:"KSh "+((D.invoices||[]).filter(function(i){return i.paid<i.amount&&!i.voided&&_invoiceOrderActive(i);}).reduce(function(s,i){return s+(i.amount-i.paid);},0)).toLocaleString(),
+    // FIX (2026-07-29): sum custDebt() per customer so this NETS store credit and
+    // matches the debtors page EXACTLY. The prior version summed collectable
+    // invoices but never subtracted cu.credit, overstating the emailed figure for
+    // any customer holding credit — contradicting this KPI's own "agrees with the
+    // debtors page" intent.
+    debt:"KSh "+((D.customers||[]).reduce(function(s,c){return s+custDebt(c.id);},0)).toLocaleString(),
     stock:(D.stock||[]).length,
     complaints:(D.complaints||[]).filter(function(c){return c.status!=="Resolved";}).length
   };
@@ -9914,7 +10369,15 @@ function autoSaveLocal(){
 // still in the ledger is surfaced to a human to confirm before
 // resubmitting - never auto-resubmitted silently, matching how every other
 // recovery action in this app already works.
-function _clearConfirmedLedgerEntries(){
+// FIX (2026-07-29): takes the set of order _cids the just-committed write
+// ACTUALLY carried. This used to derive "confirmed" from D.orders — i.e. from
+// what this device has in memory — which is not the same thing at all: an order
+// created while a write was in flight is in D but was not in that write's
+// payload, so its ledger token (the crash safety net that exists precisely to
+// notice an order that never reached the cloud) was deleted while the order was
+// still genuinely unwritten. Falls back to the old D.orders behaviour only when
+// no committed set is supplied, so any future caller is no worse off than before.
+function _clearConfirmedLedgerEntries(committedCids){
   try{
     var raw=localStorage.getItem("nd_pending_orders");
     if(!raw)return;
@@ -9922,7 +10385,8 @@ function _clearConfirmedLedgerEntries(){
     var cids=Object.keys(ledger);
     if(!cids.length)return;
     var liveCids={};
-    (D.orders||[]).forEach(function(o){if(o._cid)liveCids[o._cid]=true;});
+    if(committedCids)liveCids=committedCids;
+    else (D.orders||[]).forEach(function(o){if(o._cid)liveCids[o._cid]=true;});
     var changed=false;
     cids.forEach(function(cid){if(liveCids[cid]){delete ledger[cid];changed=true;}});
     if(changed)localStorage.setItem("nd_pending_orders",JSON.stringify(ledger));
