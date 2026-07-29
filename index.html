@@ -199,6 +199,51 @@ var firebaseConfig={
   appId:"1:71475259261:web:e6e1b2a9d313b31a854e14"
 };
 var fbAuth=null;
+/* PER-RECORD DIAGNOSTIC LOGGING GATE (2026-07-29) — measured from a real production
+   console log, not estimated. A single app-open cycle emitted ~1,100 console lines:
+   429 customers + ~340 invoices on the write side ("freshness check MERGED …") and
+   ~340 more on the read side ("snapshot merge MERGED …"). Those loops run on EVERY
+   write and EVERY snapshot — so on every order, payment and delivery, and again on
+   every other device that receives the echo. Each line built a fresh string by
+   concatenation on the main thread, unconditionally, with no way to turn it off.
+
+   Two distinct harms, and the second is the one that makes this a correctness bug
+   rather than a tidiness issue:
+     1. Main-thread cost on a phone. This is the leading remaining candidate for the
+        reported "screen hangs, goes white, then asks to send feedback" — a renderer
+        killed under sustained main-thread/GC pressure. Stated as the leading
+        candidate, NOT as a proven cause: the error boundary logged nothing, which
+        rules out a caught JS exception but does not by itself prove what killed it.
+     2. It plausibly BREAKS the sync arbitration. `isOwnWrite` is a 5-SECOND window
+        (Date.now()-FB_LAST_LOCAL_WRITE<5000, stamped in processWriteQueue). In the
+        captured log the app's own just-committed write echoed back and was judged
+        isOwnWrite=FALSE — i.e. more than five seconds elapsed between stamping the
+        write and processing its own echo, across a cycle whose only heavy work is
+        ~1,100 console lines. The commit and the next transport event are 27 seconds
+        apart in that log. So this logging is slow enough to push the app outside its
+        own conflict-detection window, which is load-bearing for deciding whose edit
+        wins. Cutting it is expected to restore isOwnWrite as a side effect.
+
+   The diagnostics stay available — they were genuinely useful here — but OFF by
+   default. Turn them on for one device with either:
+       localStorage.setItem("nd_debug","1")   (persists for that browser)
+       ...or append ?debug=1 to the URL       (one session, nothing to undo)
+   ndlog() takes SEPARATE ARGUMENTS rather than one concatenated string on purpose:
+   when the gate is off, no string is ever built, which is where the cost actually is.
+   Low-volume lifecycle lines (snapshot arrived / SENDING / COMMITTED / SUCCESS /
+   persistence status / HEAL decisions) are deliberately left as plain console.log —
+   they are a handful per cycle and they are what makes a live log readable. */
+var ND_DEBUG=(function(){
+  try{
+    if(typeof localStorage!=="undefined"&&localStorage.getItem("nd_debug")==="1")return true;
+    if(typeof location!=="undefined"&&/[?&]debug=1(&|$)/.test(location.search||""))return true;
+  }catch(_){}
+  return false;
+})();
+function ndlog(){
+  if(!ND_DEBUG)return;
+  try{console.log.apply(console,arguments);}catch(_){}
+}
 var fbDb=null;
 var FB_DOC_REF=null;
 var FB_BACKUP_COL=null; // backup collection reference
@@ -1438,7 +1483,7 @@ function processWriteQueue(){
           var serverCredit=fc.credit||0,localCredit=lc.credit||0;
           if(lc){ // always merge (additive) — also catches equal-total, different-log concurrent credit changes
             DforSync.customers[localIdx]=_mergeCustomerCredit(lc,fc);
-            console.log("[NDSYNC] freshness check MERGED customer id="+fc.id+" credit (local "+localCredit+", server "+serverCredit+", merged "+DforSync.customers[localIdx].credit+")");
+            ndlog("[NDSYNC] freshness check MERGED customer id=",fc.id,"credit (local",localCredit,"server",serverCredit,"merged",DforSync.customers[localIdx].credit,")");
           }
         });
       }
@@ -1485,7 +1530,7 @@ function processWriteQueue(){
             // sides' payments by id first, so a genuinely different payment
             // recorded locally survives regardless of which side "wins."
             DforSync.invoices[localIdx]=_mergeInvoicePayments(li,fi);
-            console.log("[NDSYNC] freshness check MERGED invoice id="+fi.id+" payments (local paid "+localPaid+", server paid "+serverPaid+", merged paid "+DforSync.invoices[localIdx].paid+")");
+            ndlog("[NDSYNC] freshness check MERGED invoice id=",fi.id,"payments (local paid",localPaid,"server paid",serverPaid,"merged paid",DforSync.invoices[localIdx].paid,")");
           }
         });
       }
@@ -1551,7 +1596,7 @@ function processWriteQueue(){
           var mergedItem=Object.assign({},fs);
           if(delta!==0){
             mergedItem.qty=(fs.qty||0)+delta; // negative-stock policy (2026-07-28): no floor, or a legitimate backorder (-7) would be clamped to 0 on this write and the shortfall lost across devices
-            console.log("[NDSYNC] freshness check MERGED stock id="+fs.id+" ("+fs.name+") — server="+fs.qty+" + our delta="+delta+" = "+mergedItem.qty);
+            ndlog("[NDSYNC] freshness check MERGED stock id=",fs.id,"(",fs.name,") server=",fs.qty,"our delta=",delta,"merged=",mergedItem.qty);
             if(_fcLocalSt&&_fcLocalSt.history)mergedItem.history=_fcLocalSt.history;
           }
           if(_fcLocalSt){
@@ -2717,7 +2762,7 @@ function startCloudListener(isWarmRefresh){
               // genuinely different payment recorded on either device
               // survives regardless of which one this merge favors overall.
               var merged=_mergeInvoicePayments(li,ri);
-              console.log("[NDSYNC] snapshot merge MERGED invoice id="+ri.id+" payments (local paid "+(li.paid||0)+", remote paid "+(ri.paid||0)+", merged paid "+merged.paid+")");
+              ndlog("[NDSYNC] snapshot merge MERGED invoice id=",ri.id,"payments (local paid",(li.paid||0),"remote paid",(ri.paid||0),"merged paid",merged.paid,")");
               return merged;
             }
             return ri;
@@ -12010,26 +12055,74 @@ window.addEventListener("load",function(){
       // outcome is recorded and surfaced, so a phone in that state is visible
       // instead of quietly fragile. Never throws: persistence failing must not
       // stop the app from starting.
+      /* ROOT-CAUSE FIX (2026-07-29) — CONFIRMED FROM A REAL PRODUCTION CONSOLE LOG.
+         THE BUG: this block probed `fbDb.enableMultiTabIndexedDbPersistence` and
+         `fbDb.enableIndexedDbPersistence`. Both of those are **MODULAR (v9+) FREE
+         FUNCTIONS** — they do not exist as methods on a Firestore instance. This app
+         loads the **COMPAT** build (see the firebase-*-compat.js script list below,
+         v10.12.2) and does `fbDb=firebase.firestore()`, whose documented instance
+         method is `enablePersistence()`. So the first probe was always undefined, the
+         inner fallback lived inside a `.catch()` that therefore never ran, and every
+         device fell straight to the `else` and logged:
+             "[NDSYNC] offline persistence UNSUPPORTED by this Firestore build"
+         — which is what a director's live console actually showed on 2026-07-29.
+
+         WHY IT MATTERS, and why it is the missing-order root cause rather than one
+         more contributing factor: with no IndexedDB persistence, Firestore holds
+         pending writes **in memory only**. A screen lock, a backgrounded tab, a
+         reload, a dead zone or a renderer kill discards them with no trace. Every
+         earlier fix in this area (immediate flush for critical edits, the logout
+         teardown deferral, the visibilitychange/pagehide flushes) shrank the window
+         in which that could happen — but the queue underneath was never durable, so
+         the window could never be closed. Persistence is what makes Firestore itself
+         retry the write after a reload instead of losing it.
+
+         ORDERING: this must run before any other Firestore operation. It does —
+         `fbDb` is created immediately above, and FB_DOC_REF / initCloudConnection
+         come after. Do not move it.
+
+         BUILD-AGNOSTIC ON PURPOSE: compat instance method first, then the modular
+         free functions if a future version of this file ever switches builds, so the
+         same silent failure cannot happen again in reverse. */
       window._ndPersistence="pending";
       try{
-        if(fbDb.enableMultiTabIndexedDbPersistence){
-          fbDb.enableMultiTabIndexedDbPersistence().then(function(){
-            window._ndPersistence="multi-tab";
-            console.log("[NDSYNC] offline persistence ENABLED (multi-tab) — writes survive a reload/tunnel");
+        var _persistOk=function(kind){
+          window._ndPersistence=kind;
+          console.log("[NDSYNC] offline persistence ENABLED ("+kind+") — writes now survive a reload/tunnel/screen-lock");
+        };
+        var _persistFail=function(err,where){
+          window._ndPersistence="failed:"+((err&&err.code)||"unknown");
+          console.log("[NDSYNC] offline persistence FAILED at "+where+" ("+((err&&err.code)||"unknown")+") — this device has NO durable offline write queue; unsent changes live only in RAM + localStorage");
+          _warnNoOfflinePersistence(err);
+        };
+        if(typeof fbDb.enablePersistence==="function"){
+          // COMPAT build (what this app actually loads).
+          fbDb.enablePersistence({synchronizeTabs:true}).then(function(){
+            _persistOk("multi-tab");
           }).catch(function(e1){
-            if(!fbDb.enableIndexedDbPersistence){window._ndPersistence="unavailable";console.log("[NDSYNC] offline persistence UNAVAILABLE: "+(e1&&e1.code));return;}
-            fbDb.enableIndexedDbPersistence().then(function(){
-              window._ndPersistence="single-tab";
-              console.log("[NDSYNC] offline persistence ENABLED (single-tab) — writes survive a reload/tunnel");
-            }).catch(function(e2){
-              window._ndPersistence="failed:"+((e2&&e2.code)||"unknown");
-              console.log("[NDSYNC] offline persistence FAILED ("+((e2&&e2.code)||"unknown")+") — this device has NO durable offline write queue; unsent changes live only in RAM + localStorage");
-              _warnNoOfflinePersistence(e2);
-            });
+            // "unimplemented" = this browser cannot do the multi-tab implementation.
+            // Retry single-tab, which is still a fully durable queue for one tab.
+            // "failed-precondition" = another tab already owns persistence; that tab
+            // has the durable queue, so this one legitimately cannot take it.
+            if(e1&&e1.code==="unimplemented"){
+              fbDb.enablePersistence().then(function(){_persistOk("single-tab");})
+                                      .catch(function(e2){_persistFail(e2,"single-tab");});
+              return;
+            }
+            _persistFail(e1,"multi-tab");
           });
+        }else if(typeof fbDb.enableMultiTabIndexedDbPersistence==="function"){
+          // MODULAR build, kept only so a future build switch degrades gracefully.
+          fbDb.enableMultiTabIndexedDbPersistence().then(function(){_persistOk("multi-tab");})
+            .catch(function(e1){
+              if(typeof fbDb.enableIndexedDbPersistence!=="function"){_persistFail(e1,"modular multi-tab");return;}
+              fbDb.enableIndexedDbPersistence().then(function(){_persistOk("single-tab");})
+                                               .catch(function(e2){_persistFail(e2,"modular single-tab");});
+            });
         }else{
           window._ndPersistence="unsupported";
-          console.log("[NDSYNC] offline persistence UNSUPPORTED by this Firestore build");
+          console.log("[NDSYNC] offline persistence UNSUPPORTED — neither enablePersistence() nor the modular equivalents are present on this Firestore build");
+          _warnNoOfflinePersistence({code:"unsupported"});
         }
       }catch(_e){window._ndPersistence="threw";}
       FB_DOC_REF=fbDb.collection("newdawn").doc("main");
