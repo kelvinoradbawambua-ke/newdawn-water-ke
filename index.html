@@ -623,6 +623,15 @@ function pgBar(page,pages,total,navFn){
 var CUST_PAGE=0,ORD_PAGE=0,INV_PAGE=0,CMP_PAGE=0,STK_PAGE=0,DEBT_PAGE=0;
 var DASH_PERIOD="today"; // today|week|month|quarter|all — default: today
 var CUST_Q="",ORD_Q="",INV_Q="",CMP_Q="",STK_Q="",DEL_Q="",DEBT_Q="",DEBT_SORT="amount",DEBT_PERIOD="all",AUDIT_Q="",AUDIT_TYPE="",AUDIT_PAGE=0;
+/* Holds the hot log + 90-day archive once "Archives" has been loaded, so the archive
+   survives the next search or filter change (2026-07-29). It is deliberately a
+   SEPARATE cache and never assigned into D.auditLog: the previous implementation
+   swapped D.auditLog, rendered, then restored it, which meant (a) any later
+   re-render silently dropped back to the ~81 hot entries while the button still
+   read "760 loaded", and (b) 760 archived entries were briefly live inside D, one
+   dirty() away from being written to the shared document. Null = archives not
+   loaded, use the hot log. */
+var AUDIT_ARCHIVE_CACHE=null;
 var CUST_SORT="recent",ORD_SORT="newest",CUST_TYPE="";
 function ia(v){return can("vInv")?"KSh "+Number(v).toLocaleString():"KSh "+String.fromCharCode(8226,8226,8226,8226);}
 function sb(s){var m={"Delivered":"bg","Pending":"ba","Out for delivery":"bp","Processing":"bb","Cancelled":"br"};var ic={"Delivered":"ti-circle-check","Pending":"ti-clock","Out for delivery":"ti-truck","Processing":"ti-loader","Cancelled":"ti-x"};return "<span class=\"badge "+(m[s]||"ba")+"\"><i class=\"ti "+(ic[s]||"ti-circle")+"\" style=\"font-size:10px;margin-right:2px\"></i>"+s+"</span>";}
@@ -6165,6 +6174,66 @@ function showCycleHistory(cId){
   if(gb)gb.innerHTML=html;
   om("m-generic");
 }
+/* CREDIT ADJUSTMENT (2026-07-29) — the missing correction path.
+   WHY THIS HAD TO EXIST. A forensic pass over the live backup found 10 customers
+   holding KSh 11,652 of store credit, and EVERY ONE of them is customer-level: the
+   credit entry carries no invId and no srcPid, and no payment was ever written to an
+   invoice. The only credit-reversal path in this file (the "Overpayment credit
+   reversed together with its payment on Invoice #..." branch) matches on exactly
+   those two fields, so it cannot touch any of them. There was literally no way to
+   correct a wrong credit balance from inside the app.
+   That mattered because one of those balances is provably wrong: Samson omondi holds
+   KSh 6,752 credit while having been invoiced KSh 1,500 in his entire history. It
+   arrived via the customer-level overpayment branch on 2026-07-27, and — because of
+   the audit bug fixed earlier today, where the PAYMENT_RECORDED entry logged the
+   post-allocation `amt` instead of the amount received — the audit trail recorded
+   it as "KSh 0". Unfindable by search, and unreversible by any existing action.
+   DESIGN, deliberately conservative:
+     - director-only (can("rest")), the same gate the restore tools use;
+     - REASON IS MANDATORY (>=4 chars). A credit correction with no stated reason is
+       exactly the kind of unexplained money movement this whole exercise is about;
+     - can only ever REDUCE credit, never invent it, and never below zero. Adding
+       credit is what a payment does, through the proven payment path;
+     - writes BOTH a creditLog entry (type "adjustment", which showCreditLog already
+       renders) and a PAYMENT_RECORDED audit line naming who, how much, why, and the
+       resulting balance — so this correction can never itself become an unexplained
+       movement;
+     - marks _hasPendingCriticalEdit so it flushes immediately rather than sitting on
+       the debounce, the same as any other money edit. */
+function adjustCredit(cId){
+  if(!can("rest")){toast("Director only","err");return;}
+  var cu=(D.customers||[]).find(function(x){return x.id===cId;});
+  if(!cu){toast("Customer not found","err");return;}
+  var bal=cu.credit||0;
+  if(bal<=0){toast("This customer has no credit to adjust");return;}
+  var amtEl=el("cradj-amt"),rsnEl=el("cradj-reason");
+  var amt=amtEl?_round2(parseFloat(amtEl.value||"0")):0;
+  var reason=rsnEl?sanitizeInput(String(rsnEl.value||"").trim()):"";
+  if(!(amt>0)){toast("Enter the amount of credit to remove","err");return;}
+  if(amt>bal){toast("Cannot remove more than the KSh "+bal.toLocaleString()+" on the account","err");return;}
+  if(reason.length<4){toast("A reason is required — it goes on the permanent record","err");return;}
+  uiConfirm({title:"Remove KSh "+amt.toLocaleString()+" credit?",
+    message:(can("vPhone")?cu.name:maskName(cu.name))+"'s store credit will go from KSh "+bal.toLocaleString()+
+      " to KSh "+_round2(bal-amt).toLocaleString()+".\n\nReason recorded: "+reason+
+      "\n\nThis is logged against your name in the audit trail and in the customer's credit history. It does not touch any invoice or order — if this customer genuinely owes money, that debt will simply become visible again.",
+    variant:"warn",confirmText:"Remove credit"}).then(function(ok){
+      if(!ok)return;
+      var cu2=(D.customers||[]).find(function(x){return x.id===cId;});
+      if(!cu2)return;
+      var before=cu2.credit||0;
+      if(amt>before){toast("Credit changed while this was open — reopen and check","warn");showCreditLog(cId);return;}
+      cu2.credit=_round2(Math.max(0,before-amt));
+      if(!cu2.creditLog)cu2.creditLog=[];
+      cu2.creditLog.push({cid:uid(),date:tday(),amt:-amt,type:"adjustment",by:CU.name,role:CU.role,note:reason});
+      _hasPendingCriticalEdit=true;
+      auditLog("PAYMENT_RECORDED","CREDIT ADJUSTMENT: KSh "+amt.toLocaleString()+" removed from "+cu2.name+"'s store credit by "+CU.name+" ("+CU.role+"). Reason: "+reason+". Credit balance: KSh "+before.toLocaleString()+" -> KSh "+cu2.credit.toLocaleString());
+      dirty();
+      toast("KSh "+amt.toLocaleString()+" credit removed — reason recorded","ok");
+      showCreditLog(cId);
+      try{if(el("pg-debts")&&el("pg-debts").classList.contains("act"))rDebts(undefined,DEBT_PAGE);}catch(_){}
+      try{if(el("pg-customers")&&el("pg-customers").classList.contains("act"))rCusts();}catch(_){}
+    });
+}
 function showCreditLog(cId){
   if(!can("vRev")){toast("Manager+ only","err");return;}
   var cu=(D.customers||[]).find(function(x){return x.id===cId;});
@@ -6181,6 +6250,19 @@ function showCreditLog(cId){
     +"<div><strong>Current credit balance: KSh "+bal.toLocaleString()+"</strong>"
     +(bal>0?"<div style=\"font-size:11px;margin-top:2px\">Available to apply on next payment</div>":"<div style=\"font-size:11px;margin-top:2px\">All credit has been used</div>")
     +"</div></div>";
+  /* Director-only correction form (2026-07-29). Lives inside this modal rather than
+     in a new one: this is the screen on which someone realises a credit is wrong, so
+     it is the screen that should be able to fix it. Reduce-only, reason mandatory. */
+  if(bal>0&&can("rest")){
+    html+="<div style=\"border:1px solid #f0d070;background:#fff8e1;border-radius:var(--r2);padding:12px;margin-bottom:14px\">"
+      +"<div style=\"font-weight:800;font-size:12px;margin-bottom:8px\"><i class=\"ti ti-edit\" style=\"margin-right:5px\"></i>Correct this credit</div>"
+      +"<div style=\"font-size:11px;color:var(--tx2);margin-bottom:9px\">Use this only when a credit balance is wrong — for example money that was never actually received. It never touches invoices or orders, so any real debt simply becomes visible again.</div>"
+      +"<div style=\"display:flex;gap:8px;flex-wrap:wrap;align-items:center\">"
+      +"<input class=\"fi\" id=\"cradj-amt\" type=\"number\" min=\"1\" max=\""+bal+"\" placeholder=\"Amount to remove\" style=\"max-width:150px\">"
+      +"<input class=\"fi\" id=\"cradj-reason\" placeholder=\"Reason (required, goes on the record)\" style=\"flex:1;min-width:190px\">"
+      +"<button class=\"btn btn-xs\" style=\"background:#b9770e;color:#fff;white-space:nowrap\" onclick=\"adjustCredit("+cId+")\"><i class=\"ti ti-minus\"></i> Remove credit</button>"
+      +"</div></div>";
+  }
   if(!log.length){
     html+="<div class=\"te\"><i class=\"ti ti-history\"></i><p>No credit history</p></div>";
   }else{
@@ -6551,6 +6633,24 @@ function recPay(){
   }else{
   // ── CUSTOMER-LEVEL PAYMENT — distribute oldest-first ─────────────────
     var cu2=(D.customers||[]).find(function(x){return x.id===cId;});
+    /* AUDIT-INTEGRITY FIX (2026-07-29) — found from a real investigation the audit
+       trail itself made impossible. `amt` is MUTATED twice below: `amt+=useCredit`
+       when existing credit is applied, and `amt=totalDebt` when the payment exceeds
+       what is owed. The PAYMENT_RECORDED entry at the end of this branch then logged
+       that MUTATED `amt` — so the amount the audit trail reported was the portion
+       allocated to invoices, NOT the money actually received.
+       Consequence, confirmed against live data: a customer received a KSh 6,752
+       payment while owing nothing. credit2=6752 went to his credit correctly, then
+       `amt=totalDebt` set amt to 0, and the audit entry read "KSh 0 ... Distributed
+       oldest-first." The 6,752 existed in the customer's creditLog but was ABSENT
+       from the audit log — the one place a director searches, filters and exports for
+       accountability. Searching the log for that amount could never find it, and the
+       owner correctly concluded "that was never entered": as far as the audit trail
+       was concerned, it never was.
+       Any payment that lands wholly on credit was therefore invisible in the audit
+       trail, and any partial overpayment was under-reported by the credited portion.
+       _amtEntered captures the figure as submitted, before either mutation. */
+    var _amtEntered=amt;
     var existingCredit=(cu2&&cu2.credit>0)?cu2.credit:0;
     var totalDebt=(D.invoices||[]).filter(function(i){return i.cId===cId&&i.paid<i.amount&&!i.voided&&_invoiceOrderActive(i);}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
     // Apply any existing credit balance first
@@ -6617,7 +6717,11 @@ function recPay(){
       cu2.creditLog.push({cid:uid(),date:payDate,amt:rem,type:"overpayment",method:method,ref:ref,by:CU.name,role:CU.role,note:"Unapplied balance stored as credit"});
       rem=0;
     }
-    auditLog("PAYMENT_RECORDED","KSh "+amt.toLocaleString()+" by "+CU.name+" ("+CU.role+") for customer #"+cId+". Method: "+method+(ref?" Ref: "+ref:"")+". Distributed oldest-first.");
+    /* Reports the money RECEIVED (_amtEntered), then shows exactly where it went, so
+       the audit trail reconciles to the customer's creditLog without a human having
+       to re-derive it. Every component is named: applied to invoices, taken from
+       existing credit, and left as new credit. */
+    auditLog("PAYMENT_RECORDED","KSh "+_amtEntered.toLocaleString()+" by "+CU.name+" ("+CU.role+") for customer #"+cId+". Method: "+method+(ref?" Ref: "+ref:"")+". Applied to invoices: KSh "+amt.toLocaleString()+(existingCredit>0&&(_amtEntered!==amt||credit2>0)?" | existing credit used: KSh "+Math.min(existingCredit,amt).toLocaleString():"")+(credit2>0?" | KSh "+credit2.toLocaleString()+" stored as NEW credit (overpayment)":"")+". Distributed oldest-first.");
   }
   cm("m-pay");
   // Refresh all affected pages
@@ -9445,9 +9549,28 @@ function rDebts(q,pg){
       if(DEBT_PERIOD==="month") return ordDate.startsWith(_dmo);
       return true;
     });
-    var debt=periodInvs.reduce(function(a,i){return a+(i.amount-i.paid);},0);
-    // Net of credit on "all" view only
-    if(DEBT_PERIOD==="all"){var cr=c.credit||0;debt=Math.max(0,debt-cr);}
+    var _grossDebt=periodInvs.reduce(function(a,i){return a+(i.amount-i.paid);},0);
+    /* MONEY-ACCURACY FIX (2026-07-29), from a real report. Credit used to be netted
+       off ONLY when DEBT_PERIOD==="all". On every other period view this column
+       showed gross unpaid invoices and silently ignored the credit the customer
+       holds. Live example that surfaced it: a customer with KSh 6,752 store credit
+       and KSh 750 of unpaid invoices was listed as OWING 750, next to a chip
+       announcing his 6,752 credit — while custDebt() for the same customer returns
+       Math.max(0, gross-credit) = 0. Two figures on one screen disagreeing about
+       whether money is collectable.
+       This is also a direct breach of this project's own standing rule: EVERY
+       debt/overdue/balance figure must match custDebt()/_invoiceOrderActive. rDebts
+       was the one place that did not. Credit is now netted in every period view, so
+       "BALANCE OWED" means the same thing here as it does everywhere else in the app.
+       Note on scoping, deliberately chosen: the credit is an account-level balance
+       while periodInvs is period-scoped, so on a narrow period the netting can wipe
+       out that period's debt using credit earned outside it. That is the correct
+       answer to the question this page actually asks — "how much can I collect from
+       this person?" — and it is far safer than the previous behaviour, which invited
+       someone to chase a customer who owes nothing. _grossDebt is kept so a future
+       change can show "gross vs net" side by side without recomputing. */
+    var _cr=(c.credit>0)?c.credit:0;
+    var debt=Math.max(0,_grossDebt-_cr);
     var lastOrd=[].concat(D.orders).filter(function(o){return o.cId===c.id;}).sort(function(a,b){return b.date>a.date?1:-1;})[0];
     var ov=periodInvs.filter(function(i){return i.due&&i.due<td;}).length;
     var old2=periodInvs.length?periodInvs.map(function(i){return i.due;}).filter(Boolean).sort()[0]:null;
@@ -10482,7 +10605,10 @@ function healReviewCSV(){
 }
 function exportAuditCSV(){
   if(!can("exp")){toast("Director only","err");return;}
-  var logs=[].concat(D.auditLog||[]).reverse();
+  // Exports what is on screen: the archive when loaded, the hot log otherwise.
+  // Previously CSV was always hot-log-only, so an operator who had just loaded 90
+  // days of archive exported ~81 rows and believed that was everything.
+  var logs=[].concat(AUDIT_ARCHIVE_CACHE||D.auditLog||[]).reverse();
   if(!logs.length){toast("No audit entries to export");return;}
   var rows=["Timestamp,User,Role,Action,Details"];
   logs.forEach(function(e){
@@ -10533,9 +10659,27 @@ function rAuditLog(pg){
     "SYNC_HEALTH":      {ic:"ti-cloud-exclamation",col:"#c0392b",bg:"#fff0f0",label:"Device sync problem"},
   };
   var allTypes=Object.keys(typeMap);
-  var allLogs=[].concat(D.auditLog||[]).reverse();
+  // Archives when loaded, hot log otherwise — so a search after clicking "Archives"
+  // still searches the archive instead of silently falling back to the hot log.
+  var allLogs=[].concat(AUDIT_ARCHIVE_CACHE||D.auditLog||[]).reverse();
   var logs=allLogs;
-  if(q2){var lq=sanitizeInput(q2).toLowerCase();logs=logs.filter(function(e){return(e.user&&e.user.toLowerCase().indexOf(lq)!==-1)||(e.action&&e.action.toLowerCase().indexOf(lq)!==-1)||(e.details&&e.details.toLowerCase().indexOf(lq)!==-1)||(e.role&&e.role.toLowerCase().indexOf(lq)!==-1);});}
+  if(q2){
+    /* FIX (2026-07-29): the search could not find a money figure. Amounts are
+       written into details with toLocaleString(), i.e. "KSh 6,752" WITH a comma,
+       but a human hunting a payment types "6752". A literal substring match then
+       returns nothing, and the operator concludes the payment does not exist —
+       which is exactly what happened while investigating a suspect KSh 6,752
+       credit. Now both sides are also compared with separators stripped, so 6752,
+       6,752 and "6 752" all find the same entry. Matching is still plain substring
+       (no regex), so nothing a user types can be interpreted as a pattern. */
+    var lq=sanitizeInput(q2).toLowerCase();
+    var _lqBare=lq.replace(/[,\s]/g,"");
+    logs=logs.filter(function(e){
+      var hay=((e.user||"")+" "+(e.action||"")+" "+(e.role||"")+" "+(e.details||"")).toLowerCase();
+      if(hay.indexOf(lq)!==-1)return true;
+      return _lqBare.length>0&&hay.replace(/[,\s]/g,"").indexOf(_lqBare)!==-1;
+    });
+  }
   if(tf)logs=logs.filter(function(e){return e.action===tf;});
   var APAGE=25;
   var totalLogs=logs.length;
@@ -10578,7 +10722,7 @@ function rAuditLog(pg){
           "<option value=\"\">All actions</option>"+
           allTypes.map(function(t){return"<option value=\""+t+"\">"+(typeMap[t].label)+"</option>";}).join("")+
         "</select>"+
-        "<button class=\"btn btn-xs\" onclick=\"AUDIT_Q='';AUDIT_TYPE='';AUDIT_PAGE=0;rAuditLog()\" style=\"white-space:nowrap\"><i class=\"ti ti-x\"></i> Clear</button>"+
+        "<button class=\"btn btn-xs\" onclick=\"AUDIT_Q='';AUDIT_TYPE='';AUDIT_PAGE=0;AUDIT_ARCHIVE_CACHE=null;rAuditLog()\" style=\"white-space:nowrap\"><i class=\"ti ti-x\"></i> Clear</button>"+
         "<button class=\"btn btn-xs\" onclick=\"rAuditLogWithArchives(event)\" style=\"background:#7c3aed;color:#fff;white-space:nowrap\"><i class=\"ti ti-archive\"></i> Archives</button>"+
         "<button class=\"btn btn-xs\" onclick=\"exportAuditCSV()\" style=\"background:#27ae60;color:#fff;white-space:nowrap\"><i class=\"ti ti-download\"></i> CSV</button>"+
         "<button class=\"btn btn-xs\" onclick=\"uiConfirm({title:'Purge audit log',message:'Purge audit entries older than 30 days?\\n\\nArchived entries are not affected — this only trims the live log.',variant:'warn',confirmText:'Purge 30d'}).then(function(k){if(k)manualPurgeAuditLog(30);})\" style=\"background:#e67e22;color:#fff;white-space:nowrap\"><i class=\"ti ti-trash\"></i> Purge 30d</button>"+
@@ -10658,12 +10802,17 @@ function rAuditLogWithArchives(event){
     // Show count
     toast("Loaded "+combined.length+" entries ("+hot.length+" hot + "+archived.length+" archived)");
     if(btn){btn.innerHTML="<i class=\"ti ti-check\"></i> "+combined.length+" loaded";btn.disabled=false;}
-    // Re-render with combined data
-    var PREV=D.auditLog;
-    D.auditLog=combined;
+    /* FIX (2026-07-29): this used to do D.auditLog=combined; rAuditLog();
+       D.auditLog=PREV — so the archive existed for exactly one render. Typing in the
+       search box or changing the action filter re-rendered from the RESTORED hot log,
+       silently searching ~81 entries while the button still claimed "760 loaded".
+       That produced a false "0 matched" during a live money investigation. It also
+       parked 760 archived entries inside D, one dirty() away from the shared
+       document. The archive now lives in its own cache that rAuditLog reads, D is
+       never touched, and it persists until Clear. */
+    AUDIT_ARCHIVE_CACHE=combined;
     AUDIT_PAGE=0;
     rAuditLog();
-    D.auditLog=PREV; // restore — archives stay in Firestore, not in hot log
   });
 }
 function rExcel(){
