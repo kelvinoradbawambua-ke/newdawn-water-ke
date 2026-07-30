@@ -1706,7 +1706,12 @@ function processWriteQueue(){
     // overwriting genuinely fresher edits from correctly-clocked devices.
     // Firestore's own server timestamp is authoritative and clock-skew-proof
     // regardless of what any individual device's clock reads.
-    updatedAt:firebase.firestore.FieldValue.serverTimestamp()
+    // ROOT-CAUSE FIX (2026-07-30): left null here deliberately — the REAL sentinel
+    // is attached below, AFTER the JSON round-trip, not here. See that comment for
+    // why: a FieldValue.serverTimestamp() placed here would just be destroyed by
+    // the round-trip anyway, so building one at this point only ever wasted a
+    // sentinel object for nothing.
+    updatedAt:null
   };
   // Estimate document size — warn director before hitting 1MB Firestore limit
   var _sizeKB=0;
@@ -1739,7 +1744,32 @@ function processWriteQueue(){
   // If it fails, _onWriteFailure() re-arms this flag.
   _pendingLocalWrite=false;
   console.log("[NDSYNC] processWriteQueue SENDING to Firestore — orders="+(DforSync.orders?DforSync.orders.length:0)+" customers="+(DforSync.customers?DforSync.customers.length:0)+" sizeKB="+_sizeKB);
-  return JSON.parse(JSON.stringify(payload));
+  // ROOT-CAUSE FIX (2026-07-30): closes PROJECT_CONTEXT.md §4's "serverTime resolves
+  // to 0 on every snapshot" defect — confirmed against a real production log line
+  // that a plain code-reading pass had missed: a genuinely SERVER-CONFIRMED snapshot
+  // (doc.metadata.fromCache===false) of this device's OWN just-committed write
+  // (isOwnWrite=true) still showed serverTime=0. That combination has no legitimate
+  // reason to be null — the documented "briefly null" case is this device's own
+  // CACHE-ONLY optimistic echo before the server confirms it, not a snapshot the
+  // server has already confirmed.
+  // ROOT CAUSE: the line below used to be `return JSON.parse(JSON.stringify(payload));`
+  // — applied to the FULL payload, AFTER `updatedAt` was set to a live
+  // firebase.firestore.FieldValue.serverTimestamp() sentinel. That sentinel is an SDK
+  // marker object, not plain data; JSON.stringify() on it does not preserve whatever
+  // internal tag the SDK relies on to recognise and resolve it during the write, so it
+  // reached .set()/txn.set() as an inert, stripped object — Firestore then had nothing
+  // to resolve into a real Timestamp, on every single write, forever. This is what made
+  // `weAreNewer = FB_MY_LAST_WRITE_SERVER_TS>=serverTime` a permanent 0>=0=true — the
+  // narrow same-instant-conflict safety net documented above never actually had a
+  // chance to fire.
+  // FIX: round-trip only the PLAIN data (still needed — this is what freezes an
+  // isolated deep copy of D so a live edit during the async write can't corrupt the
+  // in-flight payload, exactly as before), then attach a FRESH, un-mangled
+  // serverTimestamp() sentinel to the cloned object afterward, so the one thing that
+  // must reach Firestore intact never goes through JSON in the first place.
+  var _clonedPayload=JSON.parse(JSON.stringify(payload));
+  _clonedPayload.updatedAt=firebase.firestore.FieldValue.serverTimestamp();
+  return _clonedPayload;
   }
 
   function _onWriteSuccess(){
@@ -4070,10 +4100,18 @@ var LEGACY_BEFORE="2026-07-29";
    reads it. It is write-only diagnostic data, so retention is a free parameter.
    10 entries keeps recent movement per item and returns ~66KB — about 18% of the
    document — for no functional change.
-   Deliberately NOT touched: customer.cycleHistory. It is uncapped and does grow, but
-   runIntegrityCheck RECOMPUTES it from delivered orders, so capping it would fight
-   that rebuild and could worsen the non-convergence already logged in §5. It needs
-   the integrity-check fix first. */
+   Deliberately NOT touched: customer.cycleHistory. The integrity-check non-
+   convergence that made capping premature is now fixed (see runIntegrityCheck's
+   2026-07-30 fix, below) — but a SECOND, independent reason surfaced on checking:
+   cycleHistory doubles as a lookup index. Both the forensic order-recovery
+   fallback (searches every cu.cycleHistory[].ordId when an order isn't found by
+   audit entry or invoice) and the Restored-Order Review classifier (cycleRef,
+   built the same way) depend on EVERY historical entry being present, including
+   very old ones — exactly the records a naive age-based cap would remove first.
+   Trimming it the way stock.history was trimmed would silently break order
+   recovery for old orders. Any future reduction has to move a customer's
+   cycleHistory into the books archive IN STEP with their settled orders/invoices
+   (so the recovery lookups can fall back to a loaded book), not cap it in place. */
 var STOCK_HISTORY_MAX=10;
 /* ── ARCHIVE ELIGIBILITY — the safety predicate, defined and PROVEN before the
    machinery that will use it (2026-07-29). Nothing calls these yet; they exist so the
@@ -12143,7 +12181,23 @@ function syncWaterCycles(){
   }
 }
 function runIntegrityCheck(){
-  if(!CU||CU.role!=="director"||!FB_READY||!_cloudDataConfirmed)return;
+  // ROOT-CAUSE FIX (2026-07-30): PROJECT_CONTEXT.md §4 flagged this as "located, not
+  // fixed" — a real production log showed THREE CONSECUTIVE IDENTICAL water-cycle
+  // corrections (366KB write each) moments after successive cold loads, meaning the
+  // repair was not converging: it kept finding the same "drift" and re-fixing it.
+  // ROOT CAUSE: this only checked _cloudDataConfirmed, which (since offline
+  // persistence was enabled) is also satisfied by a CACHE-ONLY snapshot — this
+  // device's own possibly-incomplete IndexedDB copy of D.orders. Recomputing
+  // waterCycle/cycleHistory from an incomplete order list produces a "corrected"
+  // value that is itself wrong; the next cold load reads the true, fuller order
+  // list from the server, finds the earlier "fix" doesn't match, and rewrites again
+  // — forever, once per load, each one an unrequested full-document write on a
+  // free-tier quota, each one consuming an audit-log slot from the same bounded
+  // window the missing-order detector and event self-heal depend on.
+  // Exactly the same class of bug already closed for the self-heal rails (see
+  // _cloudServerConfirmed's declaration) — extended here rather than inventing a
+  // new mechanism. Fix: require a genuine SERVER-confirmed read, never a cache one.
+  if(!CU||CU.role!=="director"||!FB_READY||!_cloudDataConfirmed||!_cloudServerConfirmed)return;
   var issues=[];
   // FIX (2026-07-21): this used to SILENTLY ZERO a customer's real credit
   // balance whenever it saw credit>0 with an empty creditLog, inferring
