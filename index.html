@@ -1713,7 +1713,7 @@ function processWriteQueue(){
   try{
     var _payloadStr=JSON.stringify(payload);
     _sizeKB=Math.round(_payloadStr.length/1024);
-    if(_sizeKB>800){toast("⚠️ Data near Firestore limit ("+_sizeKB+"KB/1000KB). Export a backup and ask your tech team to archive old orders.","warn");}
+    _checkDocSize(_sizeKB,payload);
   }catch(e){}
   // ROOT-CAUSE FIX (2026-07-29): record exactly WHAT this payload carries, at the
   // one instant it is finalised. _onWriteSuccess() used to wipe _stockQtyDeltas,
@@ -4039,6 +4039,193 @@ function pk(k){
    restored-order review tool, and the owner explicitly preferred that over any
    further automatic re-creation of past records. */
 var HEAL_EPOCH_MS=Date.UTC(2026,6,29,9,0,0);
+/* LEGACY CUTOFF (2026-07-29), on the owner's instruction: "I cant do anything about
+   [the old invoices]. So if you make a change find a way to handle the past then we
+   move on enhanced without the past records disturbing."
+   A forensic pass over the live data found genuine legacy damage that CANNOT be
+   repaired — orders whose ids are gone but whose invoices survive, invoices pointing
+   at customers that no longer exist, and delivered orders recorded at KSh 0. Those
+   are historical facts now. The problem is that the integrity checks re-report them
+   on EVERY run: a permanent "N issue(s)" banner, a fresh audit entry each time, and a
+   toast to the director. Alerts that always fire teach people to ignore alerts, which
+   is worse than not having them.
+   So anything dated before this cutoff is EXCLUDED from the repeat-alerting checks —
+   counted once as legacy, then left alone. Nothing is hidden or deleted: the records
+   stay exactly as they are and the Data page still shows the full history on demand.
+   What changes is only that the past stops interrupting. Anything created from here
+   on is checked as strictly as before, which is the point — the enhanced behaviour
+   applies going forward, undisturbed by damage nobody can undo. */
+var LEGACY_BEFORE="2026-07-29";
+/* FIRESTORE HEADROOM (2026-07-29) — measured, not estimated.
+   The whole database is ONE Firestore document with a hard 1,024KB ceiling. At the
+   live 371KB and ~20 orders/day it was on course to hit that wall in about two
+   months, at which point EVERY write fails and the business stops.
+   Measuring the document by collection produced a genuine surprise: 21 stock items
+   were consuming 84KB — as much as all 341 invoices — because each one carried a
+   50-entry movement history, 4.1KB per row. It went unnoticed precisely because
+   there are only 21 rows.
+   Why cutting it is safe, checked rather than assumed: st.history is written in six
+   places and READ in exactly ONE — the freshness merge, which only copies it across
+   so a concurrent write cannot drop it. No report, screen, export or calculation
+   reads it. It is write-only diagnostic data, so retention is a free parameter.
+   10 entries keeps recent movement per item and returns ~66KB — about 18% of the
+   document — for no functional change.
+   Deliberately NOT touched: customer.cycleHistory. It is uncapped and does grow, but
+   runIntegrityCheck RECOMPUTES it from delivered orders, so capping it would fight
+   that rebuild and could worsen the non-convergence already logged in §5. It needs
+   the integrity-check fix first. */
+var STOCK_HISTORY_MAX=10;
+/* ── ARCHIVE ELIGIBILITY — the safety predicate, defined and PROVEN before the
+   machinery that will use it (2026-07-29). Nothing calls these yet; they exist so the
+   rule is settled and tested first, because the archive is the one change in this
+   codebase that could put a live receivable out of reach.
+   THE OWNER'S CONSTRAINT, verbatim: "order close invoices remain with debts so we can
+   have a history dont block logic but we should be able to trace users with even
+   years of debts."
+   THE INVARIANT, therefore ABSOLUTE: **DEBT NEVER LEAVES THE LIVE DOCUMENT.** A
+   customer who still owes from three years ago must appear in Debts, in their
+   statement and in collection work with NO archive loaded. Age alone is never a
+   reason to archive; only SETTLEMENT is, and age is merely a second condition on top.
+   Why this shape works for this business: orders close fast here and only the debt
+   tail lingers (owner's own description, confirmed in the data — 288 of 340 orders and
+   293 of 341 invoices are already settled, while just 52 orders and 48 invoices are
+   open, about 24KB). So the live document only ever has to hold moving business plus
+   the debt tail, and the debt tail is bounded by collection rather than by trading
+   history.
+   THREE RULES, each a refusal:
+     1. An invoice is archivable ONLY if it is settled — fully paid, or voided with a
+        reason (a written-off balance is resolved, not owed). Otherwise it stays,
+        forever if need be.
+     2. An order is archivable ONLY if its own invoice is archivable. The pair moves
+        together or not at all, so a delivered order can never be separated from an
+        unpaid receivable.
+     3. An order with NO invoice is NEVER archivable. Absence of an invoice is not
+        proof of no debt — it is exactly the legacy defect found in this data (four
+        delivered orders with no receivable). Refuse rather than guess. */
+var ARCHIVE_MIN_AGE_DAYS=60;
+function _invoiceIsSettled(i){
+  if(!i)return false;
+  if(i.voided)return true;                       // written off with a reason — resolved
+  return (Number(i.paid)||0)>=(Number(i.amount)||0);
+}
+function _olderThanArchiveAge(dateStr,todayStr){
+  try{
+    if(!dateStr)return false;                    // no date — cannot prove age, refuse
+    var t=new Date(String(todayStr||tday())+"T12:00:00").getTime();
+    var d=new Date(String(dateStr)+"T12:00:00").getTime();
+    if(isNaN(t)||isNaN(d))return false;
+    return (t-d)>=ARCHIVE_MIN_AGE_DAYS*86400000;
+  }catch(_){return false;}
+}
+function _isArchivableInvoice(i,todayStr){
+  if(!i)return false;
+  if(!_invoiceIsSettled(i))return false;         // RULE 1 — any balance owed stays
+  return _olderThanArchiveAge(i.date,todayStr);
+}
+function _invoiceForOrder(ordId){
+  var _s=String(ordId);
+  return (D.invoices||[]).find(function(i){
+    if(i.orderId!=null)return String(i.orderId)===_s;
+    return !!(i.notes&&String(i.notes).match(new RegExp("#"+_s+"(\D|$)")));
+  })||null;
+}
+function _isArchivableOrder(o,todayStr){
+  if(!o)return false;
+  var st=String(o.status||"");
+  if(st!=="Delivered"&&st!=="Cancelled")return false;   // still in flight
+  var inv=_invoiceForOrder(o.id);
+  if(!inv)return false;                                 // RULE 3 — cannot prove no debt
+  if(!_isArchivableInvoice(inv,todayStr))return false;   // RULE 2 — pair moves together
+  return _olderThanArchiveAge(o.date,todayStr);
+}
+/* ── FIRESTORE HEADROOM: TELEMETRY + ESCALATING GUARDRAIL (2026-07-29) ───────
+   THE PROBLEM THIS SOLVES. The whole database is ONE Firestore document with a hard
+   1,024KB ceiling. Past it EVERY write fails and the business stops taking orders.
+   The old protection was a single toast at 800KB — on one device, once, easily missed,
+   and it named no number the owner could act on. Worse, the 84KB stock-history block
+   went unnoticed for months precisely because nothing ever reported COMPOSITION.
+   TWO PARTS, both free: the payload string is already built for the size check, so
+   measuring it costs nothing extra.
+     1. COMPOSITION, once per session -> a single console line ranking collections by
+        size. A surprise like "21 stock rows cost as much as 341 invoices" can no
+        longer hide. This is the cheapest possible insurance against the next one.
+     2. ESCALATING ALERTS at 700 / 850 / 950KB, each fired ONCE per session and routed
+        through _reportDeviceSyncHealth so they land in the DIRECTOR's audit view
+        rather than on whichever device happened to trigger them. That is the whole
+        point: the owner cannot reach the staff phones, so a warning that only shows
+        locally is no warning at all.
+   DELIBERATELY DOES NOT BLOCK WRITES. An earlier sketch of this refused non-critical
+   writes near the ceiling. That is wrong while no archive path exists yet: staff would
+   be unable to record real orders, so the "protection" would cause exactly the data
+   loss this project has spent weeks eliminating. Losing orders is worse than a large
+   document. Escalate visibility, never block the business.
+   The projection is an ESTIMATE, stated as one: it assumes ~20 orders/day (this
+   business's documented rate) and charges each order an order row plus an invoice row
+   at the payload's own measured per-record cost. */
+var _docSizeReported=false,_docSizeAlertLevel=0;
+function _checkDocSize(sizeKB,payload){
+  try{
+    var Dp=(payload&&payload.D)||{};
+    var keys=["customers","orders","invoices","stock","auditLog","pendingPayments","offers","routes","complaints"];
+    var recs=((Dp.customers||[]).length)+((Dp.orders||[]).length)+((Dp.invoices||[]).length);
+    var perRec=recs>0?(sizeKB/recs):0;
+    var kbPerDay=perRec*40; // 20 orders/day => an order row + an invoice row each
+    var daysLeft=kbPerDay>0?Math.round((1024-sizeKB)/kbPerDay):9999;
+    if(!_docSizeReported){
+      _docSizeReported=true;
+      var parts=[];
+      keys.forEach(function(k){
+        try{
+          var arr=Dp[k]||[];
+          parts.push({k:k,kb:Math.round(JSON.stringify(arr).length/1024),n:arr.length});
+        }catch(_){}
+      });
+      parts.sort(function(a,b){return b.kb-a.kb;});
+      console.log("[NDSYNC] document "+sizeKB+"KB / 1024KB · ~"+kbPerDay.toFixed(1)+"KB per day · ~"+daysLeft+
+        " days of headroom · composition: "+parts.filter(function(p){return p.kb>0;})
+        .map(function(p){return p.k+" "+p.kb+"KB("+p.n+")";}).join(" · "));
+    }
+    var lvl=sizeKB>=950?3:(sizeKB>=850?2:(sizeKB>=700?1:0));
+    if(lvl<=_docSizeAlertLevel)return;
+    _docSizeAlertLevel=lvl;
+    var tag=lvl===3?"CRITICAL":(lvl===2?"URGENT":"WARNING");
+    var msg="database is "+sizeKB+"KB of the 1024KB Firestore limit (~"+daysLeft+
+      " days of headroom at ~"+kbPerDay.toFixed(1)+"KB/day). Settled orders and invoices must be archived out of the live document.";
+    console.log("[NDSYNC] DOC SIZE "+tag+": "+msg);
+    try{
+      if(typeof _reportDeviceSyncHealth==="function"&&CU)_reportDeviceSyncHealth("DOC_SIZE_"+tag,msg);
+    }catch(_){}
+    try{
+      if(typeof toast==="function"&&can&&can("vDebt")){
+        toast(lvl===3?("⚠️ CRITICAL: database "+sizeKB+"KB of 1024KB limit — archiving is now urgent, writes will start failing"):
+              lvl===2?("⚠️ Database "+sizeKB+"KB of 1024KB — about "+daysLeft+" days left. Archive settled orders."):
+                       ("Database "+sizeKB+"KB of 1024KB — about "+daysLeft+" days of headroom."),
+              lvl>=2?"err":"warn");
+      }
+    }catch(_){}
+  }catch(_){}
+}
+/* Applies the cap to records that already exceed it, once per session, so the space
+   is recovered from existing data rather than only from new movements. Runs after
+   cloud data has arrived (never against an empty D) and marks nothing dirty on its
+   own — the next ordinary write carries it. */
+function _trimStockHistories(){
+  try{
+    if(!D||!D.stock||!D.stock.length)return 0;
+    var trimmed=0;
+    (D.stock||[]).forEach(function(s){
+      if(s&&s.history&&s.history.length>STOCK_HISTORY_MAX){
+        s.history=s.history.slice(-STOCK_HISTORY_MAX);
+        trimmed++;
+      }
+    });
+    if(trimmed)console.log("[NDSYNC] trimmed stock movement history on "+trimmed+" item(s) to the last "+STOCK_HISTORY_MAX+" — Firestore headroom");
+    return trimmed;
+  }catch(_){return 0;}
+}
+function _isLegacyRecord(dateStr){
+  try{ return !!dateStr && String(dateStr) < LEGACY_BEFORE; }catch(_){ return false; }
+}
 var HEAL_MAX_AUTO=3;                          // more than this looks missing => restore NOTHING, report instead
 var _healSuppressReported={};                 // condition -> true; report once per session (bounded event window)
 /* RAIL 1b — THE WINDOW. This is the rail that matters most in day-to-day use, and
@@ -4207,6 +4394,7 @@ function _selfHealUnsyncedLocalRecords(){
     }
     if(window._selfHealDone)return; // once per session
     window._selfHealDone=true;
+    _trimStockHistories();                                         // Firestore headroom (safe: write-only data)
     if(!_healLiveStateLooksLoaded("LOCAL"))return;                 // RAIL 2
     var snap=_healSourceSnapshot();
     if(!snap||!snap.D)return;
@@ -6234,6 +6422,44 @@ function adjustCredit(cId){
       try{if(el("pg-customers")&&el("pg-customers").classList.contains("act"))rCusts();}catch(_){}
     });
 }
+/* PENDING-CASH RESOLUTION (2026-07-29), on the owner's instruction: acknowledgement
+   exists so cash is confirmed into COMPANY custody rather than sitting with staff.
+   The clash it had to solve: staff collect cash at delivery, which creates an
+   UNACKNOWLEDGED pendingPayments entry. If the director then records that same
+   payment MANUALLY against the delivery or the invoice — which is a completely
+   normal thing to do — two wrong things happened:
+     1. the pending-cash alert stayed up for ever, because nothing ever acknowledged
+        that entry, so the director kept being told to confirm money already banked;
+     2. acknowledging it afterwards posted the SAME cash a second time, which is
+        precisely how a customer ends up with credit nobody can explain.
+   This resolves the pending entry the moment the money is recorded by hand: matched
+   on the ORDER first (the strongest link, the same "#id" linkage used everywhere
+   else), and never by amount alone. The entry is marked acknowledged rather than
+   deleted, tagged with how it was resolved, so the custody trail is intact and the
+   cash is still attributable to the staff member who collected it.
+   Returns how many were resolved so callers can mention it. */
+function _resolvePendingCashFor(ordId,cId,why){
+  try{
+    var hits=(D.pendingPayments||[]).filter(function(p){
+      if(!p||p.ack)return false;
+      if(ordId!=null&&String(p.ordId)===String(ordId))return true;
+      return false;
+    });
+    if(!hits.length)return 0;
+    hits.forEach(function(p){
+      p.ack=true;
+      p.ackBy=CU?CU.name:"system";
+      p.ackRole=CU?CU.role:"";
+      p.ackDate=tday();
+      p.ackVia="manual-entry";
+      p.ackNote=why||"resolved by a manual payment entry — cash already accounted for";
+      auditLog("CASH_ACKNOWLEDGED","KSh "+(p.amt||0).toLocaleString()+" collected by "+(p.collectedBy||"staff")+
+        " for Order #"+p.ordId+" resolved WITHOUT a second posting by "+(CU?CU.name:"system")+
+        " ("+(CU?CU.role:"")+") — the payment was recorded manually, so acknowledging it again would have double-counted the same cash. Custody confirmed.");
+    });
+    return hits.length;
+  }catch(_){return 0;}
+}
 function showCreditLog(cId){
   if(!can("vRev")){toast("Manager+ only","err");return;}
   var cu=(D.customers||[]).find(function(x){return x.id===cId;});
@@ -6629,6 +6855,10 @@ function recPay(){
     // back to Unpaid. Placed after the order's paid/amtPaid are updated (just
     // above). Only attached when a linked order actually exists; _orderSnapshotFor
     // returns the matching invoice alongside it, so the money survives with it.
+    // A manual posting settles any staff cash still pending for this order, so the
+    // alert clears and a later acknowledgement cannot post the same money twice.
+    var _resolved=o?_resolvePendingCashFor(o.id,inv.cId):0;
+    if(_resolved)toast(_resolved+" pending staff cash entr"+(_resolved===1?"y":"ies")+" for this order marked confirmed — no double posting","ok");
     auditLog("PAYMENT_RECORDED","KSh "+amt.toLocaleString()+" on Invoice #"+invId+" by "+CU.name+" ("+CU.role+"). Method: "+method+(ref?" Ref: "+ref:"")+(credit>0?" | KSh "+credit.toLocaleString()+" overpayment added to credit":"")+". Balance: KSh "+(inv.amount-inv.paid).toLocaleString(),o?{ordSnapshot:_orderSnapshotFor(o.id)}:undefined);
   }else{
   // ── CUSTOMER-LEVEL PAYMENT — distribute oldest-first ─────────────────
@@ -7790,7 +8020,7 @@ async function saveOrd(){
       st.qty=st.qty-qty;_recordStockDelta(st.id,-qty);
       if(!st.history)st.history=[];
       st.history.push({ts:tday(),type:"sale",qty:-qty,by:CU.name,ordId:newOrdId,bal:st.qty});
-      if(st.history.length>50)st.history=st.history.slice(-50);
+      if(st.history.length>STOCK_HISTORY_MAX)st.history=st.history.slice(-STOCK_HISTORY_MAX);
       updateStockBadge();
     }
     (D.orders||[]).push({id:newOrdId,cId:cId,prod:pn,stockId:stCost?stCost.id:null,invoiceId:newInvId,qty:qty,price:price,cost:costAtSale,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:sanitizeInput(el("odlvr").value),bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?sanitizeInput(el("onotes").value):"",_ts:Date.now(),_cid:_orderCid,prodConfirmed:true});
@@ -7936,7 +8166,7 @@ async function completeDlv(){
       st.qty=st.qty-o.qty;_recordStockDelta(st.id,-o.qty); // negative-stock policy (see order-creation note): no floor, so a short delivery reconciles on restock
       if(!st.history)st.history=[];
       st.history.push({ts:tday(),type:"sale",qty:-o.qty,by:CU.name,ordId:o.id,bal:st.qty});
-      if(st.history.length>50)st.history=st.history.slice(-50);
+      if(st.history.length>STOCK_HISTORY_MAX)st.history=st.history.slice(-STOCK_HISTORY_MAX);
     }
     // Update order with confirmed product
     o.prod=confirmedProd;
@@ -8157,7 +8387,7 @@ async function delO(id){
     st.qty+=o.qty;_recordStockDelta(st.id,o.qty);
     if(!st.history)st.history=[];
     st.history.push({ts:tday(),type:"restore",qty:+o.qty,by:CU.name,ordId:id,bal:st.qty});
-    if(st.history.length>50)st.history=st.history.slice(-50);
+    if(st.history.length>STOCK_HISTORY_MAX)st.history=st.history.slice(-STOCK_HISTORY_MAX);
     updateStockBadge();
   }
   // Remove order — tombstone it INSIDE the synced document itself (not just
@@ -8280,7 +8510,7 @@ function _finishCancelO(id,disposition){
     st.qty+=o.qty;_recordStockDelta(st.id,o.qty);
     if(!st.history)st.history=[];
     st.history.push({ts:tday(),type:"restore",qty:+o.qty,by:CU.name,ordId:id,bal:st.qty});
-    if(st.history.length>50)st.history=st.history.slice(-50);
+    if(st.history.length>STOCK_HISTORY_MAX)st.history=st.history.slice(-STOCK_HISTORY_MAX);
     updateStockBadge();
   }
   o.status="Cancelled";
@@ -9111,7 +9341,7 @@ async function recreateOrder(idx){
         _stMatch.qty=_stMatch.qty-qty;_recordStockDelta(_stMatch.id,-qty,newId); // negative-stock policy: no floor
         if(!_stMatch.history)_stMatch.history=[];
         _stMatch.history.push({ts:tday(),type:"sale",qty:-qty,by:CU.name+" (recovery)",ordId:newId,bal:_stMatch.qty});
-        if(_stMatch.history.length>50)_stMatch.history=_stMatch.history.slice(-50);
+        if(_stMatch.history.length>STOCK_HISTORY_MAX)_stMatch.history=_stMatch.history.slice(-STOCK_HISTORY_MAX);
         updateStockBadge();
       }
       D.orders.push(newOrder);
@@ -9148,7 +9378,7 @@ async function recreateOrder(idx){
 
 
 function doRS(){if(!can("aSt")){toast("Permission denied","err");return;}var id=parseInt(el("rp").value);var q=parseInt(el("rq").value)||0;if(q<=0){toast("Enter quantity to add","err");return;}var p=(D.stock||[]).find(function(s){return s.id===id;});if(p){p.qty+=q;_recordStockDelta(p.id,q);
-  if(!p.history)p.history=[];p.history.push({ts:tday(),type:"restock",qty:q,by:CU.name,bal:p.qty});if(p.history.length>50)p.history=p.history.slice(-50);
+  if(!p.history)p.history=[];p.history.push({ts:tday(),type:"restock",qty:q,by:CU.name,bal:p.qty});if(p.history.length>STOCK_HISTORY_MAX)p.history=p.history.slice(-STOCK_HISTORY_MAX);
   // FIX (2026-07-27): the "auto-fulfil pending orders" loop that used to live
   // here deducted each still-Pending order's FULL quantity from stock AGAIN on
   // every restock. But an exact order already deducts its stock at creation
@@ -11551,19 +11781,53 @@ var AS_SUPPORTED=(typeof window.showSaveFilePicker==="function");
 
 function lsKey(){return "newdawn_autosave_"+(CU?CU.id+"_"+CU.role:"shared");}
 
+/* PERFORMANCE + SILENT-FAILURE FIX (2026-07-29).
+   THIS RUNS SYNCHRONOUSLY ON EVERY dirty() — every order, payment and delivery —
+   and it serialised the ENTIRE database and wrote it THREE times: user-keyed
+   localStorage, shared localStorage, and sessionStorage. At the live payload size
+   (371KB measured in production) and localStorage's UTF-16 storage, that was roughly
+   2.2MB of blocking main-thread writes per save. On an iPad, whose per-origin quota
+   is about 5MB and whose per-tab memory ceiling is far below desktop Chrome's, that
+   is the largest single piece of synchronous work in the app and the leading
+   candidate for the reported freeze-then-white-screen on tab and filter changes.
+   The sessionStorage copy is dropped: it was labelled "redundant ... for same-session
+   recovery", and localStorage already covers the same session while ALSO surviving a
+   reload, which sessionStorage does not. Nothing reads it that localStorage does not
+   answer first (autoSaveCheckLocal tries the user key, then the shared key, and only
+   then sessionStorage). That removes a third of the work and a third of the quota.
+   BOTH localStorage slots are KEPT deliberately: autoSaveCheckLocal falls back to the
+   shared slot, and the "document doesn't exist" recovery path depends on it. Dropping
+   it would weaken a data-recovery route to save bytes — the wrong trade on a system
+   whose whole problem has been lost records.
+   AND the swallowed error is fixed: catch(e){return false;} meant a
+   QuotaExceededError — inevitable as this dataset grows against a 5MB iPad quota —
+   silently disabled the local auto-save, the exact copy the lost-order recovery
+   depends on, with nobody told. It now reports through the same channel the director
+   already watches, once per session so it cannot become noise. */
+var _autoSaveFailReported=false;
 function autoSaveLocal(){
   try{
     var snapshot={D:D,USERS:USERS,nOId:nOId,nIId:nIId,nCId:nCId,ts:new Date().toISOString(),setupDone:FB_SETUP_DONE};
     var json=JSON.stringify(snapshot);
     // Save to user-keyed slot (prevents staff save overwriting director data)
-    var key=lsKey();
-    localStorage.setItem(key,json);
-    // Also save to shared slot for cross-user recovery
+    localStorage.setItem(lsKey(),json);
+    // Also save to shared slot for cross-user recovery (autoSaveCheckLocal falls back
+    // to this, and the doc-missing recovery path reads it — do not remove it).
     localStorage.setItem("newdawn_autosave_shared",json);
-    // Redundant copy in sessionStorage for same-session recovery
-    try{sessionStorage.setItem("newdawn_session_backup",json);}catch(e2){}
     return true;
-  }catch(e){return false;}
+  }catch(e){
+    if(!_autoSaveFailReported){
+      _autoSaveFailReported=true;
+      var _code=(e&&(e.name||e.code))||"unknown";
+      console.log("[NDSYNC] LOCAL AUTO-SAVE FAILED ("+_code+") — this device's offline safety copy is NOT being written");
+      try{
+        if(typeof _reportDeviceSyncHealth==="function"&&CU)
+          _reportDeviceSyncHealth("LOCAL_AUTOSAVE_FAILED","the on-device safety copy could not be written ("+_code+") — likely storage full; lost-order recovery from this device is degraded");
+        if(typeof toast==="function")toast("This device could not save its offline safety copy — tell your director","err");
+      }catch(_){}
+    }
+    return false;
+  }
 }
 // FIX (2026-07-26): pending-order recovery ledger. The atomic transaction
 // fix closes the concurrent-write clobber, and the button-disable fix
@@ -11965,8 +12229,15 @@ function runIntegrityCheck(){
     if(!custIds[o.cId])issues.push("Order #"+o.id+" references missing customer ID "+o.cId);
   });
   // Check 3: orphaned invoices (no matching order, amount unpaid)
+  // LEGACY (2026-07-29): pre-cutoff orphans are unrepairable history — an order id
+  // that no longer exists cannot be recreated. They were reported once; re-reporting
+  // them every run produced a permanent banner and a fresh audit entry each time,
+  // burning the bounded event window the missing-order detector depends on. Counted
+  // separately and silently from here.
+  var _legacyOrphans=0;
   (D.invoices||[]).forEach(function(inv){
     if(inv.paid>=inv.amount||inv.voided)return; // paid or voided — ignore
+    if(_isLegacyRecord(inv.date)){_legacyOrphans++;return;} // history — do not re-alert
     if(inv.orderId){
       var o2=(D.orders||[]).find(function(x){return x.id===inv.orderId;});
       if(!o2)issues.push("Invoice #"+inv.id+" references deleted order #"+inv.orderId+" — KSh "+(inv.amount-inv.paid)+" outstanding");
