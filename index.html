@@ -348,7 +348,7 @@ var APP_VERSION="2026-07-21-v35";
    was actually running.
    Bump this ONE line on every deploy. It is display-and-diagnostics only — nothing branches
    on it, no merge or money logic reads it, so it can never change behaviour. */
-var BUILD_STAMP="2026-07-31-b4";
+var BUILD_STAMP="2026-07-31-hyb-a";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -1269,6 +1269,72 @@ function _orderSnapshotFor(ordId){
    behaves exactly as before. See the migration notes for the rule text.
    ============================================================================ */
 var FB_OUTBOX_COL=null;              // newdawn_outbox collection (null until Firebase is up)
+/* ============================================================================
+   HYBRID MIGRATION — /orders and /invoices move OUT of the main document
+                                                                    (2026-07-31)
+   See HYBRID_MIGRATION_SPEC.md for the full design, rules and runbook.
+
+   WHY: the monolithic single-document pattern has two hard ceilings, both measured
+   against the owner's real data, not estimated:
+     1. the 1 MB Firestore document limit — a HARD limit on every plan, so money
+        cannot buy past it. At ~366 KB and ~11.7 KB/day it is breached in ~56 days.
+     2. Spark's 10 GiB/month egress — every write broadcasts the WHOLE document to
+        every listening device. 366 KB x 8 devices x 80 writes/day = 6.7 GB/month,
+        i.e. 67% of the allowance ALREADY, and it goes over at ~600 KB (~3 weeks).
+   Orders and invoices are the only collections that grow without bound, so moving
+   just those two fixes both ceilings: main doc 366 KB -> 30 KB, and 269 KB at year
+   ten; egress 6.7 GB -> 0.31 GB/month.
+
+   WHY NOT full normalization: Firestore bills per DOCUMENT READ, not per byte.
+   Moving everything out takes reads from ~3,300/day (7% of free) to ~22,040 (44%).
+   The hybrid keeps customers/products/users in the one main document, so a cold
+   start is still ONE read and reads stay at ~4,040/day (8%).
+
+   ORDER OF OPERATIONS IS LOAD-BEARING — see the spec's four phases. Everything in
+   this block is Phase 1/2 (backfill + verify): purely ADDITIVE, nothing reads from
+   these collections yet, so this build behaves EXACTLY like the frozen Build A
+   until cutover. That is deliberate: it can be deployed and observed before any
+   irreversible step.
+   ============================================================================ */
+var FB_ORDERS_COL=null;              // /orders/{orderId}
+var FB_INVOICES_COL=null;            // /invoices/{invoiceId}
+var FB_CUSTOMERS_COL=null;           // /customers/{customerId}
+var HOT_WINDOW_DAYS=90;              // see the spec: hot window = recent OR unsettled
+var _hybridMigrating=false;
+/* THE KILL SWITCH. false = this build behaves EXACTLY like the frozen Build A: orders and
+   invoices stay inside the main document, the read-side merges run, nothing touches /orders
+   or /invoices. true = cutover (Phase 3). Deliberately ONE constant so a rollback is a
+   one-character edit and a redeploy, not a code revert — on a live money system that
+   property is worth more than tidiness. Phases 1 and 2 (backfill + verify) work either way,
+   because they only ever WRITE documents and READ them back; they never change behaviour. */
+var HYBRID_COLLECTIONS_LIVE=false;
+/* SEPARATE flag for the customers extraction, deliberately independent of the orders/invoices
+   cutover (2026-07-31). Customers are 140 KB of the measured 387 KB document and are NEVER
+   archived, so with only orders and invoices moved the main document still grows with the
+   business and reaches the 1 MB ceiling eventually — moving customers removes the ceiling
+   instead of deferring it.
+   IT IS ITS OWN FLAG FOR A REASON: the /customers listener and per-document persister are NOT
+   yet implemented. Turning this on before they exist would leave D.customers neither hydrated
+   nor persisted — silent, total customer-data loss on the next write. It stays false, and the
+   read-side merge continues to run exactly as in Build A, until the listener, the flush-loop
+   entry, the payload skip and the backfill/verify coverage are all in place and proven.
+   DO NOT set this true as part of the Phase 3 cutover. It is a separate, later step. */
+var HYBRID_CUSTOMERS_LIVE=false;
+var _hybridShadow={orders:{},invoices:{},customers:{}};   // id -> JSON, last state successfully persisted
+var _hybridListenersOn=false,_hybridUnsub=[];
+/* NO-OP WRITE SUPPRESSOR state (2026-07-31) — see the long note at the txn.set site.
+   _lastCommittedSig advances ONLY on a Firestore-confirmed commit, so a failed write can
+   never be mistaken for an applied one. Reset on every cold listener start so a new session
+   never trusts a signature from a previous connection. */
+var _lastCommittedSig=null,_pendingSig=null;
+function _hybridCheapHash(s){
+  // FNV-1a, 32-bit. Not cryptographic — it only has to detect "this payload differs",
+  // and it is paired with the payload LENGTH at the call site, so a collision would need
+  // both the same length and the same hash. Cheap enough to run on every write.
+  var h=0x811c9dc5;
+  for(var i=0;i<s.length;i++){h^=s.charCodeAt(i);h=(h*0x01000193)>>>0;}
+  return h.toString(16);
+}
 var _outboxReconciling=false;        // re-entry guard — one reconcile pass at a time
 var _outboxDoneThisSession=false;    // the full pass runs once per session (cost guard)
 /* WRITE SIDE — the durable part. A plain set() on a small per-order document,
@@ -1507,6 +1573,632 @@ function _outboxReconcile(){
     });
   }catch(_){_outboxReconciling=false;}
 }
+/* ============================================================================
+   HYBRID — PER-DOCUMENT PERSISTENCE                                (2026-07-31)
+
+   Replaces "mutate the array, then rewrite the whole 366 KB document" with "write
+   the one document that changed". A plain set() — NOT a transaction — which is what
+   makes these writes offline-queueable: Firestore never places a runTransaction in
+   the offline queue, only set/update/delete. That is the ROOT CAUSE of the
+   missing-order class, and per-document writes fix it structurally rather than
+   compensating for it.
+
+   _updatedAt sentinel is attached AFTER any clone, never before. A FieldValue
+   sentinel is recognised by instance identity, so a JSON round-trip silently
+   destroys it — that exact bug made updatedAt null on every write for weeks.
+   ============================================================================ */
+/* ============================================================================
+   DERIVED `settled` FLAG — solves three separate Firestore limitations (2026-07-31)
+
+   The hot-window listeners need a companion query catching ALL unsettled records at any
+   age, so debt can never fall outside memory. Three problems make the obvious queries
+   impossible:
+
+   1. FIRESTORE CANNOT COMPARE TWO FIELDS. `where("paid","<","amount")` compares `paid`
+      against the literal string "amount" — it is simply wrong. The earlier stand-in,
+      `where("voided","==",false)`, matched EVERY non-voided invoice (~all 368), so the
+      invoice hot window did nothing and a cold start pulled ~1,000 reads/session (~64% of
+      the free tier, not the 8% first claimed).
+   2. FIRESTORE `!=` EXCLUDES DOCUMENTS WHERE THE FIELD IS ABSENT. `where("paid","!=","Paid")`
+      on orders silently skipped any legacy order with no `paid` field — invisible debt.
+   3. Both are fixed by ONE denormalised boolean, written on every persist, so it is never
+      absent and never needs a two-field comparison.
+
+   DEFINITIONS — deliberately erring toward NOT settled, because an unsettled record must
+   never be excluded from the live set (RULE 1: debt never leaves):
+     invoice: settled = voided OR paid >= amount
+     order  : settled = (paid === "Paid")
+   A malformed amount coerces to 0, which makes paid>=amount TRUE and would wrongly mark it
+   settled — so a non-numeric amount is treated as NOT settled and stays visible for a human.
+
+   Mutates the record in place on purpose: the flag then travels in the JSON the change
+   tracker hashes, so a settle/unsettle transition triggers a rewrite like any other change,
+   and the in-memory copy always agrees with the stored document. */
+function _hybridDerive(kind,rec){
+  try{
+    if(!rec||typeof rec!=="object")return rec;
+    if(kind==="i"){
+      var amt=Number(rec.amount),pd=Number(rec.paid)||0;
+      if(rec.voided)rec.settled=true;
+      else if(isNaN(amt))rec.settled=false;          // cannot prove settlement -> stays live
+      else rec.settled=(pd>=amt);
+    }else if(kind==="o"){
+      rec.settled=(String(rec.paid)==="Paid");
+    }
+    return rec;
+  }catch(_){return rec;}
+}
+function _hybridStamp(obj,kind){
+  // Defensive: never throw on the write path. Callers already guard, but a helper that can
+  // take down a save is exactly the shape this project's merge primitives are hardened against.
+  if(!obj||typeof obj!=="object")return obj;
+  if(kind)_hybridDerive(kind,obj);
+  // Plain-data clone first (isolates the payload from later live edits), sentinel after.
+  var out=JSON.parse(JSON.stringify(obj));
+  try{
+    if(typeof firebase!=="undefined"&&firebase.firestore&&firebase.firestore.FieldValue)
+      out._updatedAt=firebase.firestore.FieldValue.serverTimestamp();
+  }catch(_){}
+  return out;
+}
+function _persistOrderDoc(o){
+  try{
+    if(!FB_ORDERS_COL||!o||o.id==null)return;
+    FB_ORDERS_COL.doc(String(o.id)).set(_hybridStamp(o,"o"),{merge:true}).catch(function(e){
+      console.log("[NDHYBRID] order #"+o.id+" write failed ("+((e&&e.code)||"unknown")+") — queued offline if transient");
+    });
+  }catch(_){}
+}
+function _persistInvoiceDoc(i){
+  try{
+    if(!FB_INVOICES_COL||!i||i.id==null)return;
+    FB_INVOICES_COL.doc(String(i.id)).set(_hybridStamp(i,"i"),{merge:true}).catch(function(e){
+      console.log("[NDHYBRID] invoice #"+i.id+" write failed ("+((e&&e.code)||"unknown")+")");
+    });
+  }catch(_){}
+}
+/* ============================================================================
+   CUSTOMERS — TRANSACTIONAL PERSISTER                              (2026-07-31)
+
+   Customers CANNOT use the plain set() the orders and invoices persisters use, and the
+   reason is money.
+
+   In the monolith, two devices touching the same customer's credit were reconciled by
+   _mergeCustomerCredit during the write: creditLog entries were UNIONED by their unique
+   cid, so an overpayment recorded on one phone and a credit applied on another both
+   survived. That reconcile does not exist for per-document writes — a plain set() is
+   last-write-wins on the whole document, which would silently drop one of two concurrent
+   credit entries. Real cash, lost quietly. Exactly the 2026-07-21 bug class that
+   _mergeCustomerCredit was written to close.
+
+   So each customer write runs in a transaction: read the current document, run the
+   ALREADY-PROVEN _mergeCustomerCredit against it, write the union. Cost is 1 read + 1
+   write per changed customer, and customer edits are a handful a day — negligible against
+   50,000 reads / 20,000 writes.
+
+   Note the argument order: _mergeCustomerCredit(a=local, b=remote) bases profile fields on
+   `a` and unions credit from both. That is the same orientation the write-side reconcile
+   used, so the semantics carry over unchanged.
+
+   Falls back to a plain set() only when transactions are unavailable (no fbDb) — logged,
+   never silent, because that fallback is the lossy path. */
+function _persistCustomerDoc(c){
+  try{
+    if(!FB_CUSTOMERS_COL||!c||c.id==null)return;
+    var ref=FB_CUSTOMERS_COL.doc(String(c.id));
+    if(!fbDb||typeof fbDb.runTransaction!=="function"){
+      console.log("[NDHYBRID] customer #"+c.id+" written WITHOUT a transaction (no fbDb) — concurrent credit changes could be lost");
+      ref.set(_hybridStamp(c,"c"),{merge:true}).catch(function(){});
+      return;
+    }
+    fbDb.runTransaction(function(txn){
+      return txn.get(ref).then(function(doc){
+        var remote=(doc&&doc.exists)?doc.data():null;
+        // No remote copy yet -> nothing to union, write as-is.
+        var merged=remote?_mergeCustomerCredit(c,remote):c;
+        txn.set(ref,_hybridStamp(merged,"c"),{merge:true});
+      });
+    }).catch(function(e){
+      console.log("[NDHYBRID] customer #"+c.id+" write failed ("+((e&&e.code)||"unknown")+") — will retry next flush");
+    });
+  }catch(_){}
+}
+function _deleteCustomerDoc(id){
+  try{ if(FB_CUSTOMERS_COL&&id!=null)FB_CUSTOMERS_COL.doc(String(id)).delete().catch(function(){}); }catch(_){}
+}
+function _deleteOrderDoc(id){
+  try{ if(FB_ORDERS_COL&&id!=null)FB_ORDERS_COL.doc(String(id)).delete().catch(function(){}); }catch(_){}
+}
+function _deleteInvoiceDoc(id){
+  try{ if(FB_INVOICES_COL&&id!=null)FB_INVOICES_COL.doc(String(id)).delete().catch(function(){}); }catch(_){}
+}
+
+/* ============================================================================
+   HYBRID — CHANGE-TRACKING PERSISTER                               (2026-07-31)
+
+   WHY THIS INSTEAD OF EDITING 34 MUTATION SITES. The spec listed 34 places that
+   mutate D.orders/D.invoices and would each need a _persistOrderDoc() call added.
+   Hand-editing 34 sites in money code has an obvious failure mode: miss one, and
+   that mutation silently never reaches Firestore — a new missing-order class, in
+   the very migration meant to end missing orders. Worse, it fails SILENTLY.
+
+   Instead: diff the arrays against the last successfully-persisted state on each
+   flush, and write whatever actually changed. Every mutation site is covered
+   automatically, including any the audit missed and any added in future. Cost is
+   one JSON.stringify per record per flush (~730 today) — trivial next to the
+   366 KB serialization it replaces.
+
+   Deletions are handled the same way: an id present in the shadow but absent from
+   the array was deleted, so its document is deleted. That is derived from the
+   arrays themselves rather than from a tombstone map, which is why the hybrid can
+   drop archivedOrderIds/archivedInvoiceIds entirely (1.8 MB of ten-year growth).
+
+   The shadow is only updated for records that WROTE SUCCESSFULLY. A failed write
+   stays "dirty" and is retried on the next flush, so a dropped connection cannot
+   silently lose a change.
+   ============================================================================ */
+/* ============================================================================
+   CLOSED-PERIOD FILTER — the archive tombstone, in compact form    (2026-07-31)
+
+   THE PROBLEM. _hydrateById only ADDS and UPDATES; it never removes. That is deliberate,
+   because a Firestore listener reports a document as `removed` BOTH when it is genuinely
+   deleted AND when it merely falls out of the query window — e.g. an order becomes Paid and
+   leaves the settled==false query. Acting on `removed` would silently drop live records.
+
+   But without SOME removal signal, archiving breaks across devices: _closePeriod writes the
+   book, removes the records from its own arrays, and the change tracker deletes those
+   documents — while every OTHER device keeps its in-memory copies. Those stale copies show
+   archived history as live, and if one is edited the tracker writes it straight back,
+   RESURRECTING an archived record. That is the exact failure Build A guards against with
+   archivedOrderIds at six sites.
+
+   An earlier note in this migration claimed the hybrid could drop those tombstone maps
+   entirely because "a deleted document cannot be resurrected by a whole-document write."
+   That reasoning was incomplete — it did not account for another device's in-memory copy
+   being written back PER DOCUMENT. The tombstone is still required.
+
+   THE COMPACT FORM. D.closedPeriods[period]=ts — roughly 20 bytes per closed MONTH (2.4 KB
+   for ten years) instead of ~21 bytes per archived RECORD (1.8 MB over the same span).
+
+   THE RULE, and the settled clause is load-bearing:
+     drop a record from the live arrays only if its period is closed AND it is settled.
+   An unsettled record can NEVER have been archived (RULE 1 — debt never leaves), so it must
+   never be dropped on this signal. That single condition is what makes a period-level
+   tombstone as precise as a per-record one, without the growth. */
+function _hybridPeriodClosed(rec){
+  try{
+    if(!rec||!D.closedPeriods)return false;
+    if(typeof bookPeriodOf!=="function")return false;
+    var p=bookPeriodOf(rec.date);
+    return !!(p&&D.closedPeriods[p]);
+  }catch(_){return false;}
+}
+function _hybridDropArchived(){
+  if(!HYBRID_COLLECTIONS_LIVE)return 0;
+  try{
+    if(!D.closedPeriods||!Object.keys(D.closedPeriods).length)return 0;
+    var dropped=0;
+    ["orders","invoices"].forEach(function(key){
+      var kind=(key==="orders")?"o":"i";
+      var keep=[];
+      (D[key]||[]).forEach(function(r){
+        if(!r){return;}
+        _hybridDerive(kind,r);
+        // UNSETTLED records are never archived — keep them no matter how old the period.
+        if(r.settled===true&&_hybridPeriodClosed(r)){
+          dropped++;
+          // Forget the shadow entry too, so the tracker does not read the absence as a
+          // deletion and issue a delete against a document the archive legitimately owns.
+          try{delete _hybridShadow[key][String(r.id)];}catch(_){}
+          return;
+        }
+        keep.push(r);
+      });
+      if(dropped)D[key]=keep;
+    });
+    if(dropped)console.log("[NDHYBRID] dropped "+dropped+" archived record(s) from the live arrays (period closed AND settled) — not a deletion, they live in their book");
+    return dropped;
+  }catch(e){return 0;}
+}
+function _hybridSeedShadow(){
+  // Called after a successful Phase 1 backfill, and after listener hydration, so the
+  // first flush does not re-write all 730 documents for no reason.
+  try{
+    _hybridShadow={orders:{},invoices:{}};
+    (D.orders||[]).forEach(function(o){if(o&&o.id!=null)_hybridShadow.orders[String(o.id)]=JSON.stringify(o);});
+    (D.invoices||[]).forEach(function(i){if(i&&i.id!=null)_hybridShadow.invoices[String(i.id)]=JSON.stringify(i);});
+  }catch(_){}
+}
+function _hybridFlushDocs(){
+  if(!HYBRID_COLLECTIONS_LIVE)return;
+  if(!FB_ORDERS_COL||!FB_INVOICES_COL)return;
+  /* Run the closed-period filter FIRST, before anything can be written. This is the strongest
+     placement: an archived record cannot be written back if it is no longer in the array by the
+     time the tracker looks. Cheap — it returns immediately unless a period is actually closed. */
+  try{_hybridDropArchived();}catch(_){}
+  try{
+    var wroteO=0,wroteI=0,delO2=0,delI2=0;
+    // ---- orders: new or changed
+    var liveO={};
+    (D.orders||[]).forEach(function(o){
+      if(!o||o.id==null)return;
+      // Derive BEFORE hashing: otherwise the write would add `settled` and the very next
+      // flush would see a difference and rewrite every record, forever.
+      _hybridDerive("o",o);
+      var k=String(o.id),j=JSON.stringify(o);
+      liveO[k]=true;
+      if(_hybridShadow.orders[k]===j)return;                  // unchanged
+      var snap=j;
+      FB_ORDERS_COL.doc(k).set(_hybridStamp(o,"o"),{merge:true}).then(function(){
+        _hybridShadow.orders[k]=snap;                          // only on CONFIRMED write
+      }).catch(function(e){
+        console.log("[NDHYBRID] order #"+k+" write failed ("+((e&&e.code)||"unknown")+") — will retry next flush");
+      });
+      wroteO++;
+    });
+    // ---- orders: deleted (in shadow, gone from the array)
+    Object.keys(_hybridShadow.orders).forEach(function(k){
+      if(liveO[k])return;
+      FB_ORDERS_COL.doc(k).delete().then(function(){delete _hybridShadow.orders[k];}).catch(function(){});
+      delO2++;
+    });
+    // ---- invoices: new or changed
+    var liveI={};
+    (D.invoices||[]).forEach(function(i){
+      if(!i||i.id==null)return;
+      _hybridDerive("i",i);   // see the orders block above — derive before hashing
+      var k=String(i.id),j=JSON.stringify(i);
+      liveI[k]=true;
+      if(_hybridShadow.invoices[k]===j)return;
+      var snap=j;
+      FB_INVOICES_COL.doc(k).set(_hybridStamp(i,"i"),{merge:true}).then(function(){
+        _hybridShadow.invoices[k]=snap;
+      }).catch(function(e){
+        console.log("[NDHYBRID] invoice #"+k+" write failed ("+((e&&e.code)||"unknown")+") — will retry next flush");
+      });
+      wroteI++;
+    });
+    Object.keys(_hybridShadow.invoices).forEach(function(k){
+      if(liveI[k])return;
+      FB_INVOICES_COL.doc(k).delete().then(function(){delete _hybridShadow.invoices[k];}).catch(function(){});
+      delI2++;
+    });
+    // ---- customers (own flag; transactional persister — see _persistCustomerDoc)
+    var wroteC=0,delC2=0;
+    if(HYBRID_CUSTOMERS_LIVE&&FB_CUSTOMERS_COL){
+      var liveC={};
+      (D.customers||[]).forEach(function(c){
+        if(!c||c.id==null)return;
+        var k=String(c.id),j=JSON.stringify(c);
+        liveC[k]=true;
+        if(_hybridShadow.customers[k]===j)return;
+        /* The shadow advances OPTIMISTICALLY here, unlike orders/invoices. The transactional
+           write resolves asynchronously and may legitimately return a MERGED result that
+           differs from what we sent (another device's credit unioned in), so waiting for
+           confirmation and storing what we sent would make every subsequent flush see a
+           difference and rewrite forever. The customers listener re-seeds the shadow from
+           the authoritative server copy on arrival, which is what actually keeps it honest.
+           A failed write is therefore caught by the listener disagreeing, not by the shadow. */
+        _hybridShadow.customers[k]=j;
+        _persistCustomerDoc(c);
+        wroteC++;
+      });
+      Object.keys(_hybridShadow.customers).forEach(function(k){
+        if(liveC[k])return;
+        _deleteCustomerDoc(k);delete _hybridShadow.customers[k];
+        delC2++;
+      });
+    }
+    if(wroteO||wroteI||delO2||delI2||wroteC||delC2)
+      console.log("[NDHYBRID] flush: orders "+wroteO+"w/"+delO2+"d, invoices "+wroteI+"w/"+delI2+"d, customers "+wroteC+"w/"+delC2+"d");
+  }catch(e){
+    console.log("[NDHYBRID] flush error (main-document write is unaffected): "+(e&&e.message));
+  }
+}
+
+/* ============================================================================
+   HYBRID — LISTENERS / HYDRATION                                   (2026-07-31)
+
+   Two listeners per collection, unioned into the SAME in-memory arrays every
+   existing read site already uses, so none of the 204 read sites change:
+
+     HOT  : date >= today-HOT_WINDOW_DAYS      (recent activity)
+     OPEN : paid != "Paid"  /  invoices unsettled  (ALL collectable debt, any age)
+
+   The OPEN listener is load-bearing, not an optimisation. It guarantees every
+   unsettled record is in memory regardless of age, so custDebt, rDebts and every
+   payment screen keep working on D.orders/D.invoices exactly as today. Debt can
+   never fall outside the window. Settled history older than the window is reached
+   through ordersWithBooks()/invoicesWithBooks(), which are already wired into the
+   13 + 10 screens that need it.
+   ============================================================================ */
+function _hydrateById(arr,docs,label){
+  // Defensive: hydration runs inside an onSnapshot callback, where a throw would break the
+  // listener for the rest of the session. Bad input is a no-op, never an exception.
+  if(!arr||typeof arr.forEach!=="function")return 0;
+  if(!docs||typeof docs.forEach!=="function")return 0;
+  // Union by id: listeners overlap by design (a recent unpaid order matches both).
+  var byId={};
+  (arr||[]).forEach(function(r){if(r&&r.id!=null)byId[String(r.id)]=r;});
+  var added=0,updated=0;
+  docs.forEach(function(d){
+    var v=d.data();if(!v||v.id==null)return;
+    var k=String(v.id);
+    if(byId[k]){
+      // In-place field copy so any object identity held elsewhere stays valid.
+      var tgt=byId[k],changed=false;
+      Object.keys(v).forEach(function(f){
+        if(f==="_updatedAt")return;
+        if(JSON.stringify(tgt[f])!==JSON.stringify(v[f])){tgt[f]=v[f];changed=true;}
+      });
+      if(changed)updated++;
+    }else{
+      arr.push(v);byId[k]=v;added++;
+    }
+  });
+  if(added||updated)console.log("[NDHYBRID] "+label+": +"+added+" new, "+updated+" updated from listener");
+  return added+updated;
+}
+function _hybridStartListeners(){
+  // EITHER flag can require listeners — they are independent cutovers, so this must not
+  // gate on the orders/invoices flag alone or enabling customers first would leave
+  // D.customers unhydrated while the read-side merge was already disabled.
+  if((!HYBRID_COLLECTIONS_LIVE&&!HYBRID_CUSTOMERS_LIVE)||_hybridListenersOn)return;
+  if(HYBRID_COLLECTIONS_LIVE&&(!FB_ORDERS_COL||!FB_INVOICES_COL))return;
+  if(HYBRID_CUSTOMERS_LIVE&&!FB_CUSTOMERS_COL)return;
+  _hybridListenersOn=true;
+  var cut=new Date();cut.setDate(cut.getDate()-HOT_WINDOW_DAYS);
+  var hotCut=cut.toISOString().split("T")[0];
+  console.log("[NDHYBRID] starting listeners — hot window from "+hotCut+", plus ALL unsettled regardless of age");
+  function attach(col,q,arrName,label){
+    try{
+      var un=q.onSnapshot(function(s){
+        var docs=[];s.forEach(function(d){docs.push(d);});
+        if(!D[arrName])D[arrName]=[];
+        var n=_hydrateById(D[arrName],docs,label);
+        // Keep the shadow in step with what the server told us, so hydration never
+        // looks like a local edit and never triggers a write-back storm.
+        docs.forEach(function(d){
+          var v=d.data();if(!v||v.id==null)return;
+          var rec=(D[arrName]||[]).filter(function(r){return r&&String(r.id)===String(v.id);})[0];
+          if(rec)_hybridShadow[arrName][String(v.id)]=JSON.stringify(rec);
+        });
+        if(n){try{refreshCurrentPage();}catch(_){}}
+      },function(e){
+        console.log("[NDHYBRID] listener error ("+label+"): "+((e&&e.code)||"unknown"));
+      });
+      _hybridUnsub.push(un);
+    }catch(e){console.log("[NDHYBRID] could not attach "+label+": "+(e&&e.message));}
+  }
+  /* Only attach the order/invoice listeners when THEIR cutover is live. If customers were
+     enabled first, attaching these would hydrate D.orders from /orders while the main-document
+     merge was still authoritative for it — two sources writing the same array. */
+  if(HYBRID_COLLECTIONS_LIVE){
+    attach(FB_ORDERS_COL,FB_ORDERS_COL.where("date",">=",hotCut),"orders","orders/hot");
+    /* settled==false, NOT paid!="Paid" — a Firestore `!=` query EXCLUDES documents where the
+       field is absent, so any legacy order without a `paid` field was silently skipped, i.e.
+       invisible debt. `settled` is written on every persist so it is never absent. */
+    attach(FB_ORDERS_COL,FB_ORDERS_COL.where("settled","==",false),"orders","orders/open");
+    attach(FB_INVOICES_COL,FB_INVOICES_COL.where("date",">=",hotCut),"invoices","invoices/hot");
+    /* settled==false, NOT voided==false — the latter matched EVERY non-voided invoice (~all
+       368), so the hot window did nothing and a cold start cost ~1,000 reads. Firestore cannot
+       express `paid < amount` (no two-field comparison), hence the derived flag. */
+    attach(FB_INVOICES_COL,FB_INVOICES_COL.where("settled","==",false),"invoices","invoices/open");
+  }
+  /* CUSTOMERS — deliberately NO hot window. Unlike orders, the customer directory is needed
+     in FULL at all times: the order-creation search, every dropdown, rCusts, the debtors page
+     and maskName all assume D.customers is complete. A windowed customer list would silently
+     make older customers unfindable — the exact shape of the 2026-07-27 incident where
+     address-only search made real customers unreachable.
+     Read cost, stated honestly: a cold cache costs one read per customer (431 today). With
+     8 devices x ~4 sessions that is up to ~14,000 reads/day, about 28% of the 50,000 free
+     tier — not the "8%" some estimates claim. Warm caches are far cheaper because Firestore
+     resumes the listener and sends only changed documents, but do not budget on that. */
+  if(HYBRID_CUSTOMERS_LIVE&&FB_CUSTOMERS_COL)
+    attach(FB_CUSTOMERS_COL,FB_CUSTOMERS_COL,"customers","customers/all");
+}
+function _hybridStopListeners(){
+  _hybridUnsub.forEach(function(u){try{u();}catch(_){}});
+  _hybridUnsub=[];_hybridListenersOn=false;
+}
+
+/* ---------------------------------------------------------------------------
+   PHASE 1 — BACKFILL. Writes every current order/invoice out as a document.
+   ADDITIVE AND REVERSIBLE: the main document keeps its arrays and remains
+   authoritative, so this can be run, observed, and abandoned with no consequence.
+   Idempotent by construction (document id === record id, merge:true), so running
+   it twice is a no-op rather than a duplication.
+   --------------------------------------------------------------------------- */
+function _migrateToCollections(cb){
+  if(!CU||CU.role!=="director"){toast("Director only","err");return;}
+  if(!FB_READY||!FB_ORDERS_COL||!FB_INVOICES_COL){toast("Not connected","err");return;}
+  if(_hybridMigrating){toast("Migration already running","err");return;}
+  // Never migrate from a view that has not been server-confirmed: backfilling from
+  // this device's possibly-incomplete cache would write a partial history. Same rail
+  // the self-heals and the outbox use.
+  if(typeof _cloudServerConfirmed!=="undefined"&&!_cloudServerConfirmed){
+    toast("Waiting for a server-confirmed read before migrating","err");return;
+  }
+  var ords=(D.orders||[]).slice(),invs=(D.invoices||[]).slice();
+  // Customers are backfilled by the SAME pass (2026-07-31) so one run prepares every
+  // collection. Backfilling is always safe regardless of either live flag — it only ever
+  // writes documents; nothing reads them until a cutover flag turns on.
+  var custs=(D.customers||[]).slice();
+  if(!ords.length&&!invs.length&&!custs.length){toast("Nothing to migrate","err");return;}
+  _hybridMigrating=true;
+  console.log("[NDHYBRID] PHASE 1 backfill starting — "+ords.length+" orders, "+invs.length+" invoices");
+  var done=0,failed=0,total=ords.length+invs.length+custs.length;
+  function step(){
+    done++;
+    if(done+failed>=total){
+      _hybridMigrating=false;
+      console.log("[NDHYBRID] PHASE 1 complete — "+done+" written, "+failed+" failed");
+      auditLog("DATA_EXPORTED","HYBRID PHASE 1: backfilled "+done+" order/invoice document(s) to /orders and /invoices ("+failed+" failed). Main document untouched and still authoritative.");
+      if(failed)toast("Backfill finished with "+failed+" failure(s) — do NOT proceed to verify","err");
+      else toast("Backfill complete: "+done+" documents written. Now run verification.","ok");
+      if(cb)cb(failed===0,done,failed);
+    }
+  }
+  function fail(){ failed++; step(); }
+  // Sequential-ish in small batches: a 700-document burst on a phone can exhaust
+  // the connection. Bounded concurrency keeps it well inside the write budget too.
+  var queue=[];
+  ords.forEach(function(o){queue.push({kind:"o",rec:o});});
+  invs.forEach(function(i){queue.push({kind:"i",rec:i});});
+  custs.forEach(function(c){queue.push({kind:"c",rec:c});});
+  var idx=0,inflight=0,MAXP=8;
+  function pump(){
+    while(inflight<MAXP&&idx<queue.length){
+      var item=queue[idx++];inflight++;
+      var col=item.kind==="o"?FB_ORDERS_COL:(item.kind==="c"?FB_CUSTOMERS_COL:FB_INVOICES_COL);
+      col.doc(String(item.rec.id)).set(_hybridStamp(item.rec,item.kind),{merge:true})
+        .then(function(){inflight--;step();pump();})
+        .catch(function(e){inflight--;console.log("[NDHYBRID] backfill failed for "+item.kind+" #"+item.rec.id+": "+((e&&e.code)||"unknown"));fail();pump();});
+    }
+  }
+  pump();
+}
+
+/* ---------------------------------------------------------------------------
+   PHASE 4 — STRIP. Removes the now-stale orders/invoices arrays from the main
+   document. THIS is what realises 366 KB -> 30 KB and egress 6.7 GB -> 0.31 GB.
+
+   Needs its own explicit step because set({merge:true}) never REMOVES a field:
+   once HYBRID_COLLECTIONS_LIVE is on, the payload simply stops mentioning them, so
+   the old arrays sit in the server document untouched. That is deliberate — they
+   are the Phase 3 fallback, which is why this is a separate, later, confirmed step.
+
+   REFUSES unless verification has just passed, so the fallback can never be
+   discarded on unverified data.
+   --------------------------------------------------------------------------- */
+function _hybridStripMainDoc(){
+  if(!CU||CU.role!=="director"){toast("Director only","err");return;}
+  if(!FB_READY||!FB_DOC_REF){toast("Not connected","err");return;}
+  if(!HYBRID_COLLECTIONS_LIVE){toast("Cutover (Phase 3) is not live yet — nothing to strip","err");return;}
+  _verifyCollectionMigration(function(ok,problems){
+    if(!ok){
+      console.log("[NDHYBRID] PHASE 4 REFUSED — verification is not clean ("+((problems||[]).length)+" problem(s)). The main-document arrays are the fallback and are being kept.");
+      toast("Strip REFUSED — verification not clean. Fallback kept.","err");
+      return;
+    }
+    uiConfirm({title:"Strip orders & invoices from the main document",variant:"danger",
+      confirmText:"Strip now",
+      message:"Verification is clean.\n\nThis removes the stale orders and invoices arrays from /newdawn/main. It is what reduces the document from ~366 KB to ~30 KB.\n\nAfter this, rolling back to the old build requires restoring from a backup — the in-document copy will be gone.\n\nTake a fresh backup first if you have not already."})
+    .then(function(go){
+      if(!go)return;
+      try{
+        var FV=firebase.firestore.FieldValue;
+        FB_DOC_REF.update({"D.orders":FV.delete(),"D.invoices":FV.delete()}).then(function(){
+          console.log("[NDHYBRID] PHASE 4 complete — orders/invoices removed from the main document");
+          auditLog("DATA_EXPORTED","HYBRID PHASE 4: stripped the stale orders/invoices arrays from the main document after a CLEAN verification. Per-document collections are now the sole source for these two collections.");
+          toast("Main document stripped — orders and invoices now live only in their collections","ok");
+        }).catch(function(e){
+          console.log("[NDHYBRID] PHASE 4 failed: "+((e&&e.code)||"unknown")+" — arrays left in place, nothing lost");
+          toast("Strip failed — arrays left in place","err");
+        });
+      }catch(e){toast("Strip failed — arrays left in place","err");}
+    });
+  });
+}
+
+/* ---------------------------------------------------------------------------
+   PHASE 2 — VERIFY. Reads every document back and compares against the in-memory
+   arrays. READ-ONLY. Any single mismatch must abort the migration: this is the
+   gate that stands between a reshape and a money loss.
+   --------------------------------------------------------------------------- */
+function _verifyCollectionMigration(cb){
+  if(!CU||CU.role!=="director"){toast("Director only","err");return;}
+  if(!FB_ORDERS_COL||!FB_INVOICES_COL){toast("Not connected","err");return;}
+  console.log("[NDHYBRID] PHASE 2 verification starting (read-only)");
+  var problems=[];
+  FB_ORDERS_COL.get({source:"server"}).then(function(os){
+    var docO={};os.forEach(function(d){var v=d.data();if(v&&v.id!=null)docO[String(v.id)]=v;});
+    return FB_INVOICES_COL.get({source:"server"}).then(function(is){
+      var docI={};is.forEach(function(d){var v=d.data();if(v&&v.id!=null)docI[String(v.id)]=v;});
+      var num=function(v){var n=Number(v);return isNaN(n)?0:n;};
+
+      (D.orders||[]).forEach(function(o){
+        var d=docO[String(o.id)];
+        if(!d){problems.push("order #"+o.id+" MISSING from /orders");return;}
+        ["cId","qty","price","status","paid","date"].forEach(function(f){
+          if(String(o[f])!==String(d[f]))problems.push("order #"+o.id+" field "+f+": live="+o[f]+" doc="+d[f]);
+        });
+        // Same reasoning as invoices: the open-orders listener queries settled==false, and a
+        // `!=` query would have skipped a field-absent record entirely. Verify it explicitly.
+        if(!!d.settled!==(String(d.paid)==="Paid"))
+          problems.push("order #"+o.id+" settled flag WRONG: doc="+d.settled+" paid="+d.paid);
+      });
+      (D.invoices||[]).forEach(function(i){
+        var d=docI[String(i.id)];
+        if(!d){problems.push("invoice #"+i.id+" MISSING from /invoices");return;}
+        if(num(i.amount)!==num(d.amount))problems.push("invoice #"+i.id+" amount: "+i.amount+" vs "+d.amount);
+        if(num(i.paid)!==num(d.paid))problems.push("invoice #"+i.id+" paid: "+i.paid+" vs "+d.paid);
+        if(!!i.voided!==!!d.voided)problems.push("invoice #"+i.id+" VOIDED flag differs: "+!!i.voided+" vs "+!!d.voided);
+        var lp=(i.payments||[]),dp=(d.payments||[]);
+        if(lp.length!==dp.length)problems.push("invoice #"+i.id+" payment COUNT: "+lp.length+" vs "+dp.length);
+        else lp.forEach(function(p){
+          var m=dp.filter(function(x){return x&&String(x.pid)===String(p.pid);})[0];
+          if(!m)problems.push("invoice #"+i.id+" payment pid "+p.pid+" missing in document");
+          else if(num(m.amt)!==num(p.amt))problems.push("invoice #"+i.id+" payment "+p.pid+" amount differs");
+        });
+        var sum=Math.round(dp.reduce(function(s,x){return s+num(x&&x.amt);},0)*100)/100;
+        if(Math.abs(sum-num(d.paid))>0.005&&dp.length)problems.push("invoice #"+i.id+" sum(payments)="+sum+" != paid="+d.paid);
+        /* THE `settled` FLAG IS ITSELF VERIFIED (2026-07-31). The open-debt listener queries
+           settled==false, so a stale or wrong flag would make a real receivable invisible in
+           every live view — silently, with no error. Re-derive it from the document's OWN
+           amount/paid/voided and compare. This is the single most important assertion in this
+           function: everything else checks data was copied; this checks debt stays findable. */
+        var _expSettled=d.voided?true:(isNaN(Number(d.amount))?false:((Number(d.paid)||0)>=Number(d.amount)));
+        if(!!d.settled!==!!_expSettled)
+          problems.push("invoice #"+i.id+" settled flag WRONG: doc="+d.settled+" derived="+_expSettled+" (amount="+d.amount+" paid="+d.paid+" voided="+!!d.voided+") — unsettled debt could be invisible");
+      });
+      // counts both directions — a document with no live counterpart is just as wrong
+      Object.keys(docO).forEach(function(k){if(!(D.orders||[]).some(function(o){return String(o.id)===k;}))problems.push("/orders has orphan document #"+k);});
+      Object.keys(docI).forEach(function(k){if(!(D.invoices||[]).some(function(i){return String(i.id)===k;}))problems.push("/invoices has orphan document #"+k);});
+
+      /* CUSTOMERS (2026-07-31). Verified on the same money-first basis as invoices: credit is
+         real liability the business honours as goods, and creditLimit gates future sales. The
+         creditLog is compared by its unique cid, the same identity _mergeCustomerCredit uses,
+         so a lost or duplicated credit entry is caught rather than netting out invisibly. */
+      var docC={};
+      return FB_CUSTOMERS_COL.get({source:"server"}).then(function(cs){
+        cs.forEach(function(d){var v=d.data();if(v&&v.id!=null)docC[String(v.id)]=v;});
+        (D.customers||[]).forEach(function(c){
+          var d=docC[String(c.id)];
+          if(!d){problems.push("customer #"+c.id+" MISSING from /customers");return;}
+          ["name","phone","estate","court","house","zone","ctype"].forEach(function(f){
+            if(String(c[f]||"")!==String(d[f]||""))problems.push("customer #"+c.id+" field "+f+": live="+c[f]+" doc="+d[f]);
+          });
+          if(num(c.credit)!==num(d.credit))problems.push("customer #"+c.id+" CREDIT: "+c.credit+" vs "+d.credit);
+          if(num(c.creditLimit)!==num(d.creditLimit))problems.push("customer #"+c.id+" creditLimit: "+c.creditLimit+" vs "+d.creditLimit);
+          var lcl=(c.creditLog||[]),dcl=(d.creditLog||[]);
+          if(lcl.length!==dcl.length)problems.push("customer #"+c.id+" creditLog COUNT: "+lcl.length+" vs "+dcl.length);
+          else lcl.forEach(function(e){
+            if(!e||e.cid==null)return;
+            if(!dcl.some(function(x){return x&&String(x.cid)===String(e.cid);}))problems.push("customer #"+c.id+" creditLog cid "+e.cid+" missing in document");
+          });
+          if(num(c.waterCycle)!==num(d.waterCycle))problems.push("customer #"+c.id+" waterCycle: "+c.waterCycle+" vs "+d.waterCycle+" (8-bottle entitlement)");
+        });
+        Object.keys(docC).forEach(function(k){if(!(D.customers||[]).some(function(c){return String(c.id)===k;}))problems.push("/customers has orphan document #"+k);});
+        return null;
+      }).then(function(){
+
+      var ok=problems.length===0;
+      console.log("[NDHYBRID] PHASE 2 result: "+(ok?"CLEAN":problems.length+" PROBLEM(S)"));
+      problems.slice(0,40).forEach(function(p){console.log("   "+p);});
+      auditLog("DATA_EXPORTED","HYBRID PHASE 2 verification: "+(ok?"CLEAN — documents match the live arrays exactly":problems.length+" mismatch(es) found; migration MUST NOT proceed")+". Orders checked: "+(D.orders||[]).length+", invoices: "+(D.invoices||[]).length+".");
+      if(ok)toast("Verification CLEAN — "+(D.orders||[]).length+" orders, "+(D.invoices||[]).length+" invoices, "+(D.customers||[]).length+" customers match","ok");
+      else toast(problems.length+" mismatch(es) — see console. Do NOT proceed.","err");
+      if(cb)cb(ok,problems);
+      }); // end of the /customers verification .then (2026-07-31)
+    });
+  }).catch(function(e){
+    console.log("[NDHYBRID] PHASE 2 could not read back: "+((e&&e.code)||"unknown")+" — security rule for /orders and /invoices in place?");
+    toast("Verification could not read the collections — check the security rules","err");
+    if(cb)cb(false,["read failed: "+((e&&e.code)||"unknown")]);
+  });
+}
+
 /* Customer equivalent of _orderSnapshotFor (2026-07-28). Closes the SAME
    durability gap for customer creation that the order snapshot closed for
    orders: CUSTOMER_ADDED is written immediately as its own tiny Firestore
@@ -2085,6 +2777,18 @@ function processWriteQueue(){
   var keys=Object.keys(D);
   for(var ki=0;ki<keys.length;ki++){
     if(keys[ki]==="_ts")continue; // internal timestamp — not persisted
+    /* HYBRID CUTOVER (2026-07-31): orders and invoices no longer travel inside the main
+       document. THIS LINE is what turns 366 KB into 30 KB, and with it egress from
+       6.7 GB/month (67% of the 10 GiB free allowance) to 0.31 GB. They are persisted
+       per-document by _hybridFlushDocs instead. Phase 4 removes the now-stale arrays
+       already sitting in the server document; until then they remain as a fallback,
+       which is why the read-side merges are guarded rather than deleted. */
+    if(HYBRID_COLLECTIONS_LIVE&&(keys[ki]==="orders"||keys[ki]==="invoices"))continue;
+    /* Customers ride their OWN flag — see HYBRID_CUSTOMERS_LIVE. Measured from the live
+       console they are 140 KB of the 387 KB document and are never archived, so removing
+       them is what takes the main document from "grows with the business" to permanently
+       static (~25-30 KB: stock, team, routes, offers, counters, tombstones, audit tail). */
+    if(HYBRID_CUSTOMERS_LIVE&&keys[ki]==="customers")continue;
     if(keys[ki]==="auditLog"){
       // Last 20 audit entries in main doc — guaranteed cross-device fallback
       DforSync.auditLog=(D.auditLog||[]).slice(-20);
@@ -2634,6 +3338,18 @@ function processWriteQueue(){
   function _onWriteSuccess(){
     console.log("[NDSYNC] processWriteQueue SUCCESS — write confirmed by Firestore at "+new Date().toISOString());
     FB_WRITING=false;
+    /* HYBRID (2026-07-31): flush changed order/invoice DOCUMENTS on the same trigger as the
+       main-document write, so one user action still produces one logical save. Deliberately
+       AFTER the main write is confirmed, not before: if the main document write fails, the
+       per-document writes have not yet gone out either, so the two never diverge in the
+       direction where money exists in one place and not the other. A failed per-document
+       write leaves its shadow entry stale and is retried on the next flush. */
+    /* NO-OP SUPPRESSOR (2026-07-31): the signature advances ONLY here, on a commit Firestore
+       has confirmed. If the write failed, _pendingSig is discarded and the next attempt is
+       compared against the last genuinely-applied payload — so a dropped connection can never
+       cause a real change to be suppressed. */
+    if(_pendingSig){_lastCommittedSig=_pendingSig;_pendingSig=null;}
+    try{_hybridFlushDocs();}catch(_){}
     // ROOT-CAUSE FIX (2026-07-29): retire ONLY what this write actually carried.
     // These four lines used to clear everything unconditionally, which marked
     // work created DURING the round trip as confirmed when it had never been
@@ -2776,7 +3492,55 @@ function processWriteQueue(){
         // ROOT-CAUSE FIX (2026-07-30): re-trim AFTER reconcile — see _applyDocSizeTrim.
         _applyDocSizeTrim(DforSync);
         if(_dLooksEmpty(DforSync)&&FB_SETUP_DONE)throw new Error(ND_ABORT_EMPTY); // see _dLooksEmpty
-        txn.set(FB_DOC_REF,_buildWritePayload(DforSync,_usersT),{merge:true});
+        /* ==================================================================
+           NO-OP WRITE SUPPRESSOR (2026-07-31) — from production evidence.
+
+           Build A's live log showed a 387 KB whole-document write on EVERY app
+           open, three opens in seven minutes, with no user action: the write is
+           queued right after the cache-only snapshot and before the
+           server-confirmed read. Root cause NOT identified — _trimStockHistories,
+           runIntegrityCheck (gated on _cloudServerConfirmed), the audit merge in
+           _finishRestoreFromBackup and the uiConfirm-gated session restore were
+           each checked and eliminated. Something else calls dirty() on load.
+
+           COST, which is why this cannot wait for the root cause: each write fans
+           out to every listening device. At 8 devices and ~5 opens each that is
+           ~124 MB/day, ~3.7 GB/month — potentially more than half the measured
+           6.7 GB/month against Spark's 10 GiB egress allowance. Pure waste.
+
+           This suppresses the SYMPTOM at the only place every write must pass
+           through, so it is immune to whichever caller is responsible — including
+           any future one. If the finalised payload is byte-identical to the last
+           one Firestore confirmed, the txn.set is skipped: the transaction still
+           commits (1 read, 0 writes), the document does not change, and because
+           it does not change Firestore sends NO snapshot to any device. That is
+           what removes the egress, not just the write.
+
+           Deliberately compares the FINALISED payload — after _reconcileDforSync
+           and _applyDocSizeTrim — so a payload that differs only because the
+           server moved on is still correctly written.
+
+           The signature advances ONLY on a confirmed commit (see _onWriteSuccess),
+           so a failed write is never mistaken for an applied one. It is also
+           reset whenever the listener restarts cold, so a fresh session never
+           trusts a signature from a previous connection.
+           ================================================================== */
+        var _finalPayload=_buildWritePayload(DforSync,_usersT);
+        var _sig=null;
+        try{
+          // Hash the DATA only. _updatedAt is a fresh serverTimestamp sentinel on
+          // every build, so including it would make every payload look different
+          // and defeat the whole check.
+          var _forSig=Object.assign({},_finalPayload);delete _forSig.updatedAt;delete _forSig._updatedAt;
+          _sig=JSON.stringify(_forSig).length+":"+_hybridCheapHash(JSON.stringify(_forSig));
+        }catch(_){_sig=null;}
+        if(_sig&&_sig===_lastCommittedSig){
+          console.log("[NDSYNC] write SKIPPED — payload is byte-identical to the last confirmed write (nothing changed). No document write, and therefore no snapshot fan-out to other devices.");
+          _pendingSig=null;
+          return; // transaction commits with no write
+        }
+        _pendingSig=_sig;
+        txn.set(FB_DOC_REF,_finalPayload,{merge:true});
       });
     }).then(function(){
       _lastFreshnessCheckTime=Date.now();
@@ -3232,6 +3996,11 @@ function startAuditListener(){
       // might be lost: it delivers orders that were durably written at creation and
       // are provably not in the document. Runs once per session; see the outbox block.
       _outboxReconcile();
+      /* HYBRID (2026-07-31): attach the order/invoice listeners on the same
+         server-confirmed trigger the outbox uses. Same rail, same reason — hydrating
+         D.orders from a cache-only view would look like a shorter history than reality,
+         and every screen would silently under-report. No-op while the kill switch is off. */
+      try{_hybridStartListeners();}catch(_){}
       // If listener returned empty but we expect data, also do unordered get as safety.
       // QUOTA GUARD: this used to be able to refire on every snapshot as long as the
       // condition stayed true, which on a genuinely-empty collection meant repeated
@@ -3272,6 +4041,12 @@ function startAuditListener(){
     });
 }
 function startCloudListener(isWarmRefresh){
+  /* NO-OP SUPPRESSOR (2026-07-31): a cold (re)subscribe means a new connection and a fresh
+     view of the document. Discard the signature so this session never suppresses a write on
+     the strength of something a previous connection wrote. Cheap insurance: at worst it
+     costs one redundant write per reconnect, which is exactly what the suppressor exists to
+     avoid at scale but is the correct trade when correctness is in question. */
+  if(!isWarmRefresh){_lastCommittedSig=null;_pendingSig=null;}
   if(!FB_DOC_REF)return;
   if(FB_UNSUB)FB_UNSUB();
   // STRUCTURAL FIX for reconnect-driven write starvation: a COLD reconnect
@@ -3446,7 +4221,13 @@ function startCloudListener(isWarmRefresh){
     //    These change on staff devices — director must see them
     if(!isOwnWrite||!weAreNewer){
       // Orders: take remote (staff delivery updates MUST flow to director)
-      if(data.D.orders&&data.D.orders.length){
+      /* HYBRID CUTOVER (2026-07-31): once orders live in /orders, this whole read-side
+         merge must NOT run. During Phase 3 the main document still CONTAINS stale arrays
+         (they are stripped only in Phase 4, a day later, as the fallback), so leaving this
+         enabled would clobber the listener-hydrated D.orders with stale data on every
+         snapshot. Guarding rather than deleting keeps HYBRID_COLLECTIONS_LIVE=false as a
+         one-constant kill switch back to exact Build A behaviour. */
+      if(!HYBRID_COLLECTIONS_LIVE&&data.D.orders&&data.D.orders.length){
         // Merge: local orders that are newer (being edited) win
         // Remote orders that are Delivered win (can't un-deliver)
         // Prune tombstones older than 60s — no longer needed once safely past
@@ -3695,7 +4476,8 @@ function startCloudListener(isWarmRefresh){
       // any recently-voided invoice here for 60s, and never blindly overwrite
       // during our own write window, so a void action can never be silently
       // undone by a stale/in-flight incoming snapshot.
-      if(data.D.invoices){
+      // HYBRID CUTOVER (2026-07-31): same reasoning as the orders block above.
+      if(!HYBRID_COLLECTIONS_LIVE&&data.D.invoices){
         if(isOwnWrite){
           // Trust local entirely during our own write window — remote has not
           // caught up yet, so blindly overwriting would revert our own change.
@@ -4070,6 +4852,16 @@ function startCloudListener(isWarmRefresh){
     Object.keys(_recentlyDeletedCustomerIds).forEach(function(k){
       if(Date.now()-_recentlyDeletedCustomerIds[k]>60000)delete _recentlyDeletedCustomerIds[k];
     });
+    /* HYBRID CUTOVER (2026-07-31): customers now live in /customers. Same reasoning as the
+       orders and invoices guards — during Phase 3 the main document still holds a stale
+       customers array (stripped only in Phase 4), so leaving this merge enabled would clobber
+       the listener-hydrated D.customers with stale data on every snapshot. Guarded, not
+       deleted, so HYBRID_COLLECTIONS_LIVE=false remains a one-constant rollback.
+       WHY CUSTOMERS TOO: measured from the live console, customers are 140 KB of the 387 KB
+       document and are NEVER archived — so with only orders and invoices moved the main
+       document still grows with the business and would reach the 1 MB ceiling eventually.
+       Moving them removes the ceiling rather than deferring it. */
+    if(HYBRID_CUSTOMERS_LIVE){ /* handled by the /customers listener */ } else {
     var remoteCustomers=data.D.customers||[];
     var localCustomers=D.customers||[];
     var addedCount=0;
@@ -4153,6 +4945,10 @@ function startCloudListener(isWarmRefresh){
       D.customers=mergedCustomers;
       if(el("pg-customers")&&el("pg-customers").classList.contains("act"))rCusts();
     }
+    } // end of the HYBRID_COLLECTIONS_LIVE guard around the customers merge (see its opening note)
+    /* Deletion tombstones are merged REGARDLESS of the guard above. They live in the main
+       document either way, they are tiny, and every device must honour any device's deletion
+       — the customers listener hydrating from /customers does not carry that information. */
     // Merge shared customer-deletion tombstones — union of local and remote,
     // so any device's deletion is remembered regardless of who deletes or syncs.
     if(data.D.deletedCustomerIds){
@@ -4437,6 +5233,17 @@ function _initVisibilityRecovery(){
           console.log("[NDSYNC] backgrounded for "+(BACKGROUND_PAUSE_MS/1000)+"s — pausing listener to free the connection");
           try{FB_UNSUB();}catch(e){}
           FB_UNSUB=null;
+          /* HYBRID FIX (2026-07-31) — MY OMISSION, caught by review.
+             Build A had exactly ONE listener, so detaching FB_UNSUB here freed the whole
+             connection. The hybrid adds FIVE more (orders hot + open, invoices hot + open,
+             customers) and _hybridStopListeners() was written but never wired to this event —
+             so a backgrounded phone would have kept all five streaming, billing reads and
+             egress for a screen nobody is looking at. That is the precise waste this pause
+             exists to prevent, reintroduced by the migration.
+             _hybridStartListeners() is already called on the server-confirmed snapshot after
+             re-subscribe, and it is guarded by _hybridListenersOn, so resume needs nothing
+             extra here — stopping resets that flag. */
+          try{_hybridStopListeners();}catch(e){}
           _pausedForBackground=true;
           var c=el("cloud-status");if(c)c.innerHTML="<i class=\"ti ti-moon\"></i> Paused (backgrounded)";
         }
@@ -5471,6 +6278,14 @@ function _closePeriod(period,cb){
         if(!D.archivedOrderIds)D.archivedOrderIds={};
         if(!D.archivedInvoiceIds)D.archivedInvoiceIds={};
         var _archTs=Date.now();
+        /* HYBRID (2026-07-31): record the CLOSED PERIOD as well as the per-id tombstones.
+           The per-id maps stay for Build-A compatibility and for the six read/write guards that
+           already depend on them; the period marker is what the hybrid's cross-device filter
+           uses (_hybridDropArchived), because it is ~20 bytes per month instead of ~21 bytes
+           per record — 2.4 KB versus 1.8 MB over ten years. Both are written, so a rollback to
+           the flag-off build still finds the tombstones it expects. */
+        if(!D.closedPeriods)D.closedPeriods={};
+        D.closedPeriods[period]=_archTs;
         ordsToArchive.forEach(function(o){D.archivedOrderIds[o.id]=_archTs;});
         invsToArchive.forEach(function(i){D.archivedInvoiceIds[i.id]=_archTs;});
         D.orders=(D.orders||[]).filter(function(o){return !archOrdIds[String(o.id)];});
@@ -6290,6 +7105,24 @@ function buildApp(){
     else if(typeof fbDb!=="undefined"){
       // Restore FB_DOC_REF (was nulled on logout) then restart
       FB_DOC_REF=fbDb.collection("newdawn").doc("main");
+      /* ROOT CAUSE OF THE 387 KB WRITE ON EVERY LOGIN — identified 2026-07-31 from a live
+         console.trace on the deployed Build A:
+             scheduleCloudSync  <-  buildApp (:6293)  <-  checkAutoSaveRecovery  <-  pk (PIN entry)
+         logout() nulls both FB_UNSUB and FB_DOC_REF, so EVERY login lands in this branch and
+         this scheduleCloudSync() queues a whole-document write — 387 KB — regardless of
+         whether anything actually changed. Observed three times in seven minutes of
+         login/check/logout, and at 8 devices that is ~124 MB/day of snapshot fan-out
+         (~3.7 GB/month of Spark's 10 GiB egress) for nothing.
+
+         The call is KEPT deliberately: its purpose is to flush genuine work made while
+         disconnected, and removing it would risk losing that. What changed is that the
+         no-op write suppressor (see the txn.set site) now compares the finalised payload
+         against the last CONFIRMED write, so when nothing changed this costs 1 read and
+         ZERO writes — and because the document does not change, Firestore sends no snapshot
+         to any other device. Behaviour preserved, waste removed.
+
+         Under cutover the same login also drops from 387 KB to ~168 KB, since orders and
+         invoices no longer travel in this payload at all. */
       FB_READY=true;scheduleCloudSync();
       startCloudListener();
     }
@@ -14355,6 +15188,9 @@ window.addEventListener("load",function(){
       FB_EVENTS_COL=fbDb.collection("newdawn_events");
       FB_BOOKS_COL=fbDb.collection("newdawn_books");   // PERIOD BOOKS (see the books block)
       FB_OUTBOX_COL=fbDb.collection("newdawn_outbox"); // DURABLE ORDER OUTBOX (see the outbox block)
+      FB_ORDERS_COL=fbDb.collection("orders");         // HYBRID MIGRATION (2026-07-31)
+      FB_INVOICES_COL=fbDb.collection("invoices");     // HYBRID MIGRATION (2026-07-31)
+      FB_CUSTOMERS_COL=fbDb.collection("customers");   // HYBRID MIGRATION (2026-07-31)
       FB_COUNTERS_REF=fbDb.collection("newdawn_counters").doc("main");
     }catch(e){
       var r=document.getElementById("root");
