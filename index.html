@@ -348,7 +348,7 @@ var APP_VERSION="2026-07-21-v35";
    was actually running.
    Bump this ONE line on every deploy. It is display-and-diagnostics only — nothing branches
    on it, no merge or money logic reads it, so it can never change behaviour. */
-var BUILD_STAMP="2026-08-01-hyb-b6";
+var BUILD_STAMP="2026-08-01-hyb-a6";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -1307,7 +1307,7 @@ var _hybridMigrating=false;
    one-character edit and a redeploy, not a code revert — on a live money system that
    property is worth more than tidiness. Phases 1 and 2 (backfill + verify) work either way,
    because they only ever WRITE documents and READ them back; they never change behaviour. */
-var HYBRID_COLLECTIONS_LIVE=true;
+var HYBRID_COLLECTIONS_LIVE=false;
 /* SEPARATE flag for the customers extraction, deliberately independent of the orders/invoices
    cutover (2026-07-31). Customers are 140 KB of the measured 387 KB document and are NEVER
    archived, so with only orders and invoices moved the main document still grows with the
@@ -1319,7 +1319,7 @@ var HYBRID_COLLECTIONS_LIVE=true;
    read-side merge continues to run exactly as in Build A, until the listener, the flush-loop
    entry, the payload skip and the backfill/verify coverage are all in place and proven.
    DO NOT set this true as part of the Phase 3 cutover. It is a separate, later step. */
-var HYBRID_CUSTOMERS_LIVE=true;
+var HYBRID_CUSTOMERS_LIVE=false;
 var _hybridShadow={orders:{},invoices:{},customers:{}};   // id -> JSON, last state successfully persisted
 var _hybridListenersOn=false,_hybridUnsub=[];
 /* ============================================================================
