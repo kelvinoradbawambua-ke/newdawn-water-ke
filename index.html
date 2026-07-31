@@ -348,7 +348,7 @@ var APP_VERSION="2026-07-21-v35";
    was actually running.
    Bump this ONE line on every deploy. It is display-and-diagnostics only — nothing branches
    on it, no merge or money logic reads it, so it can never change behaviour. */
-var BUILD_STAMP="2026-08-01-hyb-b5";
+var BUILD_STAMP="2026-08-01-hyb-b6";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -2037,7 +2037,30 @@ function _hybridStartListeners(){
   // EITHER flag can require listeners — they are independent cutovers, so this must not
   // gate on the orders/invoices flag alone or enabling customers first would leave
   // D.customers unhydrated while the read-side merge was already disabled.
-  if((!HYBRID_COLLECTIONS_LIVE&&!HYBRID_CUSTOMERS_LIVE)||_hybridListenersOn)return;
+  if(!HYBRID_COLLECTIONS_LIVE&&!HYBRID_CUSTOMERS_LIVE)return;
+  /* FIX (2026-08-01) — FOUND IN LIVE PRODUCTION: after a logout/login every screen showed
+     ZERO orders, invoices and customers until a full page reload.
+
+     Logout clears D but does NOT detach these listeners, so _hybridListenersOn stayed true
+     and this function returned early — while the still-attached listeners had nothing to
+     emit, because onSnapshot only fires on CHANGE and the server data had not changed.
+     Nothing ever re-hydrated D.
+
+     THIS WAS MASKED BY THE DELETE-SWEEP BUG. In the b3 session the flush issued 1,188
+     deletes on re-login, and those deletions were changes, so snapshot events fired and
+     refilled D as a pure side effect of the data loss. Fixing the deletes removed the
+     accidental re-hydration and exposed this.
+
+     Re-subscribing is what fixes it: onSnapshot always delivers the FULL current result
+     set as its initial snapshot, so a fresh attach reloads everything. Detecting the empty
+     state here rather than relying on logout to call _hybridStopListeners is deliberate —
+     it holds however D came to be cleared, not just for the one path we know about. */
+  if(_hybridListenersOn){
+    var _liveEmpty=(D.orders||[]).length===0&&(D.invoices||[]).length===0&&(D.customers||[]).length===0;
+    if(!_liveEmpty)return;                      // already running normally — nothing to do
+    console.log("[NDHYBRID] listeners were attached but D is empty (re-login) — detaching and re-subscribing to force a fresh initial snapshot");
+    try{_hybridStopListeners();}catch(_){}
+  }
   if(HYBRID_COLLECTIONS_LIVE&&(!FB_ORDERS_COL||!FB_INVOICES_COL))return;
   if(HYBRID_CUSTOMERS_LIVE&&!FB_CUSTOMERS_COL)return;
   _hybridListenersOn=true;
@@ -2100,6 +2123,16 @@ function _hybridStartListeners(){
 function _hybridStopListeners(){
   _hybridUnsub.forEach(function(u){try{u();}catch(_){}});
   _hybridUnsub=[];_hybridListenersOn=false;
+  /* FIX (2026-08-01) — MUST clear the seeded set here. _hybridInitialLoadDone() answers
+     "has live data arrived?" for checkAutoSaveRecovery. If a previous subscription's
+     seeded flags survived a detach, that gate would read TRUE on the next login while D
+     was still empty — which is precisely the restore-over-live-data bug it was added to
+     close, reopened through the back door. Seeded state belongs to a subscription, so it
+     dies with the subscription.
+     _autoSaveRecoveryWaits is reset for the same reason: a counter left exhausted from a
+     previous session would make the next login skip the wait entirely. */
+  _hybridSeeded={};
+  _autoSaveRecoveryWaits=0;
 }
 
 /* ---------------------------------------------------------------------------
