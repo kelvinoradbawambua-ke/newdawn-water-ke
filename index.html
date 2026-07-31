@@ -348,7 +348,7 @@ var APP_VERSION="2026-07-21-v35";
    was actually running.
    Bump this ONE line on every deploy. It is display-and-diagnostics only — nothing branches
    on it, no merge or money logic reads it, so it can never change behaviour. */
-var BUILD_STAMP="2026-07-31-hyb-b4";
+var BUILD_STAMP="2026-08-01-hyb-b5";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -1322,6 +1322,38 @@ var HYBRID_COLLECTIONS_LIVE=true;
 var HYBRID_CUSTOMERS_LIVE=true;
 var _hybridShadow={orders:{},invoices:{},customers:{}};   // id -> JSON, last state successfully persisted
 var _hybridListenersOn=false,_hybridUnsub=[];
+/* ============================================================================
+   FIX (2026-08-01) — FOUND IN LIVE PRODUCTION on the first logout/login after the
+   cutover. The director was prompted to restore a backup over live data.
+
+   THIS IS A REOPENED BUG. checkAutoSaveRecovery carries a 2026-07-20 root-cause fix
+   whose whole point is: "never judge what live data looks like before live data has
+   actually had a chance to arrive." It waits on `_cloudDataConfirmed`.
+
+   But `_cloudDataConfirmed` is set by the MAIN DOCUMENT snapshot, and under cutover
+   the main document no longer carries orders, invoices or customers — they arrive
+   later, on their own collection listeners. So _cloudDataConfirmed flips true while
+   D.orders and D.customers are still empty, the count heuristic compares the local
+   autosave against zero, sees a huge divergence, and offers to wholesale-restore a
+   stale browser snapshot and push it to Firestore. Director/manager only, and it
+   prompts rather than auto-applying — but an OK there overwrites live books.
+
+   Same class as the _dLooksEmpty and _hybridFlushDocs holes: a guard that was correct
+   while all data lived in one document, silently invalidated by moving data out of it.
+   _cloudDataConfirmed is no longer a sufficient proxy for "live data has arrived".
+
+   _hybridSeeded records which collections have delivered at least one SERVER snapshot,
+   set before hydration so a legitimately empty collection still counts as seeded.
+   ============================================================================ */
+var _hybridSeeded={};
+var _autoSaveRecoveryWaits=0;   // bounded retry counter — see checkAutoSaveRecovery
+function _hybridInitialLoadDone(){
+  try{
+    if(HYBRID_COLLECTIONS_LIVE&&(!_hybridSeeded.orders||!_hybridSeeded.invoices))return false;
+    if(HYBRID_CUSTOMERS_LIVE&&!_hybridSeeded.customers)return false;
+    return true;   // with both flags off this is trivially true — old behaviour exactly
+  }catch(_){return true;}   // never block login on this check failing
+}
 /* NO-OP WRITE SUPPRESSOR state (2026-07-31) — see the long note at the txn.set site.
    _lastCommittedSig advances ONLY on a Firestore-confirmed commit, so a failed write can
    never be mistaken for an applied one. Reset on every cold listener start so a new session
@@ -2016,6 +2048,12 @@ function _hybridStartListeners(){
     try{
       var un=q.onSnapshot(function(s){
         var docs=[];s.forEach(function(d){docs.push(d);});
+        /* FIX (2026-08-01) — see _hybridInitialLoadDone. Mark this collection as having
+           delivered at least one server snapshot. `_cloudDataConfirmed` only tracks the
+           MAIN document, which no longer carries orders/invoices/customers under cutover,
+           so anything asking "has live data arrived yet?" needs this instead. Set before
+           hydration so it is true even for a legitimately empty collection. */
+        _hybridSeeded[arrName]=true;
         if(!D[arrName])D[arrName]=[];
         var n=_hydrateById(D[arrName],docs,label);
         // Keep the shadow in step with what the server told us, so hydration never
@@ -7088,6 +7126,32 @@ async function checkAutoSaveRecovery(){
   if(!_cloudDataConfirmed){
     console.log("[NDSYNC] checkAutoSaveRecovery WAITING on _cloudDataConfirmed before comparing snapshots");
     setTimeout(checkAutoSaveRecovery,500);
+    return;
+  }
+  /* FIX (2026-08-01) — the 2026-07-20 fix above is right in principle but its signal went
+     stale at the cutover: _cloudDataConfirmed tracks the MAIN document, which no longer
+     carries orders/invoices/customers. It therefore flips true while D is still empty, and
+     the count heuristic below then compares a local autosave against zero and offers to
+     wholesale-restore a stale browser snapshot over live books. Confirmed live on the first
+     logout/login after cutover: the director was prompted to restore. See
+     _hybridInitialLoadDone for the full write-up.
+
+     Bounded deliberately. If a collection listener never delivers (offline, blocked), the
+     answer is NOT to eventually proceed and compare against an unloaded D — that is the bug.
+     It is to skip the wholesale-restore heuristic entirely and still run the precise,
+     add-only self-heal, which is exactly what the staff/manager path above already does. */
+  if(!_hybridInitialLoadDone()){
+    _autoSaveRecoveryWaits++;
+    if(_autoSaveRecoveryWaits<=40){   // ~20s at 500ms
+      if(_autoSaveRecoveryWaits===1)
+        console.log("[NDSYNC] checkAutoSaveRecovery WAITING on the hybrid collections — under cutover the main document carries no orders/customers, so _cloudDataConfirmed alone cannot mean live data has arrived");
+      setTimeout(checkAutoSaveRecovery,500);
+      return;
+    }
+    console.log("[NDSYNC] checkAutoSaveRecovery SKIPPED the count heuristic — the collections never delivered a snapshot after ~20s. Comparing a local autosave against an unloaded D is how a stale browser cache overwrites live books. The add-only self-heal still runs.");
+    buildApp();
+    _selfHealUnsyncedLocalRecords();
+    _selfHealFromEventSnapshots();
     return;
   }
   // FIX (2026-07-29): heal this device's own unsynced records FIRST, add-only.
