@@ -348,7 +348,7 @@ var APP_VERSION="2026-07-21-v35";
    was actually running.
    Bump this ONE line on every deploy. It is display-and-diagnostics only — nothing branches
    on it, no merge or money logic reads it, so it can never change behaviour. */
-var BUILD_STAMP="2026-07-31-hyb-a";
+var BUILD_STAMP="2026-07-31-hyb-a2";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -2026,7 +2026,7 @@ function _migrateToCollections(cb){
   var custs=(D.customers||[]).slice();
   if(!ords.length&&!invs.length&&!custs.length){toast("Nothing to migrate","err");return;}
   _hybridMigrating=true;
-  console.log("[NDHYBRID] PHASE 1 backfill starting — "+ords.length+" orders, "+invs.length+" invoices");
+  console.log("[NDHYBRID] PHASE 1 backfill starting — "+ords.length+" orders, "+invs.length+" invoices, "+custs.length+" customers = "+(ords.length+invs.length+custs.length)+" documents");
   var done=0,failed=0,total=ords.length+invs.length+custs.length;
   function step(){
     done++;
@@ -2111,6 +2111,11 @@ function _verifyCollectionMigration(cb){
   if(!FB_ORDERS_COL||!FB_INVOICES_COL){toast("Not connected","err");return;}
   console.log("[NDHYBRID] PHASE 2 verification starting (read-only)");
   var problems=[];
+  /* `infos` = source-data conditions the migration COPIED FAITHFULLY but which were already
+     inconsistent in the live arrays. They are reported, never counted as problems: blocking
+     the cutover on them would block on something the reshape neither caused nor can repair.
+     Added 2026-07-31 after the first real Phase 2 run surfaced invoice #2011. */
+  var infos=[];
   FB_ORDERS_COL.get({source:"server"}).then(function(os){
     var docO={};os.forEach(function(d){var v=d.data();if(v&&v.id!=null)docO[String(v.id)]=v;});
     return FB_INVOICES_COL.get({source:"server"}).then(function(is){
@@ -2136,13 +2141,35 @@ function _verifyCollectionMigration(cb){
         if(!!i.voided!==!!d.voided)problems.push("invoice #"+i.id+" VOIDED flag differs: "+!!i.voided+" vs "+!!d.voided);
         var lp=(i.payments||[]),dp=(d.payments||[]);
         if(lp.length!==dp.length)problems.push("invoice #"+i.id+" payment COUNT: "+lp.length+" vs "+dp.length);
-        else lp.forEach(function(p){
-          var m=dp.filter(function(x){return x&&String(x.pid)===String(p.pid);})[0];
-          if(!m)problems.push("invoice #"+i.id+" payment pid "+p.pid+" missing in document");
-          else if(num(m.amt)!==num(p.amt))problems.push("invoice #"+i.id+" payment "+p.pid+" amount differs");
-        });
-        var sum=Math.round(dp.reduce(function(s,x){return s+num(x&&x.amt);},0)*100)/100;
-        if(Math.abs(sum-num(d.paid))>0.005&&dp.length)problems.push("invoice #"+i.id+" sum(payments)="+sum+" != paid="+d.paid);
+        else{
+          /* FIX (2026-07-31, caught by the first real Phase 2 run): this keyed payments on
+             `pid` alone. Every payment recorded before the pid field existed has NO pid, so
+             String(undefined)==="undefined" made all legacy entries collide on one key and
+             compare against the wrong array element — reported as "payment undefined amount
+             differs" on invoices whose data was in fact copied perfectly. A bug in the CHECK.
+             Now uses the SAME composite identity _mergeInvoicePayments uses, so legacy and
+             modern payments are matched the same way the merge engine matches them. */
+          var _pk=function(p){return p.srcPp?("srcPp:"+p.srcPp):(p.pid||(p.date+"|"+p.amt+"|"+p.method+"|"+p.ref));};
+          var dpByKey={};dp.forEach(function(x){if(x)dpByKey[_pk(x)]=x;});
+          lp.forEach(function(p){
+            if(!p)return;
+            var m=dpByKey[_pk(p)];
+            if(!m)problems.push("invoice #"+i.id+" payment ["+_pk(p)+"] missing in document");
+            else if(num(m.amt)!==num(p.amt))problems.push("invoice #"+i.id+" payment ["+_pk(p)+"] amount differs");
+          });
+        }
+        /* SCOPE FIX (2026-07-31): Phase 2 verifies THE COPY, not the source data's internal
+           consistency. It used to assert sum(payments)===paid on the DOCUMENT, which fails for
+           any invoice that legitimately carries a legacy `paid` total with only one
+           reconstructed payment row — the documented XLSX-restore shape. That is a
+           pre-existing data condition, faithfully copied, and blocking the migration on it
+           would be blocking on something the migration did not cause and cannot fix.
+           So: compare LIVE vs DOCUMENT (a real copy failure), and report a source-data
+           mismatch separately as INFO for RECONCILE_REPORT.js to deal with. */
+        var lsum=Math.round(lp.reduce(function(s,x){return s+num(x&&x.amt);},0)*100)/100;
+        var dsum=Math.round(dp.reduce(function(s,x){return s+num(x&&x.amt);},0)*100)/100;
+        if(Math.abs(lsum-dsum)>0.005)problems.push("invoice #"+i.id+" payment TOTAL differs: live="+lsum+" doc="+dsum);
+        if(Math.abs(dsum-num(d.paid))>0.005&&dp.length)infos.push("invoice #"+i.id+" pre-existing: paid="+d.paid+" but payments sum to "+dsum+" (copied faithfully; legacy restore shape — review in RECONCILE_REPORT.js, not a migration fault)");
         /* THE `settled` FLAG IS ITSELF VERIFIED (2026-07-31). The open-debt listener queries
            settled==false, so a stale or wrong flag would make a real receivable invisible in
            every live view — silently, with no error. Re-derive it from the document's OWN
@@ -2186,6 +2213,10 @@ function _verifyCollectionMigration(cb){
       var ok=problems.length===0;
       console.log("[NDHYBRID] PHASE 2 result: "+(ok?"CLEAN":problems.length+" PROBLEM(S)"));
       problems.slice(0,40).forEach(function(p){console.log("   "+p);});
+      if(infos.length){
+        console.log("[NDHYBRID] "+infos.length+" pre-existing data condition(s) — copied correctly, NOT blocking:");
+        infos.slice(0,40).forEach(function(p){console.log("   INFO  "+p);});
+      }
       auditLog("DATA_EXPORTED","HYBRID PHASE 2 verification: "+(ok?"CLEAN — documents match the live arrays exactly":problems.length+" mismatch(es) found; migration MUST NOT proceed")+". Orders checked: "+(D.orders||[]).length+", invoices: "+(D.invoices||[]).length+".");
       if(ok)toast("Verification CLEAN — "+(D.orders||[]).length+" orders, "+(D.invoices||[]).length+" invoices, "+(D.customers||[]).length+" customers match","ok");
       else toast(problems.length+" mismatch(es) — see console. Do NOT proceed.","err");
