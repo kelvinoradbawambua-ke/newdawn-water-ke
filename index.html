@@ -348,7 +348,7 @@ var APP_VERSION="2026-07-21-v35";
    was actually running.
    Bump this ONE line on every deploy. It is display-and-diagnostics only — nothing branches
    on it, no merge or money logic reads it, so it can never change behaviour. */
-var BUILD_STAMP="2026-08-01-hyb-a6";
+var BUILD_STAMP="2026-08-01-hyb-b7";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -1307,7 +1307,7 @@ var _hybridMigrating=false;
    one-character edit and a redeploy, not a code revert — on a live money system that
    property is worth more than tidiness. Phases 1 and 2 (backfill + verify) work either way,
    because they only ever WRITE documents and READ them back; they never change behaviour. */
-var HYBRID_COLLECTIONS_LIVE=false;
+var HYBRID_COLLECTIONS_LIVE=true;
 /* SEPARATE flag for the customers extraction, deliberately independent of the orders/invoices
    cutover (2026-07-31). Customers are 140 KB of the measured 387 KB document and are NEVER
    archived, so with only orders and invoices moved the main document still grows with the
@@ -1319,7 +1319,7 @@ var HYBRID_COLLECTIONS_LIVE=false;
    read-side merge continues to run exactly as in Build A, until the listener, the flush-loop
    entry, the payload skip and the backfill/verify coverage are all in place and proven.
    DO NOT set this true as part of the Phase 3 cutover. It is a separate, later step. */
-var HYBRID_CUSTOMERS_LIVE=false;
+var HYBRID_CUSTOMERS_LIVE=true;
 var _hybridShadow={orders:{},invoices:{},customers:{}};   // id -> JSON, last state successfully persisted
 var _hybridListenersOn=false,_hybridUnsub=[];
 /* ============================================================================
@@ -2006,7 +2006,13 @@ function _hybridFlushDocs(){
    through ordersWithBooks()/invoicesWithBooks(), which are already wired into the
    13 + 10 screens that need it.
    ============================================================================ */
-function _hydrateById(arr,docs,label){
+/* The field lists below are COPIED from the monolith read path so the two paths cannot
+   disagree: customers from the _mergeRecordFields call in the main-document snapshot
+   merge, orders from its `_preserveFields`. If either list changes there it must change
+   here — a divergence means one read path protects a field the other reverts. */
+var _HYDRATE_CUST_FIELDS=["name","phone","phone2","idno","estate","court","house","htype","road","zone","ctype","creditLimit","notes"];
+var _HYDRATE_ORDER_FIELDS=["cId","driver","notes","deliver","prod","stockId","qty","price","cost","date","prodConfirmed","bottle_before"];
+function _hydrateById(arr,docs,label,arrName){
   // Defensive: hydration runs inside an onSnapshot callback, where a throw would break the
   // listener for the rest of the session. Bad input is a no-op, never an exception.
   if(!arr||typeof arr.forEach!=="function")return 0;
@@ -2021,13 +2027,75 @@ function _hydrateById(arr,docs,label){
     if(byId[k]){
       // In-place field copy so any object identity held elsewhere stays valid.
       var tgt=byId[k],changed=false;
-      Object.keys(v).forEach(function(f){
+      /* ================================================================
+         MERGE-AWARE HYDRATION (2026-08-01) — FOUND IN LIVE PRODUCTION.
+
+         A director's credit adjustment would not stick: adjustCredit appends a
+         NEGATIVE creditLog entry, and the credit kept reappearing. Rolling back to
+         flags-off fixed it instantly.
+
+         CAUSE: this branch was a PLAIN FIELD COPY. It overwrote credit, creditLog,
+         payments, paid and every edited profile field with the server's copy. A local
+         change not yet confirmed to the server was erased by the next snapshot, and
+         the flush then had nothing to write — the edit never left the device.
+
+         On the monolith this cannot happen: the main-document snapshot runs a
+         field-level smart merge. Under the cutover flags that whole branch is skipped —
+         the customers merge sits behind `if(HYBRID_CUSTOMERS_LIVE){}else{...}`, handled
+         by the listener instead — so the reshape replaced a MERGING read path with a
+         CLOBBERING one. The storage shape was ported; the merge semantics were not.
+         (NOTE: no nested block-comment markers in here. An earlier version of this
+         comment quoted that guard verbatim, and its inner terminator closed THIS
+         comment early — turning the remaining prose into code. Caught by a proof that
+         could not parse the extracted function, not by node --check on the page.)
+
+         This mirrors the proven monolith logic EXACTLY rather than reinventing it:
+         the REMOTE record stays the base, the money fields are merged in from the
+         shared primitives, and the profile/detail fields go through
+         _mergeRecordFields so revision arbitration decides — a genuinely newer edit
+         from another device is accepted, a stale remote value never reverts a local
+         one. Same functions, same argument order (local, remote), so both read paths
+         converge on the same answer.
+
+         KNOWN REMAINING GAP, stated rather than guessed: waterCycle / cycleHistory are
+         still plain-copied here. The monolith path applies an extra rule to them that
+         is NOT replicated below, because inventing a bottle-entitlement rule at speed
+         is how the other five faults tonight happened. Concurrent water-cycle edits on
+         two devices are therefore still last-writer-wins under cutover. Not a
+         regression from the previous cutover behaviour, but not fixed either.
+         ================================================================ */
+      var rc=v;
+      try{
+        if(arrName==="customers"){
+          rc=JSON.parse(JSON.stringify(v));
+          var _mc=_mergeCustomerCredit(tgt,rc);     // (local, remote) — additive union
+          rc.credit=_mc.credit;                     // take ONLY the money fields,
+          rc.creditLog=_mc.creditLog;               // exactly as the monolith does
+          _mergeRecordFields(tgt,rc,_HYDRATE_CUST_FIELDS,"customer(hydrate)");
+        }else if(arrName==="invoices"){
+          // Unions payments by _payKey, preserves a legacy paid total, and internally
+          // arbitrates `amount` via _mergeRecordFields.
+          rc=_mergeInvoicePayments(tgt,JSON.parse(JSON.stringify(v)));
+        }else if(arrName==="orders"){
+          rc=JSON.parse(JSON.stringify(v));
+          _mergeRecordFields(tgt,rc,_HYDRATE_ORDER_FIELDS,"order(hydrate)");
+        }
+      }catch(_){rc=v;}   // a merge failure must never stop hydration
+      Object.keys(rc).forEach(function(f){
         if(f==="_updatedAt")return;
-        if(JSON.stringify(tgt[f])!==JSON.stringify(v[f])){tgt[f]=v[f];changed=true;}
+        if(JSON.stringify(tgt[f])!==JSON.stringify(rc[f])){tgt[f]=rc[f];changed=true;}
       });
       if(changed)updated++;
     }else{
-      arr.push(v);byId[k]=v;added++;
+      /* FIX (2026-08-01): the update branch above skips _updatedAt, this one did not —
+         it pushed the raw server document, Firestore Timestamp and all. A cold start
+         takes THIS branch for every record, so all 1,188 picked up an _updatedAt and
+         those went straight into the main document on the next flags-off write.
+         Measured: 395 KB -> 474 KB, headroom 47 -> 34 days. _updatedAt is transport
+         metadata; it has no business in the in-memory arrays. */
+      var nv=v;
+      try{nv=JSON.parse(JSON.stringify(v));delete nv._updatedAt;}catch(_){nv=v;}
+      arr.push(nv);byId[k]=nv;added++;
     }
   });
   if(added||updated)console.log("[NDHYBRID] "+label+": +"+added+" new, "+updated+" updated from listener");
@@ -2078,7 +2146,7 @@ function _hybridStartListeners(){
            hydration so it is true even for a legitimately empty collection. */
         _hybridSeeded[arrName]=true;
         if(!D[arrName])D[arrName]=[];
-        var n=_hydrateById(D[arrName],docs,label);
+        var n=_hydrateById(D[arrName],docs,label,arrName);
         // Keep the shadow in step with what the server told us, so hydration never
         // looks like a local edit and never triggers a write-back storm.
         docs.forEach(function(d){
