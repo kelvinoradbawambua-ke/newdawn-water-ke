@@ -348,7 +348,7 @@ var APP_VERSION="2026-07-21-v35";
    was actually running.
    Bump this ONE line on every deploy. It is display-and-diagnostics only — nothing branches
    on it, no merge or money logic reads it, so it can never change behaviour. */
-var BUILD_STAMP="2026-07-31-hyb-a2";
+var BUILD_STAMP="2026-07-31-hyb-b3";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -1307,7 +1307,7 @@ var _hybridMigrating=false;
    one-character edit and a redeploy, not a code revert — on a live money system that
    property is worth more than tidiness. Phases 1 and 2 (backfill + verify) work either way,
    because they only ever WRITE documents and READ them back; they never change behaviour. */
-var HYBRID_COLLECTIONS_LIVE=false;
+var HYBRID_COLLECTIONS_LIVE=true;
 /* SEPARATE flag for the customers extraction, deliberately independent of the orders/invoices
    cutover (2026-07-31). Customers are 140 KB of the measured 387 KB document and are NEVER
    archived, so with only orders and invoices moved the main document still grows with the
@@ -1319,7 +1319,7 @@ var HYBRID_COLLECTIONS_LIVE=false;
    read-side merge continues to run exactly as in Build A, until the listener, the flush-loop
    entry, the payload skip and the backfill/verify coverage are all in place and proven.
    DO NOT set this true as part of the Phase 3 cutover. It is a separate, later step. */
-var HYBRID_CUSTOMERS_LIVE=false;
+var HYBRID_CUSTOMERS_LIVE=true;
 var _hybridShadow={orders:{},invoices:{},customers:{}};   // id -> JSON, last state successfully persisted
 var _hybridListenersOn=false,_hybridUnsub=[];
 /* NO-OP WRITE SUPPRESSOR state (2026-07-31) — see the long note at the txn.set site.
@@ -2060,8 +2060,13 @@ function _migrateToCollections(cb){
 }
 
 /* ---------------------------------------------------------------------------
-   PHASE 4 — STRIP. Removes the now-stale orders/invoices arrays from the main
-   document. THIS is what realises 366 KB -> 30 KB and egress 6.7 GB -> 0.31 GB.
+   PHASE 4 — STRIP. Removes the now-stale orders/invoices/customers arrays from the
+   main document. THIS is what realises 395 KB -> ~25-30 KB and the egress drop.
+
+   Measured live 2026-07-31: 395 KB = orders 148 KB + customers 141 KB + invoices
+   80 KB + stock 12 KB + auditLog 7 KB + pendingPayments 5 KB. All three of the big
+   ones must go, which is why customers is included here (behind its own flag) —
+   stripping only orders and invoices would leave ~167 KB and most of the growth.
 
    Needs its own explicit step because set({merge:true}) never REMOVES a field:
    once HYBRID_COLLECTIONS_LIVE is on, the payload simply stops mentioning them, so
@@ -2081,17 +2086,33 @@ function _hybridStripMainDoc(){
       toast("Strip REFUSED — verification not clean. Fallback kept.","err");
       return;
     }
-    uiConfirm({title:"Strip orders & invoices from the main document",variant:"danger",
+    var _willStrip="orders and invoices"+(HYBRID_CUSTOMERS_LIVE?" and customers":"");
+    uiConfirm({title:"Strip "+_willStrip+" from the main document",variant:"danger",
       confirmText:"Strip now",
-      message:"Verification is clean.\n\nThis removes the stale orders and invoices arrays from /newdawn/main. It is what reduces the document from ~366 KB to ~30 KB.\n\nAfter this, rolling back to the old build requires restoring from a backup — the in-document copy will be gone.\n\nTake a fresh backup first if you have not already."})
+      message:"Verification is clean.\n\nThis removes the stale "+_willStrip+" arrays from /newdawn/main. Measured 2026-07-31: the document is 395 KB — orders 148 KB, customers 141 KB, invoices 80 KB. Removing all three leaves roughly 25-30 KB."+(HYBRID_CUSTOMERS_LIVE?"":"\n\nNOTE: customers are NOT being stripped because HYBRID_CUSTOMERS_LIVE is off, so the in-document customers array is still the live source. The document will stay around 167 KB until that flag is on and this is run again.")+"\n\nAfter this, rolling back to the old build requires restoring from a backup — the in-document copy will be gone.\n\nTake a fresh backup first if you have not already."})
     .then(function(go){
       if(!go)return;
       try{
         var FV=firebase.firestore.FieldValue;
-        FB_DOC_REF.update({"D.orders":FV.delete(),"D.invoices":FV.delete()}).then(function(){
-          console.log("[NDHYBRID] PHASE 4 complete — orders/invoices removed from the main document");
-          auditLog("DATA_EXPORTED","HYBRID PHASE 4: stripped the stale orders/invoices arrays from the main document after a CLEAN verification. Per-document collections are now the sole source for these two collections.");
-          toast("Main document stripped — orders and invoices now live only in their collections","ok");
+        /* FIX (2026-07-31): this stripped ONLY D.orders and D.invoices. Customers were
+           moved to their own collection later, behind the SEPARATE HYBRID_CUSTOMERS_LIVE
+           flag, and this step was never revisited — so the 141 KB customers array (of a
+           measured 395 KB document) would have survived the strip and the promised
+           "~30 KB" would in fact have been ~167 KB, leaving most of the growth problem
+           in place.
+           D.customers is deleted ONLY when HYBRID_CUSTOMERS_LIVE is on, because with that
+           flag off the in-document array is still the LIVE source and deleting it would
+           destroy all 431 customers. _verifyCollectionMigration (which must have just
+           returned clean to reach this line) checks every customer document and both
+           orphan directions, so the collection is proven complete before anything here
+           removes the fallback. */
+        var _strip={"D.orders":FV.delete(),"D.invoices":FV.delete()};
+        var _stripped=["orders","invoices"];
+        if(HYBRID_CUSTOMERS_LIVE){_strip["D.customers"]=FV.delete();_stripped.push("customers");}
+        FB_DOC_REF.update(_strip).then(function(){
+          console.log("[NDHYBRID] PHASE 4 complete — "+_stripped.join("/")+" removed from the main document");
+          auditLog("DATA_EXPORTED","HYBRID PHASE 4: stripped the stale "+_stripped.join(", ")+" array(s) from the main document after a CLEAN verification. Per-document collections are now the sole source for these collections.");
+          toast("Main document stripped — "+_stripped.join(", ")+" now live only in their collections","ok");
         }).catch(function(e){
           console.log("[NDHYBRID] PHASE 4 failed: "+((e&&e.code)||"unknown")+" — arrays left in place, nothing lost");
           toast("Strip failed — arrays left in place","err");
@@ -3481,10 +3502,25 @@ function processWriteQueue(){
      side. pushToCloud()'s isEmpty check cannot catch it, because that runs at
      queue time when D was still full. Same test as that guard, applied at the
      only instant that actually matters — immediately before the payload is sent. */
+  /* CUTOVER FIX (2026-07-31): this guard is only ever called with DforSync — the WRITE
+     PAYLOAD — and under cutover _buildDforSync deliberately omits orders, invoices and
+     customers, because they now persist as their own documents. So src.orders and
+     src.customers are legitimately absent on every write, and this test silently
+     collapsed to "is stock empty?" — it stopped measuring the thing it exists to
+     measure (has local D been wiped?) and was left working only by the accident that
+     stock is still carried in the main document.
+
+     Failure direction was safe (a true result ABORTS the write, it never overwrites),
+     but a device that reached an empty stock list under cutover would have had every
+     write silently refused. Now each collection is judged where it actually lives: in
+     memory when its flag is on, in the payload when it is off. With both flags off this
+     is byte-for-byte the original behaviour. */
   function _dLooksEmpty(src){
     if(!src||typeof src!=="object")return true;
-    return (!src.customers||(src.customers||[]).length===0)&&
-           (!src.orders||(src.orders||[]).length===0)&&
+    var _ord=(HYBRID_COLLECTIONS_LIVE?(D&&D.orders):src.orders)||[];
+    var _cus=(HYBRID_CUSTOMERS_LIVE?(D&&D.customers):src.customers)||[];
+    return _cus.length===0&&
+           _ord.length===0&&
            (!src.stock||(src.stock||[]).length===0);
   }
   var ND_ABORT_EMPTY="ND_ABORT_EMPTY_D";
