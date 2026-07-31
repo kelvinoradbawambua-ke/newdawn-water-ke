@@ -337,6 +337,18 @@ var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
 var APP_VERSION="2026-07-21-v35";
+/* BUILD STAMP (2026-07-30) — deliberately SEPARATE from APP_VERSION, which is frozen by
+   standing instruction and must not be bumped. It exists to solve a concrete operational
+   problem: this app already renders APP_VERSION with the tooltip "check this after every
+   update to confirm the latest fixes actually loaded", and that check has been INERT for
+   weeks because the string never changes — two builds nineteen functions and a thousand
+   lines apart displayed the identical "v35". With a mixed fleet that matters: until every
+   device runs the new build, a device on the OLD build still writes stale values over newer
+   edits and strips their revision stamps, and there was no way to tell which build a phone
+   was actually running.
+   Bump this ONE line on every deploy. It is display-and-diagnostics only — nothing branches
+   on it, no merge or money logic reads it, so it can never change behaviour. */
+var BUILD_STAMP="2026-07-31-b4";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -677,15 +689,149 @@ function btl(v){if(!v||v==="Good")return "<span class=\"badge bg\">Good</span>";
 // reference, different length). Neither alone covers both failure modes;
 // together they do, while a call with truly nothing changed (same
 // reference AND same length) still correctly skips the rebuild.
-var _ordByIdCache=null,_ordByIdCacheArr=null,_ordByIdCacheLen=-1;
+var _ordByIdCache=null,_ordByIdCacheArr=null,_ordByIdCacheLen=-1,_ordByIdCacheBooksVer=-1;
 function _getOrdByIdIndex(){
-  var orders=D.orders||[];
-  if(_ordByIdCache&&_ordByIdCacheArr===orders&&_ordByIdCacheLen===orders.length)return _ordByIdCache;
+  // BOOKS (2026-07-30): found while wiring the customer statement to read archived
+  // history. _invoiceOrderActive() looks an invoice's order up in THIS index and
+  // treats "not found" as "order was cancelled/deleted" — true before archiving
+  // existed, but archiving a settled order also removes it from D.orders, so a
+  // real, once-Delivered, since-archived order would be misread as gone and its
+  // paid-off invoice would silently drop out of every screen that filters on
+  // _invoiceOrderActive (the statement's own history rows among them). custDebt()
+  // itself needs no such fix — it only ever evaluates UNPAID invoices, and an
+  // unpaid invoice's order can never be archived (RULE 2: the pair moves together,
+  // and RULE 1 requires the invoice be settled first) — but this shared index is
+  // also used for lookups that AREN'T debt-restricted, so it has to be correct on
+  // its own terms.
+  // EFFICIENCY FIX (2026-07-30): found while checking money-flow efficiency, not
+  // just accuracy. The original book-aware version called ordersWithBooks() FIRST
+  // to decide whether the cache was still valid — but that call itself allocates a
+  // fresh merged array every time (_mergeById always .slice()s), so it defeated
+  // the cache it was feeding: this function is called once PER CUSTOMER from
+  // several debt/history loops (e.g. rDash's dashDebtMap, rCusts's debtMap), so
+  // with N customers and any book loaded it was redoing the full merge N times
+  // for one render — O(customers x orders) for work that should be O(orders) once.
+  // Fixed by checking the CHEAP signals first — D.orders identity+length (a live
+  // edit) and _booksVersion (a book finished loading, or a new close happened) —
+  // and only calling the expensive ordersWithBooks() when one of those actually
+  // changed since the last build. Same cache-hit rate as before with zero books
+  // loaded (booksLoadedCount()>0 gate keeps that path byte-identical); the fix
+  // only changes the with-books path from "rebuild every call" to "rebuild once
+  // per genuine change."
+  var _withBooks=(typeof booksLoadedCount==="function")&&booksLoadedCount()>0;
+  var _liveArr=D.orders||[];
+  var _curBooksVer=_withBooks?_booksVersion:-1;
+  if(_ordByIdCache&&_ordByIdCacheArr===_liveArr&&_ordByIdCacheLen===_liveArr.length&&_ordByIdCacheBooksVer===_curBooksVer){
+    return _ordByIdCache;
+  }
+  var orders=_withBooks?ordersWithBooks():_liveArr;
   _ordByIdCache={};
   orders.forEach(function(o){_ordByIdCache[o.id]=o;});
-  _ordByIdCacheArr=orders;
-  _ordByIdCacheLen=orders.length;
+  _ordByIdCacheArr=_liveArr;
+  _ordByIdCacheBooksVer=_curBooksVer;
+  // NOTE: cached against _liveArr.length (what the next call compares against
+  // at the top), NOT orders.length — orders can be the larger merged array
+  // once books are loaded, and caching the merged length here would never
+  // match _liveArr.length on the next call, permanently defeating the cache.
+  _ordByIdCacheLen=_liveArr.length;
   return _ordByIdCache;
+}
+/* ============================================================================
+   CANONICAL ORDER <-> INVOICE LINKING — ONE rule, replacing four   (2026-07-30)
+
+   WHY THIS EXISTS. An audit of every order<->invoice lookup in this file found
+   FOUR different, incompatible conventions for the same relationship:
+     1. `i.orderId===ordId` ONLY, no notes fallback  — _orderSnapshotFor (1 site)
+     2. notes "#id(\D|$)" ONLY, ignoring orderId     — delO, cancelO, +5 sites
+     3. orderId first, notes as fallback             — _invoiceForOrder, +2 sites
+     4. FIRST "#(\d+)" scraped out of free text      — custDebt, recPay, +12 sites
+   Each failed in a different direction, and three real defects came out of it:
+
+   * (4) is the worst. Invoice notes are MANAGER-EDITABLE (saveInv) and M-Pesa
+     references are routinely written "#99887766". `notes.match(/#(\d+)/)` takes
+     the FIRST match, so on notes like "M-Pesa ref #99887766 — for Order #1370"
+     it captured 99887766, found no such order, and custDebt/_invoiceOrderActive
+     both concluded "order gone or cancelled" -> a genuine receivable silently
+     vanished from every debt figure in the app. Proven: KSh 1000 read as 0.
+     In recPay the same miss meant the order kept showing Unpaid, no durable
+     snapshot was attached, AND _resolvePendingCashFor never ran — so the same
+     cash could later be acknowledged a second time.
+   * (1) meant every durable recovery artifact (outbox entry, ORDER_PLACED /
+     DELIVERY_COMPLETE / PAYMENT_RECORDED snapshots) was written WITHOUT the
+     invoice for any legacy order linked by notes alone. A heal from such a
+     snapshot restored a delivered sale carrying NO receivable.
+   * (2) let delO's outstanding-balance gate be bypassed: an invoice whose notes
+     a manager had edited no longer matched, so outstandingBal computed as 0 and
+     an order with real debt became deletable.
+
+   THE RULE, now in one place:
+   _linkedOrderIdOf(inv[,ordIdx]) — which order does this invoice belong to?
+     - inv.orderId when present (authoritative, set at every creation site);
+     - else scan EVERY "#<digits>" in notes and prefer the first that RESOLVES
+       to a real order — this is what defeats the payment-reference collision;
+     - else fall back to the first candidate so that "link present but order
+       deleted" still reads as a dead link (custDebt must keep EXCLUDING those);
+     - else null, meaning genuinely unlinked (a manual invoice), which callers
+       treat as active/collectable exactly as before.
+   _linkedInvoicesOf(ordId) — ALL invoices for an order, orderId or notes.
+     Plural on purpose: saveOrd's edit path issues a REPLACEMENT invoice, so one
+     order legitimately has more than one (the bulk-heal incident recorded 287
+     invoices against 277 orders). Every caller that asks "is this order settled"
+     or "what is still owed" must see all of them, not the first.
+   _linkedInvoiceOf(ordId) — the first, for callers that genuinely want one.
+
+   All three are read-only, allocate nothing beyond the match, and never throw. */
+function _linkedOrderIdOf(inv,ordIdx){
+  try{
+    if(!inv)return null;
+    if(inv.orderId!=null)return inv.orderId;
+    var notes=inv.notes?String(inv.notes):"";
+    if(notes.indexOf("#")===-1)return null;
+    var toks=notes.match(/#(\d+)/g);
+    if(!toks||!toks.length)return null;
+    var cands=[];
+    for(var t=0;t<toks.length;t++){
+      var n=parseInt(toks[t].slice(1),10);
+      if(!isNaN(n))cands.push(n);
+    }
+    if(!cands.length)return null;
+    var idx=ordIdx||(typeof _getOrdByIdIndex==="function"?_getOrdByIdIndex():null);
+    if(idx){
+      for(var k=0;k<cands.length;k++){if(idx[cands[k]])return cands[k];}
+    }
+    return cands[0]; // link present but unresolvable — deliberately NOT null
+  }catch(_){return null;}
+}
+function _linkedInvoicesOf(ordId,invArr){
+  try{
+    if(ordId==null)return [];
+    var _s=String(ordId);
+    var re=new RegExp("#"+_s+"(\\D|$)");   // double-backslash: see _invoiceForOrder
+    return (invArr||D.invoices||[]).filter(function(i){
+      if(!i)return false;
+      if(i.orderId!=null)return String(i.orderId)===_s;
+      return !!(i.notes&&re.test(String(i.notes)));
+    });
+  }catch(_){return [];}
+}
+function _linkedInvoiceOf(ordId,invArr){
+  var a=_linkedInvoicesOf(ordId,invArr);
+  return a.length?a[0]:null;
+}
+/* The inverse lookup: which ORDER does this invoice belong to? Six sites (voidInvoice,
+   recPay's invoice branch, recPay's customer-level distribution, ackPendingPay, payI, and
+   the archive-eligibility scan) each carried a byte-identical copy of
+     var ordMatch=inv.notes&&inv.notes.match(/#(\d+)/);
+     var o=inv.orderId?...find(x=>x.id===inv.orderId):(ordMatch?...find(x=>String(x.id)===ordMatch[1]):null);
+   i.e. the first-match free-text scrape a payment reference could hijack. In recPay that
+   miss was the worst: the order kept showing Unpaid, no durable ordSnapshot was attached to
+   the PAYMENT_RECORDED event, and _resolvePendingCashFor never ran — so staff cash stayed
+   pending and could be acknowledged a SECOND time, double-counting real money. */
+function _orderForInvoice(inv){
+  var _oid=_linkedOrderIdOf(inv);
+  if(_oid==null)return null;
+  var _s=String(_oid);
+  return (D.orders||[]).find(function(x){return String(x.id)===_s;})||null;
 }
 function custDebt(id){
   var cu=(D.customers||[]).find(function(x){return x.id===id;});
@@ -693,23 +839,32 @@ function custDebt(id){
   var _ordIdx=_getOrdByIdIndex();
   var gross=(D.invoices||[]).filter(function(i){
     if(i.cId!==id)return false;
-    if(i.paid>=i.amount)return false; // fully paid, no debt
+    /* C2 FIX (2026-07-30): coerce before comparing. A legacy/imported invoice with an
+       absent or non-numeric amount used to PASS this test (undefined>=undefined is
+       false, so the row was kept) and then poison the reduce below with NaN — making
+       that customer's whole debt figure NaN, which renders as "NaN" and breaks every
+       sort and comparison downstream. Reachable via restoreXL, whose _numCoerce can
+       yield a non-number when a spreadsheet column is missing. A row with no usable
+       amount now contributes nothing instead of destroying the total. */
+    var _amt=Number(i.amount)||0,_pd=Number(i.paid)||0;
+    if(_pd>=_amt)return false; // fully paid (or no usable amount) — no debt
     if(i.voided)return false; // voided/written-off — excluded from debt
-    // Check if linked to a cancelled or deleted order
-    if(i.orderId){
-      var o=_ordIdx[i.orderId];
+    /* L1/C1 FIX (2026-07-30): this used to inline `i.orderId ? ... : notes.match(/#(\d+)/)`
+       — the free-text scrape that took the FIRST "#digits" in manager-editable notes. An
+       M-Pesa reference like "#99887766" hijacked it, resolved to no order, and this
+       filter concluded "order gone or cancelled", silently dropping a genuine receivable
+       from every debt figure in the app. Proven: KSh 1000 of real debt reported as 0.
+       Now the one canonical helper: a null result means genuinely unlinked (a manual
+       invoice) and stays collectable; a link that is present but unresolvable still
+       reads as a dead order and is still excluded, exactly as before. */
+    var _oid=_linkedOrderIdOf(i,_ordIdx);
+    if(_oid!=null){
+      var o=_ordIdx[_oid];
       if(!o||o.status==="Cancelled")return false; // order gone or cancelled
-    }else if(i.notes&&i.notes.indexOf("#")!==-1){
-      var match=i.notes.match(/#(\d+)/);
-      if(match){
-        var oid=parseInt(match[1]);
-        var o=_ordIdx[oid];
-        if(!o||o.status==="Cancelled")return false; // order gone or cancelled
-      }
     }
     return true;
-  }).reduce(function(a,i){return a+(i.amount-i.paid);},0);
-  return Math.max(0,gross-credit); // net debt after credit
+  }).reduce(function(a,i){return a+((Number(i.amount)||0)-(Number(i.paid)||0));},0);
+  return Math.max(0,_round2(gross-credit)); // net debt after credit (_round2: project rule — every money figure)
 }
 // FIX (2026-07-27): shared collectable-debt predicate. custDebt() above already
 // excludes an invoice whose linked order was Cancelled or deleted (lines
@@ -723,9 +878,11 @@ function custDebt(id){
 function _invoiceOrderActive(i){
   if(!i)return false;
   var _idx=_getOrdByIdIndex();
-  var _oid=null;
-  if(i.orderId)_oid=i.orderId;
-  else if(i.notes&&i.notes.indexOf("#")!==-1){var _m=i.notes.match(/#(\d+)/);if(_m)_oid=parseInt(_m[1]);}
+  // L1/C1 FIX (2026-07-30): same free-text-scrape bug as custDebt above, same fix —
+  // one canonical helper. This predicate gates collectable-money decisions in several
+  // payment/debt screens, so a hijacked lookup here removed real debt from view AND
+  // blocked legitimate payment application.
+  var _oid=_linkedOrderIdOf(i,_idx);
   if(_oid==null)return true; // no linked order (e.g. a manual invoice) — active, same as custDebt()
   var _o=_idx[_oid];
   return !(!_o||_o.status==="Cancelled");
@@ -883,13 +1040,472 @@ function uiAlert(opts){
    Returns null rather than throwing: a missing snapshot degrades recovery
    back to today's manual re-entry, which is survivable; a thrown error here
    would abort the audit write and lose the ONLY durable trace of the order. */
+/* ============================================================================
+   EDIT REVISION STAMP — fixes cross-device edits silently reverting  (2026-07-30)
+
+   THE BUG (F1, found by an independent audit; HIGH, money-relevant). The read-side
+   order merge had one rule for a field that differs between this device and the
+   server: PREFER LOCAL. Its comment assumed local meant "this device's own
+   in-memory edit at risk of being clobbered" — but in the normal case local is
+   just the stale, previously-synced value. So when director B corrected a price,
+   every OTHER device rejected the correction on read, and then wrote its stale
+   value back over B's on its next write. The correction was reverted, permanently,
+   usually within minutes (any device writing anything is enough). Fields affected
+   include price, qty, cost and cId — all of which feed revenue and debt.
+   Recorded PAYMENTS were never at risk (they're unioned additively, so cash is
+   safe); it is CORRECTIONS to line items and amounts that reverted.
+
+   THE FIX. A monotonic per-record revision, bumped whenever a human edits the
+   record. The merge then lets the genuinely NEWER revision win instead of blindly
+   preferring local. A counter is used rather than a wall-clock timestamp on
+   purpose: this app has already been burned by cross-device clock skew (see the
+   updatedAt/weAreNewer history), and a counter needs no clock agreement at all.
+   _editedAt is stored alongside for diagnostics and as a tie-break only.
+
+   WHY THIS SHAPE IS SAFE, and why it is a strict improvement rather than a
+   gamble: the merge only overrides local when the remote PROVES it is newer
+   (remote._rev > local._rev, with a missing stamp counting as 0). If neither
+   side carries a stamp — every pre-existing order, and any edit path this fix
+   might have failed to stamp — the merge falls through to exactly today's
+   behaviour. So a missed edit site degrades to the current known bug; it can
+   never turn into the far worse "lost my own unflushed edit". Nothing regresses
+   on legacy data, and every stamped path converges correctly. */
+function _stampOrderEdit(o){
+  // Thin delegate, deliberately kept (2026-07-30): the stamp is now generic and
+  // shared with stock/offers/complaints/customers/USERS via _stampRecordEdit, but
+  // this name is wired into both order-creation/edit paths and is pinned by name in
+  // _proof_edit_convergence.js. Renaming it would churn the call sites and the proof
+  // for no behavioural gain, so the order path keeps its own verb.
+  return _stampRecordEdit(o);
+}
+/* Generic edit stamp — see the block above for the full F1 mechanism and why a
+   monotonic counter is used in preference to a wall clock (cross-device clock skew
+   has already burned this project once). Never throws: a failure to stamp must
+   degrade to the old prefer-local behaviour, never break the save it is part of. */
+function _stampRecordEdit(r){
+  try{
+    if(!r||typeof r!=="object")return r;
+    r._rev=(Number(r._rev)||0)+1;
+    r._editedAt=Date.now();
+    r._editedBy=(CU&&CU.name)||"";
+  }catch(_){}
+  return r;
+}
+/* ============================================================================
+   SHARED FIELD-MERGE PRIMITIVE — one rule, seven call sites         (2026-07-30)
+
+   WHY THIS EXISTS AT ALL. F1 (see the block above) was found in the ORDERS merge
+   and fixed there. The identical "prefer local unconditionally" rule was still
+   live at SIX more sites — stock (read AND write), offers, complaints, customers,
+   USERS — every one of them wrong for exactly the same reason, and covering money
+   fields (stock price/cost, offer disc, customer creditLimit) plus the team PIN.
+   Verified by direct reading of all six, not inferred: a director changing an
+   offer discount 10%->25% had it rejected by every other device, each of which
+   then wrote 10% back to the server — and _of.disc sets the order price directly
+   in saveOrd, so every order those devices placed was priced wrong.
+
+   That shape — ONE rule, copy-pasted to N places, later fixed at one of them — is
+   this codebase's most expensive recurring defect. It has now happened with
+   field-preservation itself (orders -> stock -> offers -> complaints -> USERS ->
+   customers: six separate dated fixes, each finding the previous one incomplete),
+   with deletion tombstones, and with the archive tombstone (six sites at once).
+   CLAUDE.md item 14 exists to catch it by hand, every time, forever.
+
+   So rather than copy the F1 fix six more times and leave seven copies for the
+   next change to miss, the rule now lives in exactly ONE function that every site
+   calls. A future change to merge semantics is one edit, not seven, and cannot be
+   applied to only some of them.
+
+   THE RULES, in order — identical to the proven orders implementation this was
+   extracted from, deliberately so, which is why _proof_edit_convergence.js's
+   behavioural assertions still hold unchanged against the orders path:
+     1. UNCONDITIONAL: a real local value is never wiped by an absent remote one.
+        Applied even when the remote is newer — "newer" is not licence to blank a
+        field that simply is not present in the incoming record. (Two bugs in the
+        first cut of the orders fix were caught here by its proof: dropping this
+        let a null remote field erase real local data.)
+     2. On a genuine disagreement, prefer local ONLY IF the remote has not proven
+        itself newer (remote._rev > local._rev, an absent stamp counting as 0).
+     3. When local is the newer side, carry its stamp onto the merged record, so a
+        following Object.assign cannot stomp _rev back down to the remote's lower
+        value and send this device's next write out under a stale rev — which would
+        stop other devices accepting it.
+
+   WHY THIS CAN ONLY IMPROVE ON TODAY'S BEHAVIOUR: with neither side stamped,
+   _remoteIsNewer is false and this is byte-for-byte the old prefer-local rule. An
+   unstamped collection, or an edit path this fix failed to stamp, therefore
+   degrades to the CURRENT known bug — never to the far worse "lost my own
+   unflushed edit".
+
+   The try/catch is a deliberate difference from the inline orders version it
+   replaces: this now runs inside SEVEN merge paths, several of them in the
+   onSnapshot handler, where a thrown error would break the entire sync cycle
+   rather than one field. Failing closed (leaving the record as the remote sent it)
+   is the safe direction, and matches how the write-side reconcile already guards
+   its own rev logic.
+
+   Mutates and returns `ro`, the incoming/remote-derived record — matching what all
+   seven call sites already did with their own inline loops. Param names lo/ro are
+   kept from the orders original so the source-text pins in
+   _proof_edit_convergence.js §6 keep asserting against the real rule. */
+function _mergeRecordFields(lo,ro,fields,label){
+  try{
+    if(!lo||!ro||!fields||!fields.forEach)return ro;
+    var _loRev=Number(lo._rev)||0,_roRev=Number(ro._rev)||0;
+    var _remoteIsNewer=_roRev>_loRev;
+    /* EQUAL-REVISION TIEBREAK (2026-07-30). A counter alone does not converge: two devices
+       editing the same record from the same starting revision BOTH produce rev N+1, so
+       neither is "strictly newer", both take the prefer-local path, and the two devices
+       DIVERGE PERMANENTLY — each certain it is right, with no further event to break the
+       tie. (The pre-fix code diverged in this case too, so the counter did not introduce
+       this; it just does not close it.)
+       Resolved by falling back to the wall clock ONLY as a tiebreak, never as the primary
+       rule — cross-device clock skew has burned this project before, which is why the
+       counter leads. If _editedAt also ties, compare _editedBy so that every device
+       independently reaches the SAME answer instead of each keeping its own.
+       Convergence check (both directions, by hand): device A holding X sees remote Y with
+       a later _editedAt -> A adopts Y. Device B holding Y sees remote X with an earlier
+       _editedAt -> B keeps Y. Both land on Y. Deterministic and symmetric.
+       Applied ONLY when both sides carry a real stamp, so legacy/unstamped data is
+       completely unaffected. */
+    if(!_remoteIsNewer&&_roRev===_loRev&&_loRev>0){
+      var _loAt=Number(lo._editedAt)||0,_roAt=Number(ro._editedAt)||0;
+      if(_roAt>_loAt)_remoteIsNewer=true;
+      else if(_roAt===_loAt&&String(ro._editedBy||"")>String(lo._editedBy||""))_remoteIsNewer=true;
+    }
+    // The label is passed as a SEPARATE ARGUMENT, deliberately never concatenated into
+    // the format string. ndlog is gated off by default, and the entire cost the
+    // 2026-07-29 logging fix removed was eager string-building at gated call sites — a
+    // concatenation here would be evaluated on every merge of every record whether
+    // logging is on or not. _proof_persistence_and_logging.js asserts this, and caught
+    // exactly that mistake in the first cut of this line.
+    if(_remoteIsNewer)ndlog("[NDSYNC]",(label||"record"),"id=",ro.id,"accepting REMOTE edit (rev",_roRev,">",_loRev,") — a newer edit from another device");
+    fields.forEach(function(f){
+      var lv=lo[f],rv=ro[f];
+      if(lv!=null&&rv==null)ro[f]=lv;
+      else if(lv!=null&&rv!=null&&lv!==rv&&!_remoteIsNewer)ro[f]=lv;
+    });
+    if(!_remoteIsNewer&&_loRev>0){
+      ro._rev=_loRev;
+      if(lo._editedAt!=null)ro._editedAt=lo._editedAt;
+      if(lo._editedBy!=null)ro._editedBy=lo._editedBy;
+    }
+  }catch(_){}
+  return ro;
+}
 function _orderSnapshotFor(ordId){
   try{
     var o=(D.orders||[]).find(function(x){return x.id===ordId;});
     if(!o)return null;
-    var inv=(D.invoices||[]).find(function(i){return i.orderId===ordId;});
+    /* B1 FIX (2026-07-30): this used to be `(D.invoices||[]).find(i=>i.orderId===ordId)` —
+       an exact orderId match with NO "#id" notes fallback, the only lookup in the file that
+       omitted it. For a legacy/imported order whose invoice is linked by notes alone, this
+       returned invoice:null, and this snapshot is what every durable recovery artifact
+       carries: the outbox entry (_outboxPut), and the ORDER_PLACED / DELIVERY_COMPLETE /
+       PAYMENT_RECORDED audit events. So a heal or outbox delivery restored a DELIVERED SALE
+       WITH NO RECEIVABLE — proven by simulation: debt read 0 on a real KSh 1000 sale.
+       Now uses the canonical helper, so the invoice travels with the order in every case. */
+    var inv=_linkedInvoiceOf(ordId);
     return JSON.parse(JSON.stringify({order:o,invoice:inv||null}));
   }catch(_){return null;}
+}
+/* ============================================================================
+   DURABLE ORDER OUTBOX — THE MISSING-ORDER ROOT CAUSE FIX      (2026-07-30)
+
+   THE ROOT CAUSE, finally identified (found by an independent audit, then
+   confirmed here by reading the code and matching it against two real field
+   incidents). Everything before this was treating symptoms.
+
+   The whole-document write goes through fbDb.runTransaction() (_atomicWrite).
+   **Firestore transactions require a live connection and are NEVER placed in
+   the offline persistence queue — only plain set()/update() writes are.** So
+   enabling offline persistence (the 2026-07-29 fix, which is real and correct)
+   does NOT make the order write durable. There IS a fallback to a durable plain
+   set(), but it only runs when the transaction actively REJECTS with a
+   recognised offline error. When a delivery phone freezes mid-transaction and
+   the tab is then evicted — the classic loss — the transaction never resolves,
+   never rejects, so the fallback never runs and NOTHING is ever queued. Every
+   "last chance" flush (visibilitychange, pagehide, logout) routes back through
+   this same transaction, so none of them can rescue it either.
+
+   WHY THIS EXACTLY MATCHES THE FIELD EVIDENCE. Orders #1378 and #1383 both
+   showed the identical signature the owner reported twice: present in the
+   AUDIT LOG, absent from the synced document. That is this bug precisely — the
+   tiny ORDER_PLACED audit event is a plain set() on its own small doc, so it
+   IS durably queued and lands on reconnect; the 330KB transactional document
+   write beside it is not, and dies with the tab.
+
+   WHAT THIS FIXES, AND WHAT IT DELIBERATELY DOES NOT. This is PREVENTION, not
+   a wider recovery net — the owner's standing instruction stands untouched:
+   HEAL_RECENT_MS stays at 5 minutes and the self-heals are not loosened at all.
+   Instead, the order gets its OWN durable write, so Firestore's offline queue
+   delivers it on reconnect by itself. Nothing has to guess what was lost,
+   because nothing is lost: recovery stops being an inference and becomes a
+   delivery. That is the difference the owner asked for — "i need the missing
+   order root cause fixed not focus on auto healing."
+
+   WHY IT IS SAFE AT ANY AGE (unlike a heal). A heal has to infer "this looks
+   lost" from local state, which is what made the 277-record incident possible.
+   An outbox entry is not an inference: it was written, deliberately, at the
+   instant that one order was created, and it is DELETED as soon as that order
+   is confirmed present in the synced document. It therefore cannot contain
+   history — there is no mechanism by which an old, already-reconciled order
+   could appear in it. On top of that, every entry is still checked against all
+   four "this absence is deliberate" signals before anything is restored:
+   deleted tombstone, archived tombstone, director dismissal, and the twin
+   guard (so a manual re-entry under a new id is never duplicated).
+   Deliberately NO max-3 circuit breaker here: unlike a heal, a phone that was
+   genuinely offline for a day SHOULD deliver all of its orders, and capping
+   that would recreate the very data loss this exists to end. The bounded
+   query below is the cost guard instead.
+
+   QUOTA. One extra small write per order (~20/day) plus one delete per order
+   once confirmed, against a 20,000/day cap — and one bounded query per
+   session. The collection self-empties, so it stays at ~0-2 documents.
+
+   REQUIRES A FIRESTORE SECURITY RULE for newdawn_outbox (same as newdawn_books).
+   Until that rule exists the writes are simply denied and this is SAFE-INERT:
+   nothing breaks, the order still syncs the way it does today, and the app
+   behaves exactly as before. See the migration notes for the rule text.
+   ============================================================================ */
+var FB_OUTBOX_COL=null;              // newdawn_outbox collection (null until Firebase is up)
+var _outboxReconciling=false;        // re-entry guard — one reconcile pass at a time
+var _outboxDoneThisSession=false;    // the full pass runs once per session (cost guard)
+/* WRITE SIDE — the durable part. A plain set() on a small per-order document,
+   which offline persistence genuinely queues and replays on reconnect. Called
+   at order creation, immediately alongside the ORDER_PLACED audit event that
+   already lands reliably today. Best-effort by design: a failure here must
+   never block or break order placement, because the order is still going out
+   through the normal path too — this is an additional guarantee, not a
+   replacement. */
+function _outboxPut(ordId){
+  try{
+    if(!FB_OUTBOX_COL||!ordId)return;
+    var snap=_orderSnapshotFor(ordId);
+    if(!snap||!snap.order)return;
+    FB_OUTBOX_COL.doc(String(ordId)).set({
+      orderId:ordId,
+      order:snap.order,
+      invoice:snap.invoice||null,
+      by:(CU&&CU.name)||"",
+      uid:(CU&&CU.id)||null,
+      createdAt:new Date().toISOString(),
+      _ts:Date.now()
+    }).catch(function(e){
+      // A denied/failed outbox write is not an error worth surfacing: the order
+      // still travels by the normal route. Logged only, so a missing security
+      // rule is visible in the console rather than silent.
+      console.log("[NDOUTBOX] queue failed for #"+ordId+" ("+((e&&e.code)||"unknown")+") — order still syncs the normal way");
+    });
+    console.log("[NDOUTBOX] durably queued order #"+ordId+" (survives reload/freeze/screen-lock)");
+  }catch(_){}
+}
+/* Confirmed-safe cleanup: the order is present in the synced document, so the
+   outbox copy has done its job and is removed. This is what keeps the
+   collection near-empty and the reconcile query cheap. */
+function _outboxDrop(ordId){
+  try{
+    if(!FB_OUTBOX_COL||ordId==null)return;
+    FB_OUTBOX_COL.doc(String(ordId)).delete().catch(function(){});
+  }catch(_){}
+}
+/* ============================================================================
+   DURABLE PAYMENT OUTBOX — closes finding B2                       (2026-07-30)
+
+   THE GAP THIS CLOSES. The order outbox above made ORDER CREATION survive the
+   freeze-then-evict loss (runTransaction is never placed in Firestore's offline
+   queue — only plain set/update/delete are — so when a phone freezes mid-write the
+   transaction never settles, never rejects, and the durable _fallbackWrite is
+   never reached). Customer creation rides a durable audit snapshot. NOTHING ELSE
+   DID — and the most valuable thing in this system after an order is RECEIVED
+   CASH. A payment recorded on a delivery phone that then froze was recoverable
+   only by a human reading the audit-log text.
+   Proven before building: a non-settling runTransaction reaches neither .then nor
+   .catch, so no durable write is ever issued (executed against the real
+   _atomicWrite). Fixing B1 helped — PAYMENT_RECORDED now carries the invoice WITH
+   its payments array — but the event self-heal only ever restores a MISSING order
+   and its invoice; it never replays a payment onto an invoice that already exists.
+   That residual payment-only loss is what this closes.
+
+   DESIGN DECISIONS, each deliberate:
+   * SAME COLLECTION as the order outbox, keyed "pay-<pid>". No new Firestore
+     collection means NO NEW SECURITY RULE — one rule covers both, which matters
+     because rules are applied by hand.
+   * IDEMPOTENT BY pid. Delivery only ever appends a payment whose pid is not
+     already in the invoice's payments array, so a payment can never be applied
+     twice no matter how many devices reconcile or how often.
+   * REVERSALS ARE TOMBSTONED, NOT INFERRED. reversePayment REMOVES the entry from
+     the array, so "pid absent" is ambiguous — it means either "never landed" or
+     "a director deliberately reversed it". Re-applying the latter would fabricate
+     revenue. reversePayment therefore records D.reversedPayPids[pid] (an explicit
+     tombstone, exactly the doctrine this codebase already uses for deletions and
+     archives) AND drops the queue entry. The tombstone is what makes this safe
+     across devices: the queue-entry delete alone would lose a race against another
+     device reconciling first.
+   * FORWARD-ONLY, and it cannot bulk-restore history. An entry is written at the
+     instant one payment is taken and deleted once that payment is confirmed
+     present, so the collection cannot accumulate a past to replay. This is a
+     DELIVERY of something durably written, never an inference about what might be
+     missing — the distinction that separates it from the self-heal that once
+     restored 277 records.
+   * NO cap on how many deliver: a phone offline all day SHOULD deliver all of its
+     cash. The bounded .limit(50) query is the cost guard instead, same as orders.
+   * Overpayment CREDIT is deliberately not re-created here. recPay caps the queued
+     payment at the invoice balance, so the queued amount is exactly the
+     invoice-applied cash; the credit half is a separate creditLog entry that merges
+     additively by its own id. Re-creating it here could double-credit. */
+function _outboxPutPayment(invId,pid){
+  try{
+    if(!FB_OUTBOX_COL||invId==null||!pid)return;
+    var inv=(D.invoices||[]).find(function(x){return x&&x.id===invId;});
+    if(!inv)return;
+    var p=(inv.payments||[]).find(function(x){return x&&String(x.pid)===String(pid);});
+    if(!p)return;
+    FB_OUTBOX_COL.doc("pay-"+String(pid)).set({
+      kind:"payment",
+      pid:String(pid),
+      invId:invId,
+      cId:(inv.cId!=null?inv.cId:null),
+      payment:JSON.parse(JSON.stringify(p)),
+      by:(CU&&CU.name)||"",
+      uid:(CU&&CU.id)||null,
+      createdAt:new Date().toISOString(),
+      _ts:Date.now()
+    }).catch(function(e){
+      // Best-effort, exactly like the order outbox: the payment still travels the
+      // normal route. Logged so a missing rule is visible rather than silent.
+      console.log("[NDOUTBOX] payment queue failed pid="+pid+" ("+((e&&e.code)||"unknown")+") — payment still syncs the normal way");
+    });
+    console.log("[NDOUTBOX] durably queued payment pid="+pid+" on invoice #"+invId+" (KSh "+((p&&p.amt)||0)+")");
+  }catch(_){}
+}
+function _outboxDropPayment(pid){
+  try{
+    if(!FB_OUTBOX_COL||pid==null)return;
+    FB_OUTBOX_COL.doc("pay-"+String(pid)).delete().catch(function(){});
+  }catch(_){}
+}
+/* Delivery for one queued payment. Mutates D and reports through `acc`; every
+   refusal path is explicit, and the only path that KEEPS the entry is the one where
+   the invoice simply has not arrived yet (the order outbox or a heal may still
+   bring it, and dropping the entry would lose the cash for good). */
+function _outboxDeliverPayment(d,acc){
+  try{
+    var pid=d.pid,invId=d.invId,p=d.payment;
+    if(!pid||invId==null||!p)return;
+    if(D.reversedPayPids&&D.reversedPayPids[pid]){_outboxDropPayment(pid);acc.skipped.push(pid+":reversed");return;}
+    if(D.deletedInvoiceIds&&D.deletedInvoiceIds[invId]){_outboxDropPayment(pid);acc.skipped.push(pid+":invoice-deleted");return;}
+    if(D.archivedInvoiceIds&&D.archivedInvoiceIds[invId]){_outboxDropPayment(pid);acc.skipped.push(pid+":invoice-archived");return;}
+    var inv=(D.invoices||[]).find(function(x){return x&&x.id===invId;});
+    if(!inv){acc.skipped.push(pid+":invoice-absent");return;}   // KEPT on purpose — see above
+    if(inv.voided){_outboxDropPayment(pid);acc.skipped.push(pid+":invoice-voided");return;}
+    if(!inv.payments)inv.payments=[];
+    if(inv.payments.some(function(x){return x&&String(x.pid)===String(pid);})){_outboxDropPayment(pid);acc.dropped++;return;}
+    var _p=JSON.parse(JSON.stringify(p));
+    _p._healedFrom="outbox";_p._healedAt=Date.now();
+    inv.payments.push(_p);
+    inv.paid=_round2(inv.payments.reduce(function(s,x){return s+((x&&Number(x.amt))||0);},0));
+    // Keep the linked order's badge honest, the same way recPay does.
+    var _o=_orderForInvoice(inv);
+    if(_o){
+      if(inv.paid>=inv.amount)_o.paid="Paid"; else if(inv.paid>0)_o.paid="Partial"; else _o.paid="Unpaid";
+      _o.amtPaid=inv.paid;
+    }
+    acc.restored.push({pid:pid,invId:invId,amt:(_p.amt||0)});
+  }catch(_){}
+}
+/* READ SIDE — the delivery. For each queued order: if it is already in the
+   synced document, drop the queue entry. If it is genuinely absent AND its
+   absence is not deliberate, merge it in (add-only, original id preserved).
+   Any device can complete this — recovery no longer depends on the device that
+   lost the write ever coming back. */
+function _outboxReconcile(){
+  try{
+    if(!FB_OUTBOX_COL)return;
+    if(_outboxReconciling||_outboxDoneThisSession)return;
+    // "Absent from the cloud" is only answerable from a SERVER-confirmed read —
+    // never from this device's own cache. Same rail as the self-heals.
+    if(typeof _cloudServerConfirmed!=="undefined"&&!_cloudServerConfirmed)return;
+    if(typeof _healLiveStateLooksLoaded==="function"&&!_healLiveStateLooksLoaded("OUTBOX"))return;
+    _outboxReconciling=true;
+    // Bounded on purpose: the collection self-empties, so a large result means
+    // something is wrong (e.g. deletes are being denied) and is worth capping
+    // rather than reading unboundedly.
+    FB_OUTBOX_COL.limit(50).get().then(function(snap){
+      _outboxReconciling=false;
+      _outboxDoneThisSession=true;
+      if(!snap||snap.empty)return;
+      var liveOrd={};(D.orders||[]).forEach(function(o){if(o&&o.id!=null)liveOrd[o.id]=true;});
+      var dismissed={};(D.dismissedMissingOrders||[]).forEach(function(id){dismissed[id]=true;});
+      var restoredO=[],restoredI=[],dropped=0,skipped=[];
+      var payAcc={restored:[],skipped:skipped,dropped:0};   // B2 — payment entries
+      snap.forEach(function(doc){
+        var d=doc.data()||{};
+        // B2 (2026-07-30): this collection now also carries payment entries, keyed
+        // "pay-<pid>". Branch BEFORE the order path, which expects an order payload.
+        if(d.kind==="payment"){_outboxDeliverPayment(d,payAcc);return;}
+        var oid=d.orderId,so=d.order;
+        if(oid==null||!so)return;
+        if(liveOrd[oid]){_outboxDrop(oid);dropped++;return;}           // landed — job done
+        if((D.deletedOrderIds&&D.deletedOrderIds[oid])||_recentlyDeletedOrderIds[oid]){_outboxDrop(oid);skipped.push(oid+":deleted");return;}
+        if(D.archivedOrderIds&&D.archivedOrderIds[oid]){_outboxDrop(oid);skipped.push(oid+":archived");return;}
+        if(dismissed[oid]){_outboxDrop(oid);skipped.push(oid+":dismissed");return;}
+        if(typeof _healTwinOf==="function"&&_healTwinOf(so)){skipped.push(oid+":twin");return;} // kept, NOT dropped — a human should look
+        var _copy=JSON.parse(JSON.stringify(so));
+        _copy._stockNotDeducted=true;        // its original deduction died with the lost write
+        _copy._healedFrom="outbox";          // provenance
+        _copy._healedAt=Date.now();
+        (D.orders||[]).push(_copy);
+        liveOrd[oid]=true;
+        restoredO.push(oid);
+        var si=d.invoice;
+        if(si&&si.id!=null&&
+           !(D.invoices||[]).some(function(x){return x.id===si.id;})&&
+           !(D.deletedInvoiceIds&&D.deletedInvoiceIds[si.id])&&
+           !(typeof _recentlyVoidedInvoiceIds!=="undefined"&&_recentlyVoidedInvoiceIds&&_recentlyVoidedInvoiceIds[si.id])){
+          var _ci=JSON.parse(JSON.stringify(si));
+          _ci._healedFrom="outbox";_ci._healedAt=Date.now();
+          (D.invoices||[]).push(_ci);
+          restoredI.push(si.id);
+        }
+      });
+      if(dropped)console.log("[NDOUTBOX] "+dropped+" queued order(s) confirmed present — queue entries cleared");
+      if(payAcc.dropped)console.log("[NDOUTBOX] "+payAcc.dropped+" queued payment(s) confirmed present — queue entries cleared");
+      if(skipped.length)console.log("[NDOUTBOX] skipped: "+skipped.join(", "));
+      /* B2 (2026-07-30): payments are reported and flushed INDEPENDENTLY of orders —
+         deliberately placed before the `if(!restoredO.length)return;` below, because the
+         common case is a payment lost on its own while its order landed fine. */
+      if(payAcc.restored.length){
+        var _pTot=payAcc.restored.reduce(function(s,r){return s+(r.amt||0);},0);
+        console.log("[NDOUTBOX] DELIVERED "+payAcc.restored.length+" payment(s) totalling KSh "+_pTot+" that never reached the document");
+        _hasPendingCriticalEdit=true;   // real money recovered — flush at once
+        auditLog("PAYMENT_RECORDED","OUTBOX DELIVERY: "+payAcc.restored.length+" payment(s) totalling KSh "+_pTot.toLocaleString()+
+          " were durably queued when the cash was taken but never reached the main document — delivered now from the outbox ("+
+          payAcc.restored.map(function(r){return "invoice #"+r.invId+" KSh "+r.amt;}).join(", ")+
+          "). Applied by payment id, so the same payment can never be counted twice. NOTE: an OVERPAYMENT credit arising from the same cash event is NOT re-created here — check the customer's credit balance if one was expected.");
+        dirty();
+        try{
+          toast("Recovered "+payAcc.restored.length+" payment(s) totalling KSh "+_pTot.toLocaleString()+" that never reached the cloud","warn");
+          refreshCurrentPage();
+        }catch(_){}
+      }
+      if(!restoredO.length)return;
+      console.log("[NDOUTBOX] DELIVERED "+restoredO.length+" order(s) that never reached the document: #"+restoredO.join(", #"));
+      _hasPendingCriticalEdit=true;   // genuine record recovery — flush at once
+      auditLog("ORDER_PLACED","OUTBOX DELIVERY: "+restoredO.length+" order(s) ["+restoredO.join(", ")+"]"+
+        (restoredI.length?" and "+restoredI.length+" invoice(s) ["+restoredI.join(", ")+"]":"")+
+        " were durably queued at creation but never reached the main document — delivered now from the outbox. Original ids preserved; stock NOT re-deducted.");
+      dirty();
+      try{
+        toast("Recovered "+restoredO.length+" order(s) that never reached the cloud: #"+restoredO.join(", #"),"warn");
+        refreshCurrentPage();
+      }catch(_){}
+    }).catch(function(e){
+      _outboxReconciling=false;
+      _outboxDoneThisSession=true;   // don't retry-hammer a denied/unavailable collection
+      console.log("[NDOUTBOX] reconcile unavailable ("+((e&&e.code)||"unknown")+") — no security rule yet? Orders still sync the normal way");
+    });
+  }catch(_){_outboxReconciling=false;}
 }
 /* Customer equivalent of _orderSnapshotFor (2026-07-28). Closes the SAME
    durability gap for customer creation that the order snapshot closed for
@@ -1320,7 +1936,48 @@ function _mergeInvoicePayments(a,b){
   var result=Object.assign({},b||a);
   result.payments=merged;
   result.paid=_round2(paid);
-  result.amount=(a&&typeof a.amount==="number")?a.amount:(b&&b.amount);
+  /* F6 / F1-FAMILY FIX (2026-07-30). This line used to be
+       result.amount=(a&&typeof a.amount==="number")?a.amount:(b&&b.amount);
+     i.e. ALWAYS prefer the local amount — the exact prefer-local bug fixed for orders
+     (F1) and then for six more collections the same night. `amount` is what the customer
+     OWES, so this is money accuracy, not cosmetics: correct an order's price or quantity
+     on device B (saveOrd recomputes linkedInv.amount) and every other device rejected the
+     new amount on arrival, then wrote its stale amount back on its next write. The order's
+     own price/qty converged after the F1 fix while its invoice amount did not — leaving
+     order and invoice permanently disagreeing about the same sale.
+     Now routed through the same shared primitive as the other seven sites, so a strictly
+     newer edit wins. `result` already carries b's amount from the Object.assign above,
+     which is what the primitive arbitrates against; with neither side stamped it falls
+     through to prefer-local — byte-identical to the line it replaces, so nothing regresses
+     on legacy invoices.
+     One deliberate semantic difference: the old typeof==="number" test is now the
+     primitive's !=null test, matching what this project already concluded is correct for
+     every other merged field (a real 0 is a legitimate value — cancelO writes exactly that
+     — and only null/undefined mean "never set"). Amounts are numeric everywhere, including
+     the XLSX restore path which coerces via _numCoerce.
+     paid / payments / voided are deliberately NOT arbitrated by revision and are handled
+     above and below: payments UNION additively (concurrent cash must never be arbitrated
+     away) and voided is a one-way ratchet. Only `amount` is a genuine single-value edit. */
+  _mergeRecordFields(a,result,["amount"],"invoice");
+  /* NOT-YET-ARBITRATED, FOUND 2026-07-30, DELIBERATELY LEFT ALONE — read before "fixing".
+     `cId`, `due` and `notes` are also human-editable on an existing invoice (saveInv edits
+     all three; saveOrd's reassignment sets linkedInv.cId), and all three still come from
+     `b` unconditionally via the Object.assign above — i.e. REMOTE always wins for them.
+     That is the opposite failure mode to the one just fixed: it discards THIS device's own
+     unflushed edit rather than rejecting someone else's.
+     NOT changed here on purpose. Adding them to the arbitration above would change the
+     UNSTAMPED fallback from remote-wins to local-wins, and during any mixed-fleet rollout
+     window (a phone still running the previous build edits an invoice and sends no stamp)
+     a new device would start REJECTING those edits where today it accepts them. That is a
+     new failure mode introduced by a fix, which this project's history says not to do
+     casually. The amount fix above has no such issue because prefer-local was already its
+     unstamped behaviour, so it is a strict improvement.
+     The correct order of operations, when someone picks this up: get the stamping build
+     onto every device FIRST (all four invoice edit sites already stamp, so the data starts
+     carrying revisions immediately), then extend the list to
+     ["amount","cId","due","notes"] once no un-stamped writer remains. Needs its own
+     two-device proof, and note cId is money-routing — a reverted cId moves an invoice to
+     the wrong customer's debt. */
   result.voided=(a&&a.voided)||(b&&b.voided)||false; // voided is a one-way ratchet - either side voiding wins
   return result;
 }
@@ -1446,51 +2103,108 @@ function processWriteQueue(){
     // relying on downstream de-dup checks to happen to make it safe.
     DforSync[keys[ki]]=Array.isArray(D[keys[ki]])?D[keys[ki]].slice():D[keys[ki]];
   }
-  // Doc size guard: trim delivered orders older than 6 months from sync payload
-  // Data stays in D (in-memory + localStorage); only Firestore doc is trimmed
-  var sixMonthsAgo=new Date();sixMonthsAgo.setMonth(sixMonthsAgo.getMonth()-6);
-  var cutoffDate=sixMonthsAgo.toISOString().split("T")[0];
-  if(DforSync.orders&&DforSync.orders.length>500){
-    // Keep all non-delivered + recent delivered; archive old delivered to backup
-    // FIX (2026-07-25): a delivered order with both deliveredAt and date
-    // blank used to evaluate as "" >= cutoffDate, which is always false -
-    // silently trimming it as if it were ancient. Mainly a real risk for
-    // CSV-imported delivered orders with a blank date column. A genuinely
-    // missing date now explicitly means "keep it," not "assume it's old."
-    DforSync.orders=DforSync.orders.filter(function(o){
-      var d=o.deliveredAt||o.date;
-      return o.status!=="Delivered"||!d||d>=cutoffDate;
-    });
-  }
-  // SAME GUARD APPLIED TO COMPLAINTS (2026-07-21): unlike stock (bounded by
-  // product count) and offers (bounded by promotion count, both naturally
-  // small), complaints accumulate one per real incident and had no size
-  // guard at all — genuinely unbounded growth over years of operation. Same
-  // pattern as orders: always keep anything still Open regardless of age,
-  // only trim old Resolved ones once the count grows large. Full history
-  // stays in D/localStorage/backups either way — only what gets re-sent on
-  // every write is trimmed.
-  if(DforSync.complaints&&DforSync.complaints.length>300){
-    DforSync.complaints=DforSync.complaints.filter(function(c){
-      return c.status!=="Resolved"||!c.date||c.date>=cutoffDate;
-    });
-  }
-  if(DforSync.invoices&&DforSync.invoices.length>500){
-    // Keep unpaid + recent paid invoices
-    DforSync.invoices=DforSync.invoices.filter(function(i){
-      return i.paid<i.amount||!i.date||i.date>=cutoffDate;
-    });
-  }
+  _applyDocSizeTrim(DforSync);
     return DforSync;
+  }
+
+  // ROOT-CAUSE FIX (2026-07-30): pulled out of _buildDforSync so it can be
+  // applied a SECOND time, after _reconcileDforSync, not just before it.
+  // Found during a deliberate whole-system audit, not from an observed
+  // failure — this predates Books entirely and would affect the live file
+  // too once order/invoice counts cross these thresholds.
+  // THE BUG: _reconcileDforSync's whole job is "a record is missing from
+  // this payload but present on the server — rescue it, unless tombstoned."
+  // An order this trim excludes for size reasons is NEITHER deleted NOR
+  // archived — it's a real, still-legitimate order that's simply too old to
+  // re-send every time — so reconcile could not tell it apart from a
+  // genuine accidental loss, and pushed it straight back into the payload
+  // immediately after this function trimmed it out. That happens on EVERY
+  // write, so the trim had no real effect at all past the 500-count
+  // threshold: it looked like it worked (this function ran, filtered
+  // correctly) but the very next step silently undid it, every time.
+  // FIX: re-apply the identical trim AFTER reconcile, right before the
+  // payload is finalised — reconcile still legitimately rescues genuinely
+  // missing recent records, but anything it adds back that this same rule
+  // would exclude anyway gets trimmed again, for real, as the true last step.
+  function _applyDocSizeTrim(DforSync){
+    // Doc size guard: trim delivered orders older than 6 months from sync payload
+    // Data stays in D (in-memory + localStorage); only Firestore doc is trimmed
+    var sixMonthsAgo=new Date();sixMonthsAgo.setMonth(sixMonthsAgo.getMonth()-6);
+    var cutoffDate=sixMonthsAgo.toISOString().split("T")[0];
+    if(DforSync.orders&&DforSync.orders.length>500){
+      // Keep all non-delivered + recent delivered; archive old delivered to backup
+      // FIX (2026-07-25): a delivered order with both deliveredAt and date
+      // blank used to evaluate as "" >= cutoffDate, which is always false -
+      // silently trimming it as if it were ancient. Mainly a real risk for
+      // CSV-imported delivered orders with a blank date column. A genuinely
+      // missing date now explicitly means "keep it," not "assume it's old."
+      DforSync.orders=DforSync.orders.filter(function(o){
+        var d=o.deliveredAt||o.date;
+        return o.status!=="Delivered"||!d||d>=cutoffDate;
+      });
+    }
+    // SAME GUARD APPLIED TO COMPLAINTS (2026-07-21): unlike stock (bounded by
+    // product count) and offers (bounded by promotion count, both naturally
+    // small), complaints accumulate one per real incident and had no size
+    // guard at all — genuinely unbounded growth over years of operation. Same
+    // pattern as orders: always keep anything still Open regardless of age,
+    // only trim old Resolved ones once the count grows large. Full history
+    // stays in D/localStorage/backups either way — only what gets re-sent on
+    // every write is trimmed.
+    if(DforSync.complaints&&DforSync.complaints.length>300){
+      DforSync.complaints=DforSync.complaints.filter(function(c){
+        return c.status!=="Resolved"||!c.date||c.date>=cutoffDate;
+      });
+    }
+    if(DforSync.invoices&&DforSync.invoices.length>500){
+      // Keep unpaid + recent paid invoices
+      DforSync.invoices=DforSync.invoices.filter(function(i){
+        return i.paid<i.amount||!i.date||i.date>=cutoffDate;
+      });
+    }
   }
 
   function _reconcileDforSync(DforSync,freshD){
       if(freshD.orders&&DforSync.orders){
+        // Index rather than a boolean set (2026-07-30): the F1 fix below needs the
+        // actual local record, not just "is it present?", to compare revisions.
+        var localOrdIdx={};DforSync.orders.forEach(function(o,ix){localOrdIdx[o.id]=ix;});
         var localOrdIds={};DforSync.orders.forEach(function(o){localOrdIds[o.id]=true;});
         freshD.orders.forEach(function(fo){
-          if(localOrdIds[fo.id])return;
-          var tombstoned=(DforSync.deletedOrderIds&&DforSync.deletedOrderIds[fo.id])||(freshD.deletedOrderIds&&freshD.deletedOrderIds[fo.id]);
-          if(tombstoned)return; // intentionally deleted elsewhere — never resurrect
+          if(localOrdIds[fo.id]){
+            /* F1, WRITE-SIDE HALF (2026-07-30). The read merge stops this device
+               DISPLAYING a stale value, but there is still a race: if this device
+               writes before that snapshot arrives, it would push its stale copy over
+               the newer edit. This closes it symmetrically — if the server's copy
+               carries a strictly higher edit revision, the outgoing payload takes the
+               server's values for the human-edited fields instead of overwriting them.
+               Same absent-stamp-counts-as-0 rule, so unstamped/legacy records behave
+               exactly as before. Deliberately field-scoped, not a wholesale replace:
+               paid/amtPaid are re-derived from the invoice by syncPaymentStatuses(),
+               and invoice payments merge additively, so those must not be touched here. */
+            try{
+              var _lix=localOrdIdx[fo.id];
+              var _lo=(_lix!==undefined)?DforSync.orders[_lix]:null;
+              var _wasRev=Number(_lo&&_lo._rev)||0;   // captured BEFORE the overwrite below, so the log is truthful
+              if(_lo&&(Number(fo._rev)||0)>_wasRev){
+                ["cId","driver","notes","deliver","prod","stockId","qty","price","cost","date","prodConfirmed","bottle_before"].forEach(function(f){
+                  if(fo[f]!=null)_lo[f]=fo[f];
+                });
+                _lo._rev=Number(fo._rev)||0;
+                _lo._editedAt=fo._editedAt;
+                _lo._editedBy=fo._editedBy;
+                console.log("[NDSYNC] freshness check DEFERRED to server's newer edit of order id="+fo.id+" (rev "+(fo._rev||0)+" > "+_wasRev+") — not overwriting it with this device's stale copy");
+              }
+            }catch(_){}
+            return;
+          }
+          var tombstoned=(DforSync.deletedOrderIds&&DforSync.deletedOrderIds[fo.id])||(freshD.deletedOrderIds&&freshD.deletedOrderIds[fo.id])||
+            // BOOKS (2026-07-30): an order this device just archived out of D is
+            // also "missing locally, present on the server" — the exact shape this
+            // rescue exists to catch. Without this check it would be pushed right
+            // back into D.orders on the very next write, undoing the archive.
+            (DforSync.archivedOrderIds&&DforSync.archivedOrderIds[fo.id])||(freshD.archivedOrderIds&&freshD.archivedOrderIds[fo.id]);
+          if(tombstoned)return; // intentionally deleted (or archived) elsewhere — never resurrect
           DforSync.orders.push(fo);
           console.log("[NDSYNC] freshness check RESCUED order id="+fo.id+" that would otherwise have been dropped by this write");
         });
@@ -1515,6 +2229,32 @@ function processWriteQueue(){
           var lc=DforSync.customers[localIdx];
           var serverCredit=fc.credit||0,localCredit=lc.credit||0;
           if(lc){ // always merge (additive) — also catches equal-total, different-log concurrent credit changes
+            /* A1 FIX (2026-07-30) — CUSTOMER EDITS WERE REVERTING ON THE SERVER.
+               _mergeCustomerCredit bases its result on `a` (local) by design, which correctly
+               stops the EDITING device losing its own unflushed edit — but it has no notion of
+               which side is NEWER, and it is this write path's only customer arbitration. So a
+               device holding a STALE copy overwrote another director's just-made edit on the
+               server (phone, address, notes, and money-adjacent creditLimit) AND, because the
+               stale copy carries a lower/absent _rev, it ERASED the revision too — leaving the
+               editing device's memory as the only surviving trace. If that device reloaded
+               before writing again, the edit was gone for good. Proven by executed
+               simulation: creditLimit 5000 -> 2000, _rev erased.
+               Fix mirrors the ORDER write-side rule immediately above (the already-proven
+               pattern): if the SERVER's copy is provably newer, adopt its human-edited profile
+               fields and its stamp before merging. credit/creditLog are deliberately untouched
+               here — they must stay on the additive union, because concurrent cash must never
+               be arbitrated away. */
+            try{
+              if((Number(fc._rev)||0)>(Number(lc._rev)||0)){
+                ["name","phone","phone2","idno","estate","court","house","htype","road","zone","ctype","creditLimit","notes"].forEach(function(f){
+                  if(fc[f]!=null)lc[f]=fc[f];
+                });
+                lc._rev=Number(fc._rev)||0;
+                lc._editedAt=fc._editedAt;
+                lc._editedBy=fc._editedBy;
+                console.log("[NDSYNC] freshness check DEFERRED to server's newer edit of customer id="+fc.id+" (rev "+(fc._rev||0)+") — not overwriting it with this device's stale profile");
+              }
+            }catch(_){}
             DforSync.customers[localIdx]=_mergeCustomerCredit(lc,fc);
             ndlog("[NDSYNC] freshness check MERGED customer id=",fc.id,"credit (local",localCredit,"server",serverCredit,"merged",DforSync.customers[localIdx].credit,")");
           }
@@ -1546,7 +2286,11 @@ function processWriteQueue(){
             // never-pruned deletedInvoiceIds map and the read side drops it next
             // snapshot), but relying on that is fragile — drop it at the source
             // so both merge paths agree.
-            var _fiDel=(DforSync.deletedInvoiceIds&&DforSync.deletedInvoiceIds[fi.id])||(freshD.deletedInvoiceIds&&freshD.deletedInvoiceIds[fi.id]);
+            var _fiDel=(DforSync.deletedInvoiceIds&&DforSync.deletedInvoiceIds[fi.id])||(freshD.deletedInvoiceIds&&freshD.deletedInvoiceIds[fi.id])||
+              // BOOKS (2026-07-30): same reasoning as the order rescue above — an
+              // invoice this device just archived is "missing locally, present on
+              // the server," which without this check gets pushed straight back in.
+              (DforSync.archivedInvoiceIds&&DforSync.archivedInvoiceIds[fi.id])||(freshD.archivedInvoiceIds&&freshD.archivedInvoiceIds[fi.id]);
             if(_fiDel)return;
             DforSync.invoices.push(fi);
             console.log("[NDSYNC] freshness check RESCUED invoice id="+fi.id+" that would otherwise have been dropped by this write");
@@ -1554,7 +2298,18 @@ function processWriteQueue(){
           }
           var li=DforSync.invoices[localIdx];
           var serverPaid=fi.paid||0,localPaid=li.paid||0;
-          var serverMoreAdvanced=(fi.voided&&!li.voided)||(serverPaid>localPaid);
+          /* F6 CLOSED (2026-07-30): `var serverMoreAdvanced=(fi.voided&&!li.voided)||
+             (serverPaid>localPaid);` used to sit here, computed and then never read — the
+             audit flagged it as "the prefer-the-more-advanced-invoice rule is not applied."
+             Checked directly rather than trusted: BOTH halves of its intent ARE applied,
+             just inside _mergeInvoicePayments rather than here — `voided` is a one-way
+             ratchet there (either side voiding wins) and `paid` is recomputed from the
+             additive UNION of both sides' payments, which is strictly better than picking
+             the larger total. So this variable was genuinely dead code, not a missing rule,
+             and is removed rather than wired up to something already handled. serverPaid /
+             localPaid are kept — the ndlog below reports them. The REAL defect the audit
+             was circling was `amount` always preferring local inside that same function;
+             that is now fixed there. */
           if(li){ // always merge (additive) — also catches equal-total, different-payment concurrent payments
             // FIX (2026-07-21): this used to fully replace the local invoice
             // with the server's version whenever the server showed more
@@ -1633,11 +2388,16 @@ function processWriteQueue(){
             if(_fcLocalSt&&_fcLocalSt.history)mergedItem.history=_fcLocalSt.history;
           }
           if(_fcLocalSt){
-            ["name","size","price","cost","min","isWater"].forEach(function(f){
-              var lv=_fcLocalSt[f],rv=mergedItem[f];
-              if(lv!=null&&rv==null)mergedItem[f]=lv; // local has a real value, server doesn't — keep local's
-              else if(lv!=null&&rv!=null&&lv!==rv)mergedItem[f]=lv; // both real and differing — prefer this device's own edit, same as the read side
-            });
+            /* F1 EXTENSION (2026-07-30): routed through the shared _mergeRecordFields so
+               this path defers to a genuinely newer SERVER edit instead of unconditionally
+               preferring local. Of the six sites the original orders-only F1 fix had not
+               reached, this one is the most damaging: it is the WRITE side, so a device
+               holding a stale price/cost did not merely reject another director's
+               correction locally — it actively pushed the stale value back into the shared
+               document for every device, on essentially every online write. The qty-delta
+               logic above is untouched and still runs first; only the arbitration of the
+               human-edited fields changes. */
+            _mergeRecordFields(_fcLocalSt,mergedItem,["name","size","price","cost","min","isWater"],"stock(write)");
           }
           DforSync.stock[idx]=mergedItem;
         });
@@ -1657,6 +2417,28 @@ function processWriteQueue(){
           }else if(fc.status==="Resolved"&&DforSync.complaints[idx].status!=="Resolved"){
             DforSync.complaints[idx]=fc;
             console.log("[NDSYNC] freshness check PREFERRED server's resolved complaint id="+fc.id);
+          }else{
+            /* A5 FIX (2026-07-30) — COMPLAINTS HAD ONLY THE RESOLVED RATCHET HERE.
+               The branch above correctly protects the TERMINAL state, but nothing protected
+               ordinary in-progress work: a manager's resolution notes (details/action) or an
+               Open -> In progress transition made on another device was overwritten on the
+               server by any stale device's next write. Proven by executed simulation
+               (action:"Refunded one unit" / status:"In progress" reverted to ""/"Open").
+               Lower severity than the money collections — it loses work-in-progress, not a
+               closed outcome — but it is the same defect, so it gets the same rev-defer.
+               Deliberately placed AFTER the Resolved ratchet so that ratchet still wins. */
+            try{
+              var _lc2=DforSync.complaints[idx];
+              if(_lc2&&(Number(fc._rev)||0)>(Number(_lc2._rev)||0)){
+                ["cId","type","details","action","status"].forEach(function(f){
+                  if(fc[f]!=null)_lc2[f]=fc[f];
+                });
+                _lc2._rev=Number(fc._rev)||0;
+                _lc2._editedAt=fc._editedAt;
+                _lc2._editedBy=fc._editedBy;
+                console.log("[NDSYNC] freshness check DEFERRED to server's newer edit of complaint id="+fc.id+" (rev "+(fc._rev||0)+")");
+              }
+            }catch(_){}
           }
         });
       }
@@ -1666,6 +2448,30 @@ function processWriteQueue(){
           if(localOffIds[fo2.id]===undefined){
             DforSync.offers.push(fo2);
             console.log("[NDSYNC] freshness check RESCUED offer id="+fo2.id+" that would otherwise have been dropped by this write");
+          }else{
+            /* A5 FIX (2026-07-30) — OFFERS HAD NO WRITE-SIDE FIELD MERGE AT ALL.
+               This block only ever rescued offers MISSING from the payload; for an offer that
+               existed on both sides it did nothing, so the local copy went to the server
+               unconditionally. A device holding a stale discount therefore overwrote another
+               director's just-made change and erased its revision. That is directly
+               money-affecting: saveOrd prices from disc via
+               price=Math.max(0,Math.round(price*(1-_disc/100))), so every device still on the
+               stale value kept selling at the wrong price. Proven by executed simulation:
+               25% reverted to 10%, i.e. KSh 450 charged instead of KSh 375 on a KSh 500 item.
+               Same rev-defer shape as orders/customers. `active` is included because togOf()
+               toggles it and an un-stamped toggle reverted the same way. */
+            try{
+              var _lo2=DforSync.offers[localOffIds[fo2.id]];
+              if(_lo2&&(Number(fo2._rev)||0)>(Number(_lo2._rev)||0)){
+                ["title","disc","minqty","prod","start","end","desc","active"].forEach(function(f){
+                  if(fo2[f]!=null)_lo2[f]=fo2[f];
+                });
+                _lo2._rev=Number(fo2._rev)||0;
+                _lo2._editedAt=fo2._editedAt;
+                _lo2._editedBy=fo2._editedBy;
+                console.log("[NDSYNC] freshness check DEFERRED to server's newer edit of offer id="+fo2.id+" (rev "+(fo2._rev||0)+") — not overwriting it with this device's stale discount");
+              }
+            }catch(_){}
           }
         });
       }
@@ -1694,9 +2500,62 @@ function processWriteQueue(){
       }
   }
 
-  function _buildWritePayload(DforSync){
+  /* ==========================================================================
+     A4 FIX (2026-07-30) — USERS HAD NO WRITE-SIDE RECONCILIATION AT ALL.
+     _reconcileDforSync only ever saw the D map; the team table lives at the payload
+     ROOT (`USERS:USERS` below), was never compared against the server, and was written
+     straight from this device's live global. So ANY device writing ANYTHING replaced the
+     whole team table with its own possibly-stale copy. Consequences, both real:
+       - a director resets a PIN on the iPad; the next write from any other phone puts
+         the OLD hash back. The REVOKED PIN KEEPS WORKING and the new one does not, with
+         the change believed to have succeeded. (Security, not just data integrity.)
+       - delU() tombstones were honoured on the READ side only, so a removed team
+         member could return the same way orders used to before tombstones existed.
+     Proven by executed simulation: handing the reconcile a newer server USERS array,
+     it consumed nothing at all.
+     This is the missing counterpart. It returns a RECONCILED COPY and deliberately does
+     NOT mutate the live USERS global — a write must not have the side effect of changing
+     the signed-in user's own session mid-flight; the read-side merge owns that.
+     Same three rules as every other collection: honour deletion tombstones, rescue a
+     local-only user the server has not seen, and let the genuinely newer edit win via
+     the shared _mergeRecordFields primitive.
+     ========================================================================== */
+  function _reconcileUsersForWrite(freshUsers,freshD){
+    try{
+      var localArr=Array.isArray(USERS)?USERS:[];
+      if(!Array.isArray(freshUsers))return localArr.slice();
+      var out=localArr.map(function(u){return Object.assign({},u);});   // isolated copy per write attempt (idempotent under transaction retry)
+      var byId={};out.forEach(function(u,ix){if(u&&u.id!=null)byId[u.id]=ix;});
+      var delMap={};
+      [(freshD&&freshD.deletedUserIds),(D&&D.deletedUserIds),(typeof _recentlyDeletedUserIds!=="undefined"?_recentlyDeletedUserIds:null)]
+        .forEach(function(m){if(m)Object.keys(m).forEach(function(k){delMap[k]=true;});});
+      freshUsers.forEach(function(fu){
+        if(!fu||fu.id==null)return;
+        if(delMap[fu.id])return;                       // deliberately removed — never resurrect
+        var ix=byId[fu.id];
+        if(ix===undefined){
+          out.push(Object.assign({},fu));              // on the server, absent locally — rescue
+          console.log("[NDSYNC] freshness check RESCUED team member id="+fu.id+" that would otherwise have been dropped by this write");
+          return;
+        }
+        // Bootstrap placeholder can only be the untouched default (a real PIN is salted-hashed),
+        // so the server record must win outright — same rule the read-side merge applies.
+        if(out[ix].pin==="1234"){out[ix]=Object.assign({},fu);return;}
+        var _before=out[ix]._rev;
+        var _merged=_mergeRecordFields(out[ix],Object.assign({},fu),["pin","name","role","ini","col"],"user(write)");
+        out[ix]=_merged;
+        if((Number(fu._rev)||0)>(Number(_before)||0))
+          console.log("[NDSYNC] freshness check DEFERRED to server's newer team-member edit id="+fu.id+" (rev "+(fu._rev||0)+") — not overwriting it with this device's stale copy");
+      });
+      return out;
+    }catch(_){return Array.isArray(USERS)?USERS.slice():[];}
+  }
+
+  function _buildWritePayload(DforSync,usersForWrite){
   var payload={
-    D:DforSync,USERS:USERS,nOId:nOId,nIId:nIId,nCId:nCId,nCmpId:nCmpId,
+    // A4 (2026-07-30): reconciled team table when the caller had a server read to compare
+    // against; the live global otherwise (offline fallback), which is the pre-fix behaviour.
+    D:DforSync,USERS:(usersForWrite||USERS),nOId:nOId,nIId:nIId,nCId:nCId,nCmpId:nCmpId,
     setupDone:FB_SETUP_DONE,
     // FIX (2026-07-21): this used to be FB_LAST_LOCAL_WRITE, a value from
     // THIS device's own clock. Every device compares its own Date.now()
@@ -1848,8 +2707,8 @@ function processWriteQueue(){
     }
   }
 
-  function _sendWritePayload(DforSync){
-    var payload=_buildWritePayload(DforSync);
+  function _sendWritePayload(DforSync,usersForWrite){
+    var payload=_buildWritePayload(DforSync,usersForWrite);
     FB_DOC_REF.set(payload,{merge:true}).then(_onWriteSuccess).catch(_onWriteFailure);
   }
 
@@ -1887,9 +2746,16 @@ function processWriteQueue(){
     var DforSync=_buildDforSync();
     FB_DOC_REF.get({source:"server"}).then(function(freshDoc){
       _lastFreshnessCheckTime=Date.now();
+      var _fdata=(freshDoc.exists&&freshDoc.data())?freshDoc.data():null;
+      // A4 (2026-07-30): reconcile the team table too — see _reconcileUsersForWrite.
+      var _usersW=_reconcileUsersForWrite(_fdata&&_fdata.USERS,_fdata&&_fdata.D);
       if(freshDoc.exists&&freshDoc.data()&&freshDoc.data().D)_reconcileDforSync(DforSync,freshDoc.data().D);
+      // ROOT-CAUSE FIX (2026-07-30): re-trim AFTER reconcile — see the comment on
+      // _applyDocSizeTrim for why reconcile alone would otherwise rescue back
+      // every old/oversized record this trim exists to exclude, on every write.
+      _applyDocSizeTrim(DforSync);
       if(_dLooksEmpty(DforSync)&&FB_SETUP_DONE){console.log("[NDSYNC] fallback write ABORTED — D is empty (teardown raced this write); refusing to clean-slate the shared document");FB_WRITING=false;return;}
-      _sendWritePayload(DforSync);
+      _sendWritePayload(DforSync,_usersW);
     }).catch(function(){
       if(_dLooksEmpty(DforSync)&&FB_SETUP_DONE){console.log("[NDSYNC] fallback write ABORTED — D is empty (teardown raced this write); refusing to clean-slate the shared document");FB_WRITING=false;return;}
       _sendWritePayload(DforSync);
@@ -1902,9 +2768,15 @@ function processWriteQueue(){
     fbDb.runTransaction(function(txn){
       return txn.get(FB_DOC_REF).then(function(freshDoc){
         var DforSync=_buildDforSync(); // FRESH each attempt - idempotent under retry
+        var _fdataT=(freshDoc.exists&&freshDoc.data())?freshDoc.data():null;
+        // A4 (2026-07-30): rebuilt fresh on every transaction attempt, same idempotency
+        // reasoning as DforSync above — a retry must not inherit a previous attempt's merge.
+        var _usersT=_reconcileUsersForWrite(_fdataT&&_fdataT.USERS,_fdataT&&_fdataT.D);
         if(freshDoc.exists&&freshDoc.data()&&freshDoc.data().D)_reconcileDforSync(DforSync,freshDoc.data().D);
+        // ROOT-CAUSE FIX (2026-07-30): re-trim AFTER reconcile — see _applyDocSizeTrim.
+        _applyDocSizeTrim(DforSync);
         if(_dLooksEmpty(DforSync)&&FB_SETUP_DONE)throw new Error(ND_ABORT_EMPTY); // see _dLooksEmpty
-        txn.set(FB_DOC_REF,_buildWritePayload(DforSync),{merge:true});
+        txn.set(FB_DOC_REF,_buildWritePayload(DforSync,_usersT),{merge:true});
       });
     }).then(function(){
       _lastFreshnessCheckTime=Date.now();
@@ -1975,7 +2847,9 @@ function _reportDeviceSyncHealth(kind,detail){
     }catch(_){}
     // auditLog stamps the actor (name + role), so the director sees WHICH phone.
     // Must be called while CU is still set — after logout clears it, auditLog no-ops.
-    auditLog("SYNC_HEALTH",kind+" — "+detail+" [device: "+dev+", app v"+APP_VERSION+"]");
+    // BUILD_STAMP included (2026-07-30): a sync-health report is exactly where you need to
+    // know WHICH BUILD the reporting device was running — a mixed fleet is itself a cause.
+    auditLog("SYNC_HEALTH",kind+" — "+detail+" [device: "+dev+", app v"+APP_VERSION+" build "+BUILD_STAMP+"]");
   }catch(e){/* a health report must never break the thing it is reporting on */}
 }
 /* FIX (2026-07-29): surface a failed offline-persistence init instead of
@@ -2351,6 +3225,13 @@ function startAuditListener(){
       // closed. Costs nothing extra: it reads D.auditLog, which the line above has
       // already populated from the existing bounded 50-event listener.
       _selfHealFromEventSnapshots();
+      // MISSING-ORDER ROOT-CAUSE FIX (2026-07-30): deliver anything still sitting in
+      // the durable outbox. Placed here for the same reason as the line above — this
+      // is a point where the live state is known to be loaded and (gated inside)
+      // server-confirmed. Unlike the heal above, this is not an inference about what
+      // might be lost: it delivers orders that were durably written at creation and
+      // are provably not in the document. Runs once per session; see the outbox block.
+      _outboxReconcile();
       // If listener returned empty but we expect data, also do unordered get as safety.
       // QUOTA GUARD: this used to be able to refire on every snapshot as long as the
       // condition stayed true, which on a genuinely-empty collection meant repeated
@@ -2582,7 +3463,14 @@ function startCloudListener(isWarmRefresh){
           // regardless of which device performed the deletion; the local one
           // remains as a fast first-line guard on the deleting device itself.
           var _sharedDelAt=(data.D.deletedOrderIds&&data.D.deletedOrderIds[ro.id])||(D.deletedOrderIds&&D.deletedOrderIds[ro.id]);
-          var _delAt=_recentlyDeletedOrderIds[ro.id]||_sharedDelAt;
+          // BOOKS (2026-07-30): an order archived (by any device) is exactly the
+          // same shape as a deleted one for this purpose — present remotely,
+          // absent locally is impossible here since ro comes FROM the remote list;
+          // the real risk is the opposite direction this same tombstone guards
+          // against a few lines below (a stale LOCAL copy on another device getting
+          // pushed back in). Checked here too for symmetry with every other site.
+          var _sharedArchAt=(data.D.archivedOrderIds&&data.D.archivedOrderIds[ro.id])||(D.archivedOrderIds&&D.archivedOrderIds[ro.id]);
+          var _delAt=_recentlyDeletedOrderIds[ro.id]||_sharedDelAt||_sharedArchAt;
           if(_delAt){
             // Was explicitly deleted (by any device, at any time this was
             // recorded) — respect that, never resurrect it
@@ -2668,11 +3556,18 @@ function startCloudListener(isWarmRefresh){
             // them from the linked invoice right after this merge, so they self-heal;
             // invoiceId not added: every lookup falls back to notes "#<id>" matching.)
             var _preserveFields=["cId","driver","notes","deliver","prod","stockId","qty","price","cost","date","prodConfirmed","bottle_before"];
-            _preserveFields.forEach(function(f){
-              var lv=lo[f],rv=ro[f];
-              if(lv!=null&&rv==null)ro[f]=lv; // local has a real value, remote doesn't - keep local's
-              else if(lv!=null&&rv!=null&&lv!==rv)ro[f]=lv; // both have real, differing values - prefer this device's own in-memory edit
-            });
+            /* ROOT-CAUSE FIX for F1 (2026-07-30) — cross-device edits silently reverting.
+               This site used to ALWAYS prefer the local value when the two sides differed,
+               on the assumption that local meant "this device's own edit at risk". In the
+               normal case local is just the stale previously-synced value, so a genuine
+               correction made on another device was rejected here and then overwritten on
+               the server by this device's next write.
+               REFACTORED (2026-07-30, same night): the rule itself now lives in
+               _mergeRecordFields — see the long note there for the full mechanism, and for
+               why it was extracted rather than copy-pasted (the identical bug was live at
+               six more sites). Behaviour at THIS site is unchanged by the extraction; that
+               is the point, and _proof_edit_convergence.js asserts it. */
+            _mergeRecordFields(lo,ro,_preserveFields,"order");
             Object.assign(lo,ro);
           }
         });
@@ -2711,8 +3606,18 @@ function startCloudListener(isWarmRefresh){
           D.orders=(D.orders||[]).filter(function(o){
             if(remoteOrdIds[o.id])return true; // still present remotely — keep
             var _sharedDelAt=(data.D.deletedOrderIds&&data.D.deletedOrderIds[o.id])||(D.deletedOrderIds&&D.deletedOrderIds[o.id]);
-            var _delAt=_recentlyDeletedOrderIds[o.id]||_sharedDelAt;
-            if(_delAt){console.log("[NDSYNC] order id="+o.id+" REMOVED — explicit tombstone found");return false;}
+            // BOOKS (2026-07-30): THE cross-device resurrection vector — this is a
+            // DIFFERENT device from the one that ran _closePeriod(), still holding a
+            // stale local copy of an order another device already archived. Absent
+            // this check, it reads as "the server lost my order, no tombstone, so
+            // I'll keep it AND schedule a re-persist" — actively pushing the
+            // archived order straight back to the shared document on this device's
+            // own next write. The archived tombstone (synced the same way the
+            // deletion one is, in the same document) is what tells this device the
+            // absence is deliberate rather than data loss.
+            var _sharedArchAt=(data.D.archivedOrderIds&&data.D.archivedOrderIds[o.id])||(D.archivedOrderIds&&D.archivedOrderIds[o.id]);
+            var _delAt=_recentlyDeletedOrderIds[o.id]||_sharedDelAt||_sharedArchAt;
+            if(_delAt){console.log("[NDSYNC] order id="+o.id+" REMOVED — explicit tombstone found (deleted or archived)");return false;}
             console.log("[NDSYNC] order id="+o.id+" kept locally though absent from this snapshot — no tombstone, scheduling a re-persist");
             _anyRescueThisSync=true;
             return true; // no tombstone — never infer deletion from absence alone
@@ -2823,6 +3728,13 @@ function startCloudListener(isWarmRefresh){
           D.invoices=data.D.invoices.filter(function(ri){
             var _delTomb=(data.D.deletedInvoiceIds&&data.D.deletedInvoiceIds[ri.id])||(D.deletedInvoiceIds&&D.deletedInvoiceIds[ri.id]);
             if(_delTomb){console.log("[NDSYNC] invoice id="+ri.id+" dropped from merge — explicit deletion tombstone");return false;}
+            // BOOKS (2026-07-30): this filter builds D.invoices FROM the remote
+            // list, so an archived invoice still present on the server (this
+            // device's own archive-write not yet landed, or read on a device that
+            // never archived it) would otherwise be taken at face value right here
+            // — resurrected before the "local-only rescue" step below even runs.
+            var _archTomb=(data.D.archivedInvoiceIds&&data.D.archivedInvoiceIds[ri.id])||(D.archivedInvoiceIds&&D.archivedInvoiceIds[ri.id]);
+            if(_archTomb){console.log("[NDSYNC] invoice id="+ri.id+" dropped from merge — archived out of the live document");return false;}
             return true;
           }).map(function(ri){
             var tombAt=_recentlyVoidedInvoiceIds[ri.id];
@@ -2856,6 +3768,12 @@ function startCloudListener(isWarmRefresh){
             if(_remoteInvIds[li.id])return; // already in the result via the map above
             var _delTomb=(data.D.deletedInvoiceIds&&data.D.deletedInvoiceIds[li.id])||(D.deletedInvoiceIds&&D.deletedInvoiceIds[li.id]);
             if(_delTomb)return; // explicitly deleted — do not resurrect
+            // BOOKS (2026-07-30): a STALE local copy on a DIFFERENT device than the
+            // one that archived this invoice would otherwise "rescue" it right back
+            // in here, then re-push it to the server on its own next write — the
+            // archive undone from a second device, not just the one that closed it.
+            var _archTomb=(data.D.archivedInvoiceIds&&data.D.archivedInvoiceIds[li.id])||(D.archivedInvoiceIds&&D.archivedInvoiceIds[li.id]);
+            if(_archTomb)return; // archived elsewhere — do not resurrect
             D.invoices.push(li);
             _anyRescueThisSync=true;
             console.log("[NDSYNC] snapshot merge RESCUED invoice id="+li.id+" that would otherwise have been silently dropped (not yet in remote)");
@@ -2912,13 +3830,10 @@ function startCloudListener(isWarmRefresh){
             console.log("[NDSYNC] snapshot merge PRESERVED pending stock delta for id="+rs.id+" ("+rs.name+") — server="+rs.qty+" + our delta="+delta+" = "+merged.qty);
           }
           var ls=_localStMap[rs.id];
-          if(ls){
-            _stPreserveFields.forEach(function(f){
-              var lv=ls[f],rv=merged[f];
-              if(lv!=null&&rv==null)merged[f]=lv;
-              else if(lv!=null&&rv!=null&&lv!==rv)merged[f]=lv;
-            });
-          }
+          // F1 EXTENSION (2026-07-30): shared primitive — a newer remote price/cost edit
+          // is now accepted instead of being rejected in favour of this device's stale
+          // copy. Read-side twin of the write-side fix in _reconcileDforSync.
+          if(ls)_mergeRecordFields(ls,merged,_stPreserveFields,"stock");
           return merged;
         });
         D.stock=_mergedRemoteStock.concat(_rescuedSt);
@@ -3011,11 +3926,12 @@ function startCloudListener(isWarmRefresh){
           _remoteOffIds[ro.id]=true;
           var lo=_localOffMap[ro.id];
           if(!lo)return ro;
-          _offPreserveFields.forEach(function(f){
-            var lv=lo[f],rv=ro[f];
-            if(lv!=null&&rv==null)ro[f]=lv;
-            else if(lv!=null&&rv!=null&&lv!==rv)ro[f]=lv;
-          });
+          /* F1 EXTENSION (2026-07-30): shared primitive. Directly money-affecting and the
+             clearest of the six: _of.disc sets the order price outright in saveOrd
+             (price=round(price*(1-disc/100))), so while a director's 10%->25% change was
+             being rejected here, every other device kept pricing orders at 10% AND wrote
+             that stale discount back to the server. */
+          _mergeRecordFields(lo,ro,_offPreserveFields,"offer");
           return ro;
         });
         var _rescuedOff=(D.offers||[]).filter(function(o){
@@ -3079,11 +3995,12 @@ function startCloudListener(isWarmRefresh){
           // fields once the Resolved-specific short-circuit doesn't apply.
           if(lc.status==="Resolved"&&rc.status!=="Resolved")return lc;
           if(rc.status==="Resolved"&&lc.status!=="Resolved")return rc;
-          _cmpPreserveFields.forEach(function(f){
-            var lv=lc[f],rv=rc[f];
-            if(lv!=null&&rv==null)rc[f]=lv;
-            else if(lv!=null&&rv!=null&&lv!==rv)rc[f]=lv;
-          });
+          /* F1 EXTENSION (2026-07-30): shared primitive. The Resolved ratchet above already
+             protected the terminal state in both directions and is deliberately left ahead
+             of this call, unchanged. What it never covered is the ordinary case: a manager
+             on device B rewriting the resolution `details`/`action`, or moving Open -> In
+             progress, was rejected by device A and then reverted on A's next write. */
+          _mergeRecordFields(lc,rc,_cmpPreserveFields,"complaint");
           return rc;
         });
         var _rescuedCmp=(D.complaints||[]).filter(function(c){
@@ -3205,11 +4122,11 @@ function startCloudListener(isWarmRefresh){
           // read-side reverts fixed earlier; customers' read path was missed.
           // creditLimit is money-adjacent. Same "prefer this device's own in-memory
           // edit when both sides hold a real, differing value" rule as those.
-          ["name","phone","phone2","idno","estate","court","house","htype","road","zone","ctype","creditLimit","notes"].forEach(function(f){
-            var lv=lc[f],rv=rc[f];
-            if(lv!=null&&rv==null)rc[f]=lv;
-            else if(lv!=null&&rv!=null&&lv!==rv)rc[f]=lv;
-          });
+          // F1 EXTENSION (2026-07-30): shared primitive, so a genuinely newer edit from
+          // another device is accepted rather than reverted. creditLimit is money-adjacent
+          // and phone/address corrections are the single most common customer edit there
+          // is, which made this one of the more visible of the six.
+          _mergeRecordFields(lc,rc,["name","phone","phone2","idno","estate","court","house","htype","road","zone","ctype","creditLimit","notes"],"customer");
         }
         if(!lc)addedCount++;
         mergedCustomers.push(rc);
@@ -3321,11 +4238,13 @@ function startCloudListener(isWarmRefresh){
         // fully preserves the original revert-during-write-window protection for
         // any real (hashed) local edit, which still flows through the loop below.
         if(lu.pin==="1234")return ru; // local is the bootstrap placeholder — trust the server record
-        _userPreserveFields.forEach(function(f){
-          var lv=lu[f],rv=ru[f];
-          if(lv!=null&&rv==null)ru[f]=lv;
-          else if(lv!=null&&rv!=null&&lv!==rv)ru[f]=lv;
-        });
+        /* F1 EXTENSION (2026-07-30): shared primitive. This is the SECURITY case of the six:
+           a director resetting a team member's PIN on the iPad had that reset rejected by
+           every other device, each of which then wrote the OLD hashed PIN back — so the
+           revoked PIN kept working and the new one did not, with the change believed to
+           have succeeded. The placeholder guard above is deliberately left ahead of this
+           call and is unchanged. */
+        _mergeRecordFields(lu,ru,_userPreserveFields,"user");
         return ru;
       });
       var _rescuedUsers=(USERS||[]).filter(function(u){
@@ -4141,6 +5060,180 @@ var STOCK_HISTORY_MAX=10;
         proof of no debt — it is exactly the legacy defect found in this data (four
         delivered orders with no receivable). Refuse rather than guess. */
 var ARCHIVE_MIN_AGE_DAYS=60;
+/* ============================================================================
+   PERIOD BOOKS - READ SIDE                                        (2026-07-30)
+   WHY THIS EXISTS. The whole database is ONE Firestore document with a hard
+   1,024KB ceiling. Measured on live data: 371KB, growing ~10.8KB/day, so the wall
+   was about two months out - and past it EVERY write fails and the business stops
+   taking orders. Trimming bought headroom; only moving settled history out of the
+   live document removes the ceiling.
+   THE OWNER'S DESIGN: a daily book, then monthly, then yearly - with two absolute
+   requirements: "nothing is lost", and a customer with "even years of debts" stays
+   traceable.
+   THE SHAPE, after working the numbers:
+     live document   customers + stock + current period + THE ENTIRE DEBT TAIL
+     month-YYYY-MM   one closed month of SETTLED records, immutable once closed
+     year-YYYY       AGGREGATES ONLY - a year of raw records is ~4MB, which would
+                     merely move the same ceiling up one level
+     index           which periods exist, and which periods each customer appears
+                     in, so a three-year statement loads 2-3 docs instead of sixty
+   Because this business closes orders fast and only the debt tail lingers (the
+   owner's own description, confirmed in the data: 288 of 340 orders and 293 of 341
+   invoices already settled, against 52 open orders and 48 open invoices ~ 24KB),
+   the live document settles at roughly 159KB and STOPS GROWING. Open work is
+   bounded by how fast money is collected, never by how long the business has
+   traded. That is what makes this a permanent fix rather than a bigger ceiling.
+   BUILT READ-FIRST, DELIBERATELY. Everything in this block only READS. Nothing
+   writes a book and nothing removes anything from the live document - that comes
+   last, on top of read paths already proven correct. With no books present every
+   accessor here returns exactly what the live arrays return, which is precisely
+   why it can ship without moving a single figure on any screen.
+   ============================================================================ */
+var FB_BOOKS_COL=null;          // newdawn_books collection (null until Firebase is up)
+var BOOK_INDEX=null;            // {periods:[],customers:{cId:[periods]}} or null
+var BOOK_CACHE={};              // period -> {orders:[],invoices:[],closed:bool}
+var BOOK_LOADING={};            // period -> true while in flight (never double-read)
+var BOOK_INDEX_STATE="idle";    // idle | loading | ready | unavailable
+// EFFICIENCY FIX (2026-07-30): bumped every time BOOK_CACHE gains or changes an
+// entry (a book finishes loading, or _closePeriod() writes one). Lets callers
+// that rebuild a merged view cheaply detect "nothing changed since last time"
+// without re-running _mergeById over every loaded book on every single call —
+// see _getOrdByIdIndex(), which is invoked once per customer in several debt/
+// history loops and was rebuilding the full merge that often once any book
+// was loaded, an O(customers x orders) cost for work that only ever needs to
+// happen once per genuine change.
+var _booksVersion=0;
+/* A period is a calendar month keyed off the record's OWN date, so a record can
+   never be filed into the wrong book. */
+function bookPeriodOf(dateStr){
+  var s=String(dateStr||"");
+  return /^[0-9]{4}-[0-9]{2}/.test(s)?s.slice(0,7):"";
+}
+function bookDocId(period){ return "month-"+period; }
+/* The index is the only document read at startup, and only when something actually
+   asks for history. It is tiny, and it is what stops a statement scanning sixty
+   books to answer one question. */
+function loadBookIndex(cb){
+  var _cb=(typeof cb==="function")?cb:function(){};
+  if(BOOK_INDEX_STATE==="ready"){_cb(BOOK_INDEX);return;}
+  if(!FB_BOOKS_COL){BOOK_INDEX_STATE="unavailable";_cb(null);return;}
+  if(BOOK_INDEX_STATE==="loading"){setTimeout(function(){loadBookIndex(_cb);},200);return;}
+  BOOK_INDEX_STATE="loading";
+  FB_BOOKS_COL.doc("index").get().then(function(doc){
+    BOOK_INDEX=(doc&&doc.exists&&doc.data())?doc.data():{periods:[],customers:{}};
+    if(!BOOK_INDEX.periods)BOOK_INDEX.periods=[];
+    if(!BOOK_INDEX.customers)BOOK_INDEX.customers={};
+    BOOK_INDEX_STATE="ready";
+    console.log("[NDBOOKS] index loaded - "+BOOK_INDEX.periods.length+" period(s): "+(BOOK_INDEX.periods.join(", ")||"none yet"));
+    _cb(BOOK_INDEX);
+  }).catch(function(e){
+    // An unreadable index must NEVER break the app. It only means no history can be
+    // added right now, and every live figure is already complete on its own.
+    BOOK_INDEX_STATE="unavailable";
+    console.log("[NDBOOKS] index unavailable ("+((e&&e.code)||"unknown")+") - live data only, nothing is lost");
+    _cb(null);
+  });
+}
+/* Loads one month on demand, cached for the session. A CLOSED book is immutable, so
+   a cached copy can never go stale. */
+function loadBook(period,cb){
+  var _cb=(typeof cb==="function")?cb:function(){};
+  if(!period||typeof period!=="string"){_cb(null);return;}
+  if(BOOK_CACHE[period]){_cb(BOOK_CACHE[period]);return;}
+  if(!FB_BOOKS_COL){_cb(null);return;}
+  if(BOOK_LOADING[period]){setTimeout(function(){loadBook(period,_cb);},200);return;}
+  BOOK_LOADING[period]=true;
+  FB_BOOKS_COL.doc(bookDocId(period)).get().then(function(doc){
+    delete BOOK_LOADING[period];
+    if(!doc||!doc.exists){
+      BOOK_CACHE[period]={orders:[],invoices:[],closed:false,missing:true};
+      _booksVersion++;
+      _cb(BOOK_CACHE[period]);return;
+    }
+    var d=doc.data()||{};
+    BOOK_CACHE[period]={orders:d.orders||[],invoices:d.invoices||[],closed:d.closed===true};
+    _booksVersion++;
+    console.log("[NDBOOKS] loaded book "+period+" - "+BOOK_CACHE[period].orders.length+" order(s), "+
+      BOOK_CACHE[period].invoices.length+" invoice(s)"+(BOOK_CACHE[period].closed?" [closed]":" [OPEN]"));
+    _cb(BOOK_CACHE[period]);
+  }).catch(function(e){
+    delete BOOK_LOADING[period];
+    console.log("[NDBOOKS] book "+period+" unavailable ("+((e&&e.code)||"unknown")+") - live data only");
+    _cb(null);
+  });
+}
+function loadBooks(periods,cb){
+  var _cb=(typeof cb==="function")?cb:function(){};
+  var list=_hrArr(periods).filter(Boolean),done=0;
+  if(!list.length){_cb();return;}
+  list.forEach(function(p){ loadBook(p,function(){ if(++done===list.length)_cb(); }); });
+}
+/* -- THE ACCESSORS EVERY READ PATH WILL USE ---------------------------------
+   These return the live arrays PLUS whatever books are loaded. Two properties make
+   them safe to adopt everywhere BEFORE any book exists:
+     1. with nothing loaded they are identical to D.orders / D.invoices;
+     2. they de-duplicate by id with LIVE ALWAYS WINNING, so a record present in
+        both places - exactly the state a half-finished close leaves behind - is
+        counted ONCE and read from the live copy. Duplication can never inflate a
+        figure, which is why the close is safe to interrupt. */
+function _mergeById(liveArr,bookArr){
+  var out=_hrArr(liveArr).slice();
+  var _bk=_hrArr(bookArr);
+  if(!_bk.length)return out;
+  var seen={};
+  out.forEach(function(r){ if(r&&r.id!=null)seen[String(r.id)]=true; });
+  _bk.forEach(function(r){
+    if(!r||r.id==null)return;
+    if(seen[String(r.id)])return;          // live wins, always
+    seen[String(r.id)]=true;
+    out.push(r);
+  });
+  return out;
+}
+function _loadedBookArrays(key){
+  var acc=[];
+  Object.keys(BOOK_CACHE).forEach(function(p){
+    var b=BOOK_CACHE[p];
+    if(b&&b[key]&&b[key].length)acc=acc.concat(b[key]);
+  });
+  return acc;
+}
+function ordersWithBooks(){ return _mergeById(D.orders,_loadedBookArrays("orders")); }
+function invoicesWithBooks(){ return _mergeById(D.invoices,_loadedBookArrays("invoices")); }
+/* How many real books are loaded - lets a screen state honestly what it is showing. */
+function booksLoadedCount(){
+  return Object.keys(BOOK_CACHE).filter(function(p){return !BOOK_CACHE[p].missing;}).length;
+}
+/* ============================================================================
+   B5 GUARD — "can I see the WHOLE order history right now?"          (2026-07-30)
+
+   Needed because two water-cycle recomputes rebuild a customer's bottle tally, and
+   their cycle HISTORY, from scratch out of delivered orders. A cycle is an 8-bottle
+   entitlement, so the tally must be computed over ALL history or not at all:
+   totalBottles%8 on a truncated list produces a confidently WRONG number and then
+   overwrites the correct stored value, destroying the record of completed cycles.
+
+   Archiving removes settled orders from D.orders, and ordersWithBooks() only sees
+   the periods whose books are actually LOADED. So "read through the books" is not
+   sufficient on its own — if a closed period is not loaded, the tally is short and
+   the recompute must REFUSE rather than guess. Same principle already applied to
+   _olderThanArchiveAge (no date -> refuse) and the self-heals (cache-only read ->
+   refuse): never act on a figure you cannot prove.
+
+   Returns true when nothing is archived at all (the live document IS the whole
+   history — the situation today, before any period has been closed). */
+function _archivedHistoryFullyLoaded(){
+  try{
+    var anyArchived=D.archivedOrderIds&&Object.keys(D.archivedOrderIds).length>0;
+    if(!anyArchived)return true;
+    if(!BOOK_INDEX||!Array.isArray(BOOK_INDEX.periods))return false;   // cannot prove -> refuse
+    for(var k=0;k<BOOK_INDEX.periods.length;k++){
+      var c=BOOK_CACHE[BOOK_INDEX.periods[k]];
+      if(!c||c.missing)return false;                                   // a closed period is not loaded
+    }
+    return true;
+  }catch(_){return false;}                                             // cannot prove -> refuse
+}
 function _invoiceIsSettled(i){
   if(!i)return false;
   if(i.voided)return true;                       // written off with a reason — resolved
@@ -4160,21 +5253,313 @@ function _isArchivableInvoice(i,todayStr){
   if(!_invoiceIsSettled(i))return false;         // RULE 1 — any balance owed stays
   return _olderThanArchiveAge(i.date,todayStr);
 }
+/* Kept as a named delegate (2026-07-30): the linking rule now lives in
+   _linkedInvoicesOf so all callers share one implementation, but this name is
+   referenced by _isArchivableOrder and pinned by _proof_archive_eligibility.js.
+   HISTORY worth keeping — this site once carried the "(\D|$)" single-backslash bug
+   described below, which is why the canonical helper spells it "(\\D|$)". */
 function _invoiceForOrder(ordId){
-  var _s=String(ordId);
-  return (D.invoices||[]).find(function(i){
-    if(i.orderId!=null)return String(i.orderId)===_s;
-    return !!(i.notes&&String(i.notes).match(new RegExp("#"+_s+"(\D|$)")));
-  })||null;
+  return _linkedInvoiceOf(ordId);
 }
 function _isArchivableOrder(o,todayStr){
   if(!o)return false;
   var st=String(o.status||"");
   if(st!=="Delivered"&&st!=="Cancelled")return false;   // still in flight
-  var inv=_invoiceForOrder(o.id);
-  if(!inv)return false;                                 // RULE 3 — cannot prove no debt
-  if(!_isArchivableInvoice(inv,todayStr))return false;   // RULE 2 — pair moves together
+  /* B4 FIX (2026-07-30) — THE "DEBT NEVER LEAVES" RULE WAS BREAKABLE.
+     This used to judge settlement from _invoiceForOrder(o.id), i.e. the FIRST matching
+     invoice only. But saveOrd's edit path issues a REPLACEMENT invoice, so one order
+     legitimately carries more than one — the bulk-heal incident recorded 287 invoices
+     against 277 orders for exactly that reason. With a settled first invoice and a
+     still-owing second, this returned true, and _recordsEligibleForPeriod then swept
+     BOTH into the book: a live receivable left the live document, and custDebt read it
+     as zero afterwards because debts read D.invoices, not invoicesWithBooks. Proven by
+     executed simulation (KSh 400 owed, archived, debt reported 0).
+     NOW: every invoice linked to this order must itself be archivable — settled AND old
+     enough. Any single unsettled or too-recent invoice keeps the whole pair live. */
+  var invs=_linkedInvoicesOf(o.id);
+  if(!invs.length)return false;                         // RULE 3 — no invoice, cannot prove no debt
+  for(var _k=0;_k<invs.length;_k++){
+    if(!_isArchivableInvoice(invs[_k],todayStr))return false; // RULE 1+2 — pair moves together, and ALL of it must qualify
+  }
   return _olderThanArchiveAge(o.date,todayStr);
+}
+/* ============================================================================
+   PERIOD BOOKS - WRITE SIDE: _closePeriod()                        (2026-07-30)
+   The archive predicates above are the LAW ("debt never leaves"); this is the
+   machinery that actually acts on them. Modeled deliberately on the one archive
+   already proven safe in this codebase, archiveAuditLogs(): write the archive
+   copy first, wait for Firestore to CONFIRM the write, and only strip the live
+   document in a separate step after that confirmation — never a single combined
+   operation. Under that ordering every failure mode is safe:
+     - book write fails             -> live untouched, nothing lost, retry later
+     - book write OK, index fails   -> live IS still cleaned up. The index is
+                                        deliberately NOT on the safety-critical
+                                        path: it is a lookup optimisation over
+                                        data the book document already holds
+                                        authoritatively, so refusing to free
+                                        already-safely-archived space over a
+                                        failed convenience-index write would
+                                        needlessly keep the live document large.
+                                        A missing index entry is repaired the
+                                        next time this same period is closed
+                                        (see IDEMPOTENT ON RE-RUN below) or can
+                                        be rebuilt by scanning newdawn_books
+                                        directly.
+     - both OK, the live removal / dirty() sync itself fails -> the live
+       document still holds the now-also-archived records (harmless
+       duplication, live always wins per _mergeById) rather than a gap
+   IDEMPOTENT ON RE-RUN: closing the same period twice (e.g. after an interrupted
+   run) loads whatever the book already holds and unions it with anything newly
+   offered by id (_mergeById) rather than overwriting, so nothing archived once
+   can be silently dropped by a second close.
+   OLDEST FIRST: _eligiblePeriods() returns periods in ascending order so the
+   earliest, most‑settled history is the first candidate for closing — the
+   right order when catching up on a backlog, not just for steady-state
+   month-end closes. */
+function _eligiblePeriods(){
+  var today=tday();
+  var set={};
+  (D.orders||[]).forEach(function(o){
+    if(o&&_isArchivableOrder(o,today)){
+      var p=bookPeriodOf(o.date);
+      if(p)set[p]=true;
+    }
+  });
+  return Object.keys(set).sort(); // ascending -> oldest period first
+}
+function _updateBookIndex(period,archivedRecords,cb){
+  var _cb=(typeof cb==="function")?cb:function(){};
+  if(!FB_BOOKS_COL){_cb();return;}
+  loadBookIndex(function(idx){
+    idx=idx||{periods:[],customers:{}};
+    if(!idx.periods)idx.periods=[];
+    if(!idx.customers)idx.customers={};
+    if(idx.periods.indexOf(period)===-1){idx.periods.push(period);idx.periods.sort();}
+    _hrArr(archivedRecords).forEach(function(r){
+      if(!r||r.cId==null)return;
+      var k=String(r.cId);
+      if(!idx.customers[k])idx.customers[k]=[];
+      if(idx.customers[k].indexOf(period)===-1)idx.customers[k].push(period);
+    });
+    FB_BOOKS_COL.doc("index").set(idx,{merge:false}).then(function(){
+      BOOK_INDEX=idx;BOOK_INDEX_STATE="ready";
+      console.log("[NDBOOKS] index updated - periods="+idx.periods.length);
+      _cb();
+    }).catch(function(e){
+      // Not fatal: the book document itself is the source of truth. A stale/
+      // missing index only means a future statement has to fall back to
+      // scanning known periods rather than jumping straight to the right one -
+      // see the comment above _closePeriod for why this must NOT block the
+      // live-document cleanup that follows.
+      console.log("[NDBOOKS] index update failed ("+((e&&e.code)||"unknown")+") - book itself is unaffected");
+      _cb();
+    });
+  });
+}
+/* Pulled out of _closePeriod (2026-07-30) so the Books panel can show a director
+   an exact, read-only PREVIEW of what a close would do — same selection rule,
+   used both to count and to actually archive, so the number shown on screen can
+   never drift from what actually moves. Read-only: never mutates D. */
+function _recordsEligibleForPeriod(period){
+  var today=tday();
+  var ordsToArchive=(D.orders||[]).filter(function(o){
+    return o&&bookPeriodOf(o.date)===period&&_isArchivableOrder(o,today);
+  });
+  var ordIds={};
+  ordsToArchive.forEach(function(o){ordIds[String(o.id)]=true;});
+  // Every invoice LINKED to an order being archived moves with it (RULE 2 — the
+  // pair never separates), matched the same way the rest of the app matches
+  // them: orderId when present, else the "#<id>" pattern in notes.
+  var invsToArchive=(D.invoices||[]).filter(function(inv){
+    if(!inv)return false;
+    // L1 FIX (2026-07-30): was an inline first-match /#(\d+)/ scrape; now the canonical
+    // helper, which prefers a "#id" that resolves to a real order over a payment reference.
+    var linkedOrdId=_linkedOrderIdOf(inv);
+    if(linkedOrdId!=null&&ordIds[String(linkedOrdId)]){
+      /* B4 FIX (2026-07-30) — SECOND, INDEPENDENT GATE. This used to `return true` with NO
+         settlement check: RULE 2 ("the pair never separates") had been read as "anything
+         linked comes along", which is only safe when an order has exactly ONE invoice. It
+         does not: an order EDIT issues a replacement invoice, and a coincidental "#<id>" in
+         manager-edited notes can link an unrelated invoice too. Either route could carry an
+         UNPAID invoice out of the live document — proven by simulation. _isArchivableOrder
+         now refuses such an order outright; this check is deliberately kept as a second,
+         independent gate so one mistaken link can never move a receivable even if the
+         order-level rule is later loosened. */
+      return _isArchivableInvoice(inv,today);
+    }
+    // A standalone invoice with no order link at all: archivable strictly on
+    // its own terms, and only if it actually belongs to this period.
+    return (linkedOrdId==null)&&bookPeriodOf(inv.date)===period&&_isArchivableInvoice(inv,today);
+  });
+  return {orders:ordsToArchive,invoices:invsToArchive};
+}
+/* How many periods are ALREADY closed and loaded this session, plus a running
+   total of what they hold — used by the Books panel to show real progress
+   ("3 months closed, 640 records archived so far") without a fresh Firestore
+   read every time the panel opens. */
+function _closedBookTotals(){
+  var periods=0,orders=0,invoices=0;
+  Object.keys(BOOK_CACHE).forEach(function(p){
+    var b=BOOK_CACHE[p];
+    if(!b||b.missing)return;
+    periods++;orders+=(b.orders||[]).length;invoices+=(b.invoices||[]).length;
+  });
+  return {periods:periods,orders:orders,invoices:invoices};
+}
+function _closePeriod(period,cb){
+  var _cb=(typeof cb==="function")?cb:function(){};
+  if(!CU||CU.role!=="director"){_cb(new Error("director role required"));return;}
+  if(!FB_READY||!FB_BOOKS_COL){_cb(new Error("not connected to Firestore"));return;}
+  if(!period){_cb(new Error("period required"));return;}
+  var _rec=_recordsEligibleForPeriod(period);
+  var ordsToArchive=_rec.orders,invsToArchive=_rec.invoices;
+  if(!ordsToArchive.length&&!invsToArchive.length){
+    _cb(null,{period:period,archivedOrders:0,archivedInvoices:0,skipped:true});
+    return;
+  }
+  loadBook(period,function(existing){
+    var mergedOrders=_mergeById(existing&&existing.orders?existing.orders:[],ordsToArchive);
+    var mergedInvoices=_mergeById(existing&&existing.invoices?existing.invoices:[],invsToArchive);
+    var payload={
+      period:period,
+      closed:true,
+      closedAt:firebase.firestore.FieldValue.serverTimestamp(),
+      closedBy:CU.name,
+      orders:mergedOrders,
+      invoices:mergedInvoices
+    };
+    FB_BOOKS_COL.doc(bookDocId(period)).set(payload,{merge:true}).then(function(){
+      BOOK_CACHE[period]={orders:mergedOrders,invoices:mergedInvoices,closed:true};
+      _booksVersion++;
+      console.log("[NDBOOKS] closed "+period+" - "+ordsToArchive.length+" order(s), "+invsToArchive.length+" invoice(s) confirmed written");
+      _updateBookIndex(period,ordsToArchive.concat(invsToArchive),function(){
+        // ONLY NOW, with the book write confirmed by Firestore and the index
+        // updated, do we touch the live document. If anything above failed,
+        // execution never reaches here and D is untouched.
+        var archOrdIds={};ordsToArchive.forEach(function(o){archOrdIds[String(o.id)]=true;});
+        var archInvIds={};invsToArchive.forEach(function(i){archInvIds[String(i.id)]=true;});
+        // ROOT-CAUSE FIX (2026-07-30): stamp a tombstone for every id leaving D,
+        // exactly parallel to deletedOrderIds/deletedInvoiceIds. WITHOUT this, the
+        // very next sync cycle silently UNDOES every archive: the write-side
+        // freshness check (_reconcileDforSync) and the read-side snapshot merge
+        // BOTH treat "present on the server, missing from my local copy" as data
+        // loss to rescue — that is their whole job, and correctly so for a real
+        // accidental drop. Neither has any way to tell "archived on purpose" apart
+        // from "lost by accident" without this tombstone, so an archived order
+        // would be pushed straight back into D.orders/D.invoices on the next
+        // snapshot or the next write's reconcile — before this device's own
+        // removal write has even reached the server. Found by tracing the exact
+        // mechanism that already rescues genuinely-missing records (the same
+        // "freshness check RESCUED ..." log lines visible in production) against
+        // what _closePeriod does — not observed as a live failure, but the code
+        // path is identical and unconditional, so the failure is certain, not
+        // merely possible. See _reconcileDforSync (write side), the onSnapshot
+        // order/invoice merge (read side), and _computeMissingOrders — all now
+        // check these maps the same way they already check the deletion tombstones.
+        // DELIBERATELY NEVER PRUNED (unlike deletedOrderIds's 90-day prune in
+        // pruneOldTombstones): a device that stays offline past a prune window and
+        // then resurrects a plain DELETED record is a minor, obvious nuisance — a
+        // director sees a stray row and deletes it again. Resurrecting an ARCHIVED
+        // record is worse: it would silently reintroduce a STALE copy (whatever
+        // payment/status state that far-behind device last saw) sitting alongside
+        // the correct, already-archived copy. Archiving is also a deliberate,
+        // occasional, director-triggered action, not a per-transaction event, so
+        // this map grows far slower than the deletion tombstones already accepted
+        // as cheap — matching deletedInvoiceIds's existing "never pruned" choice
+        // rather than deletedOrderIds's 90-day one, for the stricter of the two
+        // already-proven conventions in this file.
+        if(!D.archivedOrderIds)D.archivedOrderIds={};
+        if(!D.archivedInvoiceIds)D.archivedInvoiceIds={};
+        var _archTs=Date.now();
+        ordsToArchive.forEach(function(o){D.archivedOrderIds[o.id]=_archTs;});
+        invsToArchive.forEach(function(i){D.archivedInvoiceIds[i.id]=_archTs;});
+        D.orders=(D.orders||[]).filter(function(o){return !archOrdIds[String(o.id)];});
+        D.invoices=(D.invoices||[]).filter(function(i){return !archInvIds[String(i.id)];});
+        dirty();
+        _cb(null,{period:period,archivedOrders:ordsToArchive.length,archivedInvoices:invsToArchive.length});
+      });
+    }).catch(function(e){
+      // Book write failed — D was never touched. Nothing to undo.
+      console.log("[NDBOOKS] close "+period+" FAILED ("+((e&&e.code)||"unknown")+") - live document untouched");
+      _cb(e);
+    });
+  });
+}
+/* ── BOOKS PANEL — the director-facing trigger (2026-07-30) ──────────────────
+   Everything above this point (read side + _closePeriod) was built and proven
+   read-only-safe before any of it could actually be fired from the app. This is
+   that firing mechanism: a review list, oldest period first (the owner's stated
+   priority for a backlog), each with an explicit, specific confirm dialog before
+   anything moves — never a silent or bulk action. */
+function _eligiblePeriodSummaries(){
+  return _eligiblePeriods().map(function(p){
+    var rec=_recordsEligibleForPeriod(p);
+    return {period:p,orders:rec.orders.length,invoices:rec.invoices.length};
+  });
+}
+function showBooksPanel(){
+  if(!can("exp")){toast("Director only","err");return;}
+  if(!FB_BOOKS_COL){toast("Not connected to the cloud yet — try again in a moment","warn");return;}
+  _renderBooksPanel();
+  om("m-books");
+}
+function _renderBooksPanel(){
+  var body=el("m-books-body");if(!body)return;
+  var summaries=_eligiblePeriodSummaries();
+  var closed=_closedBookTotals();
+  var html="<div class=\"mbdy\">";
+  html+="<div class=\"notif ni\" style=\"margin-bottom:14px\">"+
+    "<i class=\"ti ti-info-circle\"></i>"+
+    "<div>Only <strong>fully settled</strong> (paid or written-off) records older than "+ARCHIVE_MIN_AGE_DAYS+" days are ever eligible. "+
+    "Any customer's outstanding debt, however old, never appears here and never moves — it stays in the live document, always traceable, exactly as before."+
+    "</div></div>";
+  if(closed.periods>0){
+    html+="<div style=\"font-size:12px;color:var(--tx2);margin-bottom:14px\">Already archived this session: <strong>"+closed.periods+" period(s)</strong>, "+closed.orders+" order(s) and "+closed.invoices+" invoice(s).</div>";
+  }
+  if(!summaries.length){
+    html+="<div class=\"te\"><i class=\"ti ti-archive\"></i><p>Nothing is eligible to archive right now.</p></div>";
+  }else{
+    html+="<div style=\"border:1px solid var(--bd);border-radius:var(--r2);overflow:hidden\">";
+    html+=summaries.map(function(s,i){
+      return "<div style=\"display:flex;align-items:center;justify-content:space-between;padding:12px 14px;"+(i>0?"border-top:1px solid var(--bd);":"")+(i===0?"background:#fff8e1;":"")+"\">"+
+        "<div><div style=\"font-weight:700\">"+s.period+(i===0?" <span style=\"font-size:10px;color:#856404;font-weight:700\">OLDEST — recommended first</span>":"")+"</div>"+
+        "<div style=\"font-size:11px;color:var(--tx2)\">"+s.orders+" order(s) &middot; "+s.invoices+" invoice(s) — all settled &amp; "+ARCHIVE_MIN_AGE_DAYS+"+ days old</div></div>"+
+        "<button class=\"btn btn-sm\" style=\"background:#1a1560;color:#fff\" onclick=\"_closePeriodConfirmed('"+s.period+"')\"><i class=\"ti ti-archive\"></i> Close "+s.period+"</button>"+
+        "</div>";
+    }).join("");
+    html+="</div>";
+  }
+  html+="</div>";
+  body.innerHTML=html;
+}
+async function _closePeriodConfirmed(period){
+  if(!can("exp")){toast("Director only","err");return;}
+  var summary=_eligiblePeriodSummaries().find(function(s){return s.period===period;});
+  var n=summary?summary.orders:0,ni=summary?summary.invoices:0;
+  var ok=await uiConfirm({
+    title:"Close "+period,
+    variant:"warn",
+    confirmText:"Archive "+period,
+    message:"This moves "+n+" settled order(s) and "+ni+" settled invoice(s) from "+period+" out of the live document into a permanent archive record.\n\n"+
+      "Outstanding debt is never touched by this — only fully paid or written-off records qualify.\n\n"+
+      "The archived records remain fully traceable (customer statements and reports still show them) but this action is not meant to be casually reversed. Continue?"
+  });
+  if(!ok)return;
+  toast("Archiving "+period+"…","ok");
+  _closePeriod(period,function(err,result){
+    if(err){
+      toast("Could not archive "+period+" — "+(err.message||"see console"),"err");
+      console.log("[NDBOOKS] panel close failed",err);
+      return;
+    }
+    if(result&&result.skipped){
+      toast(period+" had nothing left to archive","warn");
+    }else{
+      toast("Archived "+period+" — "+(result.archivedOrders||0)+" order(s), "+(result.archivedInvoices||0)+" invoice(s)","ok");
+    }
+    _renderBooksPanel();
+    if(el("pg-excel")&&el("pg-excel").classList.contains("act"))rExcel();
+  });
 }
 /* ── FIRESTORE HEADROOM: TELEMETRY + ESCALATING GUARDRAIL (2026-07-29) ───────
    THE PROBLEM THIS SOLVES. The whole database is ONE Firestore document with a hard
@@ -4462,6 +5847,17 @@ function _selfHealUnsyncedLocalRecords(){
       if(!so||so.id==null)return;
       if(_liveOrd[so.id])return;                                   // already present
       if((D.deletedOrderIds&&D.deletedOrderIds[so.id])||_recentlyDeletedOrderIds[so.id])return; // deliberately deleted
+      // BELT-AND-BRACES (2026-07-30, from an independent audit — F4): also honour the
+      // ARCHIVE tombstone here. Today this is unreachable-by-construction: an archived
+      // order is >=60 days old (ARCHIVE_MIN_AGE_DAYS) and _recent() below rejects
+      // anything older than 5 minutes (HEAL_RECENT_MS), so the age rail already stops
+      // it. But relying on two unrelated constants staying far apart is exactly the
+      // kind of implicit coupling that produced the 277-order bulk-heal incident. Every
+      // OTHER site that asks "is this record's absence deliberate?" checks both maps
+      // (the write reconcile, both read merges, the missing-order detector); these two
+      // self-heals were the only ones checking just one. Made explicit so a future
+      // change to either constant can't quietly turn a close into a resurrection.
+      if(D.archivedOrderIds&&D.archivedOrderIds[so.id])return;      // deliberately archived
       if(_dismissed[so.id])return;                                 // a director already resolved this gap by hand
       if(!_recent(so))return;                                      // outside the 1-hour window / before the epoch
       if(_healTwinOf(so))return;                                   // the same sale is already live under another id — leave it to a human
@@ -4483,7 +5879,9 @@ function _selfHealUnsyncedLocalRecords(){
       if(D.deletedInvoiceIds&&D.deletedInvoiceIds[si.id])return;
       if(_recentlyVoidedInvoiceIds&&_recentlyVoidedInvoiceIds[si.id])return;
       // Only heal an invoice whose order is (or is now) live — never a floating one.
-      var _oid=si.orderId!=null?si.orderId:(si.notes&&si.notes.match(/#(\d+)/)?parseInt(si.notes.match(/#(\d+)/)[1]):null);
+      // L1 FIX (2026-07-30): canonical helper — the inline scrape took the first "#digits"
+      // in the snapshot invoice's notes, which a payment reference could hijack.
+      var _oid=_linkedOrderIdOf(si);
       if(_oid==null)return;
       var _oRec=_projOrd[_oid];
       if(!_oRec)return;
@@ -4651,6 +6049,7 @@ function _selfHealFromEventSnapshots(){
       // can tell that apart from a genuinely fresh loss.
       if(!(so&&typeof so._ts==="number"&&so._ts>=_healCutoff))return;
       if((D.deletedOrderIds&&D.deletedOrderIds[oid])||_recentlyDeletedOrderIds[oid])return; // deliberately deleted
+      if(D.archivedOrderIds&&D.archivedOrderIds[oid])return;    // deliberately archived — see the matching note in _selfHealUnsyncedLocalRecords (F4)
       if(_dismissed[oid])return;                 // a director already resolved this gap by hand
       if(_healTwinOf(so))return;                 // the same sale is already live under another id — leave it to a human
       _evCand.push(rec);
@@ -4845,7 +6244,7 @@ function buildApp(){
       "<div class=\"topright\">"+
         "<div class=\"sts ready\" id=\"sts\"><i class=\"ti ti-circle\"></i> Ready</div>"+
         "<div id=\"sync-age\" style=\"font-size:9px;color:#999;padding:2px 6px;cursor:pointer\" onclick=\"forceRefreshNow()\" title=\"Click to force an immediate refresh\"><i class=\"ti ti-refresh\"></i> --</div>"+
-        "<div style=\"font-size:9px;color:#999;padding:2px 8px\" title=\"Build version — check this after every update to confirm the latest fixes actually loaded\">v"+APP_VERSION+"</div>"+
+        "<div style=\"font-size:9px;color:#999;padding:2px 8px\" title=\"Build version — check this after every update to confirm the latest fixes actually loaded. The build stamp after the dot changes on every deploy; APP_VERSION is intentionally frozen.\">v"+APP_VERSION+" &middot; "+BUILD_STAMP+"</div>"+
         "<div class=\"sts ready\" id=\"as-indicator\" style=\"font-size:10px\"><i class=\"ti ti-refresh\"></i> Auto-save on</div>"+
         (can("exp")?"<button class=\"bsv\" onclick=\"saveXL()\"><i class=\"ti ti-device-floppy\"></i> Save</button>":"")+
         "<div class=\"upill\" onclick=\"toggleUM()\">"+
@@ -5689,7 +7088,16 @@ function buildMods(){
     "<div class=\"mbdy\" id=\"m-heal-review-body\"></div>"+
     "<div class=\"mft\"><button class=\"btn\" onclick=\"cm('m-heal-review')\">Close</button></div>"+
   "</div></div>";
-  el("mods").innerHTML=mC+mO+mOE+mDlv+mS+mRS+mOf+mIv+mPay+mCmp+mU+mSetup+mPin+mAssign+mFollowUp+mGeneric+mRecon+mHealReview;
+  // BOOKS PANEL (2026-07-30). Its own modal, same reasoning as m-heal-review right
+  // above: this is a list of periods, each with its own "Close" action that opens a
+  // uiConfirm dialog — sharing m-generic (the uiConfirm/uiAlert surface) would let
+  // the confirm overwrite the very list it was opened from.
+  var mBooks="<div class=\"ov\" id=\"m-books\"><div class=\"modal\" style=\"max-width:760px\">"+
+    "<div class=\"mhd\"><div class=\"mttl\"><i class=\"ti ti-archive\" style=\"color:var(--gd);margin-right:7px\"></i>Period Books — Archive Settled History</div><button class=\"mcls\" onclick=\"cm('m-books')\"><i class=\"ti ti-x\"></i></button></div>"+
+    "<div class=\"mbdy\" id=\"m-books-body\"></div>"+
+    "<div class=\"mft\"><button class=\"btn\" onclick=\"cm('m-books')\">Close</button></div>"+
+  "</div></div>";
+  el("mods").innerHTML=mC+mO+mOE+mDlv+mS+mRS+mOf+mIv+mPay+mCmp+mU+mSetup+mPin+mAssign+mFollowUp+mGeneric+mRecon+mHealReview+mBooks;
 }
 
 function rDash(){
@@ -5702,7 +7110,14 @@ function rDash(){
     setTimeout(rDash,500);
     return;
   }
-  var del=(D.orders||[]).filter(function(o){return o.status==="Delivered";});
+  // BOOKS (2026-07-30): the Dashboard is the one screen checked daily, and it
+  // has an explicit year-long view (the Jan-Dec monthly revenue chart below) —
+  // exactly the kind of lookback that silently goes wrong once a month is
+  // archived, unless read through the merged accessors (identical to
+  // D.orders/D.invoices with zero books loaded).
+  var _dashOrdAll=ordersWithBooks();
+  var _dashInvAll=invoicesWithBooks();
+  var del=_dashOrdAll.filter(function(o){return o.status==="Delivered";});
   // ── Period filter for financial stats ──────────────────────────────
   // Staff locked to today — no financial period access
   if(CU&&CU.role==="staff")DASH_PERIOD="today";
@@ -5748,11 +7163,13 @@ function rDash(){
   // money collected and must still count.
   function _writtenOffFor(orders){
     var ids={};orders.forEach(function(o){ids[o.id]=true;});
-    return (D.invoices||[]).filter(function(i){
+    return _dashInvAll.filter(function(i){
       if(!i.voided)return false;
       if(i.orderId)return ids[i.orderId];
-      var m=i.notes&&i.notes.match(/#(\d+)/);
-      return m&&ids[parseInt(m[1])];
+      // L1 FIX (2026-07-30): was notes-ONLY (so an invoice linked by orderId was never
+      // matched here at all) AND took the first "#digits" a payment ref could hijack.
+      var _mo=_linkedOrderIdOf(i);
+      return _mo!=null&&!!ids[_mo];
     }).reduce(function(a,i){return a+(i.amount-i.paid);},0);
   }
   var wkRevs=wkDays.map(function(_,i){
@@ -5787,7 +7204,10 @@ function rDash(){
   var lastRev=del.filter(function(o){var dd=o.deliveredAt||o.date;return dd&&dd.startsWith(lastMonth);}).reduce(function(s,o){return s+o.qty*o.price;},0);
   if(can("vRev")&&lastRev>0){var tp=Math.round((thisRev-lastRev)/lastRev*100);if(Math.abs(tp)>=10){var tc=tp>0?"#27ae60":"#c0392b";alerts.push({t:"ni",i:(tp>0?"ti-trending-up":"ti-trending-down"),m:"Revenue "+(tp>0?"+":"")+tp+"% vs last month — KSh "+thisRev.toLocaleString()+" this month",dest:"reports"});}}
   var churnDate=_ymd(new Date(Date.now()-30*86400000)); // local-safe
-  var churned=(D.customers||[]).filter(function(cu){var lo=(D.orders||[]).filter(function(o){return o.cId===cu.id&&o.status==="Delivered";}).sort(function(a,b){return b.date>a.date?1:-1;})[0];return lo&&lo.date<churnDate;}).length;
+  // BOOKS (2026-07-30): a genuinely churned customer's LAST order is exactly
+  // the one most likely to be archived by now — without the merge, the most
+  // dormant customers would be the ones silently dropped from this alert.
+  var churned=(D.customers||[]).filter(function(cu){var lo=_dashOrdAll.filter(function(o){return o.cId===cu.id&&o.status==="Delivered";}).sort(function(a,b){return b.date>a.date?1:-1;})[0];return lo&&lo.date<churnDate;}).length;
   if(churned>0)alerts.push({t:"nw",i:"ti-user-exclamation",m:churned+" customer(s) have not ordered in 30+ days",dest:"customers"});
 
   var lowStock=(D.stock||[]).filter(function(s){return s.qty<=s.min;});
@@ -6039,9 +7459,17 @@ function rCusts(q,pg,sort,type){
     if(can("vPhone"))searchFields.push(c.phone,c.phone2);
     return searchFields.some(function(v){return v&&String(v).toLowerCase().indexOf(lq)!==-1;});
   });
+  // BOOKS (2026-07-30): order count / last order / last payment / revenue-sort below
+  // are all-time, per-customer aggregates — exactly what silently shrinks once an
+  // old, settled order or invoice is archived, unless read through the merged
+  // accessors (identical to D.orders/D.invoices with zero books loaded). debtMap is
+  // untouched — custDebt() only ever evaluates unpaid invoices, which the archive
+  // rule guarantees can never be archived, so it needs no change.
+  var _custOrdAll=ordersWithBooks();
+  var _custInvAll=invoicesWithBooks();
   // Sort
-  var del=(D.orders||[]).filter(function(o){return o.status==="Delivered";});
-  var revMap={};var delCusts=(D.orders||[]).filter(function(o){return o.status==="Delivered";});delCusts.forEach(function(o){revMap[o.cId]=(revMap[o.cId]||0)+o.qty*o.price;});
+  var del=_custOrdAll.filter(function(o){return o.status==="Delivered";});
+  var revMap={};var delCusts=del;delCusts.forEach(function(o){revMap[o.cId]=(revMap[o.cId]||0)+o.qty*o.price;});
   var debtMap={};(D.customers||[]).forEach(function(cu){debtMap[cu.id]=custDebt(cu.id);});
   // FIX (2026-07-25): the debt and nodebts sorts below used to call
   // custDebt() directly inside the comparator, completely ignoring the
@@ -6050,7 +7478,7 @@ function rCusts(q,pg,sort,type){
   // comparisons. Same fix applied to the orders sort, which recomputed a
   // full filter().length on every single comparison instead of using a
   // count built once.
-  var orderCountMap={};(D.orders||[]).forEach(function(o){orderCountMap[o.cId]=(orderCountMap[o.cId]||0)+1;});
+  var orderCountMap={};_custOrdAll.forEach(function(o){orderCountMap[o.cId]=(orderCountMap[o.cId]||0)+1;});
   fil=fil.slice().sort(function(a,b){
     if(sort2==="debt"){return (debtMap[b.id]||0)-(debtMap[a.id]||0);}
     if(sort2==="orders"){
@@ -6105,9 +7533,9 @@ function rCusts(q,pg,sort,type){
       "<tbody>"+
         (paged.items.length?paged.items.map(function(c){
           var debt=(debtMap[c.id]||0);
-          var ords=(D.orders||[]).filter(function(o){return o.cId===c.id;});
+          var ords=_custOrdAll.filter(function(o){return o.cId===c.id;});
           var lastOrd=ords.filter(function(o){return o.status==="Delivered";}).sort(function(a,b){return b.date>a.date?1:-1;})[0];
-          var allPays=(D.invoices||[]).filter(function(i){return i.cId===c.id&&i.payments&&i.payments.length;}).reduce(function(a,i){return a.concat(i.payments);},[]).sort(function(a,b){return b.date>a.date?1:-1;});
+          var allPays=_custInvAll.filter(function(i){return i.cId===c.id&&i.payments&&i.payments.length;}).reduce(function(a,i){return a.concat(i.payments);},[]).sort(function(a,b){return b.date>a.date?1:-1;});
           var lp=allPays[0];
           return "<tr class=\""+(debt>0?"dr":"")+"\">"+
             "<td><div style=\"font-weight:700\">"+(can("vPhone")?c.name:maskName(c.name))+"</div><div class=\"ca\">"+cAddr(c)+"</div>"+(c.waterCycle>0||(c.waterCycle===0&&c.cycleHistory&&c.cycleHistory.length>0)?"<div style=\"margin-top:3px\"><span class=\"badge ba\" style=\"cursor:pointer;font-size:9px\" onclick=\"showCycleHistory("+c.id+")\" title=\"Water cycle\"><i class=\"ti ti-droplet\"></i> "+c.waterCycle+"/8</span></div>":"")+"</td>"+
@@ -6164,6 +7592,10 @@ async function saveCust(){
       c.estate=sanitizeInput(el("cestate").value);c.court=sanitizeInput(el("ccourt").value);c.house=sanitizeInput(el("chouse").value);
       c.htype=el("chtype").value;c.road=sanitizeInput(el("croad").value);c.zone=sanitizeInput(el("czone").value);
       c.ctype=el("ctype").value;c.creditLimit=_round2(parseFloat(el("ccl").value)||0);c.notes=sanitizeInput(el("cnotes").value);
+      // F1 EXTENSION (2026-07-30): see saveSt. Only the profile fields above are arbitrated
+      // by _rev — credit/creditLog stay on their own additive merge (_mergeCustomerCredit),
+      // which is deliberately untouched here: money entries must union, never arbitrate.
+      _stampRecordEdit(c);
       auditLog("CUSTOMER_UPDATED","Customer updated by "+CU.name+" ("+CU.role+"): "+n);
       if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
 cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer updated");
@@ -6690,14 +8122,28 @@ function reversePayment(invId,pid,payIdx){
   }
   inv.paid=_round2(pays.reduce(function(s,p){return s+(p.amt||0);},0));
   inv.payments=pays;
+  /* B2 (2026-07-30) — REVERSAL TOMBSTONE. The durable payment outbox delivers any queued
+     payment whose pid is not present in the invoice. A reversal REMOVES the entry, so
+     "pid absent" would otherwise be indistinguishable from "never landed" and the outbox
+     would re-apply a payment a director deliberately reversed — fabricating revenue.
+     An explicit tombstone is the doctrine this codebase already uses for deletions and
+     archives, and it is what makes this safe ACROSS devices: dropping the queue entry
+     alone loses a race against another device reconciling first, whereas the tombstone
+     travels in D and every device honours it. Never pruned — reversals are rare and
+     resurrecting real money is not a nuisance, it is a false receipt. */
+  try{
+    if(pid){
+      if(!D.reversedPayPids)D.reversedPayPids={};
+      D.reversedPayPids[pid]=Date.now();
+      _outboxDropPayment(pid);
+    }
+  }catch(_){}
   // Sync linked order payment status
-  var o;
-  if(inv.orderId){
-    o=(D.orders||[]).find(function(x){return x.id===inv.orderId;});
-  }else{
-    var ordMatch=inv.notes&&inv.notes.match(/#(\d+)/);
-    if(ordMatch)o=(D.orders||[]).find(function(x){return String(x.id)===ordMatch[1];});
-  }
+  // L1/C1 FIX (2026-07-30): same first-match free-text scrape as the other five sites. A
+  // payment reference in the notes hijacked it, so reversing a payment corrected the
+  // INVOICE but silently failed to correct the ORDER's paid status/amtPaid — leaving the
+  // two permanently disagreeing about the same sale. Canonical helper.
+  var o=_orderForInvoice(inv);
   if(o){
     if(inv.paid>=inv.amount){o.paid="Paid";}else if(inv.paid>0){o.paid="Partial";}else{o.paid="Unpaid";}
     o.amtPaid=inv.paid;
@@ -6793,8 +8239,9 @@ voidInvoice._confirm=function(invId){
   var bal=inv.amount-inv.paid;
   inv.voided=true;inv.voidedBy=CU.name;inv.voidedAt=tday();inv.voidReason=reason;
   _recentlyVoidedInvoiceIds[invId]=Date.now();
-  var ordMatch=inv.notes&&inv.notes.match(/#(\d+)/);
-  var _voidO=inv.orderId?D.orders.find(function(x){return x.id===inv.orderId;}):(ordMatch?D.orders.find(function(x){return String(x.id)===ordMatch[1];}):null);
+  // L1/C1 FIX (2026-07-30): was a first-match /#(\d+)/ scrape of free-text notes that a
+  // payment reference could hijack — see _orderForInvoice for the full mechanism.
+  var _voidO=_orderForInvoice(inv);
   if(_voidO)_voidO.paid="Voided";
   auditLog("PAYMENT_RECORDED","VOID: Invoice #"+invId+" voided by "+CU.name+". Reason: "+reason+". Amount written off: KSh "+bal);
     if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
@@ -6870,6 +8317,7 @@ function recPay(){
     var _ovPayPid=uid();
     inv.payments.push({pid:_ovPayPid,date:payDate,amt:amt,method:method,ref:ref});
     inv.paid=_round2(inv.payments.reduce(function(s,p){return s+(p.amt||0);},0));
+    _outboxPutPayment(invId,_ovPayPid); // B2: durable copy of received cash — see the payment outbox
     // Store overpayment as customer credit balance
     if(credit>0){
       var cu=(D.customers||[]).find(function(x){return x.id===cId;});
@@ -6881,8 +8329,9 @@ function recPay(){
       }
     }
     // Sync linked order
-    var ordMatch=inv.notes&&inv.notes.match(/#(\d+)/);
-    var o=inv.orderId?(D.orders||[]).find(function(x){return x.id===inv.orderId;}):(ordMatch?(D.orders||[]).find(function(x){return String(x.id)===ordMatch[1];}):null);
+    // L1/C1 FIX (2026-07-30): was a first-match /#(\d+)/ scrape of free-text notes that a
+    // payment reference could hijack — see _orderForInvoice for the full mechanism.
+    var o=_orderForInvoice(inv);
     if(o){
       if(inv.paid>=inv.amount){o.paid="Paid";}else if(inv.paid>0){o.paid="Partial";}else{o.paid="Unpaid";}
       o.amtPaid=inv.paid;
@@ -6962,11 +8411,14 @@ function recPay(){
         if(rem<=0)return;
         var tap=Math.min(rem,inv.amount-inv.paid);
         if(!inv.payments)inv.payments=[];
-        inv.payments.push({pid:uid(),date:payDate,amt:tap,method:method,ref:ref});
+        var _distPid=uid();
+        inv.payments.push({pid:_distPid,date:payDate,amt:tap,method:method,ref:ref});
+        _outboxPutPayment(inv.id,_distPid); // B2: customer-level payment distributed across invoices — each slice durably queued
         inv.paid=_round2(inv.payments.reduce(function(s,p){return s+(p.amt||0);},0));
         rem-=tap;
-        var ordId=inv.notes&&inv.notes.match(/#(\d+)/);
-        var o2=inv.orderId?(D.orders||[]).find(function(x){return x.id===inv.orderId;}):(ordId?(D.orders||[]).find(function(x){return String(x.id)===ordId[1];}):null);
+        // L1/C1 FIX (2026-07-30): was a first-match /#(\d+)/ scrape of free-text notes that a
+        // payment reference could hijack — see _orderForInvoice for the full mechanism.
+        var o2=_orderForInvoice(inv);
         if(o2){
             if(inv.paid>=inv.amount){o2.paid="Paid";}else if(inv.paid>0){o2.paid="Partial";}else{o2.paid="Unpaid";}
             o2.amtPaid=inv.paid;
@@ -7014,7 +8466,12 @@ function rOrds(q,pg,sort){
   var q2=ORD_Q||"";var sort2=ORD_SORT||"newest";var sf=ORD_STATUS_F||"";
   var pgEl=el("pg-orders");if(!pgEl)return;
   var df=ORD_DATE_F||"";
-  var fil=(D.orders||[]).filter(function(o){
+  // BOOKS (2026-07-30): this page supports searching/filtering by ANY past date
+  // (see ORD_DATE_F and the "not your full order list" banner below) — exactly
+  // an all-time browse surface, so an archived order must still be findable
+  // here. Identical to D.orders with zero books loaded.
+  var _ordAllForList=ordersWithBooks();
+  var fil=_ordAllForList.filter(function(o){
     if(sf&&o.status!==sf)return false;
     if(df){var dd=o.deliveredAt||o.date;if(!dd||!dd.startsWith(df))return false;}
     if(!q2)return true;
@@ -7046,10 +8503,10 @@ function rOrds(q,pg,sort){
   var sBtn=function(v,lbl){return "<button onclick=\"rOrds(undefined,0,'"+v+"')\" style=\"padding:5px 9px;font-size:11px;border:1.5px solid "+(sort2===v?"var(--nv)":"var(--bd)")+";background:"+(sort2===v?"var(--nv)":"#fff")+";color:"+(sort2===v?"#fff":"var(--tx)")+";border-radius:6px;cursor:pointer;font-weight:"+(sort2===v?"700":"400")+"\">"+lbl+"</button>";};
   if(!el("ords-srch")){
     pgEl.innerHTML=
-    "<div class=\"ph\"><h1>Orders</h1><p>"+(D.orders||[]).length+" total &middot; "+(D.orders||[]).filter(function(o){return o.status==="Pending"||o.status==="Processing";}).length+" active</p></div>"+
+    "<div class=\"ph\"><h1>Orders</h1><p>"+_ordAllForList.length+" total &middot; "+_ordAllForList.filter(function(o){return o.status==="Pending"||o.status==="Processing";}).length+" active</p></div>"+
     (df?"<div style=\"background:#fff8e1;border:1.5px solid #f39c12;border-radius:8px;padding:8px 14px;margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px\">"+
       "<span style=\"font-size:12px;font-weight:700;color:#856404\"><i class=\"ti ti-filter\"></i> Showing only: "+fmt(df)+(sf?" &middot; "+sf:"")+" — this is NOT your full order list</span>"+
-      "<button class=\"btn btn-xs\" style=\"background:#856404;color:#fff\" onclick=\"ORD_STATUS_F='';ORD_DATE_F='';rOrds(undefined,0);\"><i class=\"ti ti-x\"></i> Clear filter — show all "+(D.orders||[]).length+"</button>"+
+      "<button class=\"btn btn-xs\" style=\"background:#856404;color:#fff\" onclick=\"ORD_STATUS_F='';ORD_DATE_F='';rOrds(undefined,0);\"><i class=\"ti ti-x\"></i> Clear filter — show all "+_ordAllForList.length+"</button>"+
     "</div>":"")+
     "<div class=\"toolbar\">"+
       "<div class=\"srch\"><i class=\"ti ti-search\"></i><input id=\"ords-srch\" type=\"text\" autocomplete=\"off\" autocorrect=\"off\" autocapitalize=\"off\" spellcheck=\"false\" inputmode=\"search\" placeholder=\"Search by order #, product, address, driver...\" oninput=\"rOrds(this.value,0)\" value=\""+q2+"\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
@@ -7856,6 +9313,7 @@ async function saveOrd(){
     }
     var stCostE=(D.stock||[]).find(function(s){return s.name===pn;});
     o.cId=cId;o.prod=pn;o.stockId=stCostE?stCostE.id:null;o.qty=qty;o.price=_round2(price);o.cost=stCostE?_round2(stCostE.cost):0;o.date=el("od").value;
+    _stampOrderEdit(o); // F1: mark this as a genuine human edit so other devices ACCEPT it instead of reverting it
     // FIX (2026-07-21): prodConfirmed is the authoritative flag every
     // downstream path (delivery at 4981, delete at 5179, cancel at 5280)
     // trusts to decide whether stock was already deducted for this order.
@@ -7896,6 +9354,7 @@ async function saveOrd(){
     if(payStatus!=="Paid"){
       if(linkedInv){
         linkedInv.amount=_round2(price*qty);
+        _stampRecordEdit(linkedInv); // F6 (2026-07-30): the order's own price/qty edit is stamped a few lines below; without stamping the INVOICE too, its amount stays un-arbitrated and other devices revert it while accepting the order change — order and invoice would then disagree permanently about the same sale
         if(amtPaid>linkedInv.paid){
           var diff=_round2(amtPaid-linkedInv.paid); // FIX (2026-07-29): _round2-wrap like the two sibling correction branches, so a decimal price can't push a sub-cent residue into the payments ledger.
           if(!linkedInv.payments)linkedInv.payments=[];
@@ -7961,6 +9420,7 @@ async function saveOrd(){
       var paidTarget=_round2(price*qty);
       if(linkedInv){
         linkedInv.amount=paidTarget;
+        _stampRecordEdit(linkedInv); // F6 (2026-07-30): same reasoning as the sibling branch above — this is the downward-correction path, so an un-stamped amount would be reverted by other devices exactly like the upward one
         var diffPaid=_round2(paidTarget-(linkedInv.paid||0));
         if(diffPaid!==0){
           if(!linkedInv.payments)linkedInv.payments=[];
@@ -8003,6 +9463,7 @@ async function saveOrd(){
     reserveNextOrderId().then(function(newOrdId){
       (D.orders||[]).push({id:newOrdId,cId:cId,prod:pn,stockId:stCost?stCost.id:null,qty:qty,price:0,cost:0,date:el("od").value,status:"Pending",paid:"Unpaid",amtPaid:0,driver:el("odrv").value,deliver:sanitizeInput(el("odlvr").value),bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?sanitizeInput(el("onotes").value):"",prodConfirmed:false,_ts:Date.now(),_cid:_orderCid});
       auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty+" (category/TBC) — customer #"+cId+" "+(function(){var _c=(D.customers||[]).find(function(x){return x.id===cId;});return _c?unescapeForEdit(_c.name):"unknown";})(),{ordSnapshot:_orderSnapshotFor(newOrdId)});
+      _outboxPut(newOrdId);   // MISSING-ORDER ROOT-CAUSE FIX — durable per-order write; see the outbox block
       if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
       rDel();
       cm("m-o");rOrds(undefined,ORD_PAGE);dirty();
@@ -8068,6 +9529,7 @@ async function saveOrd(){
     // see reserveNextOrderAndInvoiceIds - instead of two sequential ones.
     (D.invoices||[]).push({id:newInvId,orderId:newOrdId,cId:cId,amount:total,paid:amtPaid,due:(function(){var dd=new Date((el("od").value||tday())+"T12:00:00");dd.setDate(dd.getDate()+7);return dd.toISOString().split("T")[0];})(),notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{pid:uid(),date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
     auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty+" — customer #"+cId+" "+(function(){var _c=(D.customers||[]).find(function(x){return x.id===cId;});return _c?unescapeForEdit(_c.name):"unknown";})(),{ordSnapshot:_orderSnapshotFor(newOrdId)});
+    _outboxPut(newOrdId);   // MISSING-ORDER ROOT-CAUSE FIX — durable per-order write; see the outbox block
     if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
     rDel();
     cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+newOrdId+" placed");
@@ -8211,6 +9673,7 @@ async function completeDlv(){
     o.price=_round2(confirmedPrice);
     o.cost=stCost?stCost.cost:0;
     o.prodConfirmed=true;
+    _stampOrderEdit(o); // F1: a driver naming the exact product IS a real edit — other devices must accept it
   }
 
   o.status="Delivered";
@@ -8257,6 +9720,9 @@ async function completeDlv(){
       if(dlvAmt>0){
         _dlvPayPid=uid();
         inv.payments.push({pid:_dlvPayPid,date:tday(),amt:dlvAmt,method:dlvMethod,ref:"Delivery #"+oid});
+        // B2: the highest-risk cash event in the whole system — money taken at the door on a
+        // delivery phone, which is exactly the device that freezes and gets evicted.
+        _outboxPutPayment(inv.id,_dlvPayPid);
         inv.paid=_round2(inv.payments.reduce(function(s,p){return s+(p.amt||0);},0)); // source of truth
       }
       var dlvOver=_round2(amt-dlvAmt);
@@ -8370,8 +9836,19 @@ async function completeDlv(){
 async function delO(id){
   if(!can("dOrd"))return;
   var o=(D.orders||[]).find(function(x){return x.id===id;});if(!o)return;
-  var linkedInv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.match(new RegExp("#"+id+"(\\D|$)"));});
-  var outstandingBal=(linkedInv&&!linkedInv.voided)?Math.max(0,linkedInv.amount-linkedInv.paid):0;
+  /* D1 FIX (2026-07-30): this lookup was notes-ONLY — it ignored o.invoiceId and i.orderId
+     entirely — so an invoice whose notes a manager had edited (saveInv permits free-text
+     notes) no longer matched, outstandingBal computed as 0, and ENTERPRISE RULE 1 below
+     then allowed an order carrying REAL DEBT to be deleted. It also considered only the
+     FIRST match, while saveOrd's edit path can leave a second invoice on the same order,
+     so the balance has to cover ALL of them. Both closed by the canonical helper.
+     `linkedInv` stays the first match, because the void/confirm paths below act on one
+     invoice; only the BALANCE arithmetic needed to become total. */
+  var _linkedInvs=_linkedInvoicesOf(id);
+  var linkedInv=_linkedInvs.length?_linkedInvs[0]:null;
+  var outstandingBal=_linkedInvs.reduce(function(s,iv){
+    return s+((iv&&!iv.voided)?Math.max(0,(Number(iv.amount)||0)-(Number(iv.paid)||0)):0);
+  },0);
 
   // ENTERPRISE RULE 1: an order that hasn't been delivered yet and still has a
   // balance should be CANCELLED, not deleted — Cancel already correctly
@@ -8441,8 +9918,12 @@ async function delO(id){
   // remove an invoice with zero payment history, and keep one with real
   // payment history for the books, exactly as before.
   D.invoices=(D.invoices||[]).filter(function(i){
-    var linked=i.notes&&i.notes.match(new RegExp("#"+id+"(\\D|$)"));
-    if(linked&&i.paid<=0){
+    // D1/L1 FIX (2026-07-30): matched by notes only, so an invoice linked by orderId with
+    // edited notes was left orphaned behind a deleted order. Same canonical rule as the
+    // balance check above, so what is counted and what is cleaned up can never disagree.
+    var linked=(i.orderId!=null)?String(i.orderId)===String(id)
+                                :!!(i.notes&&new RegExp("#"+id+"(\\D|$)").test(String(i.notes)));
+    if(linked&&(Number(i.paid)||0)<=0){
       // FIX (2026-07-27): this removal had no corresponding entry in
       // D.deletedInvoiceIds - the exact same tombstone mechanism that
       // already protects the order removal two lines above, and that the
@@ -8558,6 +10039,13 @@ function _finishCancelO(id,disposition){
     if(hasPaid){
       // Nothing further owed — goods were never delivered.
       inv.amount=inv.paid;
+      /* F6 (2026-07-30): stamp the write-off. This is the branch whose revert was already
+         confirmed live once before (the 2026-07-27 note above _mergeInvoicePayments: a
+         cancelled order with a partial payment stayed permanently stuck because the stale
+         server amount kept coming back, so outstandingBal never reached zero and Delete
+         kept refusing). That fix made LOCAL win; this stamp is what makes the write-off
+         win on every OTHER device too, instead of only on the one that performed it. */
+      _stampRecordEdit(inv);
       o.cancelDisposition=disposition; // internal record only — doesn't affect any badge/status logic elsewhere
       if(disposition==="credit"){
         var cu=(D.customers||[]).find(function(x){return x.id===o.cId;});
@@ -8647,7 +10135,11 @@ function rDel(q){
     if(o.status!=="Delivered")return false;
     var dd=o.deliveredAt||o.date;return dd&&dd.startsWith(_dlvMo);
   }).length;
-  var totalDel=(D.orders||[]).filter(function(o){return o.status==="Delivered";}).length;
+  // BOOKS (2026-07-30): unlike pend/todayDel/weekDel/monthDel (all inherently
+  // scoped to well within the 60-day archive floor), this is a genuine all-time
+  // total shown directly in the board's subtitle ("N total delivered") — needs
+  // the merge or it silently shrinks as history is archived.
+  var totalDel=(ordersWithBooks()||[]).filter(function(o){return o.status==="Delivered";}).length;
   var q2=DEL_Q||"";
   var pendFil=q2?pend.filter(function(o){var cu=(D.customers||[]).find(function(x){return x.id===o.cId;});var lq=sanitizeInput(q2).toLowerCase();return(cu&&((can("vPhone")&&cu.name&&cu.name.toLowerCase().indexOf(lq)!==-1)||cAddr(cu).toLowerCase().indexOf(lq)!==-1))||String(o.id).indexOf(DEL_Q)!==-1||(o.prod&&o.prod.toLowerCase().indexOf(lq)!==-1)||(o.driver&&o.driver.toLowerCase().indexOf(lq)!==-1);}):pend;
   // Partial render: build shell once, only update results on search
@@ -8845,6 +10337,14 @@ function saveSt(){
       // whole reconciliation effort has been about. Quantity is no longer
       // touched by this form at all once a product already exists.
       s.isWater=el("sw")&&el("sw").checked?true:false;
+      // F1 EXTENSION (2026-07-30): stamp the edit so OTHER devices can tell this is a
+      // genuinely newer change and accept it, instead of rejecting it in favour of their
+      // own stale copy and then writing that stale copy back. Must come after every field
+      // assignment above and before dirty(), so the bumped _rev travels with this write.
+      // Deliberately NOT applied to the create path below: a brand-new record has no
+      // competing remote version to arbitrate against, and leaving it unstamped keeps
+      // legacy and new records on the same footing (absent stamp === 0).
+      _stampRecordEdit(s);
       auditLog("STOCK_UPDATED","Product saved by "+CU.name+" ("+CU.role+"): "+n+(s.isWater?" [water cycle product]":""));
       if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
 cm("m-s");rStock();dirty();
@@ -8937,6 +10437,14 @@ function _computeMissingOrders(){
     // consistent. Note: a CANCELLED order is NOT affected — cancelO() leaves the
     // order in D.orders (status "Cancelled"), so liveIds already covers it.
     if((D.deletedOrderIds&&D.deletedOrderIds[id])||_recentlyDeletedOrderIds[id])return;
+    // BOOKS (2026-07-30): same reasoning as the deletion-tombstone guard right
+    // above — an ARCHIVED order's ORDER_PLACED entry can also linger in the audit
+    // log (or its 90-day archive) long after the order itself has been moved to a
+    // book. In practice this business's audit volume rotates the hot log well
+    // within 60 days, so it's unlikely to bite — but "unlikely given today's
+    // volume" is not the same guarantee a tombstone gives, so it's checked the
+    // same way rather than assumed away.
+    if(D.archivedOrderIds&&D.archivedOrderIds[id])return;
     var rec=placed[id];
     var cust=null,priceSource=null;
     if(rec.auditCId){
@@ -9458,7 +10966,12 @@ function rInvs(q,pg){
   var q2=INV_Q||"";
   var pgEl=el("pg-invoices");if(!pgEl)return;
   var td=tday();
-  var fil=[].concat(D.invoices).reverse();
+  // BOOKS (2026-07-30): the Invoices tab is a search/browse surface — without
+  // this, an archived invoice would be findable in Reports/statements but
+  // silently absent from a search right here, an inconsistency a director
+  // would have no way to explain. Identical to D.invoices with zero books loaded.
+  var _invAllForList=invoicesWithBooks();
+  var fil=[].concat(_invAllForList).reverse();
   if(q2){var lq=sanitizeInput(q2).toLowerCase();fil=fil.filter(function(i){var c=(D.customers||[]).find(function(x){return x.id===i.cId;});return(c&&(can("vPhone")&&c.name&&c.name.toLowerCase().indexOf(lq)!==-1))||String(i.id).indexOf(q2)!==-1||String(i.amount).indexOf(q2)!==-1;});}
   var paged=paginate(fil,INV_PAGE);
   // Show pending cash payments requiring acknowledgement (director/manager only)
@@ -9494,7 +11007,7 @@ function rInvs(q,pg){
       "<div id=\"inv-results\"></div>";
   }
   var _is=el("inv-stats");
-  if(_is)_is.innerHTML=(D.invoices||[]).length+" total &middot; "+(D.invoices||[]).filter(function(i){return i.paid>=i.amount;}).length+" paid &middot; "+(D.invoices||[]).filter(function(i){return i.paid<i.amount&&i.due&&i.due<td&&!i.voided&&_invoiceOrderActive(i);}).length+" overdue"+((D.invoices||[]).filter(function(i){return i.voided;}).length?" &middot; "+(D.invoices||[]).filter(function(i){return i.voided;}).length+" voided":"");
+  if(_is)_is.innerHTML=_invAllForList.length+" total &middot; "+_invAllForList.filter(function(i){return i.paid>=i.amount;}).length+" paid &middot; "+_invAllForList.filter(function(i){return i.paid<i.amount&&i.due&&i.due<td&&!i.voided&&_invoiceOrderActive(i);}).length+" overdue"+(_invAllForList.filter(function(i){return i.voided;}).length?" &middot; "+_invAllForList.filter(function(i){return i.voided;}).length+" voided":"");
   var _ip=el("inv-pending");if(_ip)_ip.innerHTML=pendingBanner;
   var _ir=el("inv-results");
   if(_ir)_ir.innerHTML=
@@ -9527,7 +11040,9 @@ function rInvs(q,pg){
 }
 function filterInvs(f){
   INV_PAGE=0;var td=tday();
-  var fil=[].concat(D.invoices).reverse();
+  // BOOKS (2026-07-30): same reasoning as rInvs() above — this dropdown filter
+  // is a separate render path over the same list, so it needs the same reach.
+  var fil=[].concat(invoicesWithBooks()).reverse();
   if(f==="Paid")fil=fil.filter(function(i){return i.paid>=i.amount;});
   else if(f==="Unpaid")fil=fil.filter(function(i){return i.paid<i.amount&&(!i.due||i.due>=td);});
   else if(f==="Overdue")fil=fil.filter(function(i){return i.paid<i.amount&&i.due&&i.due<td&&!i.voided&&_invoiceOrderActive(i);}); // FIX (2026-07-28): "overdue" means collectable + past due — exclude voided (written-off) and cancelled/deleted-order invoices, matching the debtors-page KPI and custDebt.
@@ -9604,6 +11119,7 @@ function saveInv(){
       // real one. Sanitising here matches the create path exactly; the two
       // render sinks are hardened separately as defence in depth.
       i.cId=cId;i.amount=_round2(a);i.due=el("ivd").value;i.notes=sanitizeInput(el("ivn").value);
+      _stampRecordEdit(i); // F6 (2026-07-30): the manual invoice edit (manager+). Only `amount` is revision-arbitrated by the merge today — see the NOT-YET-ARBITRATED note on _mergeInvoicePayments for cId/due/notes, which this same edit also changes.
       // Only touch paid/payments if no real payments exist yet
       if(!i.payments||!i.payments.length){
         i.paid=_round2(p);
@@ -9614,8 +11130,9 @@ function saveInv(){
         i.paid=_round2(i.payments.reduce(function(s,py){return s+(py.amt||0);},0));
       }
       // Sync linked order
-      var ordMatch=i.notes&&i.notes.match(/#(\d+)/);
-      var _o5=i.orderId?(D.orders||[]).find(function(x){return x.id===i.orderId;}):(ordMatch?(D.orders||[]).find(function(x){return String(x.id)===ordMatch[1];}):null);
+      // L1/C1 FIX (2026-07-30): was a first-match /#(\d+)/ scrape of free-text notes that a
+      // payment reference could hijack — see _orderForInvoice for the full mechanism.
+      var _o5=_orderForInvoice(i);
       if(_o5){if(i.paid>=i.amount){_o5.paid="Paid";}else if(i.paid>0){_o5.paid="Partial";}else{_o5.paid="Unpaid";}_o5.amtPaid=i.paid;}
       cm("m-iv");rInvs(undefined,INV_PAGE);dirty();toast("Invoice #"+editId+" updated");
       return;
@@ -9664,7 +11181,9 @@ function ackPendingPay(id){
     var apply=Math.min(remaining,inv.amount-inv.paid);
     if(apply>0){
       if(!inv.payments)inv.payments=[];
-      inv.payments.push({pid:uid(),srcPp:pp.id,date:tday(),amt:apply,method:pp.method,ref:"Staff collection by "+pp.collectedBy+" — ack by "+CU.name});
+      var _ackPid=uid();
+      inv.payments.push({pid:_ackPid,srcPp:pp.id,date:tday(),amt:apply,method:pp.method,ref:"Staff collection by "+pp.collectedBy+" — ack by "+CU.name});
+      _outboxPutPayment(inv.id,_ackPid); // B2: director acknowledging staff cash — durable copy of the posting
       inv.paid=_round2(inv.payments.reduce(function(s,p){return s+(p.amt||0);},0));
       remaining-=apply;
       var o=(D.orders||[]).find(function(x){return x.id===pp.ordId;});
@@ -9802,14 +11321,26 @@ function rDebts(q,pg){
   var _dwkStart=new Date(_dnow);_dwkStart.setDate(_dnow.getDate()-(_ddow===0?6:_ddow-1));
   var _dwkS=_ymd(_dwkStart); // local-safe
   var _dmo=_dnow.getFullYear()+"-"+String(_dnow.getMonth()+1).padStart(2,"0");
+  // BOOKS (2026-07-30): debt itself needs NO merge — custDebt()/_invoiceOrderActive()
+  // and the periodInvs/gross-debt math below only ever look at UNPAID invoices, and
+  // the archive rule (_isArchivableInvoice) refuses to archive anything unpaid. So an
+  // invoice this page would count as debt can never have left the live document —
+  // debt correctness holds with zero changes here, by construction, not by luck.
+  // ordersWithBooks() is used ONLY below for the cosmetic "last order" date, which
+  // CAN legitimately point at an old, since-archived, fully-settled order (e.g. a
+  // credit-covered customer with no open debt) — without it that date would go
+  // blank for exactly the customers this screen most wants to reassure a director
+  // about.
+  var _debtOrdAll=ordersWithBooks();
   var debtors=(D.customers||[]).map(function(c){
     // Period-scoped debt: find orders in this period and their unpaid invoices
     var allInvs=(D.invoices||[]).filter(function(i){return i.cId===c.id&&i.paid<i.amount&&!i.voided&&_invoiceOrderActive(i);});
     var periodInvs=(DEBT_PERIOD==="all")?allInvs:allInvs.filter(function(i){
       // Use the linked order's date — the actual date the debt was created
       var ordDate="";
-      var ordMatch=i.notes&&i.notes.match(/#(\d+)/);
-      var _o=i.orderId?(D.orders||[]).find(function(x){return x.id===i.orderId;}):(ordMatch?(D.orders||[]).find(function(x){return String(x.id)===ordMatch[1];}):null);
+      // L1/C1 FIX (2026-07-30): was a first-match /#(\d+)/ scrape of free-text notes that a
+      // payment reference could hijack — see _orderForInvoice for the full mechanism.
+      var _o=_orderForInvoice(i);
       if(_o)ordDate=_o.date||"";
       if(!ordDate)return false; // no linked order = exclude from period views
       if(DEBT_PERIOD==="today") return ordDate===td;
@@ -9839,7 +11370,7 @@ function rDebts(q,pg){
        change can show "gross vs net" side by side without recomputing. */
     var _cr=(c.credit>0)?c.credit:0;
     var debt=Math.max(0,_grossDebt-_cr);
-    var lastOrd=[].concat(D.orders).filter(function(o){return o.cId===c.id;}).sort(function(a,b){return b.date>a.date?1:-1;})[0];
+    var lastOrd=[].concat(_debtOrdAll).filter(function(o){return o.cId===c.id;}).sort(function(a,b){return b.date>a.date?1:-1;})[0];
     var ov=periodInvs.filter(function(i){return i.due&&i.due<td;}).length;
     var old2=periodInvs.length?periodInvs.map(function(i){return i.due;}).filter(Boolean).sort()[0]:null;
     return{c:c,debt:debt,gross:_grossDebt,credit:_cr,lastOrd:lastOrd,invCount:periodInvs.length,ov:ov,oldest:old2};
@@ -9850,7 +11381,7 @@ function rDebts(q,pg){
     debtors=D.customers
       .filter(function(cu){return cu.credit>0;})
       .map(function(cu){
-        var lastOrd=[].concat(D.orders).filter(function(o){return o.cId===cu.id;}).sort(function(a,b){return b.date>a.date?1:-1;})[0];
+        var lastOrd=[].concat(_debtOrdAll).filter(function(o){return o.cId===cu.id;}).sort(function(a,b){return b.date>a.date?1:-1;})[0];
         return {c:cu,debt:custDebt(cu.id),credit:cu.credit||0,lastOrd:lastOrd,ov:0,oldest:null};
       })
       .sort(function(a,b){return b.credit-a.credit;});
@@ -10097,6 +11628,7 @@ function saveCmp(){
     if(ex){
       ex.cId=parseInt(el("cmp-c").value);ex.type=el("cmp-t").value;
       ex.details=det;ex.action=sanitizeInput(el("cmp-act").value);ex.status=el("cmp-s").value;
+      _stampRecordEdit(ex); // F1 EXTENSION (2026-07-30): see saveSt. The Resolved ratchet already covered the terminal state; this covers resolution notes and Open -> In progress
       var cs2=el("cmp-c-search");if(cs2){cs2.disabled=false;cs2.value="";}
       if(el("cmp-c"))el("cmp-c").value="";
       if(editIdEl)editIdEl.value="";
@@ -10246,6 +11778,7 @@ function saveOff(){
       // OVERCHARGED, and prod was a raw stored-XSS sink in rOffers.
       o.title=t;o.disc=Math.max(0,Math.min(100,parseInt(el("ofd").value)||0));o.minqty=parseInt(el("ofmq").value)||1;
       o.prod=sanitizeInput(el("ofp").value);o.start=el("ofs").value;o.end=el("ofe").value;o.desc=sanitizeInput(el("ofdesc").value);
+      _stampRecordEdit(o); // F1 EXTENSION (2026-07-30): see saveSt — disc feeds order pricing, so a rejected edit here mis-prices real sales on every other device
       cm("m-of");rOffers();dirty();toast("Offer updated");
       return;
     }
@@ -10253,7 +11786,10 @@ function saveOff(){
   (D.offers||[]).push({id:uid(),title:t,disc:Math.max(0,Math.min(100,parseInt(el("ofd").value)||0)),minqty:parseInt(el("ofmq").value)||1,prod:sanitizeInput(el("ofp").value),start:el("ofs").value,end:el("ofe").value,desc:sanitizeInput(el("ofdesc").value),active:true});
   el("oft").value="";el("ofd").value="";el("ofmq").value="1";el("ofdesc").value="";cm("m-of");rOffers();dirty();toast("Offer created");
 }
-function togOf(id){if(!can("aOff"))return;var o=(D.offers||[]).find(function(x){return x.id===id;});if(o)o.active=!o.active;rOffers();dirty();}
+// F1 EXTENSION (2026-07-30): `active` is in _offPreserveFields, so an un-stamped toggle
+// was reverted cross-device exactly like a disc edit — a promotion switched off on the
+// iPad silently came back on, and kept discounting orders on every other device.
+function togOf(id){if(!can("aOff"))return;var o=(D.offers||[]).find(function(x){return x.id===id;});if(o){o.active=!o.active;_stampRecordEdit(o);}rOffers();dirty();}
 function editOf(id){
   if(!can("eOff"))return;
   var o=(D.offers||[]).find(function(x){return x.id===id;});if(!o)return;
@@ -10290,7 +11826,9 @@ var RPT_FROM="";var RPT_TO="";
 function exportReportXL(){
   if(!can("exp")){toast("Director only","err");return;}
   var from=RPT_FROM||"";var to2=RPT_TO||tday();
-  var delivered=(D.orders||[]).filter(function(o){
+  // BOOKS (2026-07-30): same reach as rReports() below — an Excel export over an
+  // "All time"/historical range must include archived (settled+old) deliveries too.
+  var delivered=(ordersWithBooks()||[]).filter(function(o){
     var dd=o.deliveredAt||o.date;if(o.status!=="Delivered")return false;
     if(from&&dd<from)return false;if(to2&&dd>to2)return false;return true;
   });
@@ -10318,7 +11856,14 @@ function exportReportXL(){
 }
 function rReports(){
   var pg=el("pg-reports");if(!pg)return;
-  var del=(D.orders||[]).filter(function(o){
+  // BOOKS (2026-07-30): Reports supports an explicit "All time" view and arbitrary
+  // RPT_FROM/RPT_TO ranges — exactly the kind of lookback that can reach into
+  // already-archived (settled+old) months. Read through the merged accessors
+  // (identical to D.orders/D.invoices with zero books loaded) once here, then use
+  // these locals everywhere below instead of the raw D arrays.
+  var _rptOrdAll=ordersWithBooks();
+  var _rptInvAll=invoicesWithBooks();
+  var del=_rptOrdAll.filter(function(o){
     if(o.status!=="Delivered")return false;
     if(RPT_FROM||RPT_TO){
       // Date range selected: use deliveredAt for accuracy
@@ -10349,15 +11894,16 @@ function rReports(){
   // period. Restricting to delivered-order ids aligns the two: revenue is recognised
   // at delivery and reduced only by write-offs of that same recognised revenue.
   var _delIds={};del.forEach(function(o){_delIds[o.id]=true;});
-  var writtenOff=(D.invoices||[]).filter(function(i){
+  var writtenOff=_rptInvAll.filter(function(i){
     if(!i.voided)return false;
     if(i.orderId)return !!_delIds[i.orderId];
-    var _wm=i.notes&&i.notes.match(/#(\d+)/);
-    return !!(_wm&&_delIds[parseInt(_wm[1])]);
+    // L1 FIX (2026-07-30): same as above — notes-only plus first-match scrape.
+    var _wo=_linkedOrderIdOf(i);
+    return !!(_wo!=null&&_delIds[_wo]);
   }).reduce(function(a,i){return a+(i.amount-i.paid);},0);
   var rev=del.reduce(function(a,o){return a+o.qty*o.price;},0)-writtenOff;
   var cost=del.reduce(function(a,o){return a+o.qty*(o.cost||0);},0);
-  var btlIss=(D.orders||[]).filter(function(o){return o.bottle_after&&o.bottle_after!=="Good";}).length;
+  var btlIss=_rptOrdAll.filter(function(o){return o.bottle_after&&o.bottle_after!=="Good";}).length;
   // Driver performance
   // Driver performance: group by who COMPLETED the delivery (completedBy)
   // Fall back to assigned driver if completedBy not set (legacy orders)
@@ -10382,8 +11928,9 @@ function rReports(){
     // inflating the AR-aging buckets the directors act on (chasing dead debt).
     if(!_invoiceOrderActive(i))return false;
     if(!RPT_FROM&&!RPT_TO)return true;
-    var ordMatch=i.notes&&i.notes.match(/#(\d+)/);
-    var _ao=i.orderId?(D.orders||[]).find(function(x){return x.id===i.orderId;}):(ordMatch?(D.orders||[]).find(function(x){return String(x.id)===ordMatch[1];}):null);
+    // L1/C1 FIX (2026-07-30): was a first-match /#(\d+)/ scrape of free-text notes that a
+    // payment reference could hijack — see _orderForInvoice for the full mechanism.
+    var _ao=_orderForInvoice(i);
     if(_ao&&_ao.date){
       if(RPT_FROM&&_ao.date<RPT_FROM)return false;
       if(RPT_TO&&_ao.date>RPT_TO)return false;
@@ -10502,8 +12049,8 @@ function rReports(){
       "<div class=\"card\"><div class=\"ct\"><div class=\"ctl\"><i class=\"ti ti-droplet\"></i>Bottle condition</div></div>"+
         "<div class=\"tw\"><table><thead><tr><th>Condition</th><th>Count</th><th>%</th></tr></thead><tbody>"+
         ["Good","Cracked","Damaged","Missing"].map(function(cond){
-          var cnt=(D.orders||[]).filter(function(o){return o.bottle_after===cond||(cond==="Good"&&!o.bottle_after&&o.status==="Delivered");}).length;
-          var tot=Math.max((D.orders||[]).filter(function(o){return o.status==="Delivered";}).length,1);
+          var cnt=_rptOrdAll.filter(function(o){return o.bottle_after===cond||(cond==="Good"&&!o.bottle_after&&o.status==="Delivered");}).length;
+          var tot=Math.max(_rptOrdAll.filter(function(o){return o.status==="Delivered";}).length,1);
           return "<tr><td>"+btl(cond)+"</td><td style=\"font-weight:700\">"+cnt+"</td><td>"+Math.round(cnt/tot*100)+"%</td></tr>";
         }).join("")+
         "</tbody></table></div>"+
@@ -11134,6 +12681,7 @@ function rExcel(){
         "<button class=\"btn btn-navy\" onclick=\"showBackupHistory()\"><i class=\"ti ti-history\"></i> View backup history</button>"+
         "<button class=\"btn\" style=\"background:#c0392b;color:#fff\" onclick=\"showMissingOrders()\" title=\"Find orders in the audit log with no matching live order\"><i class=\"ti ti-search\"></i> Find missing orders</button>"+
         "<button class=\"btn\" style=\"background:#b9770e;color:#fff\" onclick=\"showHealReview()\" title=\"Review orders that a self-heal restored: which are duplicates of a hand re-entry, which were reverted, which are genuinely recovered\"><i class=\"ti ti-file-search\"></i> Review restored orders</button>"+
+        "<button class=\"btn\" style=\"background:#1a1560;color:#fff\" onclick=\"showBooksPanel()\" title=\"Archive settled, old orders/invoices out of the live document — outstanding debt is never touched\"><i class=\"ti ti-archive\"></i> Books</button>"+
         "<button class=\"btn\" style=\"background:#7c3aed;color:#fff\" onclick=\"runAutoBackup();toast('Backup snapshot saved to cloud')\"><i class=\"ti ti-device-floppy\"></i> Snapshot now</button>"+
       "</div>"+
       "<div id=\"backup-history\" style=\"margin-top:14px\"></div>"+
@@ -11382,6 +12930,12 @@ function savePin(){
     if(conflict){errEl.textContent="That PIN is already used by "+conflict.name+" — choose a different one";return;}
     hashPinSalted(p1).then(function(saltedP1){
       u.pin=saltedP1||p1;
+      /* F1 EXTENSION (2026-07-30): stamp the PIN change so other devices accept it. This is
+         the security half of the fix — without the stamp, every other device rejected the
+         new hashed PIN in favour of the old one it still held, then wrote the OLD hash back
+         to the shared document, so the revoked PIN kept working. Stamped BEFORE the CU sync
+         below so the current user's own session and the USERS record carry the same rev. */
+      _stampRecordEdit(u);
       // If changing own PIN, update CU too
       if(u.id===CU.id)CU.pin=saltedP1||p1;
       cm("m-pin");rUsers();
@@ -11411,11 +12965,41 @@ function delU(id){if(!can("mUsers"))return;var toDel=(USERS||[]).find(function(u
 function buildBackupWB(){
   if(!can("exp"))return null;
   var wb=XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.customers||[]).map(function(c){return{ID:c.id,Name:unescapeForEdit(c.name),Phone:unescapeForEdit(c.phone),Phone2:unescapeForEdit(c.phone2||""),IDNo:unescapeForEdit(c.idno||""),Estate:unescapeForEdit(c.estate||""),Court:unescapeForEdit(c.court||""),HouseNo:unescapeForEdit(c.house||""),HouseType:c.htype||"",Road:unescapeForEdit(c.road||""),Zone:unescapeForEdit(c.zone||""),Type:c.ctype,Credit:c.credit||0,CreditLimit:c.creditLimit||0,CreditLog:c.creditLog&&c.creditLog.length?JSON.stringify(c.creditLog):"",Notes:unescapeForEdit(c.notes||""),Created:c.created||""};})),"Customers");
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.orders||[]).map(function(o){var c=(D.customers||[]).find(function(x){return x.id===o.cId;});return{ID:o.id,CustomerID:o.cId,CustomerName:c?unescapeForEdit(c.name):"",Product:unescapeForEdit(o.prod),StockID:o.stockId||"",InvoiceID:o.invoiceId||"",Qty:o.qty,UnitPrice:o.price,Total:o.qty*o.price,Date:o.date,Status:o.status,Payment:o.paid,AmtPaid:o.amtPaid||0,Driver:unescapeForEdit(o.driver||""),DeliveryAddr:unescapeForEdit(o.deliver||""),BottleBefore:o.bottle_before||"",BottleAfter:o.bottle_after||"",Notes:unescapeForEdit(o.notes||"")};})),"Orders");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.customers||[]).map(function(c){return{ID:c.id,Name:unescapeForEdit(c.name),Phone:unescapeForEdit(c.phone),Phone2:unescapeForEdit(c.phone2||""),IDNo:unescapeForEdit(c.idno||""),Estate:unescapeForEdit(c.estate||""),Court:unescapeForEdit(c.court||""),HouseNo:unescapeForEdit(c.house||""),HouseType:c.htype||"",Road:unescapeForEdit(c.road||""),Zone:unescapeForEdit(c.zone||""),Type:c.ctype,Credit:c.credit||0,CreditLimit:c.creditLimit||0,CreditLog:c.creditLog&&c.creditLog.length?JSON.stringify(c.creditLog):"",Notes:unescapeForEdit(c.notes||""),Created:c.created||"",
+    // B6 (2026-07-30): water cycle is a customer ENTITLEMENT (8 bottles). It was absent
+    // from this "full" backup entirely, so a restore lost every earned cycle and its
+    // provenance — the recompute would rebuild counts but stamp every history entry
+    // "System (sync)", erasing who/when. Real data: 8 customers have already earned one.
+    WaterCycle:c.waterCycle||0,
+    CycleHistoryJSON:(c.cycleHistory&&c.cycleHistory.length)?JSON.stringify(c.cycleHistory):""};})),"Customers");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((ordersWithBooks()||[]).map(function(o){var c=(D.customers||[]).find(function(x){return x.id===o.cId;});return{ID:o.id,CustomerID:o.cId,CustomerName:c?unescapeForEdit(c.name):"",Product:unescapeForEdit(o.prod),StockID:o.stockId||"",InvoiceID:o.invoiceId||"",Qty:o.qty,UnitPrice:o.price,Total:o.qty*o.price,Date:o.date,Status:o.status,Payment:o.paid,AmtPaid:o.amtPaid||0,Driver:unescapeForEdit(o.driver||""),DeliveryAddr:unescapeForEdit(o.deliver||""),BottleBefore:o.bottle_before||"",BottleAfter:o.bottle_after||"",Notes:unescapeForEdit(o.notes||""),
+    // B6 (2026-07-30): deliveredAt orders the water-cycle tally and feeds archive age;
+    // prodConfirmed gates whether stock was ever deducted. Both were silently dropped,
+    // so a restored order could mis-order cycles or double-restore stock on delete.
+    DeliveredAt:o.deliveredAt||"",
+    ProdConfirmed:(o.prodConfirmed===false?"No":"Yes")};})),"Orders");
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.stock||[]).map(function(s){return{ID:s.id,Name:unescapeForEdit(s.name),Size:unescapeForEdit(s.size||""),SalePrice:s.price,CostPrice:s.cost,InStock:s.qty,MinLevel:s.min};})),"Stock");
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.offers||[]).map(function(o){return{ID:o.id,Title:unescapeForEdit(o.title),Discount:o.disc,MinQty:o.minqty,Product:unescapeForEdit(o.prod),StartDate:o.start,EndDate:o.end,Description:unescapeForEdit(o.desc||""),Active:o.active?"Yes":"No"};})),"Offers");
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.invoices||[]).map(function(i){var c=(D.customers||[]).find(function(x){return x.id===i.cId;});var lp=(i.payments||[]).slice().sort(function(a,b){return b.date>a.date?1:-1;})[0];return{ID:i.id,OrderID:i.orderId||"",CustomerID:i.cId,CustomerName:c?unescapeForEdit(c.name):"",Amount:i.amount,Paid:i.paid,Balance:i.amount-i.paid,DueDate:i.due,IssueDate:i.date,Notes:unescapeForEdit(i.notes||""),LastPayDate:lp?lp.date:"",LastPayAmt:lp?lp.amt:0,LastPayMethod:lp?unescapeForEdit(lp.method||""):""};})),"Invoices");
+  // BOOKS (2026-07-30): this workbook is the director's own "Save full backup" —
+  // explicitly named and described as complete, and the cross-device merge tool
+  // ("share this file to merge on any other device"). Reading raw D.orders/
+  // D.invoices here would make a "full" backup silently incomplete the moment
+  // any history is archived. Both sheets now read through the merged accessors
+  // (identical to the raw D arrays with zero books loaded).
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((invoicesWithBooks()||[]).map(function(i){var c=(D.customers||[]).find(function(x){return x.id===i.cId;});var lp=(i.payments||[]).slice().sort(function(a,b){return b.date>a.date?1:-1;})[0];return{ID:i.id,OrderID:i.orderId||"",CustomerID:i.cId,CustomerName:c?unescapeForEdit(c.name):"",Amount:i.amount,Paid:i.paid,Balance:i.amount-i.paid,DueDate:i.due,IssueDate:i.date,Notes:unescapeForEdit(i.notes||""),LastPayDate:lp?lp.date:"",LastPayAmt:lp?lp.amt:0,LastPayMethod:lp?unescapeForEdit(lp.method||""):"",
+    /* B6 FIX (2026-07-30) — THIS WORKBOOK WAS NOT A SAFE RESTORE SOURCE.
+       Found by analysing the owner's real 2026-07-31 backup: the Invoices sheet carried
+       NO voided flag and only a LastPay* SUMMARY, never the payments array. So a
+       clear-and-restore from this file would (a) resurrect every voided / written-off
+       invoice as LIVE COLLECTABLE DEBT, and (b) collapse real payment history to one
+       reconstructed entry per invoice. The file is named "Backup" and described as
+       complete, and the owner was planning a full downtime rebuild from it — which
+       would have destroyed the very debt accuracy the rebuild was meant to protect.
+       Voided and the full payments array are now exported. Old files without these
+       columns still restore exactly as before (see restoreXL's fallbacks), so existing
+       backups are not invalidated. */
+    Voided:(i.voided?"Yes":"No"),
+    PaymentsJSON:(i.payments&&i.payments.length)?JSON.stringify(i.payments):""};})),"Invoices");
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.complaints||[]).map(function(c){var cu=(D.customers||[]).find(function(x){return x.id===c.cId;});return{ID:c.id,CustomerID:c.cId,CustomerName:cu?unescapeForEdit(cu.name):"",Type:c.type,Details:unescapeForEdit(c.details||""),ActionTaken:unescapeForEdit(c.action||""),Status:c.status,Date:c.date};})),"Complaints");
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.routes||[]).map(function(r){return{Name:unescapeForEdit(r.name||""),Driver:unescapeForEdit(r.driver||""),Vehicle:unescapeForEdit(r.vehicle||""),Zone:unescapeForEdit(r.zone||""),Days:r.days};})),"DeliveryRoutes");
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((USERS||[]).map(function(u){return{ID:u.id,Name:unescapeForEdit(u.name),Role:u.role,Initials:u.ini};})),"Team");
@@ -11424,7 +13008,12 @@ function buildBackupWB(){
   // column - the balance was written under the CreditLimit header instead)
   // and refuse to misread it rather than silently zeroing real credit
   // balances or turning them into bogus credit limits.
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet([{FormatVersion:2,Note:"Credit and CreditLimit are separate columns from this version onward"}]),"_Meta");
+  // FormatVersion 3 (2026-07-30, finding B6): adds Invoices.Voided + Invoices.PaymentsJSON,
+  // Orders.DeliveredAt + Orders.ProdConfirmed, Customers.WaterCycle + Customers.CycleHistoryJSON.
+  // Before v3 this workbook could NOT round-trip: a restore resurrected voided invoices as
+  // live debt and flattened payment history. restoreXL reads all six conditionally, so v1/v2
+  // files still restore exactly as they did before.
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet([{FormatVersion:3,Note:"v2+: Credit/CreditLimit separate. v3+: invoice Voided + full PaymentsJSON, order DeliveredAt/ProdConfirmed, customer WaterCycle/CycleHistoryJSON — required for a lossless restore."}]),"_Meta");
   return wb;
 }
 function saveXL(){
@@ -11445,7 +13034,13 @@ function saveXL(){
   toast("Backup saved — keep this file safe!");
 }
 function printInvoice(invId){
-  var i=(D.invoices||[]).find(function(x){return x.id===invId;});if(!i)return;
+  // BOOKS (2026-07-30): reprinting an old receipt ("customer lost their copy,
+  // can you print the one from March?") is a genuine, ordinary request that
+  // doesn't stop being valid just because the invoice has since been settled,
+  // aged 60+ days, and archived — unlike void/payment actions (which only ever
+  // target an invoice that's still unpaid, and therefore never archived), a
+  // reprint has to reach archived history too.
+  var i=(invoicesWithBooks()||[]).find(function(x){return x.id===invId;});if(!i)return;
   var cu=(D.customers||[]).find(function(x){return x.id===i.cId;});if(!cu)cu={name:"Unknown",address:""};
   var pays=(i.payments||[]).map(function(p){
     return "<tr><td>"+fmt(p.date)+"</td><td>"+p.method+"</td><td>"+( p.ref||"")+"</td><td style='text-align:right'>KSh "+p.amt.toLocaleString()+"</td></tr>";
@@ -11505,7 +13100,13 @@ function printStatement(cId){
   // payment history); Balance Due is taken straight from custDebt() so the
   // customer-facing figure matches the debtors page and dashboard exactly,
   // including store-credit netting.
-  var invs=(D.invoices||[]).filter(function(i){return i.cId===cId&&!i.voided&&_invoiceOrderActive(i);}).sort(function(a,b){return a.date>b.date?1:-1;});
+  // BOOKS (2026-07-30): this statement is explicitly "Period: All time" — the exact
+  // screen the owner means by "trace users with even years of debts." A settled
+  // invoice this old could since have been archived into a book, so it must be read
+  // through invoicesWithBooks() (identical to D.invoices with zero books loaded) or
+  // an old, fully-paid invoice would silently vanish from a customer's own history
+  // even though the money was never in question.
+  var invs=(invoicesWithBooks()||[]).filter(function(i){return i.cId===cId&&!i.voided&&_invoiceOrderActive(i);}).sort(function(a,b){return a.date>b.date?1:-1;});
   var totalAmt=invs.reduce(function(s,i){return s+i.amount;},0);
   var totalPaid=invs.reduce(function(s,i){return s+i.paid;},0);
   var storeCredit=(cu.credit>0)?_round2(cu.credit):0;
@@ -12052,9 +13653,12 @@ function xSheet(name){
   var td=tday();
   var sheets={
     "Customers":(D.customers||[]).map(function(c){return{Name:unescapeForEdit(c.name),Phone:unescapeForEdit(c.phone),Estate:unescapeForEdit(c.estate||""),Court:unescapeForEdit(c.court||""),HouseNo:unescapeForEdit(c.house||""),Type:c.ctype,Debt:"KSh "+(custDebt(c.id)||0).toLocaleString()};}),
-    "Orders":(D.orders||[]).map(function(o){var c=(D.customers||[]).find(function(x){return x.id===o.cId;});return{OrderID:o.id,Customer:c?unescapeForEdit(c.name):"",Product:unescapeForEdit(o.prod),Qty:o.qty,Total:o.qty*o.price,Date:o.date,Status:o.status,Payment:o.paid,Bottle:o.bottle_after||o.bottle_before||""};}),
+    // BOOKS (2026-07-30): this is a director-triggered export of the same data
+    // the full backup covers — read through the merged accessors for the same
+    // reason (identical to the raw D arrays with zero books loaded).
+    "Orders":(ordersWithBooks()||[]).map(function(o){var c=(D.customers||[]).find(function(x){return x.id===o.cId;});return{OrderID:o.id,Customer:c?unescapeForEdit(c.name):"",Product:unescapeForEdit(o.prod),Qty:o.qty,Total:o.qty*o.price,Date:o.date,Status:o.status,Payment:o.paid,Bottle:o.bottle_after||o.bottle_before||""};}),
     "Stock":(D.stock||[]).map(function(s){return{Product:unescapeForEdit(s.name),Size:unescapeForEdit(s.size),Price:s.price,InStock:s.qty,MinLevel:s.min,Status:s.qty<=s.min?"Low":"OK"};}),
-    "Invoices":(D.invoices||[]).map(function(i){var c=(D.customers||[]).find(function(x){return x.id===i.cId;});return{Invoice:i.id,Customer:c?unescapeForEdit(c.name):"",Amount:i.amount,Paid:i.paid,Balance:i.amount-i.paid,Due:i.due,Status:i.paid>=i.amount?"Paid":i.due<td?"Overdue":"Unpaid"};}),
+    "Invoices":(invoicesWithBooks()||[]).map(function(i){var c=(D.customers||[]).find(function(x){return x.id===i.cId;});return{Invoice:i.id,Customer:c?unescapeForEdit(c.name):"",Amount:i.amount,Paid:i.paid,Balance:i.amount-i.paid,Due:i.due,Status:i.paid>=i.amount?"Paid":i.due<td?"Overdue":"Unpaid"};}),
     "Complaints":(D.complaints||[]).map(function(c){var cu=(D.customers||[]).find(function(x){return x.id===c.cId;});return{Customer:cu?unescapeForEdit(cu.name):"",Type:unescapeForEdit(c.type),Details:unescapeForEdit(c.details),Status:c.status,Date:c.date};}),
     "Offers":(D.offers||[]).map(function(o){return{Title:unescapeForEdit(o.title),Discount:o.disc+"%",Active:o.active?"Yes":"No",Expires:o.end};})
   };
@@ -12095,10 +13699,28 @@ function restoreXL(input){
         toast("⚠️ This backup predates the Credit/CreditLimit fix — every customer's Credit and CreditLimit have been set to ZERO (not preserved) to avoid misreading old data. Re-enter any real customer credit manually.","warn");
       }
 
-      var c=get("Customers");if(c&&c.length)D.customers=c.map(function(r){var _cLog=[];if(!_isLegacyFormat&&r.CreditLog){try{_cLog=JSON.parse(r.CreditLog);}catch(e){_cLog=[];}}return{id:(r.ID!==undefined&&r.ID!==null&&r.ID!=="")?Number(r.ID):Date.now()+Math.floor(Math.random()*1000),name:sanitizeInput(r.Name||""),phone:sanitizeInput(r.Phone||""),phone2:sanitizeInput(r.Phone2||""),idno:sanitizeInput(r.IDNo||""),estate:sanitizeInput(r.Estate||""),court:sanitizeInput(r.Court||""),house:sanitizeInput(r.HouseNo||""),htype:r.HouseType||"House",road:sanitizeInput(r.Road||""),zone:sanitizeInput(r.Zone||""),ctype:r.Type||"Residential",credit:_isLegacyFormat?0:(_numCoerce(r.Credit)),creditLimit:_isLegacyFormat?0:(_numCoerce(r.CreditLimit)),creditLog:_cLog,notes:sanitizeInput(r.Notes||""),created:r.Created||""};});
+      var c=get("Customers");if(c&&c.length)D.customers=c.map(function(r){var _cLog=[];if(!_isLegacyFormat&&r.CreditLog){try{_cLog=JSON.parse(r.CreditLog);}catch(e){_cLog=[];}}var _c={id:(r.ID!==undefined&&r.ID!==null&&r.ID!=="")?Number(r.ID):Date.now()+Math.floor(Math.random()*1000),name:sanitizeInput(r.Name||""),phone:sanitizeInput(r.Phone||""),phone2:sanitizeInput(r.Phone2||""),idno:sanitizeInput(r.IDNo||""),estate:sanitizeInput(r.Estate||""),court:sanitizeInput(r.Court||""),house:sanitizeInput(r.HouseNo||""),htype:r.HouseType||"House",road:sanitizeInput(r.Road||""),zone:sanitizeInput(r.Zone||""),ctype:r.Type||"Residential",credit:_isLegacyFormat?0:(_numCoerce(r.Credit)),creditLimit:_isLegacyFormat?0:(_numCoerce(r.CreditLimit)),creditLog:_cLog,notes:sanitizeInput(r.Notes||""),created:r.Created||""};
+        /* B6 (2026-07-30): restore the water-cycle ENTITLEMENT and its provenance when the
+           file carries them. Without this a restore dropped both; runIntegrityCheck would
+           rebuild the counts from delivered orders but stamp every history entry
+           "System (sync)", erasing who recorded each cycle and when. Only set when present,
+           so an older workbook restores exactly as before. */
+        if(r.WaterCycle!==undefined&&r.WaterCycle!==null&&r.WaterCycle!=="")_c.waterCycle=_numCoerce(r.WaterCycle);
+        if(r.CycleHistoryJSON){
+          try{
+            var _ch=JSON.parse(r.CycleHistoryJSON);
+            if(Object.prototype.toString.call(_ch)==="[object Array]")_c.cycleHistory=_ch;
+          }catch(e){}
+        }
+        return _c;});
       else if(c)D.customers=[];
 
-      var o=get("Orders");if(o&&o.length)D.orders=o.map(function(r){var _pStatus=["Paid","Partial","Unpaid","Cancelled"].indexOf(r.Payment)!==-1?r.Payment:"Unpaid";return{id:(r.ID!==undefined&&r.ID!==null&&r.ID!=="")?Number(r.ID):Date.now()+Math.floor(Math.random()*1000),cId:_numCoerce(r.CustomerID),prod:sanitizeInput(r.Product||""),stockId:r.StockID?_numCoerce(r.StockID):null,invoiceId:r.InvoiceID?_numCoerce(r.InvoiceID):null,qty:_numCoerce(r.Qty),price:_numCoerce(r.UnitPrice),date:r.Date||"",status:r.Status||"Pending",paid:_pStatus,amtPaid:_numCoerce(r.AmtPaid),driver:sanitizeInput(r.Driver||""),deliver:sanitizeInput(r.DeliveryAddr||""),bottle_before:sanitizeInput(r.BottleBefore||"Good"),bottle_after:r.BottleAfter?sanitizeInput(r.BottleAfter):null,notes:sanitizeInput(r.Notes||"")};});
+      var o=get("Orders");if(o&&o.length)D.orders=o.map(function(r){var _pStatus=["Paid","Partial","Unpaid","Cancelled"].indexOf(r.Payment)!==-1?r.Payment:"Unpaid";var _o={id:(r.ID!==undefined&&r.ID!==null&&r.ID!=="")?Number(r.ID):Date.now()+Math.floor(Math.random()*1000),cId:_numCoerce(r.CustomerID),prod:sanitizeInput(r.Product||""),stockId:r.StockID?_numCoerce(r.StockID):null,invoiceId:r.InvoiceID?_numCoerce(r.InvoiceID):null,qty:_numCoerce(r.Qty),price:_numCoerce(r.UnitPrice),date:r.Date||"",status:r.Status||"Pending",paid:_pStatus,amtPaid:_numCoerce(r.AmtPaid),driver:sanitizeInput(r.Driver||""),deliver:sanitizeInput(r.DeliveryAddr||""),bottle_before:sanitizeInput(r.BottleBefore||"Good"),bottle_after:r.BottleAfter?sanitizeInput(r.BottleAfter):null,notes:sanitizeInput(r.Notes||"")};
+        // B6 (2026-07-30): only set these when the file actually carries them, so an older
+        // workbook restores byte-identically to before rather than gaining invented values.
+        if(r.DeliveredAt)_o.deliveredAt=r.DeliveredAt;
+        if(r.ProdConfirmed!==undefined&&r.ProdConfirmed!==null&&r.ProdConfirmed!=="")_o.prodConfirmed=String(r.ProdConfirmed).toLowerCase()!=="no";
+        return _o;});
       else if(o)D.orders=[];
 
       var s=get("Stock");if(s&&s.length)D.stock=s.map(function(r){return{id:(r.ID!==undefined&&r.ID!==null&&r.ID!=="")?Number(r.ID):Date.now()+Math.floor(Math.random()*1000),name:sanitizeInput(r.Name||""),size:sanitizeInput(r.Size||""),price:_numCoerce(r.SalePrice),cost:_numCoerce(r.CostPrice),qty:_numCoerce(r.InStock),min:_numCoerce(r.MinLevel)||10};});
@@ -12107,7 +13729,28 @@ function restoreXL(input){
       var of=get("Offers");if(of&&of.length)D.offers=of.map(function(r){return{id:(r.ID!==undefined&&r.ID!==null&&r.ID!=="")?Number(r.ID):Date.now()+Math.floor(Math.random()*1000),title:sanitizeInput(r.Title||""),disc:_numCoerce(r.Discount),minqty:_numCoerce(r.MinQty)||1,prod:sanitizeInput(r.Product||""),start:r.StartDate||"",end:r.EndDate||"",desc:sanitizeInput(r.Description||""),active:r.Active==="Yes"};});
       else if(of)D.offers=[];
 
-      var iv=get("Invoices");if(iv&&iv.length)D.invoices=iv.map(function(r){var pays=[];if(r.LastPayAmt&&_numCoerce(r.LastPayAmt)>0)pays.push({date:r.LastPayDate||tday(),amt:_numCoerce(r.LastPayAmt),method:sanitizeInput(r.LastPayMethod||"Cash"),ref:"Restored"});return{id:(r.ID!==undefined&&r.ID!==null&&r.ID!=="")?Number(r.ID):Date.now()+Math.floor(Math.random()*1000),orderId:r.OrderID?_numCoerce(r.OrderID):null,cId:_numCoerce(r.CustomerID),amount:_numCoerce(r.Amount),paid:_numCoerce(r.Paid),due:r.DueDate||"",notes:sanitizeInput(r.Notes||""),date:r.IssueDate||tday(),payments:pays};});
+      /* B6 FIX (2026-07-30): restore the VOIDED flag and the FULL payments array when the
+         workbook carries them (FormatVersion 3+). Before this, a restore silently turned
+         every voided/written-off invoice back into live collectable debt and flattened real
+         payment history into one "Restored" entry — so a restore could not preserve the
+         debts screen it was supposed to protect.
+         BACKWARD COMPATIBLE ON PURPOSE: an older file has neither column, and falls through
+         to exactly the previous behaviour (single reconstructed payment, voided undefined).
+         Existing backups therefore remain usable, just as incomplete as they always were. */
+      var iv=get("Invoices");if(iv&&iv.length)D.invoices=iv.map(function(r){
+        var pays=[],_paysFromFile=false;
+        if(r.PaymentsJSON){
+          try{
+            var _pj=JSON.parse(r.PaymentsJSON);
+            if(Object.prototype.toString.call(_pj)==="[object Array]"){pays=_pj;_paysFromFile=true;}
+          }catch(e){pays=[];}
+        }
+        if(!_paysFromFile&&r.LastPayAmt&&_numCoerce(r.LastPayAmt)>0)pays.push({date:r.LastPayDate||tday(),amt:_numCoerce(r.LastPayAmt),method:sanitizeInput(r.LastPayMethod||"Cash"),ref:"Restored"});
+        var _out={id:(r.ID!==undefined&&r.ID!==null&&r.ID!=="")?Number(r.ID):Date.now()+Math.floor(Math.random()*1000),orderId:r.OrderID?_numCoerce(r.OrderID):null,cId:_numCoerce(r.CustomerID),amount:_numCoerce(r.Amount),paid:_numCoerce(r.Paid),due:r.DueDate||"",notes:sanitizeInput(r.Notes||""),date:r.IssueDate||tday(),payments:pays};
+        // Only ever SET voided when the column exists and says so — never clear a flag the
+        // file cannot speak about, and never invent one.
+        if(r.Voided!==undefined&&r.Voided!==null&&r.Voided!==""&&String(r.Voided).toLowerCase()!=="no")_out.voided=true;
+        return _out;});
       else if(iv)D.invoices=[];
 
       var cmp=get("Complaints");if(cmp&&cmp.length)D.complaints=cmp.map(function(r){return{id:(r.ID!==undefined&&r.ID!==null&&r.ID!=="")?Number(r.ID):Date.now()+Math.floor(Math.random()*1000),cId:_numCoerce(r.CustomerID),type:sanitizeInput(r.Type||"Other"),details:sanitizeInput(r.Details||""),action:sanitizeInput(r.ActionTaken||""),status:r.Status||"Open",date:r.Date||tday()};});
@@ -12149,9 +13792,22 @@ function syncWaterCycles(){
   // Lightweight water-only resync — no credit migration, no stock fixes
   // Safe to call after stock edit without racing the main dirty() write
   if(!CU||CU.role!=="director"||!FB_READY)return;
+  /* B5 FIX (2026-07-30): read through the books, and REFUSE outright when any closed
+     period is not loaded. This used to read D.orders directly, so the first Books close
+     would have silently reset every affected customer's water cycle: archived delivered
+     orders leave D.orders, totalBottles shrinks, totalBottles%8 yields a wrong lower
+     number, and the block below overwrites cu.waterCycle AND rebuilds cu.cycleHistory
+     from the truncated list — destroying the record of completed 8-bottle cycles, which
+     is a customer entitlement. Nothing archived yet means the live document IS the whole
+     history, so today this guard is a no-op; it arms the moment a period is closed. */
+  if(!_archivedHistoryFullyLoaded()){
+    console.log("[NDSYNC] water-cycle resync SKIPPED — a closed period is not loaded, so bottle totals cannot be proven. Cycles left untouched (refusing to guess).");
+    return;
+  }
+  var _wcOrders=ordersWithBooks();
   var changed=0;
   (D.customers||[]).forEach(function(cu){
-    var waterOrds=(D.orders||[]).filter(function(o){
+    var waterOrds=_wcOrders.filter(function(o){
       return o.cId===cu.id&&o.status==="Delivered"&&is20ltr(o.prod);
     }).sort(function(a,b){
       var da=a.deliveredAt||a.date||"";var db=b.deliveredAt||b.date||"";
@@ -12224,9 +13880,17 @@ function runIntegrityCheck(){
   // Source of truth: sum of o.qty for all delivered 20ltr orders per customer
   // Runs every director login to auto-correct any drift
   var bootstrapped=0;
-  (D.customers||[]).forEach(function(cu){
+  /* B5 FIX (2026-07-30): same defect and same fix as syncWaterCycles — this is the second,
+     more dangerous instance because runIntegrityCheck runs on every director login and
+     WRITES. Reading D.orders directly meant the first Books close would reset cycles and
+     rebuild cycleHistory from a truncated order list on the next login, then persist it.
+     Read through the books, and refuse entirely when a closed period is not loaded. */
+  var _wcLoaded=_archivedHistoryFullyLoaded();
+  if(!_wcLoaded)issues.push("Water cycles NOT recomputed — a closed period is not loaded, so bottle totals cannot be proven. Existing cycle counts left untouched.");
+  var _wcOrdersIC=_wcLoaded?ordersWithBooks():[];
+  (_wcLoaded?(D.customers||[]):[]).forEach(function(cu){
     // Find ALL delivered 20ltr water orders for this customer, sorted by date
-    var waterOrds=(D.orders||[]).filter(function(o){
+    var waterOrds=_wcOrdersIC.filter(function(o){
       return o.cId===cu.id&&o.status==="Delivered"&&is20ltr(o.prod);
     }).sort(function(a,b){
       var da=a.deliveredAt||a.date||"";
@@ -12292,15 +13956,14 @@ function runIntegrityCheck(){
   (D.invoices||[]).forEach(function(inv){
     if(inv.paid>=inv.amount||inv.voided)return; // paid or voided — ignore
     if(_isLegacyRecord(inv.date)){_legacyOrphans++;return;} // history — do not re-alert
-    if(inv.orderId){
-      var o2=(D.orders||[]).find(function(x){return x.id===inv.orderId;});
-      if(!o2)issues.push("Invoice #"+inv.id+" references deleted order #"+inv.orderId+" — KSh "+(inv.amount-inv.paid)+" outstanding");
-      return;
-    }
-    var ordMatch=inv.notes&&inv.notes.match(/#(\d+)/);
-    if(ordMatch){
-      var o=(D.orders||[]).find(function(x){return String(x.id)===ordMatch[1];});
-      if(!o)issues.push("Invoice #"+inv.id+" references deleted order #"+ordMatch[1]+" — KSh "+(inv.amount-inv.paid)+" outstanding");
+    /* L1 FIX (2026-07-30): the two branches are now one canonical lookup. The notes branch
+       used to scrape the FIRST "#digits", so an invoice whose notes carried a payment
+       reference produced a FALSE integrity alert — "references deleted order #99887766",
+       naming a number that was never an order id — while the real link went unchecked. */
+    var _oidIC=_linkedOrderIdOf(inv);
+    if(_oidIC!=null){
+      var _oIC=(D.orders||[]).find(function(x){return String(x.id)===String(_oidIC);});
+      if(!_oIC)issues.push("Invoice #"+inv.id+" references deleted order #"+_oidIC+" — KSh "+((Number(inv.amount)||0)-(Number(inv.paid)||0))+" outstanding");
     }
   });
   // Check 4: ID counter sync
@@ -12690,6 +14353,8 @@ window.addEventListener("load",function(){
       FB_DOC_REF=fbDb.collection("newdawn").doc("main");
       FB_BACKUP_COL=fbDb.collection("newdawn_backups");
       FB_EVENTS_COL=fbDb.collection("newdawn_events");
+      FB_BOOKS_COL=fbDb.collection("newdawn_books");   // PERIOD BOOKS (see the books block)
+      FB_OUTBOX_COL=fbDb.collection("newdawn_outbox"); // DURABLE ORDER OUTBOX (see the outbox block)
       FB_COUNTERS_REF=fbDb.collection("newdawn_counters").doc("main");
     }catch(e){
       var r=document.getElementById("root");
