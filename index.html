@@ -348,7 +348,7 @@ var APP_VERSION="2026-07-21-v35";
    was actually running.
    Bump this ONE line on every deploy. It is display-and-diagnostics only — nothing branches
    on it, no merge or money logic reads it, so it can never change behaviour. */
-var BUILD_STAMP="2026-07-31-hyb-a3";
+var BUILD_STAMP="2026-07-31-hyb-b4";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -1307,7 +1307,7 @@ var _hybridMigrating=false;
    one-character edit and a redeploy, not a code revert — on a live money system that
    property is worth more than tidiness. Phases 1 and 2 (backfill + verify) work either way,
    because they only ever WRITE documents and READ them back; they never change behaviour. */
-var HYBRID_COLLECTIONS_LIVE=false;
+var HYBRID_COLLECTIONS_LIVE=true;
 /* SEPARATE flag for the customers extraction, deliberately independent of the orders/invoices
    cutover (2026-07-31). Customers are 140 KB of the measured 387 KB document and are NEVER
    archived, so with only orders and invoices moved the main document still grows with the
@@ -1319,7 +1319,7 @@ var HYBRID_COLLECTIONS_LIVE=false;
    read-side merge continues to run exactly as in Build A, until the listener, the flush-loop
    entry, the payload skip and the backfill/verify coverage are all in place and proven.
    DO NOT set this true as part of the Phase 3 cutover. It is a separate, later step. */
-var HYBRID_CUSTOMERS_LIVE=false;
+var HYBRID_CUSTOMERS_LIVE=true;
 var _hybridShadow={orders:{},invoices:{},customers:{}};   // id -> JSON, last state successfully persisted
 var _hybridListenersOn=false,_hybridUnsub=[];
 /* NO-OP WRITE SUPPRESSOR state (2026-07-31) — see the long note at the txn.set site.
@@ -1809,9 +1809,75 @@ function _hybridSeedShadow(){
     (D.invoices||[]).forEach(function(i){if(i&&i.id!=null)_hybridShadow.invoices[String(i.id)]=JSON.stringify(i);});
   }catch(_){}
 }
+/* ============================================================================
+   CRITICAL FIX (2026-07-31) — FOUND IN LIVE PRODUCTION, CAUSED REAL DATA LOSS.
+
+   Captured log, a single logout->login cycle minutes after the cutover went live:
+
+     [NDSYNC]   logout SKIPPED final push — snapshot not confirmed fresh
+     [NDSYNC]   HEAL SUPPRESSED (LIVE_STATE_EMPTY): live data not loaded (customers=0, orders=0)
+     [NDHYBRID] flush: orders 0w/378d, invoices 0w/379d, customers 0w/431d   <-- 1,188 DELETES
+     [NDHYBRID] orders/hot: +377 new      (was 378)
+     [NDHYBRID] invoices/hot: +378 new    (was 379)
+     [NDHYBRID] customers/all: +430 new   (was 431)
+
+   ROOT CAUSE. Logout clears D. It does NOT clear _hybridShadow, which still holds
+   every key from the session — correctly, because clearing it would make the next
+   flush rewrite all 1,188 documents. On the following login the flush ran BEFORE the
+   collection listeners had delivered anything, so D.orders was [] while the shadow
+   held 378 keys. The "in shadow, gone from the array" branch is the delete branch, so
+   it read an unloaded D as "the user deleted every order" and issued 1,188 deletes.
+
+   The main-document write path has _dLooksEmpty guarding exactly this mistake, and the
+   read/heal path has _healLiveStateLooksLoaded (RAIL 2). The flush path — the only one
+   that can delete per-record documents — had no equivalent. That was the hole.
+
+   TWO RAILS, following this codebase's established convention that no single guard has
+   to be perfect:
+     RAIL 1 — _hybridFlushDocs returns early when NOTHING is loaded in memory. An
+       unloaded D can never legitimately mean "everything was deleted".
+     RAIL 2 — HYBRID_MAX_DELETES_PER_FLUSH: a circuit breaker in the one shared reaper
+       below. Deleting 1-5 records is a real user action; deleting hundreds is a load
+       failure, and the two must never be treated the same. This mirrors HEAL_MAX_AUTO,
+       which exists for the identical reason on the heal path.
+
+   Deliberately NOT done: clearing _hybridShadow on logout. That would leave the next
+   flush diffing against an empty shadow and rewriting all 1,188 documents — trading
+   data loss for a quota blowout. The shadow is correct; reading it without checking
+   whether D is loaded was the bug.
+   ============================================================================ */
+var HYBRID_MAX_DELETES_PER_FLUSH=5;
+
+/* ONE reaper for all three collections, rather than the same cap pasted three times —
+   a per-collection copy is how the original three delete branches drifted into having
+   no guard at all. `del` is passed in because customers delete through
+   _deleteCustomerDoc (tombstone-aware) while orders/invoices delete directly. */
+function _hybridReapDeletes(shadow,live,del,label){
+  var gone=Object.keys(shadow||{}).filter(function(k){return !live[k];});
+  if(!gone.length)return 0;
+  if(gone.length>HYBRID_MAX_DELETES_PER_FLUSH){
+    console.log("[NDHYBRID] DELETE SWEEP REFUSED ("+label+"): "+gone.length+" records are in the shadow but missing from D — that is a load failure, not "+gone.length+" deletions. NOTHING deleted; the shadow is left intact so a normal flush resumes once D is loaded.");
+    try{
+      if(typeof _reportDeviceSyncHealth==="function"&&CU)
+        _reportDeviceSyncHealth("HYBRID_DELETE_SWEEP_REFUSED",label+": refused to delete "+gone.length+" documents in one flush (cap "+HYBRID_MAX_DELETES_PER_FLUSH+"). Live state was almost certainly not loaded.");
+    }catch(_){}
+    return 0;
+  }
+  gone.forEach(function(k){try{del(k);}catch(_){}});
+  return gone.length;
+}
+
 function _hybridFlushDocs(){
   if(!HYBRID_COLLECTIONS_LIVE)return;
   if(!FB_ORDERS_COL||!FB_INVOICES_COL)return;
+  /* RAIL 1 — see the block comment above. Nothing at all in memory means D is not
+     loaded (logout clears it; a cold start has not received the listeners yet), and a
+     flush in that state can only produce deletions that were never asked for. */
+  if((D.orders||[]).length===0&&(D.invoices||[]).length===0&&(D.customers||[]).length===0){
+    if(Object.keys(_hybridShadow.orders).length||Object.keys(_hybridShadow.invoices).length||Object.keys(_hybridShadow.customers).length)
+      console.log("[NDHYBRID] flush SKIPPED — D is empty while the shadow still holds records (logout, or a cold start before the listeners arrive). Reading that as mass deletion is the bug this guard closes.");
+    return;
+  }
   /* Run the closed-period filter FIRST, before anything can be written. This is the strongest
      placement: an archived record cannot be written back if it is no longer in the array by the
      time the tracker looks. Cheap — it returns immediately unless a period is actually closed. */
@@ -1836,12 +1902,10 @@ function _hybridFlushDocs(){
       });
       wroteO++;
     });
-    // ---- orders: deleted (in shadow, gone from the array)
-    Object.keys(_hybridShadow.orders).forEach(function(k){
-      if(liveO[k])return;
+    // ---- orders: deleted (in shadow, gone from the array) — RAIL 2, see _hybridReapDeletes
+    delO2=_hybridReapDeletes(_hybridShadow.orders,liveO,function(k){
       FB_ORDERS_COL.doc(k).delete().then(function(){delete _hybridShadow.orders[k];}).catch(function(){});
-      delO2++;
-    });
+    },"orders");
     // ---- invoices: new or changed
     var liveI={};
     (D.invoices||[]).forEach(function(i){
@@ -1858,11 +1922,10 @@ function _hybridFlushDocs(){
       });
       wroteI++;
     });
-    Object.keys(_hybridShadow.invoices).forEach(function(k){
-      if(liveI[k])return;
+    // ---- invoices: deleted — RAIL 2, see _hybridReapDeletes
+    delI2=_hybridReapDeletes(_hybridShadow.invoices,liveI,function(k){
       FB_INVOICES_COL.doc(k).delete().then(function(){delete _hybridShadow.invoices[k];}).catch(function(){});
-      delI2++;
-    });
+    },"invoices");
     // ---- customers (own flag; transactional persister — see _persistCustomerDoc)
     var wroteC=0,delC2=0;
     if(HYBRID_CUSTOMERS_LIVE&&FB_CUSTOMERS_COL){
@@ -1883,11 +1946,10 @@ function _hybridFlushDocs(){
         _persistCustomerDoc(c);
         wroteC++;
       });
-      Object.keys(_hybridShadow.customers).forEach(function(k){
-        if(liveC[k])return;
+      // ---- customers: deleted — RAIL 2, see _hybridReapDeletes
+      delC2=_hybridReapDeletes(_hybridShadow.customers,liveC,function(k){
         _deleteCustomerDoc(k);delete _hybridShadow.customers[k];
-        delC2++;
-      });
+      },"customers");
     }
     if(wroteO||wroteI||delO2||delI2||wroteC||delC2)
       console.log("[NDHYBRID] flush: orders "+wroteO+"w/"+delO2+"d, invoices "+wroteI+"w/"+delI2+"d, customers "+wroteC+"w/"+delC2+"d");
