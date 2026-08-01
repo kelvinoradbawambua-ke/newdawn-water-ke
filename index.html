@@ -348,7 +348,7 @@ var APP_VERSION="2026-07-21-v35";
    was actually running.
    Bump this ONE line on every deploy. It is display-and-diagnostics only — nothing branches
    on it, no merge or money logic reads it, so it can never change behaviour. */
-var BUILD_STAMP="2026-08-01-hyb-b11";
+var BUILD_STAMP="2026-08-01-hyb-b12";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -2187,7 +2187,22 @@ function _hybridStartListeners(){
        require. It is also immune to the false-positive an emptiness test would hit on a
        legitimately empty collection, because seeding is recorded when a snapshot ARRIVES,
        not when it contains rows. */
-    if(_hybridInitialLoadDone())return;          // every required collection has delivered
+    /* Seeding alone is not sufficient: it records that a snapshot ARRIVED, not that D still
+       holds it. Logout is now handled at its source (see logout()), but any other path that
+       empties D would leave the flags claiming "loaded" against empty arrays — the exact
+       dead-screen this whole block exists to prevent.
+       The shadow is the discriminator, and it is precise: it retains a key per record known
+       to exist server-side, so shadow-has-records AND arrays-empty can only mean D was
+       cleared underneath us. On a genuinely empty database the shadow is empty too, so this
+       cannot fire — which is what stops it re-subscribing in a loop every 8 seconds. */
+    var _shadowHas=Object.keys(_hybridShadow.orders||{}).length
+                 ||Object.keys(_hybridShadow.invoices||{}).length
+                 ||Object.keys(_hybridShadow.customers||{}).length;
+    var _arraysCleared=!!_shadowHas
+                 &&(D.orders||[]).length===0
+                 &&(D.invoices||[]).length===0
+                 &&(D.customers||[]).length===0;
+    if(_hybridInitialLoadDone()&&!_arraysCleared)return;   // delivered AND still held
     /* GRACE PERIOD (2026-08-01) — without this, b10 tore the listeners down and
        re-subscribed on EVERY login. The captured log:
          starting listeners
@@ -7937,6 +7952,26 @@ function logout(){
   // login screen — not by the exact timing of the D wipe. Clearing CU here is
   // also what makes the guard at the top of _finishLogoutTeardown() meaningful.
   CU=null;SU=null;PE="";
+  /* ROOT-CAUSE FIX (2026-08-01) — the logout/login dead screen. Logout tears D down but
+     never unsubscribed the per-record collection listeners, so `_hybridSeeded` still
+     claimed all three collections had delivered. On the next login
+     _hybridInitialLoadDone() therefore returned TRUE against an EMPTY D,
+     _hybridStartListeners() returned early, nothing re-subscribed, and every screen read
+     zero — dashboard, debts, alerts. A page refresh worked because that rebuilds the whole
+     JS context, clearing the stale flags.
+
+     Captured live on b11, the second login:
+       startCloudListener called (cold)
+       snapshot received ... localOrders=0
+       flush SKIPPED — D is empty while the shadow still holds records
+       ... and no "starting listeners", no "orders/hot" at all.
+
+     Stopping here is the correct place: seeded state describes a SUBSCRIPTION, and the
+     subscription is what logout is ending. _hybridStopListeners clears _hybridSeeded and
+     _hybridListenersStartedAt, so the next login starts genuinely cold and re-subscribes.
+     This also removes the need for the empty-D restart path to fire on a normal logout —
+     that stays as the backstop for any OTHER way D gets cleared. */
+  try{_hybridStopListeners();}catch(_){}
   if(_unsyncedAtLogout){
     console.log("[NDSYNC] logout — unsynced local work detected, flushing BEFORE teardown (this used to be discarded)");
     _flushPendingWritesNow("logout",true); // force: see the QUOTA GUARD note in _flushPendingWritesNow
