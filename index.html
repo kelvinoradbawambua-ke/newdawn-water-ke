@@ -348,7 +348,7 @@ var APP_VERSION="2026-07-21-v35";
    was actually running.
    Bump this ONE line on every deploy. It is display-and-diagnostics only — nothing branches
    on it, no merge or money logic reads it, so it can never change behaviour. */
-var BUILD_STAMP="2026-08-01-hyb-b10";
+var BUILD_STAMP="2026-08-01-hyb-b11";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -1322,6 +1322,10 @@ var HYBRID_COLLECTIONS_LIVE=true;
 var HYBRID_CUSTOMERS_LIVE=true;
 var _hybridShadow={orders:{},invoices:{},customers:{}};   // id -> JSON, last state successfully persisted
 var _hybridListenersOn=false,_hybridUnsub=[];
+/* When the current subscription was established. Used only to give a brand-new
+   subscription time to deliver its first snapshot before anything judges it dead —
+   see the grace period in _hybridStartListeners. 0 means "not currently subscribed". */
+var _hybridListenersStartedAt=0;
 /* ============================================================================
    FIX (2026-08-01) — FOUND IN LIVE PRODUCTION on the first logout/login after the
    cutover. The director was prompted to restore a backup over live data.
@@ -2184,12 +2188,34 @@ function _hybridStartListeners(){
        legitimately empty collection, because seeding is recorded when a snapshot ARRIVES,
        not when it contains rows. */
     if(_hybridInitialLoadDone())return;          // every required collection has delivered
-    console.log("[NDHYBRID] listeners attached but a collection has not delivered (orders="+((D.orders||[]).length)+", invoices="+((D.invoices||[]).length)+", customers="+((D.customers||[]).length)+") — detaching and re-subscribing to force a fresh initial snapshot");
+    /* GRACE PERIOD (2026-08-01) — without this, b10 tore the listeners down and
+       re-subscribed on EVERY login. The captured log:
+         starting listeners
+         listeners attached but a collection has not delivered (orders=0, invoices=0, customers=0)
+           — detaching and re-subscribing
+         starting listeners
+         orders/hot: +378 ...
+       Of course nothing had delivered — the subscription was milliseconds old. Two
+       snapshots of the main document arrive in quick succession (cache, then server), each
+       calls this, and the second one judged a healthy brand-new subscription as failed.
+
+       Cost was real, not cosmetic: 2,378 document reads per login instead of 1,189, plus
+       the wasted round-trip, which is the login delay the owner reported. On a free tier
+       with 50k reads/day and 8 devices that is the difference between comfortable and
+       tight.
+
+       A subscription is only "not delivering" if it has had TIME to deliver. Eight seconds
+       is far longer than any healthy first snapshot in these logs (sub-second) and still
+       well inside the ~6s recovery gate plus its retry, so a genuinely dead subscription
+       is still caught and restarted. */
+    if(_hybridListenersStartedAt&&(Date.now()-_hybridListenersStartedAt)<8000)return;
+    console.log("[NDHYBRID] listeners attached but a collection has not delivered after "+Math.round((Date.now()-_hybridListenersStartedAt)/1000)+"s (orders="+((D.orders||[]).length)+", invoices="+((D.invoices||[]).length)+", customers="+((D.customers||[]).length)+") — detaching and re-subscribing to force a fresh initial snapshot");
     try{_hybridStopListeners();}catch(_){}
   }
   if(HYBRID_COLLECTIONS_LIVE&&(!FB_ORDERS_COL||!FB_INVOICES_COL))return;
   if(HYBRID_CUSTOMERS_LIVE&&!FB_CUSTOMERS_COL)return;
   _hybridListenersOn=true;
+  _hybridListenersStartedAt=Date.now();   // starts the grace period — see above
   var cut=new Date();cut.setDate(cut.getDate()-HOT_WINDOW_DAYS);
   var hotCut=cut.toISOString().split("T")[0];
   console.log("[NDHYBRID] starting listeners — hot window from "+hotCut+", plus ALL unsettled regardless of age");
@@ -2249,6 +2275,7 @@ function _hybridStartListeners(){
 function _hybridStopListeners(){
   _hybridUnsub.forEach(function(u){try{u();}catch(_){}});
   _hybridUnsub=[];_hybridListenersOn=false;
+  _hybridListenersStartedAt=0;   // no subscription -> no grace period to honour
   /* FIX (2026-08-01) — MUST clear the seeded set here. _hybridInitialLoadDone() answers
      "has live data arrived?" for checkAutoSaveRecovery. If a previous subscription's
      seeded flags survived a detach, that gate would read TRUE on the next login while D
