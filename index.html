@@ -348,7 +348,7 @@ var APP_VERSION="2026-07-21-v35";
    was actually running.
    Bump this ONE line on every deploy. It is display-and-diagnostics only — nothing branches
    on it, no merge or money logic reads it, so it can never change behaviour. */
-var BUILD_STAMP="2026-08-01-hyb-b7";
+var BUILD_STAMP="2026-08-01-hyb-b8";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -1878,6 +1878,49 @@ function _hybridSeedShadow(){
    data loss for a quota blowout. The shadow is correct; reading it without checking
    whether D is loaded was the bug.
    ============================================================================ */
+/* ============================================================================
+   _stableStr — CANONICAL, KEY-ORDER-INDEPENDENT SERIALISATION.
+
+   FIX (2026-08-01) — FOUND IN LIVE PRODUCTION. The log showed, on a reconnect where
+   nothing had changed:
+       [NDHYBRID] customers/all: +0 new, 75 updated from listener
+   and flushes of `customers 75w/0d` then `200w/0d` — hundreds of writes for no edits.
+
+   ROOT CAUSE: **Firestore does not preserve object key order.** The owner's own backup
+   proves it — the same customer's cycleHistory came back with two different key orders
+   inside one array:
+       {"ts":..,"ordId":..,"bottles":..,"event":..,"by":..,"qty":..}
+       {"by":..,"qty":..,"ts":..,"bottles":..,"ordId":..,"event":..}
+   Both the hydration comparison and the flush's change tracker used raw JSON.stringify,
+   which IS key-order sensitive. So every customer holding a creditLog or cycleHistory
+   compared as "changed" on every single snapshot: hydrate marks it dirty -> the flush
+   writes it -> the write echoes back a new snapshot -> compares changed again. A
+   self-sustaining write loop, and the reason this hit customers rather than stock: only
+   customers and invoices carry arrays of nested objects.
+
+   Why this matters beyond the noise: those writes are the daily quota and the egress
+   budget, and this is a business that has to run on the free tier for years. Comparing
+   canonically is what makes "nothing changed -> nothing written" actually true.
+
+   The replacer is applied at every nesting level by JSON.stringify, so sorting keys in it
+   canonicalises the whole tree. Falls back to plain stringify, then String(), so a compare
+   can never throw on the sync path.
+   ============================================================================ */
+function _stableStr(v){
+  try{
+    return JSON.stringify(v,function(k,val){
+      if(val&&typeof val==="object"&&!Array.isArray(val)){
+        var out={},ks=Object.keys(val).sort();
+        for(var i=0;i<ks.length;i++)out[ks[i]]=val[ks[i]];
+        return out;
+      }
+      return val;
+    });
+  }catch(_){
+    try{return JSON.stringify(v);}catch(__){return String(v);}
+  }
+}
+
 var HYBRID_MAX_DELETES_PER_FLUSH=5;
 
 /* ONE reaper for all three collections, rather than the same cap pasted three times —
@@ -1923,7 +1966,7 @@ function _hybridFlushDocs(){
       // Derive BEFORE hashing: otherwise the write would add `settled` and the very next
       // flush would see a difference and rewrite every record, forever.
       _hybridDerive("o",o);
-      var k=String(o.id),j=JSON.stringify(o);
+      var k=String(o.id),j=_stableStr(o);
       liveO[k]=true;
       if(_hybridShadow.orders[k]===j)return;                  // unchanged
       var snap=j;
@@ -1943,7 +1986,7 @@ function _hybridFlushDocs(){
     (D.invoices||[]).forEach(function(i){
       if(!i||i.id==null)return;
       _hybridDerive("i",i);   // see the orders block above — derive before hashing
-      var k=String(i.id),j=JSON.stringify(i);
+      var k=String(i.id),j=_stableStr(i);
       liveI[k]=true;
       if(_hybridShadow.invoices[k]===j)return;
       var snap=j;
@@ -1964,7 +2007,7 @@ function _hybridFlushDocs(){
       var liveC={};
       (D.customers||[]).forEach(function(c){
         if(!c||c.id==null)return;
-        var k=String(c.id),j=JSON.stringify(c);
+        var k=String(c.id),j=_stableStr(c);
         liveC[k]=true;
         if(_hybridShadow.customers[k]===j)return;
         /* The shadow advances OPTIMISTICALLY here, unlike orders/invoices. The transactional
@@ -2083,7 +2126,7 @@ function _hydrateById(arr,docs,label,arrName){
       }catch(_){rc=v;}   // a merge failure must never stop hydration
       Object.keys(rc).forEach(function(f){
         if(f==="_updatedAt")return;
-        if(JSON.stringify(tgt[f])!==JSON.stringify(rc[f])){tgt[f]=rc[f];changed=true;}
+        if(_stableStr(tgt[f])!==_stableStr(rc[f])){tgt[f]=rc[f];changed=true;}
       });
       if(changed)updated++;
     }else{
@@ -2152,7 +2195,7 @@ function _hybridStartListeners(){
         docs.forEach(function(d){
           var v=d.data();if(!v||v.id==null)return;
           var rec=(D[arrName]||[]).filter(function(r){return r&&String(r.id)===String(v.id);})[0];
-          if(rec)_hybridShadow[arrName][String(v.id)]=JSON.stringify(rec);
+          if(rec)_hybridShadow[arrName][String(v.id)]=_stableStr(rec);
         });
         if(n){try{refreshCurrentPage();}catch(_){}}
       },function(e){
@@ -15015,6 +15058,59 @@ function runIntegrityCheck(){
   var _wcLoaded=_archivedHistoryFullyLoaded();
   if(!_wcLoaded)issues.push("Water cycles NOT recomputed — a closed period is not loaded, so bottle totals cannot be proven. Existing cycle counts left untouched.");
   var _wcOrdersIC=_wcLoaded?ordersWithBooks():[];
+  /* ============================================================================
+     CRITICAL FIX (2026-08-01) — FOUND IN LIVE PRODUCTION, THIS WROTE BAD BUSINESS DATA.
+
+     Captured log, on the cutover build:
+       runIntegrityCheck AUTO-SAVING due to water cycle drift — bootstrapped=195 D.orders.length=0
+     and the audit tab filled with repeats of
+       "Water cycle synced for 116 customer(s) — quantities recomputed from delivered orders"
+
+     `_archivedHistoryFullyLoaded()` returns TRUE when nothing is archived — it proves a
+     closed PERIOD is loaded, it says nothing about whether the order list has ARRIVED.
+     Under cutover, orders live in their own collection and reach D milliseconds later, so
+     this ran with D.orders===[]. `ordersWithBooks()` was therefore empty, every customer
+     computed to totalBottles=0 -> waterCycle=0 with an empty system cycleHistory, and 195
+     customers were written that way and re-written on every login.
+
+     Fifth instance of tonight's class — logic that read D as truth before D was populated
+     — and the most damaging, because unlike the others this one WRITES DERIVED BUSINESS
+     VALUES rather than merely misjudging emptiness. It is the 8-bottle entitlements.
+
+     TWO RAILS, per this codebase's convention:
+       RAIL 1 (flag-independent): an empty order list can NEVER justify resetting bottle
+         counts that customers demonstrably hold. Zero orders with non-zero cycles is a
+         load failure, not a business event. This also protects the monolith build against
+         any future path that empties D.orders.
+       RAIL 2 (cutover-specific): require the per-record collections to have delivered at
+         least one snapshot, via the same _hybridInitialLoadDone() predicate the autosave
+         recovery gate uses.
+
+     RECOVERABILITY, verified by reading: `manualEntries` is filtered off the EXISTING
+     cycleHistory before the overwrite, so person-entered entries were never destroyed.
+     Everything else here is derived from orders, and orders were untouched — so once the
+     order list is genuinely loaded, this same code recomputes the correct values. The
+     damage self-heals; it does not need a separate repair tool.
+     ============================================================================ */
+  if(_wcLoaded){
+    var _wcHeld=(D.customers||[]).filter(function(cu){
+      return (Number(cu.waterCycle)||0)>0||((cu.cycleHistory||[]).length>0);
+    }).length;
+    if(_wcOrdersIC.length===0&&_wcHeld>0){
+      _wcLoaded=false;
+      console.log("[NDSYNC] water-cycle recompute REFUSED — 0 orders loaded but "+_wcHeld+" customer(s) hold bottle counts. That is a load failure, not a reset. Nothing written.");
+      issues.push("Water cycles NOT recomputed — the order list was empty while "+_wcHeld+" customer(s) hold bottle counts, which is a load failure rather than a reset. Existing counts left untouched.");
+    }
+  }
+  if(_wcLoaded&&(HYBRID_COLLECTIONS_LIVE||HYBRID_CUSTOMERS_LIVE)){
+    var _wcSeeded=true;
+    try{_wcSeeded=_hybridInitialLoadDone();}catch(_){_wcSeeded=true;}
+    if(!_wcSeeded){
+      _wcLoaded=false;
+      console.log("[NDSYNC] water-cycle recompute DEFERRED — the per-record collections have not delivered a snapshot yet, so bottle totals cannot be proven.");
+      issues.push("Water cycles NOT recomputed — the per-record collections had not delivered yet. Existing counts left untouched.");
+    }
+  }
   (_wcLoaded?(D.customers||[]):[]).forEach(function(cu){
     // Find ALL delivered 20ltr water orders for this customer, sorted by date
     var waterOrds=_wcOrdersIC.filter(function(o){
