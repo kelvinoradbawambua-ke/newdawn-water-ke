@@ -348,7 +348,7 @@ var APP_VERSION="2026-07-21-v35";
    was actually running.
    Bump this ONE line on every deploy. It is display-and-diagnostics only — nothing branches
    on it, no merge or money logic reads it, so it can never change behaviour. */
-var BUILD_STAMP="2026-08-01-hyb-b9";
+var BUILD_STAMP="2026-08-01-hyb-b10";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -2167,9 +2167,24 @@ function _hybridStartListeners(){
      state here rather than relying on logout to call _hybridStopListeners is deliberate —
      it holds however D came to be cleared, not just for the one path we know about. */
   if(_hybridListenersOn){
-    var _liveEmpty=(D.orders||[]).length===0&&(D.invoices||[]).length===0&&(D.customers||[]).length===0;
-    if(!_liveEmpty)return;                      // already running normally — nothing to do
-    console.log("[NDHYBRID] listeners were attached but D is empty (re-login) — detaching and re-subscribing to force a fresh initial snapshot");
+    /* FIX (2026-08-01) — the previous condition required ALL THREE arrays to be empty:
+         var _liveEmpty=(D.orders||[]).length===0&&(D.invoices||[]).length===0&&(D.customers||[]).length===0;
+       Captured live: after a re-login the customers listener had delivered (432) while
+       orders and invoices had not. _liveEmpty was therefore FALSE, this returned early as
+       "already running normally", and orders/invoices were never re-subscribed. The
+       dashboard showed zero revenue, zero active orders and zero debt, and the log read
+         HEAL SUPPRESSED (LIVE_STATE_EMPTY): live data not loaded (customers=432, orders=0)
+       followed by both DELETE SWEEP REFUSED rails and the water-cycle rail firing — the
+       guards correctly protecting against a partial load I had caused.
+
+       An all-or-nothing emptiness test cannot express "one collection is missing". The
+       right question is per-collection and already has a predicate:
+       _hybridInitialLoadDone() checks _hybridSeeded for exactly the collections the flags
+       require. It is also immune to the false-positive an emptiness test would hit on a
+       legitimately empty collection, because seeding is recorded when a snapshot ARRIVES,
+       not when it contains rows. */
+    if(_hybridInitialLoadDone())return;          // every required collection has delivered
+    console.log("[NDHYBRID] listeners attached but a collection has not delivered (orders="+((D.orders||[]).length)+", invoices="+((D.invoices||[]).length)+", customers="+((D.customers||[]).length)+") — detaching and re-subscribing to force a fresh initial snapshot");
     try{_hybridStopListeners();}catch(_){}
   }
   if(HYBRID_COLLECTIONS_LIVE&&(!FB_ORDERS_COL||!FB_INVOICES_COL))return;
