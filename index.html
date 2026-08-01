@@ -348,7 +348,7 @@ var APP_VERSION="2026-07-21-v35";
    was actually running.
    Bump this ONE line on every deploy. It is display-and-diagnostics only — nothing branches
    on it, no merge or money logic reads it, so it can never change behaviour. */
-var BUILD_STAMP="2026-08-01-hyb-b8";
+var BUILD_STAMP="2026-08-01-hyb-b9";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -4405,6 +4405,28 @@ function startCloudListener(isWarmRefresh){
       _cloudServerConfirmed=true;
     }
     console.log("[NDSYNC] snapshot arrived — _cloudDataConfirmed=true, doc.exists="+doc.exists+", doc.metadata.fromCache="+(doc.metadata&&doc.metadata.fromCache));
+    /* PERF FIX (2026-08-01) — FOUND IN LIVE PRODUCTION: login took ~20 s after a
+       background resume. The captured log:
+         backgrounded for 120s — pausing listener
+         startCloudListener called (cold) ... fromCache=true
+         checkAutoSaveRecovery WAITING on the hybrid collections
+         checkAutoSaveRecovery SKIPPED the count heuristic — ... never delivered after ~20s
+
+       The pause calls _hybridStopListeners(), which clears _hybridSeeded. But the only
+       call to _hybridStartListeners() sat inside the SERVER-CONFIRMED branch below, and
+       the first snapshot after a resume is cache-only — so the collections were never
+       re-subscribed, _hybridSeeded stayed empty, and the recovery gate waited out its
+       whole timeout before giving up. Nothing was broken; the login was just blocked.
+
+       Started here instead, on ANY snapshot. The server-confirmed rail below is correct
+       for the HEAL and the outbox — those judge what the cloud is missing, which a
+       cache-only view cannot support. These listeners judge nothing: they are independent
+       queries against their own collections, they carry their own cache/server state, and
+       _hydrateById only adds or merges. Waiting for the MAIN document to be
+       server-confirmed before subscribing to OTHER collections coupled two unrelated
+       things. The call below is left in place — _hybridStartListeners is idempotent via
+       _hybridListenersOn, so whichever fires first wins and the other is a no-op. */
+    try{_hybridStartListeners();}catch(_){}
     if(!doc.exists){
       // CRITICAL FIX (2026-07-26): "document doesn't exist" must NEVER be
       // trusted from a locally-cached read - only from a confirmed server
@@ -7285,14 +7307,28 @@ async function checkAutoSaveRecovery(){
      It is to skip the wholesale-restore heuristic entirely and still run the precise,
      add-only self-heal, which is exactly what the staff/manager path above already does. */
   if(!_hybridInitialLoadDone()){
+    /* PERF FIX (2026-08-01) — this gate cost the owner a ~20 second login. Two causes,
+       both fixed:
+         (a) It waited on _hybridSeeded even when the listeners were not RUNNING, so there
+             was nothing that could ever seed them. After a background resume the pause had
+             stopped them and the only restart sat behind a server-confirmed snapshot that
+             had not arrived. Now it kicks a start and, if the listeners still are not on,
+             stops waiting immediately — an unstartable subscription is not worth blocking
+             a login for, and the fall-through is the SAFE path anyway (heuristic skipped,
+             add-only self-heal still runs).
+         (b) 40 x 500ms was far too generous. In every healthy log the collections deliver
+             in well under a second, so 12 attempts (~6s) is already a wide margin for a
+             slow phone on mobile data. The point of the wait is to avoid comparing against
+             an unloaded D — not to stall the app until the network cooperates. */
+    try{if(!_hybridListenersOn)_hybridStartListeners();}catch(_){}
     _autoSaveRecoveryWaits++;
-    if(_autoSaveRecoveryWaits<=40){   // ~20s at 500ms
+    if(_hybridListenersOn&&_autoSaveRecoveryWaits<=12){   // ~6s at 500ms
       if(_autoSaveRecoveryWaits===1)
         console.log("[NDSYNC] checkAutoSaveRecovery WAITING on the hybrid collections — under cutover the main document carries no orders/customers, so _cloudDataConfirmed alone cannot mean live data has arrived");
       setTimeout(checkAutoSaveRecovery,500);
       return;
     }
-    console.log("[NDSYNC] checkAutoSaveRecovery SKIPPED the count heuristic — the collections never delivered a snapshot after ~20s. Comparing a local autosave against an unloaded D is how a stale browser cache overwrites live books. The add-only self-heal still runs.");
+    console.log("[NDSYNC] checkAutoSaveRecovery SKIPPED the count heuristic — the collections had not delivered a snapshot (listenersOn="+_hybridListenersOn+", waits="+_autoSaveRecoveryWaits+"). Comparing a local autosave against an unloaded D is how a stale browser cache overwrites live books. The add-only self-heal still runs.");
     buildApp();
     _selfHealUnsyncedLocalRecords();
     _selfHealFromEventSnapshots();
