@@ -348,7 +348,7 @@ var APP_VERSION="2026-07-21-v35";
    was actually running.
    Bump this ONE line on every deploy. It is display-and-diagnostics only — nothing branches
    on it, no merge or money logic reads it, so it can never change behaviour. */
-var BUILD_STAMP="2026-08-01-hyb-b12";
+var BUILD_STAMP="2026-08-02-hyb-b15";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -1946,7 +1946,96 @@ function _hybridReapDeletes(shadow,live,del,label){
   return gone.length;
 }
 
-function _hybridFlushDocs(){
+/* ROOT-CAUSE FIX (2026-08-02) — THE MISSING ORDER. Captured live on the owner's
+   machine, 14:51-15:01, ten minutes of:
+     WebChannelConnection RPC 'Write' stream ... transport errored
+     RestConnection RPC 'BatchGetDocuments' ... {"code":"unavailable"}
+   and then a real thrown error, not a network one:
+     processWriteQueue FAILED — Cannot use 'in' operator to search for '_delegate' in null
+
+   Until this fix, this function had EXACTLY ONE call site in the whole file, inside
+   _onWriteSuccess(). That made an order's arrival in /orders conditional on the MAIN
+   document write committing first — and those two writes have opposite durability:
+
+     main document  -> fbDb.runTransaction(...)  needs a live server round trip.
+                       Firestore CANNOT queue a transaction offline; it just fails.
+     order document -> FB_ORDERS_COL.doc(k).set(...,{merge:true})  a plain set(),
+                       which offline persistence DOES queue in IndexedDB and replays.
+
+   So the one write that survives a dead connection was gated behind the one that
+   does not. Before the cutover this was harmless, because the order travelled INSIDE
+   the main document — "the main write committed" and "the order is saved" were the
+   same event. After the cutover they are not. Same shape as the six read-side faults
+   in DEPLOY_RUNBOOK §2c-§2h, on the write side.
+
+   THE FIX: pushToCloud() now flushes in WRITES-ONLY mode the moment it decides to
+   queue a write, so the order reaches /orders through the durable path immediately,
+   whatever the connection then does. The original call in _onWriteSuccess is kept
+   unchanged and still does the full pass.
+
+   WHY writesOnly, and why deletions are deliberately NOT included: the write path is
+   additive and idempotent (document id === record id, merge:true, shadow-diffed, so a
+   second call for an unchanged record writes nothing), which makes running it early
+   free and safe. Deletion is destructive and, per CLAUDE.md, must never act on a
+   partially-loaded D. Running the reaper twice as often would double the exposure of
+   the one operation that can destroy data, for no benefit — deletions are not what
+   was being lost. They stay on the confirmed path, at exactly their previous
+   frequency, behind exactly their previous rails.
+
+   Proof: _proofB_order_durability.js sections 2 and 6. */
+/* ROOT-CAUSE FIX (2026-08-02) — DELETED AND ARCHIVED RECORDS COULD COME BACK.
+
+   Found by tracing the "delete a customer who still has pending orders" path, not by
+   a failure report — so this has NOT been seen in production, but the route is real.
+
+   THE HOLE. _hydrateById() unions whatever the collection listener delivers into D,
+   by id, with no reference to the tombstones. Deletion normally stays deleted only
+   because _hybridReapDeletes() removes the underlying document, so the listener has
+   nothing left to deliver. There are two ordinary ways that removal does not happen:
+
+     1. THE DELETE CAP. HYBRID_MAX_DELETES_PER_FLUSH is 5. delC()'s cascade removes
+        EVERY pending/processing order for that customer in one go, so a customer with
+        six unfulfilled orders trips the cap. The sweep then correctly refuses (it
+        cannot tell a real bulk delete from a partial load) and deletes nothing.
+     2. A FAILED DELETE. FB_ORDERS_COL.doc(k).delete().catch(function(){}) swallows the
+        error; the shadow keeps the entry so a later flush retries — but if the session
+        ends first, no later flush ever comes.
+
+   In both cases the documents survive in the collection, and on the next login the
+   listener hands them straight back to _hydrateById, which re-adds them to D. The
+   order the director deleted reappears, with its invoice and its debt.
+
+   The monolith read path never had this hole: _reconcileDforSync() checks BOTH
+   deletedOrderIds and archivedOrderIds before rescuing anything, and refuses to
+   resurrect. This is that same, already-proven predicate applied to the collection
+   read path, which the cutover left without one. Same rule, same two maps, matching
+   the precedent rather than inventing a new mechanism.
+
+   ARCHIVED is included for the same reason it is in _reconcileDforSync: a record that
+   a closed Books period now owns must not be pulled back into the live arrays. Note
+   _hybridDropArchived() deliberately forgets the shadow entry so the reaper never
+   DELETES an archived document — it lives on in the collection by design, which is
+   precisely why hydration has to know to leave it alone.
+
+   NOT a heuristic, and does not weaken anything CLAUDE.md marks absolute: this is
+   strictly tombstone-based, uses the existing durable maps, and those maps are still
+   pruned on their existing schedule, so a legitimately recreated id is unaffected. */
+function _hybridTombstoned(arrName,k){
+  try{
+    if(arrName==="orders")
+      return !!((D.deletedOrderIds&&D.deletedOrderIds[k])
+             ||(D.archivedOrderIds&&D.archivedOrderIds[k])
+             ||(typeof _recentlyDeletedOrderIds!=="undefined"&&_recentlyDeletedOrderIds&&_recentlyDeletedOrderIds[k]));
+    if(arrName==="invoices")
+      return !!((D.deletedInvoiceIds&&D.deletedInvoiceIds[k])
+             ||(D.archivedInvoiceIds&&D.archivedInvoiceIds[k]));
+    if(arrName==="customers")
+      return !!(D.deletedCustomerIds&&D.deletedCustomerIds[k]);
+  }catch(_){}
+  return false;
+}
+
+function _hybridFlushDocs(writesOnly){
   if(!HYBRID_COLLECTIONS_LIVE)return;
   if(!FB_ORDERS_COL||!FB_INVOICES_COL)return;
   /* RAIL 1 — see the block comment above. Nothing at all in memory means D is not
@@ -1977,12 +2066,21 @@ function _hybridFlushDocs(){
       FB_ORDERS_COL.doc(k).set(_hybridStamp(o,"o"),{merge:true}).then(function(){
         _hybridShadow.orders[k]=snap;                          // only on CONFIRMED write
       }).catch(function(e){
-        console.log("[NDHYBRID] order #"+k+" write failed ("+((e&&e.code)||"unknown")+") — will retry next flush");
+        /* ENHANCEMENT (2026-08-02): "will retry next flush" was true but incomplete —
+           if no further flush ever happens (the user stops working, or logs out), there
+           is no next flush and the failure is simply forgotten. The shadow is correctly
+           left un-advanced so a later flush WOULD rewrite it; this re-arms the flag that
+           actually causes a later flush to occur, so the retry stops depending on the
+           user happening to do something else. Costs nothing when writes succeed. */
+        _pendingLocalWrite=true;
+        console.log("[NDHYBRID] order #"+k+" write failed ("+((e&&e.code)||"unknown")+") — shadow left stale and a retry re-armed");
       });
       wroteO++;
     });
     // ---- orders: deleted (in shadow, gone from the array) — RAIL 2, see _hybridReapDeletes
-    delO2=_hybridReapDeletes(_hybridShadow.orders,liveO,function(k){
+    // writesOnly skips this entirely — see the block comment on this function for why
+    // deletion stays on the confirmed path at its original frequency.
+    if(!writesOnly)delO2=_hybridReapDeletes(_hybridShadow.orders,liveO,function(k){
       FB_ORDERS_COL.doc(k).delete().then(function(){delete _hybridShadow.orders[k];}).catch(function(){});
     },"orders");
     // ---- invoices: new or changed
@@ -1997,12 +2095,15 @@ function _hybridFlushDocs(){
       FB_INVOICES_COL.doc(k).set(_hybridStamp(i,"i"),{merge:true}).then(function(){
         _hybridShadow.invoices[k]=snap;
       }).catch(function(e){
-        console.log("[NDHYBRID] invoice #"+k+" write failed ("+((e&&e.code)||"unknown")+") — will retry next flush");
+        // Same re-arm as the orders write above — an invoice is money, so a silently
+        // forgotten failure here is worse, not better.
+        _pendingLocalWrite=true;
+        console.log("[NDHYBRID] invoice #"+k+" write failed ("+((e&&e.code)||"unknown")+") — shadow left stale and a retry re-armed");
       });
       wroteI++;
     });
-    // ---- invoices: deleted — RAIL 2, see _hybridReapDeletes
-    delI2=_hybridReapDeletes(_hybridShadow.invoices,liveI,function(k){
+    // ---- invoices: deleted — RAIL 2, see _hybridReapDeletes  (writesOnly: see above)
+    if(!writesOnly)delI2=_hybridReapDeletes(_hybridShadow.invoices,liveI,function(k){
       FB_INVOICES_COL.doc(k).delete().then(function(){delete _hybridShadow.invoices[k];}).catch(function(){});
     },"invoices");
     // ---- customers (own flag; transactional persister — see _persistCustomerDoc)
@@ -2025,13 +2126,13 @@ function _hybridFlushDocs(){
         _persistCustomerDoc(c);
         wroteC++;
       });
-      // ---- customers: deleted — RAIL 2, see _hybridReapDeletes
-      delC2=_hybridReapDeletes(_hybridShadow.customers,liveC,function(k){
+      // ---- customers: deleted — RAIL 2, see _hybridReapDeletes  (writesOnly: see above)
+      if(!writesOnly)delC2=_hybridReapDeletes(_hybridShadow.customers,liveC,function(k){
         _deleteCustomerDoc(k);delete _hybridShadow.customers[k];
       },"customers");
     }
     if(wroteO||wroteI||delO2||delI2||wroteC||delC2)
-      console.log("[NDHYBRID] flush: orders "+wroteO+"w/"+delO2+"d, invoices "+wroteI+"w/"+delI2+"d, customers "+wroteC+"w/"+delC2+"d");
+      console.log("[NDHYBRID] flush"+(writesOnly?" (durable, pre-write)":"")+": orders "+wroteO+"w/"+delO2+"d, invoices "+wroteI+"w/"+delI2+"d, customers "+wroteC+"w/"+delC2+"d");
   }catch(e){
     console.log("[NDHYBRID] flush error (main-document write is unaffected): "+(e&&e.message));
   }
@@ -2067,10 +2168,15 @@ function _hydrateById(arr,docs,label,arrName){
   // Union by id: listeners overlap by design (a recent unpaid order matches both).
   var byId={};
   (arr||[]).forEach(function(r){if(r&&r.id!=null)byId[String(r.id)]=r;});
-  var added=0,updated=0;
+  var added=0,updated=0,_tombSkipped=0;
   docs.forEach(function(d){
     var v=d.data();if(!v||v.id==null)return;
     var k=String(v.id);
+    /* Never hydrate a record this business has deleted or archived — see the block
+       comment on _hybridTombstoned. Without this, a deletion the delete-cap refused
+       (or whose document delete failed) silently reappears on the next login, invoice
+       and debt included. Placed FIRST so a tombstoned id cannot be added OR updated. */
+    if(_hybridTombstoned(arrName,k)){_tombSkipped++;return;}
     if(byId[k]){
       // In-place field copy so any object identity held elsewhere stays valid.
       var tgt=byId[k],changed=false;
@@ -2145,7 +2251,9 @@ function _hydrateById(arr,docs,label,arrName){
       arr.push(nv);byId[k]=nv;added++;
     }
   });
-  if(added||updated)console.log("[NDHYBRID] "+label+": +"+added+" new, "+updated+" updated from listener");
+  if(added||updated||_tombSkipped)
+    console.log("[NDHYBRID] "+label+": +"+added+" new, "+updated+" updated from listener"+
+      (_tombSkipped?" ("+_tombSkipped+" deleted/archived record(s) refused re-entry — the collection still holds them; the delete cap or a failed delete is why)":""));
   return added+updated;
 }
 function _hybridStartListeners(){
@@ -3086,6 +3194,21 @@ function pushToCloud(){
   if(FB_WRITE_RETRY_TIMER){clearTimeout(FB_WRITE_RETRY_TIMER);FB_WRITE_RETRY_TIMER=null;}
   // Queue the write — process one at a time to prevent race conditions
   console.log("[NDSYNC] pushToCloud PROCEEDING — queuing write, D.orders.length="+(D.orders||[]).length);
+  /* ROOT-CAUSE FIX (2026-08-02) — persist the RECORDS before, and independently of,
+     the main-document write. See the block comment on _hybridFlushDocs for the full
+     reasoning and the captured production log.
+
+     In one line: the per-record writes are plain set() calls that offline persistence
+     queues durably, while the main-document write is a transaction that simply fails
+     when the connection is down. Gating the former on the latter meant a connection
+     wobble lost the order outright. Every guard reached from here is unchanged — this
+     only moves WHEN the durable write is issued, from "after the main write commits"
+     to "the moment we have decided to write at all".
+
+     Placed after the _cloudDataConfirmed gate and the isEmpty guard on purpose, so it
+     inherits both: it can never run against an unconfirmed connection or an emptied D.
+     writesOnly=true — deletions stay on the confirmed path (see _hybridFlushDocs). */
+  try{_hybridFlushDocs(true);}catch(_){}
   FB_WRITE_QUEUE.push(Date.now());
   if(!FB_WRITING)processWriteQueue();
 }
@@ -3738,6 +3861,24 @@ function processWriteQueue(){
     if(FB_WRITE_QUEUE.length)processWriteQueue();
   }
 
+  /* NEW (2026-08-02) — the no-document-reference abort, deliberately NOT routed through
+     _onWriteFailure. Losing the reference is overwhelmingly an ordinary logout, not a
+     cloud problem, and _onWriteFailure would (a) start an exponential-backoff retry
+     against a torn-down session and (b) after 3 attempts raise the offline banner and
+     write a WRITES_FAILING event into the shared audit stream — telling the director
+     that "cloud writes are failing" every time somebody signs out. A false alarm in the
+     one channel that exists to make real failures visible is worse than no alarm.
+
+     What it does instead is the part that actually matters: re-arm _pendingLocalWrite so
+     the work is still known to be unsent, clear _syncInFlight so nothing is mistakenly
+     retired as confirmed, and release FB_WRITING so the queue is not left wedged. */
+  function _abortWriteNoDocRef(where){
+    console.log("[NDSYNC] "+where+" SKIPPED — no document reference (session torn down mid-write); work stays pending, no retry storm, no false alarm");
+    FB_WRITING=false;
+    _pendingLocalWrite=true;
+    _syncInFlight=null;
+  }
+
   function _onWriteFailure(err){
     console.log("[NDSYNC] processWriteQueue FAILED — code="+(err&&err.code)+" message="+(err&&err.message));
     FB_WRITING=false;
@@ -3778,7 +3919,12 @@ function processWriteQueue(){
 
   function _sendWritePayload(DforSync,usersForWrite){
     var payload=_buildWritePayload(DforSync,usersForWrite);
-    FB_DOC_REF.set(payload,{merge:true}).then(_onWriteSuccess).catch(_onWriteFailure);
+    // Third site of the same null-reference exposure (CLAUDE.md rule 14). Reached from
+    // both _fallbackWrite branches, including the .catch() one where the server read
+    // itself failed — so the connection is already known to be unhealthy here.
+    var _sendRef=FB_DOC_REF;
+    if(!_sendRef){_abortWriteNoDocRef("payload send");return;}
+    _sendRef.set(payload,{merge:true}).then(_onWriteSuccess).catch(_onWriteFailure);
   }
 
   function _isTransientOffline(err){
@@ -3828,7 +3974,13 @@ function processWriteQueue(){
 
   function _fallbackWrite(){
     var DforSync=_buildDforSync();
-    FB_DOC_REF.get({source:"server"}).then(function(freshDoc){
+    /* Same null-reference exposure as _atomicWrite, found by checking the pattern rather
+       than waiting for it to fire (CLAUDE.md rule 14). This path is reached from the
+       transient-offline branch — i.e. exactly the flaky-connection conditions under which
+       a teardown is most likely to have raced the write. Bind once, refuse cleanly. */
+    var _fbRef=FB_DOC_REF;
+    if(!_fbRef){_abortWriteNoDocRef("fallback write");return;}
+    _fbRef.get({source:"server"}).then(function(freshDoc){
       _lastFreshnessCheckTime=Date.now();
       var _fdata=(freshDoc.exists&&freshDoc.data())?freshDoc.data():null;
       // A4 (2026-07-30): reconcile the team table too — see _reconcileUsersForWrite.
@@ -3849,8 +4001,41 @@ function processWriteQueue(){
   // PRIMARY atomic path.
   function _atomicWrite(){
     if(!fbDb||typeof fbDb.runTransaction!=="function"){ _fallbackWrite(); return; }
+    /* ROOT-CAUSE FIX (2026-08-02) — captured live, and a REAL THROWN ERROR rather than a
+       network failure, at 15:01:33 on the owner's machine:
+         [NDSYNC] processWriteQueue FAILED — code=undefined
+           message=Cannot use 'in' operator to search for '_delegate' in null
+       with the stack naming _atomicWrite -> processWriteQueue -> pushToCloud.
+
+       ROOT CAUSE: _finishLogoutTeardown() sets FB_DOC_REF=null. It carefully cancels
+       FB_WRITE_RETRY_TIMER and FB_PENDING_CONFIRM_RETRY "so nothing fires against the
+       now-null FB_DOC_REF" — but a transaction ALREADY IN FLIGHT is not a timer and
+       cannot be cancelled, and runTransaction re-runs its callback on retry. On that
+       retry the callback read the module-level FB_DOC_REF, which was by then null, and
+       the Firebase compat layer threw while probing it. The write died where it should
+       have deferred, and because _hybridFlushDocs used to hang off _onWriteSuccess, the
+       per-record flush that write would have triggered never ran either.
+
+       THE FIX, two parts:
+       1. Bind the reference ONCE, here, into a local. A transaction retry then re-reads
+          the same object it started with instead of whatever the global has become —
+          which is what makes the callback idempotent under retry, exactly as DforSync
+          and _usersT already are for the same reason.
+       2. Refuse to START a transaction with no reference, and abort cleanly inside the
+          callback if one is somehow still absent, instead of throwing. _onWriteFailure
+          re-arms _pendingLocalWrite, so the work is remembered for the next connection
+          rather than being silently marked as sent.
+
+       Deliberately does NOT keep writing after teardown: a torn-down session must not
+       write. The point is that the write FAILS SAFE and is retried, rather than dying
+       with a TypeError that no retry path understands.
+
+       Proof: _proofB_order_durability.js sections 3 and 7. */
+    var _txnRef=FB_DOC_REF;
+    if(!_txnRef){_abortWriteNoDocRef("atomic write");return;}
     fbDb.runTransaction(function(txn){
-      return txn.get(FB_DOC_REF).then(function(freshDoc){
+      if(!_txnRef)throw new Error("ND_NO_DOC_REF");
+      return txn.get(_txnRef).then(function(freshDoc){
         var DforSync=_buildDforSync(); // FRESH each attempt - idempotent under retry
         var _fdataT=(freshDoc.exists&&freshDoc.data())?freshDoc.data():null;
         // A4 (2026-07-30): rebuilt fresh on every transaction attempt, same idempotency
@@ -3908,7 +4093,10 @@ function processWriteQueue(){
           return; // transaction commits with no write
         }
         _pendingSig=_sig;
-        txn.set(FB_DOC_REF,_finalPayload,{merge:true});
+        // _txnRef, not FB_DOC_REF — the same bound reference the get() used, so a
+        // transaction retry cannot read and write two different things. See the fix
+        // comment at the top of _atomicWrite.
+        txn.set(_txnRef,_finalPayload,{merge:true});
       });
     }).then(function(){
       _lastFreshnessCheckTime=Date.now();
@@ -5652,8 +5840,43 @@ function _initVisibilityRecovery(){
     _flushPendingWritesNow("pagehide");
   });
 }
+var _unsentSince=0;   // ms timestamp when outgoing work first went unsent — see _updateSyncAge
+/* ENHANCEMENT (2026-08-02) — SHOW UNSENT WORK TO THE PERSON HOLDING THE PHONE.
+
+   Every diagnostic this project has for predicting data loss reaches the DIRECTOR:
+   _reportDeviceSyncHealth writes to the shared audit stream, the offline banner and
+   the console are on the failing device but nobody reads a phone console. The staff
+   member actually holding the device — the one who could simply wait five seconds
+   before pocketing it — had no signal at all. That asymmetry is why the same class
+   of loss kept being diagnosed after the fact instead of prevented.
+
+   This indicator was already measuring the wrong direction: "Synced 12s ago" is the
+   age of the last INCOMING snapshot, which stays reassuringly green while this
+   device's own OUTGOING write is stuck. Now, whenever there is genuinely unsent work,
+   that takes precedence and is shown with its age.
+
+   Cost is exactly zero: it reuses the existing 1s DOM ticker and the existing
+   element, reads only in-memory flags, and touches Firestore not at all. The 10s
+   grace stops it flickering on every healthy sub-second write. */
 function _updateSyncAge(){
-  var el2=el("sync-age");if(!el2||!FB_LAST_SNAPSHOT)return;
+  var el2=el("sync-age");if(!el2)return;
+  var unsent=(typeof _pendingLocalWrite!=="undefined"&&_pendingLocalWrite)
+          ||(typeof FB_WRITE_QUEUE!=="undefined"&&FB_WRITE_QUEUE&&FB_WRITE_QUEUE.length>0)
+          ||(typeof FB_WRITING!=="undefined"&&FB_WRITING);
+  if(unsent){ if(!_unsentSince)_unsentSince=Date.now(); }
+  else _unsentSince=0;
+  // A write in flight for more than 10s is no longer "just saving" — say so plainly,
+  // in words a delivery driver can act on, and escalate at 30s.
+  if(_unsentSince){
+    var usecs=Math.floor((Date.now()-_unsentSince)/1000);
+    if(usecs>=10){
+      el2.innerHTML="<i class=\"ti ti-cloud-off\"></i> NOT SAVED YET — "+
+        (usecs<60?usecs+"s":Math.floor(usecs/60)+"m")+" · keep this screen open";
+      el2.style.color=usecs>=30?"#c0392b":"#e67e22";
+      return;
+    }
+  }
+  if(!FB_LAST_SNAPSHOT)return;
   var secs=Math.floor((Date.now()-FB_LAST_SNAPSHOT)/1000);
   var label=secs<5?"Synced":secs<60?"Synced "+secs+"s ago":"Synced "+Math.floor(secs/60)+"m ago";
   el2.innerHTML="<i class=\"ti ti-refresh\"></i> "+label;
@@ -6794,24 +7017,57 @@ var _docSizeReported=false,_docSizeAlertLevel=0;
 function _checkDocSize(sizeKB,payload){
   try{
     var Dp=(payload&&payload.D)||{};
-    var keys=["customers","orders","invoices","stock","auditLog","pendingPayments","offers","routes","complaints"];
+    // (the hardcoded `keys` list that used to live here was removed 2026-08-02 — the
+    //  composition loop below now enumerates the payload itself; see its comment)
     var recs=((Dp.customers||[]).length)+((Dp.orders||[]).length)+((Dp.invoices||[]).length);
     var perRec=recs>0?(sizeKB/recs):0;
     var kbPerDay=perRec*40; // 20 orders/day => an order row + an invoice row each
     var daysLeft=kbPerDay>0?Math.round((1024-sizeKB)/kbPerDay):9999;
     if(!_docSizeReported){
       _docSizeReported=true;
-      var parts=[];
-      keys.forEach(function(k){
+      /* LONG-TERM CEILING FIX (2026-08-02) — this loop used to walk a HARDCODED list of
+         nine array names. Everything else in the main document was invisible to it,
+         including every tombstone map (deletedOrderIds, deletedCustomerIds,
+         deletedInvoiceIds, archivedOrderIds, archivedInvoiceIds, reversedPayPids, ...).
+
+         That matters more than it looks. After Phase 4 the bounded things — stock, the
+         20-entry audit tail, pendingPayments — stop being the growth story, and the
+         tombstone maps become the ONLY structures in this document that gain an entry per
+         deletion and never lose one. They are, per HANDOVER §12.4E, the thing that will
+         eventually push the document back toward the 1 MiB hard limit. A monitor that
+         cannot see them is a monitor that will report "healthy" right up until it isn't.
+
+         Now it measures every key actually present, so anything that starts growing shows
+         up by itself, including keys added by future work that nobody remembered to add
+         to a list. The tombstone subtotal is broken out separately because it is the one
+         number worth watching over years rather than weeks.
+
+         Deliberately NOT doing any compaction here. Bounding tombstone lifetime touches
+         rules CLAUDE.md marks absolute ("never replace tombstone-based deletion checks
+         with age- or count-based heuristics" — that exact mistake caused real live data
+         loss earlier in this project), and the honest position is that it needs its own
+         session and its own proofs. What it needs FIRST is a real measurement, which is
+         what this provides. Today tombstones do not even reach the top three, so there is
+         no case for touching them yet. */
+      var parts=[],tombKB=0,tombN=0;
+      var TOMB=/^(deleted|archived|reversed|dismissed)/i;
+      Object.keys(Dp).forEach(function(k){
         try{
-          var arr=Dp[k]||[];
-          parts.push({k:k,kb:Math.round(JSON.stringify(arr).length/1024),n:arr.length});
+          var v=Dp[k];if(v==null)return;
+          var kb=JSON.stringify(v).length/1024;
+          var n=Array.isArray(v)?v.length:(typeof v==="object"?Object.keys(v).length:1);
+          if(TOMB.test(k)){tombKB+=kb;tombN+=n;}
+          parts.push({k:k,kb:kb,n:n});
         }catch(_){}
       });
       parts.sort(function(a,b){return b.kb-a.kb;});
+      var shown=parts.filter(function(p){return p.kb>=0.5;}).slice(0,6);
+      var restKB=parts.slice(shown.length).reduce(function(s,p){return s+p.kb;},0);
       console.log("[NDSYNC] document "+sizeKB+"KB / 1024KB · ~"+kbPerDay.toFixed(1)+"KB per day · ~"+daysLeft+
-        " days of headroom · composition: "+parts.filter(function(p){return p.kb>0;})
-        .map(function(p){return p.k+" "+p.kb+"KB("+p.n+")";}).join(" · "));
+        " days of headroom · composition: "+shown
+        .map(function(p){return p.k+" "+Math.round(p.kb)+"KB("+p.n+")";}).join(" · ")+
+        (restKB>=0.5?" · everything else "+Math.round(restKB)+"KB":"")+
+        " · TOMBSTONES "+tombKB.toFixed(1)+"KB("+tombN+" entries — grows forever, never shrinks; see HANDOVER 12.4E)");
     }
     var lvl=sizeKB>=950?3:(sizeKB>=850?2:(sizeKB>=700?1:0));
     if(lvl<=_docSizeAlertLevel)return;
@@ -7377,6 +7633,33 @@ async function checkAutoSaveRecovery(){
              in well under a second, so 12 attempts (~6s) is already a wide margin for a
              slow phone on mobile data. The point of the wait is to avoid comparing against
              an unloaded D — not to stall the app until the network cooperates. */
+    /* READ-COST + CHURN FIX (2026-08-02) — this retry loop belongs to a SESSION, and had
+       no idea when that session ended. Captured live on 2026-08-02: a logout ran
+       _hybridStopListeners(), a still-pending tick of this loop fired 500ms later, saw
+       _hybridListenersOn===false, and re-subscribed all five collection listeners into a
+       session that was being torn down. The log shows both stacks interleaved —
+       _hybridStopListeners from logout(), and attach() from _hybridStartListeners called
+       right here — followed by a run of
+         POST .../Listen/channel ... 400 (Bad Request)
+       as those brand-new listeners were immediately ripped down again.
+
+       COST: a fresh subscription re-delivers the whole result set — currently ~1,271
+       documents (406 orders + 407 invoices + 27 open + 431 customers). Measured Firestore
+       usage for 2026-08-01/02 was 23,000 reads/day, 46% of the 50,000 free-tier ceiling,
+       against a target of under 15,000; ~18 full cold subscriptions accounts for it, and
+       the logs show "starting listeners" firing two to three times per session rather
+       than once. This is the single largest read saving available that does not change
+       WHICH records load — and therefore the only one that cannot change which debts
+       appear on screen.
+
+       CU is the discriminator, deliberately the same one _finishLogoutTeardown() uses
+       ("if(CU)return;"). It is set (CU=SU) before this function is ever reached on the
+       login path, and cleared synchronously at the top of logout(), so it is true for
+       exactly the window in which re-subscribing is legitimate. */
+    if(!CU){
+      console.log("[NDSYNC] checkAutoSaveRecovery ABANDONED — the session ended while waiting on the collections; not re-subscribing into a torn-down session");
+      return;
+    }
     try{if(!_hybridListenersOn)_hybridStartListeners();}catch(_){}
     _autoSaveRecoveryWaits++;
     if(_hybridListenersOn&&_autoSaveRecoveryWaits<=12){   // ~6s at 500ms
@@ -7941,6 +8224,36 @@ function logout(){
     }else if(FB_READY&&FB_DOC_REF&&typeof D==="object"&&_snapshotIsFresh){
       var snap=JSON.parse(JSON.stringify({D:D}));
       delete snap.D.auditLog;
+      /* CUTOVER FIX (2026-08-02) — this push had NO hybrid guard, and it is the reason
+         the main document's "stale" arrays were never actually stale. Observed on the
+         server across 2026-08-01/02: remoteOrders walked 378 -> 404 -> 406, tracking
+         whichever device most recently logged out cleanly. The handover describes those
+         arrays as frozen leftovers awaiting Phase 4; they were being actively rewritten.
+
+         Three separate harms, all from the same missing guard:
+         1. It re-inflates the main document with ~370 KB of orders/invoices/customers —
+            the exact payload the migration existed to remove, put back on every clean
+            logout. It bypasses _buildDforSync, _applyDocSizeTrim, _checkDocSize AND the
+            no-op suppressor, so none of the size protections see it.
+         2. merge:true replaces array fields WHOLESALE, so the arrays end up as one
+            device's private snapshot of D rather than any agreed truth.
+         3. It makes Phase 4 impossible to complete: _hybridStripMainDoc() would delete
+            the arrays and the very next clean logout would write them straight back.
+
+         THE FIX is narrow on purpose — strip only what now lives in its own collection,
+         and only when that collection is actually live. Everything else the push carries
+         (stock, pendingPayments, routes, offers, counters, tombstones) still travels
+         exactly as before, because those genuinely do live in the main document and this
+         "just in case" net is still worth having for them.
+
+         The freshness guard above is NOT touched. It is correct, it is doing its job —
+         confirmed live at 15:10 on 2026-08-02 ("logout SKIPPED final push — snapshot not
+         confirmed fresh") — and weakening it would reopen the 2026-07-20 stale-clobber
+         bug this branch was written to close.
+
+         Proof: _proofB_order_durability.js sections 4 and 8. */
+      if(HYBRID_COLLECTIONS_LIVE){delete snap.D.orders;delete snap.D.invoices;}
+      if(HYBRID_CUSTOMERS_LIVE){delete snap.D.customers;}
       FB_DOC_REF.set(snap,{merge:true});
     }else if(FB_READY&&FB_DOC_REF){
       console.log("[NDSYNC] logout SKIPPED final push — snapshot not confirmed fresh (avoids clobbering other devices' data)");
@@ -10137,11 +10450,20 @@ function calcO(){
 }
 var _idleTimer=null;
 var _idleLast=Date.now();
+/* Idle-logout deferral budget (2026-08-02) — see _idleExpire below.
+   4 x 15s = at most one extra minute on a phone that already has unsent work, then
+   it logs out regardless. Deliberately small: this is a security timeout, and the
+   deferral exists to avoid destroying a write, not to keep sessions alive. */
+var IDLE_DEFER_MS=15000, IDLE_DEFER_MAX=4, _idleDefers=0;
 function resetIdleTimer(){
   _idleLast=Date.now();
   if(_idleTimer)clearTimeout(_idleTimer);
   if(_idleWarnTimer)clearTimeout(_idleWarnTimer);
   _dismissIdleWarning();
+  // Real user activity restarts the whole budget — otherwise a phone that deferred
+  // earlier in the shift would carry an exhausted counter into a later idle period
+  // and lose the protection exactly when it needed it again.
+  _idleDefers=0;
   if(!CU)return;
   // TIER 1a (2026-07-20): director idle timeout reduced from 600s to 180s —
   // a genuinely forgotten/unattended director session now re-locks sooner.
@@ -10150,12 +10472,54 @@ function resetIdleTimer(){
   _idleWarnTimer=setTimeout(function(){
     if(CU)_showIdleWarning(warnWindow/1000);
   },limit-warnWindow);
-  _idleTimer=setTimeout(function(){
+  function _idleExpire(){
     if(!CU)return;
+    /* ENHANCEMENT (2026-08-02) — DO NOT AUTO-LOGOUT ON TOP OF AN UNSENT WRITE.
+
+       This timer is the TRIGGER for the whole missing-order class. Staff get 60s
+       (vs 300s manager / 180s director), resetIdleTimer only listens for
+       click/keydown/touchstart/mousemove, and a delivery phone pocketed straight
+       after an order produces none of those — so logout fires about a minute later,
+       on the exact device most likely to be on a weak connection, while its write is
+       still in flight. PROJECT_CONTEXT 2026-07-29 identified this as the root cause
+       of order #1355 being lost.
+
+       The write path is now durable (see _hybridFlushDocs / pushToCloud), so an order
+       already survives this. But the MAIN-document payload — stock deductions,
+       pendingPayments, counters — is a transaction, and a transaction cannot be
+       queued offline. Logging out on top of one still throws that work away.
+
+       So: while there is genuinely unsent work, defer the auto-logout by one grace
+       period and let the existing flush machinery drain it, rather than racing it.
+
+       SECURITY IS PRESERVED, deliberately and explicitly:
+       - the deferral is BOUNDED (_idleDeferMax), so a phone cannot stay signed in
+         indefinitely because one write keeps failing — on a dead connection it logs
+         out after the cap exactly as it does today;
+       - it only ever defers while _pendingLocalWrite / FB_WRITE_QUEUE / FB_WRITING
+         say there IS unsent work, which on an idle phone is a short, finite state;
+       - the moment work drains, the next tick logs out normally;
+       - nothing about the session-identity teardown changes — logout() still clears
+         CU/SU/PE synchronously when it does run.
+       The trade is a bounded extra window of at most _idleDeferMax on a phone that
+       is already unattended, in exchange for not destroying money data. */
+    var _unsent=(typeof _pendingLocalWrite!=="undefined"&&_pendingLocalWrite)
+             ||(typeof FB_WRITE_QUEUE!=="undefined"&&FB_WRITE_QUEUE&&FB_WRITE_QUEUE.length>0)
+             ||(typeof FB_WRITING!=="undefined"&&FB_WRITING);
+    if(_unsent&&_idleDefers<IDLE_DEFER_MAX){
+      _idleDefers++;
+      console.log("[NDSYNC] idle logout DEFERRED ("+_idleDefers+"/"+IDLE_DEFER_MAX+") — this device still has unsent work; flushing rather than logging out on top of it");
+      try{if(typeof _flushPendingWritesNow==="function")_flushPendingWritesNow("idle-defer");}catch(_){}
+      _idleTimer=setTimeout(_idleExpire,IDLE_DEFER_MS);
+      return;
+    }
+    if(_unsent)
+      console.log("[NDSYNC] idle logout PROCEEDING despite unsent work — deferral cap reached; logout()'s own flush-before-teardown is the remaining net");
     _dismissIdleWarning();
     toast("Session expired due to inactivity — logging out","err");
     setTimeout(logout,1500);
-  },limit);
+  }
+  _idleTimer=setTimeout(_idleExpire,limit);
 }
 function _showIdleWarning(seconds){
   _dismissIdleWarning();
