@@ -348,7 +348,7 @@ var APP_VERSION="2026-07-21-v35";
    was actually running.
    Bump this ONE line on every deploy. It is display-and-diagnostics only — nothing branches
    on it, no merge or money logic reads it, so it can never change behaviour. */
-var BUILD_STAMP="2026-08-03-hyb-b19";
+var BUILD_STAMP="2026-08-03-hyb-b20";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -5877,8 +5877,65 @@ var _pausedForBackground=false;
    The honest position is that BOTH costs are unmeasured, so the existing decision stands
    until there is evidence. To gather it: count "resuming after background pause" lines
    across a normal trading day and compare a like-for-like day in the Usage tab. If
-   resumes prove expensive, raise this THEN, with numbers. */
+   resumes prove expensive, raise this THEN, with numbers.
+
+   ---- THE NUMBERS ARRIVED (2026-08-03). SEE KEEP_COLLECTIONS_ON_BACKGROUND BELOW. ----
+   Firebase Usage, last-60-minutes view, 3 active connections: 5.6K reads in one hour,
+   arriving as discrete ~1,200-read SPIKES rather than a trickle. A ~1,200 spike on a
+   ~1,294-document subscription is a full re-subscribe, and nothing else in this app
+   reads that shape. Day total 49K against the 50K free-tier ceiling; run rate ~134K/day.
+   Pre-hybrid the same business used ~10K.
+
+   BACKGROUND_PAUSE_MS STAYS AT 2 MINUTES. Raising it was the wrong lever — it only makes
+   the expensive event rarer, and it weakens the reason the pause exists. The actual defect
+   was WHAT the pause tears down, fixed directly below. */
 var BACKGROUND_PAUSE_MS=2*60*1000;
+/* READ-COST FIX (2026-08-03, build b20) — THE SINGLE LARGEST SOURCE OF READS IN THIS APP.
+
+   WHAT WAS WRONG. The 2026-07-31 comment in the pause handler below justified detaching
+   the collection listeners on background like this:
+
+     "a backgrounded phone would have kept all five streaming, billing reads and egress
+      for a screen nobody is looking at"
+
+   That is true of EGRESS and false of READS, and the two were conflated. Firestore bills
+   an ATTACHED listener only for documents that CHANGE — about 20 orders a day here, so
+   ~20 reads. It bills a RE-ATTACHED listener for the ENTIRE initial result set, because
+   onSnapshot always delivers the full current state on a fresh attach — orders 429 +
+   invoices 430 + customers 435 = ~1,294 reads.
+
+   So the pause detached six listeners to save ~20 reads and paid ~1,294 to get them back.
+   Every screen-lock longer than two minutes, on every device, all day. That is the
+   inversion, and it is a reasoning error in a comment rather than a bug in any line of
+   code — which is exactly why it survived review.
+
+   WHY THE MIGRATION CREATED IT. Under the monolith a resume re-read ONE document: 1 read.
+   The hybrid made the identical code path ~1,294x more expensive and the pause was never
+   re-costed. The tear-down was correct engineering for Build A and became the dominant
+   cost the moment the collections went live.
+
+   WHAT THIS CHANGES. The MAIN-DOCUMENT listener still pauses exactly as before — it is one
+   document, so re-attaching it costs 1 read, and pausing it is what actually frees the
+   connection this feature was built to free. Only _hybridStopListeners() is skipped.
+
+   WHY RESUME THEN COSTS NOTHING. _hybridStartListeners() returns early at
+     if(_hybridInitialLoadDone()&&!_arraysCleared)return;   // delivered AND still held
+   Leaving the listeners attached leaves _hybridSeeded populated (only
+   _hybridStopListeners clears it) and D populated, so both halves hold and the resume
+   re-subscribes nothing. The saving is not a new mechanism; it is an existing guard that
+   the tear-down was defeating.
+
+   WHAT IT COSTS. A backgrounded device holds six streams open instead of one. That shows
+   up in "peak concurrent connections", measured at 5 against a free-tier ceiling of 100.
+   Egress for a dark screen is ~20 changed documents a day, not 1,294.
+
+   NOTHING ABOUT CORRECTNESS MOVES. No merge, tombstone, deletion, money or write path is
+   touched. This changes only WHEN a listener is detached, and the resume path already
+   handled "still attached and healthy" — that branch simply stops being unreachable.
+
+   Set to false to restore the old tear-down exactly. Mirrors KEEP_SUBSCRIPTION_ON_LOGOUT
+   (b18), which closed the same class of waste on the logout path. */
+var KEEP_COLLECTIONS_ON_BACKGROUND=true;
 function _initVisibilityRecovery(){
   if(_visRecoveryAttached)return; // never attach twice across multiple logins in one tab
   _visRecoveryAttached=true;
@@ -5952,8 +6009,21 @@ function _initVisibilityRecovery(){
              exists to prevent, reintroduced by the migration.
              _hybridStartListeners() is already called on the server-confirmed snapshot after
              re-subscribe, and it is guarded by _hybridListenersOn, so resume needs nothing
-             extra here — stopping resets that flag. */
-          try{_hybridStopListeners();}catch(e){}
+             extra here — stopping resets that flag.
+
+             SUPERSEDED (2026-08-03, b20) — the "billing reads" half of the paragraph above
+             is WRONG and was the largest read cost in the app. An attached listener bills
+             for CHANGES (~20/day); a re-attached one bills the FULL result set (~1,294).
+             The tear-down paid 1,294 to save 20, on every screen-lock, on every device.
+             Measured at 5.6K reads/hour in ~1,200-read spikes with 3 connections, 49K/day
+             against a 50K ceiling. Full reasoning at KEEP_COLLECTIONS_ON_BACKGROUND.
+             The MAIN-document listener above still detaches — it is one document, costs
+             1 read to restore, and is what actually frees the connection. */
+          if(!KEEP_COLLECTIONS_ON_BACKGROUND){
+            try{_hybridStopListeners();}catch(e){}
+          }else{
+            console.log("[NDHYBRID] background pause — main-document listener detached, but the "+_hybridUnsub.length+" collection listeners STAY ATTACHED; re-subscribing them would cost a full re-read (~1,294 docs) to save ~20 (see KEEP_COLLECTIONS_ON_BACKGROUND)");
+          }
           _pausedForBackground=true;
           var c=el("cloud-status");if(c)c.innerHTML="<i class=\"ti ti-moon\"></i> Paused (backgrounded)";
         }
