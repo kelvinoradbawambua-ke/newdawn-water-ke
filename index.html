@@ -348,7 +348,7 @@ var APP_VERSION="2026-07-21-v35";
    was actually running.
    Bump this ONE line on every deploy. It is display-and-diagnostics only — nothing branches
    on it, no merge or money logic reads it, so it can never change behaviour. */
-var BUILD_STAMP="2026-08-02-hyb-b15";
+var BUILD_STAMP="2026-08-03-hyb-b19";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -2033,6 +2033,112 @@ function _hybridTombstoned(arrName,k){
       return !!(D.deletedCustomerIds&&D.deletedCustomerIds[k]);
   }catch(_){}
   return false;
+}
+
+/* FIELD FIX (2026-08-03) — A RECORD DELETED ON ANOTHER DEVICE LINGERED UNTIL REFRESH.
+
+   Reported by the owner: a customer was deleted on one phone; a second phone, already
+   logged in, kept showing that customer and only lost it after a manual refresh.
+
+   CAUSE. _hydrateById() only ever ADDS or UPDATES — it walks the incoming documents and
+   never removes anything already in memory. That is deliberate and correct: with five
+   OVERLAPPING listeners, Firestore reports a document as "removed" both when it is
+   genuinely deleted AND when it merely leaves a query. An order being paid flips
+   `settled` and leaves orders/open while remaining perfectly alive in orders/hot —
+   honouring that removal would delete live orders out of memory. So absence can never
+   be trusted as deletion, and the read path rightly refuses to infer it.
+
+   The result was a device showing a customer who no longer exists — and able to take an
+   order against them. That is not hypothetical: the pre-migration audit found 2 invoices
+   already referencing a deleted customer.
+
+   THE FIX uses the mechanism that IS authoritative. Deleting a record writes a tombstone
+   into the MAIN document, which every device receives. The comment above the customer
+   tombstone union says exactly why they live there — "every device must honour any
+   device's deletion — the customers listener hydrating from /customers does not carry
+   that information" — but nothing ever acted on them for the in-memory arrays. This is
+   that missing half.
+
+   A tombstone means "a human deleted this". It can never mean "this left a query
+   window", so it is safe where snapshot absence is not.
+
+   TWO DELIBERATE CHOICES:
+   1. DELETION tombstones only, never `archived*`. Archiving is a Books period movement
+      with its own handler (_hybridDropArchived) that checks settled-ness and period
+      closure. Pruning archived records here would duplicate that logic through a second,
+      less careful route.
+   2. The shadow entry is removed ALONGSIDE the array entry. That is what makes this
+      read-only: the flush tracker compares D against the shadow, so dropping both leaves
+      them in agreement and NO write and NO delete is issued. The record was already
+      deleted by the other device; this device simply stops believing in it.
+
+   Together with the b15 re-entry guard this closes the loop in both directions: b15 stops
+   a deleted record coming BACK, this stops it LINGERING.
+
+   Proof: _proofB_order_durability.js §13. */
+function _hybridDeletedTombstone(arrName,k){
+  try{
+    if(arrName==="orders")   return !!(D.deletedOrderIds&&D.deletedOrderIds[k]);
+    if(arrName==="invoices") return !!(D.deletedInvoiceIds&&D.deletedInvoiceIds[k]);
+    if(arrName==="customers")return !!(D.deletedCustomerIds&&D.deletedCustomerIds[k]);
+  }catch(_){}
+  return false;
+}
+/* RAIL (2026-08-03) — mirrors HYBRID_MAX_DELETES_PER_FLUSH.
+
+   Every other destructive path in this file is capped, on the reasoning that a handful
+   of removals is a user action while hundreds is a failure. The first version of this
+   prune had no such cap, which was an inconsistency worth closing BEFORE it shipped: a
+   corrupted or oversized tombstone map would empty the arrays on every device, and
+   because _hybridTombstoned refuses re-entry for tombstoned ids, those records would
+   stay invisible until the tombstone itself was removed.
+
+   25, not 5, because a legitimate bulk prune is real: delC() cascades a tombstone for
+   EVERY pending order of the customer being deleted, so one deletion can legitimately
+   produce a dozen or more at once. 25 clears any realistic remediation while still
+   catching a map that has gone wrong.
+
+   Refusing degrades gracefully to exactly the pre-b16 behaviour — the records simply
+   stay on screen until the next reload — so the rail can never make things worse than
+   not having the feature at all. */
+var HYBRID_MAX_PRUNE_PER_SNAPSHOT=25;
+function _hybridPruneTombstoned(){
+  if(!HYBRID_COLLECTIONS_LIVE&&!HYBRID_CUSTOMERS_LIVE)return 0;
+  var pruned=0,detail=[];
+  function sweep(arrName,flagLive){
+    if(!flagLive)return;
+    var arr=D[arrName];
+    if(!Array.isArray(arr)||!arr.length)return;
+    var keep=[],gone=[];
+    arr.forEach(function(r){
+      if(r&&r.id!=null&&_hybridDeletedTombstone(arrName,String(r.id)))gone.push(String(r.id));
+      else keep.push(r);
+    });
+    if(!gone.length)return;
+    if(gone.length>HYBRID_MAX_PRUNE_PER_SNAPSHOT){
+      console.log("[NDHYBRID] PRUNE REFUSED ("+arrName+"): "+gone.length+" records are tombstoned in one snapshot (cap "+HYBRID_MAX_PRUNE_PER_SNAPSHOT+"). That is a tombstone-map problem, not "+gone.length+" deletions. NOTHING pruned; the records stay visible until reload, exactly as before this feature existed.");
+      try{
+        if(typeof _reportDeviceSyncHealth==="function"&&CU)
+          _reportDeviceSyncHealth("HYBRID_PRUNE_REFUSED",arrName+": refused to prune "+gone.length+" tombstoned records in one snapshot (cap "+HYBRID_MAX_PRUNE_PER_SNAPSHOT+"). Investigate the deletion tombstones before trusting any deletion on this device.");
+      }catch(_){}
+      return;
+    }
+    D[arrName]=keep;
+    // Drop the shadow entries too — see choice 2 above. Without this the flush would
+    // read "in shadow, missing from D" as a deletion to issue, turning a passive
+    // convergence into an outbound delete sweep against records already gone.
+    gone.forEach(function(k){try{delete _hybridShadow[arrName][k];}catch(_){}});
+    pruned+=gone.length;
+    detail.push(arrName+" "+gone.length);
+  }
+  sweep("orders",HYBRID_COLLECTIONS_LIVE);
+  sweep("invoices",HYBRID_COLLECTIONS_LIVE);
+  sweep("customers",HYBRID_CUSTOMERS_LIVE);
+  if(pruned){
+    console.log("[NDHYBRID] pruned "+pruned+" record(s) deleted on another device ("+detail.join(", ")+") — tombstone-driven; no write and no delete issued");
+    try{refreshCurrentPage();}catch(_){}
+  }
+  return pruned;
 }
 
 function _hybridFlushDocs(writesOnly){
@@ -5535,6 +5641,14 @@ function startCloudListener(isWarmRefresh){
         if(!D.deletedCustomerIds[k])D.deletedCustomerIds[k]=data.D.deletedCustomerIds[k];
       });
     }
+    /* FIELD FIX (2026-08-03) — act on the tombstones we have just unioned in. Placed
+       HERE, after all three unions (orders ~line 4988, invoices ~4999, customers just
+       above), so it sees the complete, converged deletion set rather than a partial one.
+       This is the half that was missing: the tombstones were already being collected and
+       shared for exactly this purpose, but nothing removed the matching records from the
+       in-memory arrays, so a record deleted on another device stayed on screen until a
+       manual refresh. See the block comment on _hybridPruneTombstoned. */
+    try{_hybridPruneTombstoned();}catch(_){}
     // Always ensure required arrays exist
     if(!D.routes)D.routes=[];
     if(!D.complaints)D.complaints=[];
@@ -5746,7 +5860,25 @@ function _reconnectCloudListener(){
 var _visRecoveryAttached=false;
 var _backgroundPauseTimer=null;
 var _pausedForBackground=false;
-var BACKGROUND_PAUSE_MS=2*60*1000; // 2 minutes — long enough that a brief app-switch (checking a message, glancing away) never triggers a teardown, short enough to meaningfully reduce peak concurrent connections from tabs genuinely left in the background
+/* DELIBERATELY LEFT AT 2 MINUTES — and here is the reasoning, so it is not re-litigated.
+
+   During the b16 pass this was raised to 15 minutes to cut the cost of resumes: the pause
+   tears down FB_UNSUB and all five collection listeners, and the resume is a COLD
+   reconnect that re-subscribes every query. Under the monolith that resume re-read ONE
+   document; under the hybrid it re-reads ~1,271.
+
+   It was reverted before shipping. The saving was ASSERTED FROM READING THE CODE and then
+   supported with a measurement that turned out to be wrong — "3.1K reads in an idle hour"
+   was in fact Phase 4's own verification runs, misattributed because the console stamps
+   are UTC and the usage panel is local. Raising this also inverts a deliberate decision:
+   2 minutes exists to stop a backgrounded device streaming updates to a screen nobody is
+   looking at, which is a real cost in the other direction.
+
+   The honest position is that BOTH costs are unmeasured, so the existing decision stands
+   until there is evidence. To gather it: count "resuming after background pause" lines
+   across a normal trading day and compare a like-for-like day in the Usage tab. If
+   resumes prove expensive, raise this THEN, with numbers. */
+var BACKGROUND_PAUSE_MS=2*60*1000;
 function _initVisibilityRecovery(){
   if(_visRecoveryAttached)return; // never attach twice across multiple logins in one tab
   _visRecoveryAttached=true;
@@ -8134,6 +8266,12 @@ function _wizFinishWrite(finalUsers){
   });
 }
 var LOGOUT_FLUSH_MAX_MS=6000; // hard cap on how long teardown waits for a rescue write; the UI has already returned to the login screen, so this is never felt
+/* One switch for the whole "keep the subscription warm across logout" behaviour — see the
+   long note in logout() for the reasoning, the b12 analysis and the security position.
+   true  = a re-login on the same device re-uses the live listeners and costs ~0 reads.
+   false = the pre-2026-08-03 behaviour: full teardown, and every login re-reads ~1,271
+           documents. Flip to false to revert entirely; nothing else needs changing. */
+var KEEP_SUBSCRIPTION_ON_LOGOUT=true;
 function logout(){
   stopAutoSaveLoop();
   // Stop idle timer for ALL roles immediately
@@ -8284,7 +8422,40 @@ function logout(){
      _hybridListenersStartedAt, so the next login starts genuinely cold and re-subscribes.
      This also removes the need for the empty-D restart path to fire on a normal logout —
      that stays as the backstop for any OTHER way D gets cleared. */
-  try{_hybridStopListeners();}catch(_){}
+  /* READ-COST FIX (2026-08-03) — THE SUBSCRIPTION BELONGS TO THE TAB, NOT THE SESSION.
+
+     Measured: 15,000 reads in ~3 hours across 5 devices. That is ~12 full subscriptions
+     (~1,271 documents each: 412 orders + 413 invoices + the open sets + 431 customers),
+     i.e. about 2.4 per device — exactly what you get when staff idle out after 60s and
+     log back in, because logout tore the listeners down and login rebuilt them from zero.
+
+     Firestore listeners already do the right thing natively: deliver the result set once,
+     then stream only deltas. Tearing them down on logout throws that away and makes every
+     re-login pay for the initial set again. Keeping them attached IS the "load once, then
+     add updates" behaviour — no new mechanism needed, just stop destroying the old one.
+
+     WHY THIS DOES NOT REOPEN THE b12 DEAD SCREEN. That bug was `_hybridSeeded` reading
+     TRUE while D was EMPTY — an inconsistent pair, so _hybridStartListeners() returned
+     early and nothing re-hydrated. The b12 fix reached consistency by tearing BOTH down.
+     Keeping BOTH alive reaches the same consistency from the other side, and the b15
+     backstop (shadow-has-records AND arrays-empty => D was cleared) still catches any
+     other path that empties D.
+
+     WHY THIS DOES NOT WEAKEN SECURITY. autoSaveLocal() writes the entire dataset —
+     customers, phones, orders, invoices — to localStorage on every change, and NOTHING
+     clears it on logout (the only removeItem in this file is for a sessionStorage key).
+     So the data already survives logout on disk, in the same browser, readable by anyone
+     who can open the app. Holding it in memory as well adds no exposure that does not
+     already exist. What actually protects the next person at a shared phone is unchanged:
+     CU/SU/PE are cleared synchronously above, the login screen is shown, and a PIN is
+     required. This changes what is CACHED, not who can SEE or DO anything.
+
+     Set KEEP_SUBSCRIPTION_ON_LOGOUT=false to restore the old teardown exactly. */
+  if(!KEEP_SUBSCRIPTION_ON_LOGOUT){
+    try{_hybridStopListeners();}catch(_){}
+  }else{
+    console.log("[NDSYNC] logout — keeping the collection subscription warm; a re-login on this device costs no reads (see KEEP_SUBSCRIPTION_ON_LOGOUT)");
+  }
   if(_unsyncedAtLogout){
     console.log("[NDSYNC] logout — unsynced local work detected, flushing BEFORE teardown (this used to be discarded)");
     _flushPendingWritesNow("logout",true); // force: see the QUOTA GUARD note in _flushPendingWritesNow
@@ -8328,21 +8499,53 @@ function _finishLogoutTeardown(){
   if(window._syncAgeTicker){clearInterval(window._syncAgeTicker);window._syncAgeTicker=null;}
   if(FB_RECONNECT_TIMER){clearTimeout(FB_RECONNECT_TIMER);FB_RECONNECT_TIMER=null;}
   FB_RECONNECT_ATTEMPTS=0;
-  if(FB_UNSUB){try{FB_UNSUB();}catch(e){}FB_UNSUB=null;}
+  /* WARM LOGOUT (2026-08-03) — see KEEP_SUBSCRIPTION_ON_LOGOUT and the note in logout().
+
+     Everything ABOVE this point still runs: the heartbeat, the sync-age ticker and the
+     reconnect timer are all per-session and are correctly stopped. What is skipped below
+     is only the DESTRUCTION of state that a re-login on this same device would otherwise
+     have to pay ~1,271 reads to rebuild.
+
+     The audit listener is stopped either way — it is bounded, per-session, and cheap to
+     re-attach, so there is no reason to leave it streaming to a logged-out screen. */
   if(FB_AUDIT_UNSUB){try{FB_AUDIT_UNSUB();}catch(e){}FB_AUDIT_UNSUB=null;}
-  FB_READY=false;FB_DOC_REF=null;_APP_READY=false;
-  // Now — and only now — stop accepting writes. Moved here from the top of
-  // logout(); clearing it there is precisely what discarded pending orders.
-  FB_WRITE_QUEUE=[];FB_WRITING=false;
-  // Cancel retries so nothing fires against the now-null FB_DOC_REF.
-  if(FB_WRITE_RETRY_TIMER){clearTimeout(FB_WRITE_RETRY_TIMER);FB_WRITE_RETRY_TIMER=null;}
-  if(FB_PENDING_CONFIRM_RETRY){clearTimeout(FB_PENDING_CONFIRM_RETRY);FB_PENDING_CONFIRM_RETRY=null;}
-  // D is about to be emptied, so there is genuinely nothing left in memory to
-  // flush — leaving these set would make them lie to the next session.
-  _pendingLocalWrite=false;_syncInFlight=null;
-  // Clear all session data — security: prevent data leak to next user
-  D={customers:[],stock:[],orders:[],offers:[],invoices:[],routes:[],
-     complaints:[],pendingPayments:[],auditLog:[]};
+  if(!KEEP_SUBSCRIPTION_ON_LOGOUT){
+    if(FB_UNSUB){try{FB_UNSUB();}catch(e){}FB_UNSUB=null;}
+    FB_READY=false;FB_DOC_REF=null;_APP_READY=false;
+  }else{
+    /* _APP_READY still drops: it gates UI rendering, and there is no app on screen.
+       FB_READY / FB_DOC_REF stay so the main-document listener keeps delivering and any
+       write still pending from before logout can complete rather than being stranded —
+       which is the same reasoning that moved the write-queue wipe below this point. */
+    _APP_READY=false;
+  }
+  if(!KEEP_SUBSCRIPTION_ON_LOGOUT){
+    // Now — and only now — stop accepting writes. Moved here from the top of
+    // logout(); clearing it there is precisely what discarded pending orders.
+    FB_WRITE_QUEUE=[];FB_WRITING=false;
+    // Cancel retries so nothing fires against the now-null FB_DOC_REF.
+    if(FB_WRITE_RETRY_TIMER){clearTimeout(FB_WRITE_RETRY_TIMER);FB_WRITE_RETRY_TIMER=null;}
+    if(FB_PENDING_CONFIRM_RETRY){clearTimeout(FB_PENDING_CONFIRM_RETRY);FB_PENDING_CONFIRM_RETRY=null;}
+    // D is about to be emptied, so there is genuinely nothing left in memory to
+    // flush — leaving these set would make them lie to the next session.
+    _pendingLocalWrite=false;_syncInFlight=null;
+    // Clear all session data — security: prevent data leak to next user
+    D={customers:[],stock:[],orders:[],offers:[],invoices:[],routes:[],
+       complaints:[],pendingPayments:[],auditLog:[]};
+  }
+  /* WARM LOGOUT: D, the write queue and the retry timers all survive deliberately.
+
+     D is what a re-login would otherwise re-read at ~1,271 documents. The queue and its
+     retries survive with it because the connection survives — cancelling them here while
+     FB_DOC_REF is still live would strand exactly the unsent work that logout() just
+     spent up to LOGOUT_FLUSH_MAX_MS trying to save. _pendingLocalWrite is likewise left
+     truthful rather than being reset to a convenient lie.
+
+     The "prevent data leak to next user" comment above is preserved verbatim because it
+     still describes the FALSE branch precisely. It is worth being explicit that it is not
+     what protects a shared phone: autoSaveLocal() has already written the same dataset to
+     localStorage and nothing clears it, so the next person's access is governed by the
+     login screen and the PIN — both unchanged — not by whether D is resident in memory. */
 }
 function nav(p,btn){
   if(!can(p))return;
@@ -10001,12 +10204,16 @@ function recPay(){
       amt=totalDebt;
     }
     var rem=amt;
+    // Record which invoices this payment actually touched, so the pending-staff-cash
+    // resolution below can clear exactly those orders and no others (2026-08-03).
+    var _touchedInvoiceIds=[];
     (D.invoices||[]).filter(function(i){return i.cId===cId&&i.paid<i.amount&&!i.voided&&_invoiceOrderActive(i);})
       .sort(function(a,b){return a.date>b.date?1:-1;})
       .forEach(function(inv){
         if(rem<=0)return;
         var tap=Math.min(rem,inv.amount-inv.paid);
         if(!inv.payments)inv.payments=[];
+        _touchedInvoiceIds.push(inv.id);
         var _distPid=uid();
         inv.payments.push({pid:_distPid,date:payDate,amt:tap,method:method,ref:ref});
         _outboxPutPayment(inv.id,_distPid); // B2: customer-level payment distributed across invoices — each slice durably queued
@@ -10033,10 +10240,27 @@ function recPay(){
       cu2.creditLog.push({cid:uid(),date:payDate,amt:rem,type:"overpayment",method:method,ref:ref,by:CU.name,role:CU.role,note:"Unapplied balance stored as credit"});
       rem=0;
     }
-    /* Reports the money RECEIVED (_amtEntered), then shows exactly where it went, so
-       the audit trail reconciles to the customer's creditLog without a human having
-       to re-derive it. Every component is named: applied to invoices, taken from
-       existing credit, and left as new credit. */
+    /* DOUBLE-POSTING FIX (2026-08-03) — this branch never resolved pending staff cash.
+
+       The invoice-specific branch above has called _resolvePendingCashFor() since
+       2026-07-29, precisely so that a manual posting clears the staff-cash banner and a
+       later acknowledgement cannot post the same money twice. The CUSTOMER-LEVEL branch
+       was never given the same treatment, so paying a customer's account down manually
+       left every pending collection still flagged — and acknowledging one of those was
+       the exact entry point into the phantom-credit path fixed in ackPendingPay().
+
+       Resolves by ORDER for every invoice this payment actually touched, which is the
+       same key the pending entries carry. Marking them acknowledged here is the honest
+       record: the cash IS accounted for, it was simply posted by hand instead. */
+    try{
+      var _resolvedC=0;
+      (_touchedInvoiceIds||[]).forEach(function(_iid){
+        var _inv=(D.invoices||[]).find(function(x){return x.id===_iid;});
+        var _o=_inv?_orderForInvoice(_inv):null;
+        if(_o)_resolvedC+=_resolvePendingCashFor(_o.id,cId,"resolved by a customer-level payment — cash already accounted for");
+      });
+      if(_resolvedC)toast(_resolvedC+" pending staff cash entr"+(_resolvedC===1?"y":"ies")+" marked confirmed — no double posting","ok");
+    }catch(_){}
     auditLog("PAYMENT_RECORDED","KSh "+_amtEntered.toLocaleString()+" by "+CU.name+" ("+CU.role+") for customer #"+cId+". Method: "+method+(ref?" Ref: "+ref:"")+". Applied to invoices: KSh "+amt.toLocaleString()+(existingCredit>0&&(_amtEntered!==amt||credit2>0)?" | existing credit used: KSh "+Math.min(existingCredit,amt).toLocaleString():"")+(credit2>0?" | KSh "+credit2.toLocaleString()+" stored as NEW credit (overpayment)":"")+". Distributed oldest-first.");
   }
   cm("m-pay");
@@ -10450,11 +10674,27 @@ function calcO(){
 }
 var _idleTimer=null;
 var _idleLast=Date.now();
-/* Idle-logout deferral budget (2026-08-02) — see _idleExpire below.
-   4 x 15s = at most one extra minute on a phone that already has unsent work, then
-   it logs out regardless. Deliberately small: this is a security timeout, and the
-   deferral exists to avoid destroying a write, not to keep sessions alive. */
-var IDLE_DEFER_MS=15000, IDLE_DEFER_MAX=4, _idleDefers=0;
+/* Idle-logout deferral budget — see _idleExpire below.
+   8 x 15s = at most 120 SECONDS of extra time, and ONLY on a phone that still has
+   unsent work. Set by the owner (2026-08-03) alongside the decision to keep the staff
+   idle timeout itself at 60s:
+
+     "leave at 60s of inactivity and 120s in case unsent work, to cater for missing
+      orders"
+
+   The two numbers do different jobs and that separation is the point:
+     60s   — the SECURITY window. A shared delivery phone (up to three staff, or a
+             personal phone put down mid-round) with nothing pending re-locks fast, so
+             nobody can act under someone else's identity. Unchanged.
+     +120s — the DATA window, and it can only ever be spent when _pendingLocalWrite /
+             FB_WRITE_QUEUE / FB_WRITING say something is genuinely unsent. A phone
+             with nothing pending — the overwhelmingly common case — still logs out at
+             exactly 60s and never touches this budget.
+
+   Checked every 15s rather than in one long wait, so the session ends the moment the
+   work actually drains instead of always burning the full allowance. Past the cap it
+   logs out regardless: a permanently failing write must not hold a session open. */
+var IDLE_DEFER_MS=15000, IDLE_DEFER_MAX=8, _idleDefers=0;
 function resetIdleTimer(){
   _idleLast=Date.now();
   if(_idleTimer)clearTimeout(_idleTimer);
@@ -10467,6 +10707,26 @@ function resetIdleTimer(){
   if(!CU)return;
   // TIER 1a (2026-07-20): director idle timeout reduced from 600s to 180s —
   // a genuinely forgotten/unattended director session now re-locks sooner.
+  /* 60 SECONDS FOR STAFF IS DELIBERATE — DO NOT RAISE IT. (owner, 2026-08-03)
+
+     This was briefly raised to 180000 during the b16 pass, on the reasoning that the
+     DIRECTOR role already accepts 180s and holds more privilege. That reasoning was
+     WRONG and the owner corrected it the same morning:
+
+       "why should staff stay on 24/7 without activity? some phone is used by 3 staff
+        sometimes, or they use their own phones"
+
+     The governing constraint is DEVICE SHARING, not privilege. A delivery phone passed
+     between three staff, or a personal phone put down mid-round, must re-lock fast —
+     otherwise the next person can place orders, view customer data and take payments
+     under someone else's identity. The director's phone is not shared that way, so the
+     180s accepted there does not transfer.
+
+     The data risk that USED to justify raising this is already closed by other means:
+     _idleExpire() defers logout while _pendingLocalWrite / FB_WRITE_QUEUE / FB_WRITING
+     say work is unsent (bounded, 4 x 15s), so an order in flight is no longer destroyed
+     by the timeout firing on top of it. Duration and safety are separate problems and
+     only the safety one needed solving. */
   var limit=CU.role==="staff"?60000:CU.role==="manager"?300000:180000;
   var warnWindow=CU.role==="staff"?10000:20000; // show warning 10s (staff) or 20s (mgr/dir) before logout
   _idleWarnTimer=setTimeout(function(){
@@ -12790,6 +13050,138 @@ function saveInv(){
     el("iva").value="";el("ivp").value="0";el("ivn").value="";cm("m-iv");rInvs(undefined,INV_PAGE);dirty();toast("Invoice created");
   });
 }
+/* Step 2 of the acknowledgement rule — see the block comment inside ackPendingPay().
+
+   Cash left over after the order's own invoice is settled is applied to that
+   customer's OTHER open invoices, oldest first, before anything else is considered.
+   The customer owes what they owe across the whole account, not per document, so
+   money in hand must clear real debt wherever it sits before being called excess.
+
+   Uses _invoiceOrderActive() — the shared collectable predicate — so this agrees
+   with custDebt() exactly. That matters: a weaker filter here would post real cash
+   onto an invoice whose order was cancelled or deleted, which is precisely the
+   defect the 2026-07-27 predicate consolidation was written to close. A voided
+   invoice is likewise never paid down; it has been deliberately written off.
+
+   Returns whatever is STILL in hand, rounded. The caller treats that as custody. */
+function _ackDistributeToOpenInvoices(pp,remaining,skipInv){
+  try{
+    if(!(remaining>0))return 0;
+    var open=(D.invoices||[]).filter(function(i){
+      if(!i||i.cId!==pp.cId)return false;
+      if(skipInv&&i.id===skipInv.id)return false;   // already handled by the caller
+      if(i.voided)return false;
+      if(!_invoiceOrderActive(i))return false;
+      return ((Number(i.amount)||0)-(Number(i.paid)||0))>0;
+    }).sort(function(a,b){return (a.date||"")>(b.date||"")?1:-1;});   // oldest first
+    open.forEach(function(i){
+      if(remaining<=0)return;
+      var bal=_round2((Number(i.amount)||0)-(Number(i.paid)||0));
+      if(bal<=0)return;
+      var take=_round2(Math.min(remaining,bal));
+      if(!i.payments)i.payments=[];
+      var _pid=uid();
+      i.payments.push({pid:_pid,srcPp:pp.id,date:tday(),amt:take,method:pp.method,
+        ref:"Staff collection by "+pp.collectedBy+" — ack by "+CU.name+" (applied to Invoice #"+i.id+")"});
+      _outboxPutPayment(i.id,_pid);   // durable copy, same as every other cash posting
+      i.paid=_round2(i.payments.reduce(function(s,p){return s+(p.amt||0);},0));
+      var _o=_orderForInvoice(i);
+      if(_o){
+        if(i.paid>=i.amount){_o.paid="Paid";}else if(i.paid>0){_o.paid="Partial";}
+        _o.amtPaid=i.paid;
+      }
+      remaining=_round2(remaining-take);
+    });
+    return _round2(remaining);
+  }catch(_){return _round2(remaining);}
+}
+/* REPAIR (2026-08-03) — reverse store credit the pre-fix acknowledgement path invented.
+
+   Every phantom entry carries an unmistakable signature: type "overpayment" with a note
+   beginning "Overpayment acknowledging ". No other code path in this file writes that
+   text — genuine overpayments read "Overpayment on Invoice #", "Overpayment on customer
+   account", "Unapplied balance stored as credit", "Overpayment at delivery of Order #",
+   or the cancellation conversion. So the match is exact and cannot catch real money.
+
+   REVERSED, NOT DELETED, and that is deliberate. _mergeCustomerCredit() unions credit
+   log entries BY cid and is additive by design — a locally deleted entry would simply be
+   re-added by the next device that still holds it. Appending a negative reversal is the
+   only edit that converges across devices, and it is the shape adjustCredit() and the
+   payment-reversal path already use.
+
+   IDEMPOTENT by construction: the reversal's cid is derived from the original
+   ("revack-<cid>"), so a second pass sees it already present and does nothing. That
+   holds across devices too, because the derived cid is identical everywhere.
+
+   Credit is floored at 0 — if some of the phantom amount has already been spent, the
+   business absorbs the difference rather than pushing a customer into negative credit,
+   which no screen in this app is built to display. */
+/* DRY-RUN BY DEFAULT (2026-08-03). _sweepPhantomAckCredit() only REPORTS; you must call
+   _sweepPhantomAckCredit(true) to actually reverse anything.
+
+   The first revision applied automatically from runIntegrityCheck() on every director
+   login. That is the shape this project has been damaged by before — an unattended repair
+   that rewrites money. A self-heal once restored 277 orders and corrupted the books, and
+   CLAUDE.md's standing rule is that recovery is forward-only and never bulk-applied.
+
+   Reversing store credit is CUSTOMER-FACING: a customer who believes they hold KSh 500 of
+   credit and finds it gone will ask why. The director should see the list, recognise the
+   names, and decide — not discover it after the fact in an audit log. So the integrity
+   check now surfaces the count and the total, and the director applies it deliberately.
+
+   The matching itself is exact and closed: only entries whose note begins "Overpayment
+   acknowledging " — a string written by exactly one line of code, which this build
+   removes. It cannot match a genuine overpayment. The caution is about WHO decides, not
+   about whether the detection is sound. */
+function _sweepPhantomAckCredit(apply){
+  var fixed=0,total=0,names=[];
+  try{
+    (D.customers||[]).forEach(function(cu){
+      if(!cu||!Array.isArray(cu.creditLog)||!cu.creditLog.length)return;
+      var have={};
+      cu.creditLog.forEach(function(e){if(e&&e.cid!=null)have[String(e.cid)]=true;});
+      cu.creditLog.filter(function(e){
+        return e&&e.type==="overpayment"&&(Number(e.amt)||0)>0
+          &&typeof e.note==="string"
+          &&e.note.indexOf("Overpayment acknowledging ")===0
+          &&!have["revack-"+e.cid];
+      }).forEach(function(e){
+        var amt=_round2(Number(e.amt)||0);
+        fixed++;total=_round2(total+amt);
+        if(names.length<12)names.push((cu.name||("#"+cu.id))+" KSh "+amt.toLocaleString());
+        if(!apply)return;   // DRY RUN — detect and report only; see the note above
+        cu.creditLog.push({cid:"revack-"+e.cid,date:tday(),amt:-amt,type:"reversal",
+          ordId:e.ordId,by:(typeof CU!=="undefined"&&CU?CU.name:"system"),
+          role:(typeof CU!=="undefined"&&CU?CU.role:""),
+          note:"PHANTOM CREDIT REVERSED — KSh "+amt+" was booked as an overpayment when a staff "+
+               "cash acknowledgement for Order #"+e.ordId+" found the invoice already settled. "+
+               "No customer money was ever in excess: the cash was a custody handover of a sale "+
+               "already paid and recorded, so this credit was the same money counted twice."});
+        cu.credit=_round2(Math.max(0,(Number(cu.credit)||0)-amt));
+        try{
+          auditLog("CUSTOMER_UPDATED","PHANTOM CREDIT REVERSED: KSh "+amt.toLocaleString()+
+            " removed from a customer's store credit. It was created by acknowledging staff cash "+
+            "against an already-settled invoice (Order #"+e.ordId+"), not by any real overpayment. "+
+            "Credit is now KSh "+cu.credit.toLocaleString()+".");
+        }catch(_){}
+      });
+    });
+  }catch(e){
+    /* Never swallow this silently. An earlier revision had a bare `catch(_){}` here and a
+       missing helper made the whole sweep a no-op that reported success — caught only
+       because the proof asserted the REVERSAL, not merely that the function ran. A repair
+       that quietly does nothing is worse than one that fails loudly. */
+    console.log("[NDSYNC] phantom-credit sweep FAILED — no credit was changed: "+((e&&e.message)||e));
+    try{_reportDeviceSyncHealth("PHANTOM_CREDIT_SWEEP_FAILED","The phantom store-credit repair could not run ("+((e&&e.message)||e)+"). Customer credit may still include amounts created by acknowledging staff cash on already-settled invoices.");}catch(_){}
+  }
+  if(fixed){
+    console.log("[NDSYNC] phantom credit "+(apply?"REVERSED":"DETECTED (dry run — nothing changed)")+
+      ": "+fixed+" entr"+(fixed===1?"y":"ies")+" totalling KSh "+total.toLocaleString()+
+      (names.length?" — "+names.join("; "):"")+
+      (apply?"":". Run _sweepPhantomAckCredit(true) as director to reverse."));
+  }
+  return fixed;
+}
 function ackPendingPay(id){
   if(!can("mPaid")){toast("No permission","err");return;}
   if(!D.pendingPayments)return;
@@ -12840,18 +13232,55 @@ function ackPendingPay(id){
       }
     }
   }
-  // Leftover (invoice fully settled, or none found at all) becomes customer
-  // credit rather than being silently lost.
-  if(remaining>0){
-    var cu=(D.customers||[]).find(function(x){return x.id===pp.cId;});
-    if(cu){
-      cu.credit=_round2((cu.credit||0)+remaining);
-      if(!cu.creditLog)cu.creditLog=[];
-      cu.creditLog.push({cid:uid(),date:tday(),amt:remaining,type:"overpayment",ordId:pp.ordId,method:pp.method,by:CU.name,role:CU.role,note:"Overpayment acknowledging "+pp.collectedBy+"'s collection for Order #"+pp.ordId});
-    }
-  }
+  /* ROOT-CAUSE FIX (2026-08-03) \u2014 PHANTOM STORE CREDIT ON CASH ACKNOWLEDGEMENT.
+
+     WHAT THIS BLOCK USED TO DO, and why it was wrong:
+
+       if(remaining>0){ cu.credit += remaining;  ...creditLog "overpayment"... }
+
+     `remaining` is only reduced inside `if(apply>0)` above. When the linked invoice
+     is ALREADY settled \u2014 paid at placement, posted earlier through recPay(), or
+     synced from another device \u2014 `inv.amount-inv.paid` is 0, so `apply` is 0, that
+     branch never runs, and `remaining` is still the FULL collected amount. This
+     block then booked the entire staff collection as customer store credit.
+
+     THE REAL-WORLD SEQUENCE, reproduced in _proofB_phantom_credit.js \u00a71:
+       1. Driver delivers KSh 500 and records "cash collected"  -> pendingPayments
+       2. Director records the KSh 500 manually before acknowledging -> invoice settled
+       3. Director later clicks "Acknowledge receipt" on the banner
+       4. apply = min(500, 500-500) = 0  ->  remaining stays 500  ->  KSh 500 credit
+     One physical KSh 500 became KSh 500 of revenue AND a KSh 500 liability the
+     business must later honour as free goods. The same cash, counted twice.
+
+     THE RULE NOW: acknowledging staff cash is a CUSTODY handover. The director is
+     confirming they physically received money already collected against a sale that
+     is already on the books. It is not a new payment and it can NEVER mint credit.
+
+     Order of operations:
+       1. apply to the order's own invoice (above, unchanged)
+       2. apply any leftover to that customer's OTHER open invoices, oldest first \u2014
+          real debt anywhere on the account is settled before anything else
+       3. anything STILL in hand is money already accounted for -> record it as a
+          custody confirmation, touch no balances, create no credit
+
+     Credit is still created normally by recPay(), where a human explicitly types an
+     amount above the balance and can see exactly what they are approving. That is
+     the only place an overpayment can be a deliberate act rather than an artefact. */
+  if(remaining>0)remaining=_ackDistributeToOpenInvoices(pp,remaining,inv);
+  var _custodyOnly=(remaining>0);
   pp.ack=true;pp.ackedBy=CU.name;pp.ackedDate=tday();
-  auditLog("CASH_ACKNOWLEDGED","Director "+CU.name+" acknowledged KSh "+pp.amt+" cash collected by "+pp.collectedBy+" for Order #"+pp.ordId+(remaining>0?" (KSh "+remaining+" over invoice balance \u2192 customer credit)":""));
+  if(_custodyOnly){
+    pp.ackVia="custody-confirmation";
+    pp.ackCustodyAmt=_round2(remaining);
+    auditLog("CASH_ACKNOWLEDGED","Director "+CU.name+" confirmed CUSTODY of KSh "+pp.amt.toLocaleString()+
+      " cash collected by "+pp.collectedBy+" for Order #"+pp.ordId+". KSh "+_round2(remaining).toLocaleString()+
+      " of it matched no outstanding balance on this customer's account \u2014 the sale was already paid and recorded, "+
+      "so this is a handover of money already on the books. NO customer credit was created and no balance changed. "+
+      "(Before 2026-08-03 this path silently booked that amount as store credit, counting the same cash twice.)");
+  }else{
+    auditLog("CASH_ACKNOWLEDGED","Director "+CU.name+" acknowledged KSh "+pp.amt.toLocaleString()+
+      " cash collected by "+pp.collectedBy+" for Order #"+pp.ordId+" \u2014 applied to outstanding balances.");
+  }
   dirty();
   toast("Payment of KSh "+pp.amt.toLocaleString()+" acknowledged and applied");
   // Refresh ALL affected views so changes appear immediately
@@ -15502,6 +15931,22 @@ function runIntegrityCheck(){
   // new mechanism. Fix: require a genuine SERVER-confirmed read, never a cache one.
   if(!CU||CU.role!=="director"||!FB_READY||!_cloudDataConfirmed||!_cloudServerConfirmed)return;
   var issues=[];
+  /* REPAIR (2026-08-03) — reverse any store credit invented by the pre-fix cash
+     acknowledgement path. Runs here because this function already holds the two rails
+     that matter: director-only, and a SERVER-confirmed load (never a cache-only one),
+     so it can never act on a partially-hydrated D. Idempotent — the reversal's cid is
+     derived from the original, so once reversed an entry is never touched again, on
+     this device or any other. See _sweepPhantomAckCredit. */
+  var _phantomFound=0;
+  try{_phantomFound=_sweepPhantomAckCredit(false);}catch(_){}   // DRY RUN — report only
+  if(_phantomFound){
+    issues.push(_phantomFound+" phantom store-credit entr"+(_phantomFound===1?"y":"ies")+
+      " DETECTED — created by acknowledging staff cash against an already-settled invoice. "+
+      "The customers never overpaid; that credit is the same cash counted twice. "+
+      "NOT reversed automatically: this is customer-facing money, so a director must review "+
+      "the list (see the console line naming each customer and amount) and then run "+
+      "_sweepPhantomAckCredit(true) to apply. Nothing has been changed.");
+  }
   // FIX (2026-07-21): this used to SILENTLY ZERO a customer's real credit
   // balance whenever it saw credit>0 with an empty creditLog, inferring
   // that meant "old form-set limit data." That inference could be made
