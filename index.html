@@ -348,7 +348,7 @@ var APP_VERSION="2026-07-21-v35";
    was actually running.
    Bump this ONE line on every deploy. It is display-and-diagnostics only — nothing branches
    on it, no merge or money logic reads it, so it can never change behaviour. */
-var BUILD_STAMP="2026-08-03-hyb-b20";
+var BUILD_STAMP="2026-08-03-hyb-b21";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -1320,6 +1320,76 @@ var HYBRID_COLLECTIONS_LIVE=true;
    entry, the payload skip and the backfill/verify coverage are all in place and proven.
    DO NOT set this true as part of the Phase 3 cutover. It is a separate, later step. */
 var HYBRID_CUSTOMERS_LIVE=true;
+/* ============================================================================
+   DELTA SYNC + INDEX DOCUMENTS (2026-08-03, build b21)   READ-COST ARCHITECTURE
+
+   THE PROBLEM. Under the hybrid a cold load re-reads the entire working set —
+   orders 429 + invoices 430 + customers 435 = ~1,294 documents. Under the
+   monolith the same event cost 1 read. Measured 2026-08-03: 49K reads against
+   the 50,000/day free ceiling, run rate ~134K/day. b20 removed the background
+   pause as a trigger; a genuine page load still costs full price.
+
+   THE DESIGN, in two halves that fix each other's weakness:
+
+     INDEX DOCUMENT — one Firestore document per collection holding a scalar
+     snapshot of every record, plus the server time it was built. 435 customers
+     at ~120 bytes is ~52 KB against a 1 MiB limit. Reading it costs 1 READ
+     INSTEAD OF 435. It is REBUILT WHOLESALE, never edited incrementally, which
+     is what stops two devices clobbering each other — the failure mode that
+     makes a shared-array document unsafe for money. The per-record documents
+     stay authoritative; the index is a derived cache and nothing more.
+
+     DELTA QUERY — where("_updatedAt",">",builtAt). Returns only records changed
+     since the index was built, typically 10-30. This is what keeps a stale
+     index correct: the index supplies the baseline, the delta supplies the gap.
+
+   WHY THE DATE WINDOW DISAPPEARS IN DELTA MODE. Firestore permits range filters
+   on only ONE field per query, so where("date",">=",cut).where("_updatedAt",">",wm)
+   is ILLEGAL. It is also pointless: in delta mode you want every changed record
+   regardless of age. Delta mode therefore collapses orders/hot + orders/open
+   into a SINGLE query, because any settlement change stamps _updatedAt.
+
+   ---- THE LANDMINE, AND WHY THIS IS GATED ----
+   A Firestore range query EXCLUDES documents where the field is ABSENT. This
+   file already documents that exact trap for `paid` (see _hybridDerive: a `!=`
+   query "silently skipped any legacy order with no paid field — invisible
+   debt"). _updatedAt has the same exposure, and worse: line ~1622 records that
+   "a JSON round-trip silently destroys [the sentinel] — that exact bug made
+   updatedAt null on every write for weeks."
+
+   ANY DOCUMENT WITHOUT _updatedAt IS INVISIBLE TO DELTA SYNC FOREVER. No error,
+   no warning — the order simply stops arriving. That is the missing-order class
+   rebuilt deliberately, so delta mode MUST NOT be enabled until
+   _auditUpdatedAtCoverage() reports 0 documents missing the field.
+
+   THREE INDEPENDENT SAFETY NETS, because one is not enough for money:
+     1. GATE      — no watermark, or a stale one, falls back to the FULL query
+                    set, which is byte-identical to b20. The fallback is the
+                    current behaviour, not new code.
+     2. DRIFT     — the main document publishes a record count per collection.
+                    Every device already receives that document, so comparing it
+                    against local array lengths costs ZERO extra reads. A
+                    mismatch forces one full reconcile.
+     3. AUDIT     — _auditUpdatedAtCoverage() must be run and clean by a
+                    director before the flag is turned on.
+
+   HOT-WINDOW RULE PRESERVED. The orders/invoices index is built from
+   "date >= hotCut OR settled == false", the SAME predicate as the live queries.
+   An old unpaid order that never changes would otherwise fall out of both the
+   index and the delta and become invisible debt. RULE 1: debt never leaves.
+
+   SHIPS OFF. With the flag false, _hybridStartListeners takes exactly the b20
+   path and nothing below runs. Turning it on is a deliberate, audited act.
+   ============================================================================ */
+var HYBRID_DELTA_SYNC_LIVE=false;
+/* How old an index/watermark may be before it is refused and a full load is taken
+   instead. A device that has been off for longer than this cannot trust its baseline:
+   too much may have changed, and — more importantly — a record DELETED while it was
+   away is only knowable from the tombstones, which are bounded. Seven days is well
+   inside the tombstone retention and far beyond any normal absence. */
+var DELTA_MAX_BASELINE_AGE_MS=7*24*60*60*1000;
+var _deltaMode=false;             // true only while a delta subscription is live
+var _deltaBaselineAt=0;           // server ms the current baseline was built
 var _hybridShadow={orders:{},invoices:{},customers:{}};   // id -> JSON, last state successfully persisted
 var _hybridListenersOn=false,_hybridUnsub=[];
 /* When the current subscription was established. Used only to give a brand-new
@@ -2362,6 +2432,99 @@ function _hydrateById(arr,docs,label,arrName){
       (_tombSkipped?" ("+_tombSkipped+" deleted/archived record(s) refused re-entry — the collection still holds them; the delete cap or a failed delete is why)":""));
   return added+updated;
 }
+/* DELTA SYNC — THE GATE (2026-08-03, b21). Returns the server-ms baseline a delta
+   subscription may safely start from, or 0 meaning "take the full load".
+
+   Every condition below is a REFUSAL to use delta. The default answer is 0, and any
+   error, any missing value, any doubt returns 0. That direction is deliberate: a
+   wrong 0 costs ~1,294 reads, a wrong baseline costs missing orders. */
+function _deltaBaselineOrZero(){
+  try{
+    if(!HYBRID_DELTA_SYNC_LIVE)return 0;
+    if(!HYBRID_COLLECTIONS_LIVE||!HYBRID_CUSTOMERS_LIVE)return 0;   // partial cutover: never
+    var raw=null;
+    try{raw=localStorage.getItem("nd_delta_baseline");}catch(_){return 0;}
+    if(!raw)return 0;                                   // first ever run on this device
+    var b=null;try{b=JSON.parse(raw);}catch(_){return 0;}
+    if(!b||typeof b.at!=="number"||!(b.at>0))return 0;
+    /* A baseline older than the tombstone horizon cannot be trusted: a record DELETED
+       while this device was away may no longer be listed, and a delta query can never
+       report a deletion. Fall back to the full load, which reconciles from scratch. */
+    if((Date.now()-b.at)>DELTA_MAX_BASELINE_AGE_MS)return 0;
+    /* The audit must have been run and clean on this device. _updatedAt is absent on any
+       document written during the documented sentinel-destroying window, and a range query
+       silently excludes those forever — see the block at HYBRID_DELTA_SYNC_LIVE. */
+    if(b.auditClean!==true)return 0;
+    /* DRIFT: the main document publishes a count per collection, and every device already
+       receives it, so this check costs ZERO reads. Local arrays shorter than the published
+       count mean this device is missing records — a delta can only make that worse. */
+    var pub=(D&&D.collectionCounts)||null;
+    if(pub){
+      var names=["orders","invoices","customers"];
+      for(var i=0;i<names.length;i++){
+        var n=names[i],have=((D&&D[n])||[]).length,want=Number(pub[n]);
+        if(!isNaN(want)&&want>have){
+          console.log("[NDDELTA] REFUSED — drift detected: "+n+" local="+have+" published="+want+" (this device is missing records; taking the full load so nothing stays lost)");
+          return 0;
+        }
+      }
+    }
+    return b.at;
+  }catch(_){return 0;}   // never let this throw a device into a broken read path
+}
+/* Advance the baseline ONLY after a delta subscription has actually delivered. Stored with
+   the audit result so a later build cannot silently inherit an unaudited baseline. */
+function _deltaRecordBaseline(atMs,auditClean){
+  try{
+    localStorage.setItem("nd_delta_baseline",JSON.stringify({
+      at:atMs,auditClean:!!auditClean,stamp:(typeof BUILD_STAMP!=="undefined"?BUILD_STAMP:"")}));
+  }catch(_){}
+}
+/* DIRECTOR TOOL — the gate that must pass before delta sync may be enabled.
+   Reads every document in all three collections and counts how many lack _updatedAt.
+   Costs a full read set (~1,294) ON PURPOSE and once: this is the check that stands
+   between delta sync and permanently invisible orders. */
+function _auditUpdatedAtCoverage(){
+  if(!CU||CU.role!=="director"){toast("Director only","err");return;}
+  if(!FB_ORDERS_COL||!FB_INVOICES_COL||!FB_CUSTOMERS_COL){toast("Not connected","err");return;}
+  console.log("[NDDELTA] _updatedAt coverage audit starting (read-only, ~1,294 reads)");
+  var cols=[["orders",FB_ORDERS_COL],["invoices",FB_INVOICES_COL],["customers",FB_CUSTOMERS_COL]];
+  var missing=[],total=0;
+  var step=function(i){
+    if(i>=cols.length){
+      var clean=(missing.length===0);
+      console.log("[NDDELTA] audit "+(clean?"CLEAN":"FAILED")+" — "+total+" documents checked, "+
+        missing.length+" missing _updatedAt"+(missing.length?": "+missing.slice(0,20).join(", ")+(missing.length>20?" …":""):""));
+      if(clean){
+        /* Persist the AUDIT RESULT ONLY — never a usable baseline. The baseline is written
+           by the full-load path once a complete result set has actually been delivered
+           (see _hybridStartListeners). Separating the two is what stops a clean audit from
+           being mistaken for "this device holds every record". */
+        try{localStorage.setItem("nd_delta_audit_clean","1");}catch(_){}
+        console.log("[NDDELTA] delta sync may now be enabled. Set HYBRID_DELTA_SYNC_LIVE=true in the next build.");
+        toast("Audit CLEAN — "+total+" documents all carry _updatedAt","ok");
+      }else{
+        console.log("[NDDELTA] DO NOT ENABLE DELTA SYNC. Those documents would become invisible to every device, permanently and silently. Re-save each one (any edit re-stamps _updatedAt) and re-run this audit.");
+        toast(missing.length+" documents missing _updatedAt — delta sync MUST stay off","err");
+      }
+      try{auditLog("DATA_EXPORTED","DELTA AUDIT: "+total+" documents checked across /orders, /invoices, /customers; "+missing.length+" missing _updatedAt. "+(clean?"Clean — delta sync may be enabled.":"NOT clean — delta sync must remain disabled."));}catch(_){}
+      return;
+    }
+    cols[i][1].get({source:"server"}).then(function(s){
+      s.forEach(function(d){
+        total++;
+        var v=d.data();
+        if(!v||v._updatedAt==null)missing.push(cols[i][0]+"#"+d.id);
+      });
+      step(i+1);
+    }).catch(function(e){
+      console.log("[NDDELTA] audit could not read "+cols[i][0]+": "+((e&&e.code)||"unknown")+
+        " — code 'unavailable' means connectivity (reload the page), 'permission-denied' means rules");
+      toast("Audit failed to read "+cols[i][0],"err");
+    });
+  };
+  step(0);
+}
 function _hybridStartListeners(){
   // EITHER flag can require listeners — they are independent cutovers, so this must not
   // gate on the orders/invoices flag alone or enabling customers first would leave
@@ -2477,6 +2640,39 @@ function _hybridStartListeners(){
   /* Only attach the order/invoice listeners when THEIR cutover is live. If customers were
      enabled first, attaching these would hydrate D.orders from /orders while the main-document
      merge was still authoritative for it — two sources writing the same array. */
+  /* DELTA MODE (2026-08-03, b21) — see the block at HYBRID_DELTA_SYNC_LIVE.
+     _deltaBaselineOrZero() returns 0 for every doubt, and 0 takes the ORIGINAL full-query
+     path below unchanged. With the flag off it always returns 0, so this build behaves
+     exactly like b20 until delta is deliberately enabled and audited.
+
+     WHY THE DATE WINDOW IS ABSENT HERE. Firestore allows range filters on ONE field per
+     query, so where("date",">=",cut).where("_updatedAt",">",base) is illegal. It is also
+     unwanted: a delta must carry changes to records of ANY age, including an unpaid order
+     from last year. Dropping the window is what makes one query replace hot+open — a
+     settlement change stamps _updatedAt, so orders/open has nothing left to catch. */
+  var _deltaBase=0;
+  try{_deltaBase=_deltaBaselineOrZero();}catch(_){_deltaBase=0;}
+  if(_deltaBase>0){
+    _deltaMode=true;_deltaBaselineAt=_deltaBase;
+    var _bTs=null;
+    try{_bTs=firebase.firestore.Timestamp.fromMillis(_deltaBase);}catch(_){_bTs=null;}
+    if(!_bTs){
+      console.log("[NDDELTA] could not build a Timestamp for the baseline — falling back to the FULL load");
+      _deltaMode=false;_deltaBaselineAt=0;
+    }else{
+      console.log("[NDDELTA] DELTA MODE — baseline "+new Date(_deltaBase).toISOString()+
+        "; expecting tens of documents, not ~1,294. Local baseline: orders="+((D.orders||[]).length)+
+        " invoices="+((D.invoices||[]).length)+" customers="+((D.customers||[]).length));
+      attach(FB_ORDERS_COL,FB_ORDERS_COL.where("_updatedAt",">",_bTs),"orders","orders/delta");
+      attach(FB_INVOICES_COL,FB_INVOICES_COL.where("_updatedAt",">",_bTs),"invoices","invoices/delta");
+      attach(FB_CUSTOMERS_COL,FB_CUSTOMERS_COL.where("_updatedAt",">",_bTs),"customers","customers/delta");
+      /* The baseline advances to NOW only once a delta subscription is actually attached.
+         Advancing it earlier would let a failed attach skip a window of changes for ever. */
+      _deltaRecordBaseline(Date.now(),true);
+      return;
+    }
+  }
+  _deltaMode=false;_deltaBaselineAt=0;
   if(HYBRID_COLLECTIONS_LIVE){
     attach(FB_ORDERS_COL,FB_ORDERS_COL.where("date",">=",hotCut),"orders","orders/hot");
     /* settled==false, NOT paid!="Paid" — a Firestore `!=` query EXCLUDES documents where the
@@ -2489,6 +2685,22 @@ function _hybridStartListeners(){
        express `paid < amount` (no two-field comparison), hence the derived flag. */
     attach(FB_INVOICES_COL,FB_INVOICES_COL.where("settled","==",false),"invoices","invoices/open");
   }
+  /* BOOTSTRAP THE BASELINE (2026-08-03, b21). The full path has just subscribed to the
+     COMPLETE result set, so from this moment this device holds everything the server has.
+     That — and only that — is what makes a delta baseline legitimate, which is why it is
+     recorded here and never by the audit.
+
+     Recorded only when the audit has separately been run clean on this device: without
+     that, any document missing _updatedAt would be invisible to every future delta. Both
+     conditions must hold, and _deltaBaselineOrZero() re-checks the audit flag anyway. */
+  try{
+    var _auditOk=false;
+    try{_auditOk=(localStorage.getItem("nd_delta_audit_clean")==="1");}catch(_){}
+    if(HYBRID_DELTA_SYNC_LIVE&&_auditOk&&HYBRID_COLLECTIONS_LIVE&&HYBRID_CUSTOMERS_LIVE){
+      _deltaRecordBaseline(Date.now(),true);
+      console.log("[NDDELTA] full load subscribed — baseline recorded; the NEXT cold load on this device runs in delta mode");
+    }
+  }catch(_){}
   /* CUSTOMERS — deliberately NO hot window. Unlike orders, the customer directory is needed
      in FULL at all times: the order-creation search, every dropdown, rCusts, the debtors page
      and maskName all assume D.customers is complete. A windowed customer list would silently
