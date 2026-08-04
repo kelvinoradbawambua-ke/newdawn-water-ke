@@ -348,7 +348,7 @@ var APP_VERSION="2026-07-21-v35";
    was actually running.
    Bump this ONE line on every deploy. It is display-and-diagnostics only — nothing branches
    on it, no merge or money logic reads it, so it can never change behaviour. */
-var BUILD_STAMP="2026-08-04-hyb-b22.t2";
+var BUILD_STAMP="2026-08-04-hyb-b22.t4";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -5210,6 +5210,24 @@ var AUDIT_RETRY_ATTEMPTS=0;   // QUOTA GUARD: drives exponential backoff instead
 var AUDIT_FALLBACK_DONE=false;// QUOTA GUARD: the 200-doc safety-net read may only ever fire once per session
 function startAuditListener(){
   if(!FB_EVENTS_COL)return;
+  /* ALREADY STREAMING? DO NOT RE-SUBSCRIBE. (2026-08-04, b22.t2)
+
+     onSnapshot delivers the FULL result set as its initial snapshot, so every
+     re-subscribe of this listener costs 50 document reads. It was being re-issued
+     on every login AND on every visit to the Data/Excel tab (see the rExcel entry),
+     while the b20 work had already made the five collection listeners free across
+     the same events. With hydration and delta in place this listener became roughly
+     50 of the ~51 reads a refresh costs — the single largest remaining line item,
+     and most of it was redundant re-subscribes of a stream already running.
+
+     This is the b20 fix applied here: same query, same 50-event window, same
+     recovery reach. The ONLY thing removed is re-issuing a subscription that is
+     already live and healthy. Nothing about _selfHealFromEventSnapshots() changes.
+
+     "Healthy" is judged by the existing signal, not a new one: AUDIT_RETRY_ATTEMPTS
+     is reset to 0 by every good snapshot and incremented on error, so a listener
+     that is erroring still falls through and re-subscribes exactly as before. */
+  if(FB_AUDIT_UNSUB&&AUDIT_RETRY_ATTEMPTS===0&&!AUDIT_RETRY_TIMER)return;
   // QUOTA GUARD: cancel any retry that's already in flight before doing
   // anything else. Without this, calling startAuditListener() again (page
   // nav, re-login, initCloudConnection) while an error-triggered retry is
@@ -9193,9 +9211,17 @@ function _finishLogoutTeardown(){
      is only the DESTRUCTION of state that a re-login on this same device would otherwise
      have to pay ~1,271 reads to rebuild.
 
-     The audit listener is stopped either way — it is bounded, per-session, and cheap to
-     re-attach, so there is no reason to leave it streaming to a logged-out screen. */
-  if(FB_AUDIT_UNSUB){try{FB_AUDIT_UNSUB();}catch(e){}FB_AUDIT_UNSUB=null;}
+     The audit listener WAS stopped either way, described as "bounded, per-session, and
+     cheap to re-attach". REVISED (2026-08-04, b22.t2): cheap is 50 document reads, paid
+     again on every single re-login, while the line directly below keeps the far larger
+     collection subscription warm for exactly this reason. On a shared phone that logs in
+     and out all day that was the dominant remaining read cost. It now follows the same
+     rule as the collections — kept warm when KEEP_SUBSCRIPTION_ON_LOGOUT is set, torn
+     down otherwise. A logged-out screen renders nothing from it; the only thing it does
+     while idle is stay eligible to deliver a change for free. */
+  if(!KEEP_SUBSCRIPTION_ON_LOGOUT){
+    if(FB_AUDIT_UNSUB){try{FB_AUDIT_UNSUB();}catch(e){}FB_AUDIT_UNSUB=null;}
+  }
   if(!KEEP_SUBSCRIPTION_ON_LOGOUT){
     if(FB_UNSUB){try{FB_UNSUB();}catch(e){}FB_UNSUB=null;}
     FB_READY=false;FB_DOC_REF=null;_APP_READY=false;
@@ -13868,6 +13894,71 @@ function _sweepPhantomAckCredit(apply){
       (apply?"":". Run _sweepPhantomAckCredit(true) as director to reverse."));
   }
   return fixed;
+}
+/* ============================================================================
+   MARK PHANTOM CREDIT AS ALREADY RESOLVED            (2026-08-04, b22.t3)
+   DIRECTOR TOOL. Dry run by default: _markPhantomCreditResolved() reports,
+   _markPhantomCreditResolved(true) applies.
+
+   THE PROBLEM. _sweepPhantomAckCredit() only skips an entry when it finds a
+   reversal tagged "revack-<cid>" — a marker it writes for ITSELF. The 11 entries
+   totalling KSh 4,200 were reversed by hand months ago with adjustCredit, which
+   creates entries under different cids, so the detector cannot see that work and
+   reports the same 11 on every boot for ever.
+
+   WHY NOT JUST RUN THE SWEEP. It would append 11 audit entries reading "PHANTOM
+   CREDIT REVERSED — KSh X removed from a customer's store credit" when nothing
+   was removed. The audit log is the record relied on in a customer dispute; a
+   false money-movement entry in it is worse than a noisy console line.
+
+   WHAT THIS DOES INSTEAD. Writes the same marker the detector looks for, with
+   amt:0 so no balance moves by even a shilling, and an audit note that states
+   what actually happened: verified already zero, marking resolved. The console
+   line goes quiet because the condition it reports is genuinely satisfied.
+
+   THE REFUSAL THAT MAKES IT SAFE. A customer is only marked when their CURRENT
+   credit is exactly 0. If any credit remains, the phantom entry may still be
+   live money and is left flagged for per-row review — the standing rule on this
+   data is per-row judgement, never a bulk action. */
+function _markPhantomCreditResolved(apply){
+  if(typeof CU==="undefined"||!CU||CU.role!=="director"){try{toast("Director only","err");}catch(_){}return 0;}
+  var marked=0,skipped=[],names=[];
+  (D.customers||[]).forEach(function(cu){
+    if(!cu||!Array.isArray(cu.creditLog)||!cu.creditLog.length)return;
+    var have={};
+    cu.creditLog.forEach(function(e){if(e&&e.cid!=null)have[String(e.cid)]=true;});
+    var ph=cu.creditLog.filter(function(e){
+      return e&&e.type==="overpayment"&&(Number(e.amt)||0)>0
+        &&typeof e.note==="string"
+        &&e.note.indexOf("Overpayment acknowledging ")===0
+        &&!have["revack-"+e.cid];
+    });
+    if(!ph.length)return;
+    var cur=Number(cu.credit)||0;
+    if(cur!==0){
+      skipped.push((cu.name||("#"+cu.id))+" — credit is KSh "+cur.toLocaleString()+", NOT zero; left flagged for per-row review");
+      return;
+    }
+    if(!apply){names.push((cu.name||("#"+cu.id))+" ("+ph.length+")");marked+=ph.length;return;}
+    ph.forEach(function(e){
+      cu.creditLog.push({cid:"revack-"+e.cid,date:tday(),amt:0,type:"reversal",
+        ordId:e.ordId,by:(CU?CU.name:"system"),role:(CU?CU.role:""),
+        note:"VERIFIED ALREADY RESOLVED — this KSh "+(Number(e.amt)||0)+" acknowledgement credit was reversed manually (adjustCredit) before this marker was written. The customer's store credit was confirmed to be exactly KSh 0 at the time of marking, so NO balance was changed by this entry (amt 0). It exists only so the phantom-credit detector stops reporting an issue that no longer exists."});
+      marked++;
+    });
+    names.push(cu.name||("#"+cu.id));
+  });
+  skipped.forEach(function(s){console.log("[NDPHANTOM] SKIP "+s);});
+  if(!marked){console.log("[NDPHANTOM] nothing to mark — no unresolved acknowledgement credit found");return 0;}
+  if(!apply){
+    console.log("[NDPHANTOM] WOULD MARK "+marked+" entr"+(marked===1?"y":"ies")+" as already-resolved across: "+names.join(", ")+
+      ". No balance would change (amt 0). DRY RUN — run _markPhantomCreditResolved(true) as director to apply.");
+    return marked;
+  }
+  try{auditLog("CUSTOMER_UPDATED","PHANTOM CREDIT MARKED RESOLVED: "+marked+" acknowledgement-credit entries flagged by the detector were confirmed already reversed manually — every affected customer's store credit was exactly KSh 0. Zero-value markers were written so the detector stops reporting them. NO customer balance was changed.");}catch(_){}
+  console.log("[NDPHANTOM] MARKED "+marked+" entr"+(marked===1?"y":"ies")+" as resolved across: "+names.join(", ")+". No balance changed. The detector will be quiet from the next boot.");
+  try{dirty();}catch(_){}
+  return marked;
 }
 /* ============================================================================
    RENUMBER TIMESTAMP-DERIVED ORDER/INVOICE IDs          (2026-08-04, b22)
