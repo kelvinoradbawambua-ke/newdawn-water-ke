@@ -348,7 +348,7 @@ var APP_VERSION="2026-07-21-v35";
    was actually running.
    Bump this ONE line on every deploy. It is display-and-diagnostics only — nothing branches
    on it, no merge or money logic reads it, so it can never change behaviour. */
-var BUILD_STAMP="2026-08-04-hyb-b22.t";
+var BUILD_STAMP="2026-08-04-hyb-b22.t2";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -1429,6 +1429,10 @@ var _hybridShadow={orders:{},invoices:{},customers:{}};   // id -> JSON, last st
    HIGH simply forces a full load, which is the safe direction (see the ratchet in
    _buildWritePayload). Clearing localStorage clears both, and the empty-D check then
    refuses regardless. */
+/* Set while a bulk repair is rewriting records, so a write fired mid-operation cannot
+   publish a count taken from a half-finished state. That is exactly how b22 published
+   439 during the renumber and refused delta fleet-wide until it was reset by hand. */
+var _bulkOpInFlight=false;
 var _publishedCounts=(function(){
   try{
     var r=localStorage.getItem("nd_published_counts");
@@ -2503,7 +2507,18 @@ function _deltaBaselineOrZero(){
     /* The audit must have been run and clean on this device. _updatedAt is absent on any
        document written during the documented sentinel-destroying window, and a range query
        silently excludes those forever — see the block at HYBRID_DELTA_SYNC_LIVE. */
+    /* BOTH sources must agree (2026-08-04, b22.t2). b22 checked only the flag baked
+       into the stored baseline, so when the audit found a gap and cleared
+       nd_delta_audit_clean, the gate never looked — a stale-but-clean baseline still
+       let delta run, and the log line claiming "delta stays OFF" was simply false.
+       An audit result that cannot actually refuse is not a guard. */
     if(b.auditClean!==true)return 0;
+    var _auditFlag=null;
+    try{_auditFlag=localStorage.getItem("nd_delta_audit_clean");}catch(_){return 0;}
+    if(_auditFlag!=="1"){
+      console.log("[NDDELTA] REFUSED — the last full load found document(s) without _updatedAt, so this device cannot trust a range query. Taking the FULL load until an audit comes back clean.");
+      return 0;
+    }
     /* ======================================================================
        COMPLETENESS — THE CHECK THAT MAKES DELTA SAFE AT ALL (2026-08-04, b22)
 
@@ -2914,7 +2929,18 @@ function _hybridStartListeners(){
            definition and would report a meaningless zero. */
         if(!_deltaMode){
           var _miss=0;
-          docs.forEach(function(d){var v=d.data();if(!v||v._updatedAt==null)_miss++;});
+          docs.forEach(function(d){
+            /* FIX (2026-08-04, b22.t2) — FALSE POSITIVE SEEN IN PRODUCTION.
+               _hybridStamp writes _updatedAt as FieldValue.serverTimestamp(), a
+               SENTINEL. The local listener echoes a write back before the server
+               resolves it, and in that echo the field genuinely IS null. b22 counted
+               that as missing coverage, so a device that wrote anything during a
+               full-load session reported "audit NOT clean" against its own perfectly
+               good write. A device's own in-flight write must never count against its
+               own coverage — only server-resolved documents can. */
+            if(d.metadata&&d.metadata.hasPendingWrites)return;
+            var v=d.data();if(!v||v._updatedAt==null)_miss++;
+          });
           _updatedAtMissing[label]=_miss;
         }
         if(!D[arrName])D[arrName]=[];
@@ -4404,13 +4430,29 @@ function processWriteQueue(){
      intended, cheap failure mode — the 7-day baseline horizon already forces a
      full reconcile independently. */
   try{
-    if(typeof _hybridInitialLoadDone==="function"&&_hybridInitialLoadDone()){
-      var _pubPrev=_publishedCounts||{};
-      var _mk=function(name){
-        var mine=((D&&D[name])||[]).length;
-        var prev=Number(_pubPrev[name]);
-        return (!isNaN(prev)&&prev>mine)?prev:mine;   // rule 2 — max, never lower
-      };
+    if(typeof _hybridInitialLoadDone==="function"&&_hybridInitialLoadDone()&&!_bulkOpInFlight){
+      /* RATCHET REMOVED (2026-08-04, b22.t2) — IT BROKE THE FEATURE IN PRODUCTION.
+
+         b22 published max(mine, previouslyPublished), reasoning that a count too
+         HIGH only forces a full load, which is the safe direction. It is — but
+         there was NO RELEASE, so a wrong-high value was permanent. During the
+         order renumber D.orders transiently held 439 (old record re-delivered by
+         the listener before the tombstone prune ran) and a write fired at exactly
+         that instant. 439 was then republished for ever, every device saw
+         published(439) > local(437), and delta was refused on the whole fleet.
+         It had to be reset by hand. Silent, total loss of the build's benefit.
+
+         THE RATCHET WAS ALSO UNNECESSARY. It guarded against a partially-loaded
+         device publishing a low count — but _hybridInitialLoadDone() ALREADY
+         restricts publishing to devices holding a complete set, and a complete
+         device's count is simply the truth. A device momentarily behind on a new
+         order publishes one less; another device seeing want <= have passes the
+         gate, and the BASELINE (not the count) is what guarantees completeness —
+         the delta returns everything changed since it regardless.
+
+         So: publish what this device actually holds. Deletions and repairs now
+         reflect correctly, and the stuck-high state is unreachable. */
+      var _mk=function(name){return ((D&&D[name])||[]).length;};
       var _counts={orders:_mk("orders"),invoices:_mk("invoices"),customers:_mk("customers")};
       payload.collectionCounts=_counts;
       /* Keep the module variable in step so THIS device's own gate sees the same
@@ -13885,9 +13927,14 @@ function _renumberTimestampIds(apply){
   }
   if(!D.deletedOrderIds)D.deletedOrderIds={};
   if(!D.deletedInvoiceIds)D.deletedInvoiceIds={};
+  /* Suppress count publishing for the whole operation — see _bulkOpInFlight. A write
+     that fires while records are mid-rewrite would otherwise publish a count taken
+     from a half-finished state, which is exactly what happened in b22. */
+  _bulkOpInFlight=true;
   var done=0;
   var step=function(i){
     if(i>=work.length){
+      _bulkOpInFlight=false;
       console.log("[NDRENUM] COMPLETE — "+done+" order/invoice pair(s) renumbered into the normal sequence.");
       try{dirty();}catch(_){}
       try{refreshCurrentPage();}catch(_){}
@@ -13899,9 +13946,22 @@ function _renumberTimestampIds(apply){
       /* The counter fell back to a timestamp again — abort rather than swap one
          unusable number for another. Nothing has been changed at this point. */
       if(!(Number(newOid)>0)||Number(newOid)>TS_MIN||!(Number(newIid)>0)||Number(newIid)>TS_MIN){
+        _bulkOpInFlight=false;
         console.log("[NDRENUM] ABORTED at #"+oldOid+" — the counter is unreachable and returned another timestamp id. Nothing changed. Try again when online.");
         return;
       }
+      /* 0. TOMBSTONE THE OLD IDS FIRST (2026-08-04, b22.t2). b22 mutated o.id in
+         place and only tombstoned after the write confirmed. In between, the old
+         document still existed server-side, the listener delivered it, and with
+         nothing in D matching its id any more it was re-added as a NEW record —
+         D.orders went 437 -> 439 and only the tombstone prune cleaned up. Worse, a
+         write fired during that window and published a count of 439 that the
+         ratchet then made permanent. Tombstoning BEFORE the mutation means
+         _hybridTombstoned() refuses the old document the instant it arrives.
+         The tombstone is harmless if the write later fails: the rollback below
+         removes it again, and the record never left D. */
+      D.deletedOrderIds[oldOid]=Date.now();
+      D.deletedInvoiceIds[oldIid]=Date.now();
       // 1. rewrite the records themselves
       w.o.id=newOid;
       w.inv.id=newIid;
@@ -13923,10 +13983,8 @@ function _renumberTimestampIds(apply){
       var _wOrd=FB_ORDERS_COL.doc(String(newOid)).set(_hybridStamp(w.o,"o"),{merge:true});
       var _wInv=FB_INVOICES_COL.doc(String(newIid)).set(_hybridStamp(w.inv,"i"),{merge:true});
       Promise.all([_wOrd,_wInv]).then(function(){
-        // 4. CONFIRMED on the server — only now may the old ids go. Tombstones stop
-        //    another device's cache resurrecting the old copy alongside the new one.
-        D.deletedOrderIds[oldOid]=Date.now();
-        D.deletedInvoiceIds[oldIid]=Date.now();
+        // 4. CONFIRMED on the server — the tombstones set in step 0 stand, and the
+        //    old documents can now be removed.
         try{_deleteOrderDoc(oldOid);}catch(_){}
         try{_deleteInvoiceDoc(oldIid);}catch(_){}
         try{delete _hybridShadow.orders[oldOid];delete _hybridShadow.invoices[oldIid];}catch(_){}
@@ -13939,12 +13997,14 @@ function _renumberTimestampIds(apply){
         /* ROLL BACK. The new documents are not confirmed, so nothing is deleted and
            the in-memory record is put back exactly as it was — including every
            reference repointed above. The order keeps its ugly number and stays whole. */
+        try{delete D.deletedOrderIds[oldOid];delete D.deletedInvoiceIds[oldIid];}catch(_){}
         w.o.id=oldOid;w.inv.id=oldIid;w.inv.orderId=oldOid;
         (D.customers||[]).forEach(function(cu){
           (cu&&cu.creditLog||[]).forEach(function(en){if(en&&String(en.ordId)===String(newOid))en.ordId=oldOid;});
         });
         (D.pendingPayments||[]).forEach(function(p){if(p&&String(p.ordId)===String(newOid))p.ordId=oldOid;});
-        console.log("[NDRENUM] ABORTED at #"+oldOid+" — the new documents were NOT confirmed by the server ("+((e&&e.code)||(e&&e.message)||"unknown")+"). Nothing was deleted; the record is unchanged and still complete. Retry when the connection is healthy.");
+        _bulkOpInFlight=false;
+        console.log("[NDRENUM] ABORTED at #"+oldOid+" — the new documents were NOT confirmed by the server ("+((e&&e.code)||(e&&e.message)||"unknown")+"). Nothing was deleted, the tombstones were withdrawn, and the record is unchanged and still complete. Retry when the connection is healthy.");
       });
     }).catch(function(e){
       console.log("[NDRENUM] ABORTED at #"+oldOid+" — could not reserve a new id ("+((e&&e.message)||e)+"). Nothing changed for this pair.");
