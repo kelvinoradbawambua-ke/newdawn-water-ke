@@ -348,7 +348,7 @@ var APP_VERSION="2026-07-21-v35";
    was actually running.
    Bump this ONE line on every deploy. It is display-and-diagnostics only — nothing branches
    on it, no merge or money logic reads it, so it can never change behaviour. */
-var BUILD_STAMP="2026-08-04-hyb-b22";
+var BUILD_STAMP="2026-08-04-hyb-b22.t";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -13826,6 +13826,132 @@ function _sweepPhantomAckCredit(apply){
       (apply?"":". Run _sweepPhantomAckCredit(true) as director to reverse."));
   }
   return fixed;
+}
+/* ============================================================================
+   RENUMBER TIMESTAMP-DERIVED ORDER/INVOICE IDs          (2026-08-04, b22)
+   DIRECTOR TOOL. Dry run by default: _renumberTimestampIds() reports,
+   _renumberTimestampIds(true) applies.
+
+   WHY THESE IDs EXIST. reserveNextOrderAndInvoiceIds() reserves the next number
+   in a transaction against newdawn_counters/main. A transaction requires a READ,
+   and on 2026-08-03 the daily read quota was exhausted, so every attempt failed
+   with resource-exhausted. The documented fallback then minted
+   Date.now()*1000+random — deliberately collision-resistant, deliberately not
+   sequential. Two orders were created that way (#1785772131185960 and
+   #1785771681707972) and each carries an invoice numbered the same way.
+
+   WHAT THIS REWRITES, and why the order of operations is not negotiable:
+     1. A NEW pair of ids is reserved through the REAL counter, so the numbers
+        can never collide with an order placed later. If that reservation itself
+        falls back to a timestamp (counter still unreachable), this ABORTS rather
+        than swapping one unusable number for another.
+     2. The new order and invoice documents are WRITTEN FIRST. At no instant does
+        the record exist only in memory or only under a deleted id.
+     3. Every reference is repointed: invoice.orderId, creditLog[].ordId (the
+        phantom-credit entry for emmanuel carries one), pendingPayments[].ordId.
+     4. Only THEN are the old ids tombstoned and their documents deleted. The
+        tombstone is what stops another device's cache resurrecting the old copy
+        and leaving the order present twice under two numbers.
+
+   REFUSALS, because a wrong renumber is worse than an ugly number:
+     - anything other than a clean 1:1 order/invoice pair is skipped. An edited
+       order carries a replacement invoice, and picking the wrong one to repoint
+       is how a live receivable gets orphaned (the 2026-07-30 B4 incident).
+     - an invoice with any balance outstanding is skipped. Renumbering is not
+       worth touching money still owed.
+   The audit log keeps the OLD number in its historical entries deliberately —
+   those record what actually happened. A new entry records the mapping. */
+function _renumberTimestampIds(apply){
+  if(typeof CU==="undefined"||!CU||CU.role!=="director"){try{toast("Director only","err");}catch(_){}return 0;}
+  var TS_MIN=1e12;   // real sequence ids are ~1,000-9,999; a timestamp id is ~1.78e15
+  var work=[],skips=[];
+  (D.orders||[]).forEach(function(o){
+    if(!o||o.id==null||!(Number(o.id)>TS_MIN))return;
+    var invs=[];
+    try{invs=_linkedInvoicesOf(o.id);}catch(_){invs=[];}
+    if(invs.length!==1){skips.push("#"+o.id+" — "+invs.length+" linked invoice(s); only a clean 1:1 pair is renumbered");return;}
+    if(!_invoiceIsSettled(invs[0])){skips.push("#"+o.id+" — invoice #"+invs[0].id+" still owes KSh "+_round2((Number(invs[0].amount)||0)-(Number(invs[0].paid)||0)));return;}
+    work.push({o:o,inv:invs[0]});
+  });
+  skips.forEach(function(s){console.log("[NDRENUM] SKIP "+s);});
+  if(!work.length){console.log("[NDRENUM] nothing to renumber — no timestamp-derived order ids found");return 0;}
+  if(!apply){
+    work.forEach(function(w){
+      console.log("[NDRENUM] WOULD RENUMBER order #"+w.o.id+" (invoice #"+w.inv.id+") — "+
+        (w.o.cust||w.o.custName||"")+" KSh "+(w.o.total||w.o.amount||"?")+" "+(w.o.status||""));
+    });
+    console.log("[NDRENUM] DRY RUN — nothing changed. Run _renumberTimestampIds(true) as director to apply.");
+    return work.length;
+  }
+  if(!D.deletedOrderIds)D.deletedOrderIds={};
+  if(!D.deletedInvoiceIds)D.deletedInvoiceIds={};
+  var done=0;
+  var step=function(i){
+    if(i>=work.length){
+      console.log("[NDRENUM] COMPLETE — "+done+" order/invoice pair(s) renumbered into the normal sequence.");
+      try{dirty();}catch(_){}
+      try{refreshCurrentPage();}catch(_){}
+      return;
+    }
+    var w=work[i],oldOid=String(w.o.id),oldIid=String(w.inv.id);
+    reserveNextOrderAndInvoiceIds().then(function(r){
+      var newOid=r&&r.orderId,newIid=r&&r.invoiceId;
+      /* The counter fell back to a timestamp again — abort rather than swap one
+         unusable number for another. Nothing has been changed at this point. */
+      if(!(Number(newOid)>0)||Number(newOid)>TS_MIN||!(Number(newIid)>0)||Number(newIid)>TS_MIN){
+        console.log("[NDRENUM] ABORTED at #"+oldOid+" — the counter is unreachable and returned another timestamp id. Nothing changed. Try again when online.");
+        return;
+      }
+      // 1. rewrite the records themselves
+      w.o.id=newOid;
+      w.inv.id=newIid;
+      w.inv.orderId=newOid;
+      // 2. repoint every reference that keys off the old order id
+      var refs=0;
+      (D.customers||[]).forEach(function(cu){
+        (cu&&cu.creditLog||[]).forEach(function(e){if(e&&String(e.ordId)===oldOid){e.ordId=newOid;refs++;}});
+      });
+      (D.pendingPayments||[]).forEach(function(p){if(p&&String(p.ordId)===oldOid){p.ordId=newOid;refs++;}});
+      /* 3. WRITE THE NEW DOCUMENTS AND WAIT FOR THE SERVER TO CONFIRM.
+         The first cut of this called _persistOrderDoc()/_persistInvoiceDoc() and
+         deleted the old ids on the very next line. Both helpers are fire-and-forget
+         with a swallowed .catch — so a write that failed (offline, quota, rules)
+         would have been followed immediately by deleting the ONLY remaining copy.
+         That is a data-loss path, and it is the whole reason the delete now hangs
+         off .then() of an explicit, awaited write. A renumber that cannot confirm
+         the new document simply rolls back and leaves the record exactly as it was. */
+      var _wOrd=FB_ORDERS_COL.doc(String(newOid)).set(_hybridStamp(w.o,"o"),{merge:true});
+      var _wInv=FB_INVOICES_COL.doc(String(newIid)).set(_hybridStamp(w.inv,"i"),{merge:true});
+      Promise.all([_wOrd,_wInv]).then(function(){
+        // 4. CONFIRMED on the server — only now may the old ids go. Tombstones stop
+        //    another device's cache resurrecting the old copy alongside the new one.
+        D.deletedOrderIds[oldOid]=Date.now();
+        D.deletedInvoiceIds[oldIid]=Date.now();
+        try{_deleteOrderDoc(oldOid);}catch(_){}
+        try{_deleteInvoiceDoc(oldIid);}catch(_){}
+        try{delete _hybridShadow.orders[oldOid];delete _hybridShadow.invoices[oldIid];}catch(_){}
+        try{_hybridShadow.orders[String(newOid)]=_stableStr(w.o);_hybridShadow.invoices[String(newIid)]=_stableStr(w.inv);}catch(_){}
+        done++;
+        console.log("[NDRENUM] order #"+oldOid+" -> #"+newOid+", invoice #"+oldIid+" -> #"+newIid+" ("+refs+" reference(s) repointed)");
+        try{auditLog("ORDER_UPDATED","ORDER RENUMBERED: #"+oldOid+" -> #"+newOid+" (invoice #"+oldIid+" -> #"+newIid+"). The original numbers were minted by the collision-resistant fallback on 2026-08-03 when the read quota was exhausted and the id counter could not be reached. Amounts, payments and customer links are unchanged; "+refs+" reference(s) were repointed and the old ids tombstoned.");}catch(_){}
+        step(i+1);
+      }).catch(function(e){
+        /* ROLL BACK. The new documents are not confirmed, so nothing is deleted and
+           the in-memory record is put back exactly as it was — including every
+           reference repointed above. The order keeps its ugly number and stays whole. */
+        w.o.id=oldOid;w.inv.id=oldIid;w.inv.orderId=oldOid;
+        (D.customers||[]).forEach(function(cu){
+          (cu&&cu.creditLog||[]).forEach(function(en){if(en&&String(en.ordId)===String(newOid))en.ordId=oldOid;});
+        });
+        (D.pendingPayments||[]).forEach(function(p){if(p&&String(p.ordId)===String(newOid))p.ordId=oldOid;});
+        console.log("[NDRENUM] ABORTED at #"+oldOid+" — the new documents were NOT confirmed by the server ("+((e&&e.code)||(e&&e.message)||"unknown")+"). Nothing was deleted; the record is unchanged and still complete. Retry when the connection is healthy.");
+      });
+    }).catch(function(e){
+      console.log("[NDRENUM] ABORTED at #"+oldOid+" — could not reserve a new id ("+((e&&e.message)||e)+"). Nothing changed for this pair.");
+    });
+  };
+  step(0);
+  return work.length;
 }
 function ackPendingPay(id){
   if(!can("mPaid")){toast("No permission","err");return;}
