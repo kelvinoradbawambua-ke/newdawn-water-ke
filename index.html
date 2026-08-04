@@ -348,7 +348,7 @@ var APP_VERSION="2026-07-21-v35";
    was actually running.
    Bump this ONE line on every deploy. It is display-and-diagnostics only — nothing branches
    on it, no merge or money logic reads it, so it can never change behaviour. */
-var BUILD_STAMP="2026-08-03-hyb-b21";
+var BUILD_STAMP="2026-08-04-hyb-b22";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -1381,7 +1381,7 @@ var HYBRID_CUSTOMERS_LIVE=true;
    SHIPS OFF. With the flag false, _hybridStartListeners takes exactly the b20
    path and nothing below runs. Turning it on is a deliberate, audited act.
    ============================================================================ */
-var HYBRID_DELTA_SYNC_LIVE=false;
+var HYBRID_DELTA_SYNC_LIVE=true;
 /* How old an index/watermark may be before it is refused and a full load is taken
    instead. A device that has been off for longer than this cannot trust its baseline:
    too much may have changed, and — more importantly — a record DELETED while it was
@@ -1391,6 +1391,55 @@ var DELTA_MAX_BASELINE_AGE_MS=7*24*60*60*1000;
 var _deltaMode=false;             // true only while a delta subscription is live
 var _deltaBaselineAt=0;           // server ms the current baseline was built
 var _hybridShadow={orders:{},invoices:{},customers:{}};   // id -> JSON, last state successfully persisted
+/* PUBLISHED COLLECTION COUNTS (2026-08-04, b22) — the server's statement of how many
+   records exist per collection, used ONLY by _deltaBaselineOrZero() to prove a device
+   holds a complete set. See _buildWritePayload for the two publishing rules.
+
+   DELIBERATELY NOT STORED ON `D`. The first draft hung this off D.collectionCounts,
+   which is wrong on a live system: _buildDforSync() copies every non-array key of D
+   into the write payload by reference (the `Array.isArray(...)?slice():value` line), so
+   the counts would have been duplicated INSIDE payload.D as well as at the top level,
+   and would additionally have ridden along into getBackupPayload() and into the
+   localStorage autosave — three places that have no business carrying them, and three
+   more shapes to reason about on every future change. A standalone module variable
+   keeps D's shape byte-for-byte identical to b21, which is what makes the b21 -> b22
+   transition inert for every existing code path. */
+/* SEEDED FROM localStorage AT PARSE TIME — NOT null (2026-08-04, b22).
+
+   FOUND BY REVIEW, BEFORE DEPLOYMENT, AND IT WOULD HAVE SILENTLY COST THE ENTIRE
+   BENEFIT OF THIS BUILD. _hybridStartListeners() is called from the events-listener
+   callback (~line 5190) and from startCloudListener (~line 5305). BOTH run before the
+   main-document snapshot handler assigns _publishedCounts (~line 5423). So on every
+   boot the gate was consulted while this was still null, refused with "publishes no
+   collection counts", took the full load, and set _hybridListenersOn=true — after
+   which the early-return at the top of _hybridStartListeners meant it was never
+   re-evaluated. Delta would have been permanently unreachable: ~1,294 reads on every
+   single boot, with the logs cheerfully reporting the gate working as designed.
+
+   Reordering the assignment alone would not fix it — the first snapshot on a cold boot
+   is fromCache and may carry no counts at all. The counts must survive the page load,
+   like the baseline they are checked against. So they are persisted and read back here,
+   at parse time, before any listener can run.
+
+   STALE COUNTS ARE SAFE, and deliberately so. If the stored count is LOWER than the
+   server's true count, the gate can pass — but the delta query then returns every
+   record changed since the baseline, which includes anything added in the interim, so
+   D converges anyway. Completeness is established by the BASELINE; the counts only
+   catch a device that is missing records it should already hold. A count that is too
+   HIGH simply forces a full load, which is the safe direction (see the ratchet in
+   _buildWritePayload). Clearing localStorage clears both, and the empty-D check then
+   refuses regardless. */
+var _publishedCounts=(function(){
+  try{
+    var r=localStorage.getItem("nd_published_counts");
+    if(!r)return null;
+    var v=JSON.parse(r);
+    return (v&&typeof v==="object")?v:null;
+  }catch(_){return null;}
+})();
+function _persistPublishedCounts(c){
+  try{if(c&&typeof c==="object")localStorage.setItem("nd_published_counts",JSON.stringify(c));}catch(_){}
+}
 var _hybridListenersOn=false,_hybridUnsub=[];
 /* When the current subscription was established. Used only to give a brand-new
    subscription time to deliver its first snapshot before anything judges it dead —
@@ -2455,18 +2504,66 @@ function _deltaBaselineOrZero(){
        document written during the documented sentinel-destroying window, and a range query
        silently excludes those forever — see the block at HYBRID_DELTA_SYNC_LIVE. */
     if(b.auditClean!==true)return 0;
-    /* DRIFT: the main document publishes a count per collection, and every device already
-       receives it, so this check costs ZERO reads. Local arrays shorter than the published
-       count mean this device is missing records — a delta can only make that worse. */
-    var pub=(D&&D.collectionCounts)||null;
-    if(pub){
-      var names=["orders","invoices","customers"];
-      for(var i=0;i<names.length;i++){
-        var n=names[i],have=((D&&D[n])||[]).length,want=Number(pub[n]);
-        if(!isNaN(want)&&want>have){
-          console.log("[NDDELTA] REFUSED — drift detected: "+n+" local="+have+" published="+want+" (this device is missing records; taking the full load so nothing stays lost)");
-          return 0;
-        }
+    /* ======================================================================
+       COMPLETENESS — THE CHECK THAT MAKES DELTA SAFE AT ALL (2026-08-04, b22)
+
+       CORRECTED. As shipped in b21 this block was `if(pub){...}` — the whole
+       check was skipped whenever D.collectionCounts was absent, and NOTHING in
+       b21 ever wrote D.collectionCounts, so it was absent always. The gate
+       therefore returned a usable baseline on a COLD PAGE LOAD, where D is
+       empty by construction.
+
+       Production evidence that D starts empty (2026-08-03 16:35:49Z):
+         startCloudListener called (cold)
+         snapshot received — localOrders=0
+         orders/hot: +432 new     <- the listener is what fills D, nothing else
+
+       Had the flag been on, that load would have run three _updatedAt queries,
+       received ~20 changed documents, and left the device showing 20 orders
+       instead of 432. Every debt figure, every report and the water-cycle count
+       would have been computed off 5% of the books. The flag shipped false, so
+       this never reached production — but the gate did not prevent it, and the
+       gate is the only thing that was supposed to.
+
+       THE RULE NOW: delta runs only when this device can PROVE it already holds
+       a complete set. Proof requires both
+         (a) every array non-empty  — catches the cold boot, needs nothing
+                                      published, cannot be skipped; and
+         (b) local count >= published count for all three collections
+                                    — catches a PARTIAL set, which (a) cannot
+                                      see. Published counts ride the main
+                                      document every device already receives,
+                                      so this costs ZERO reads.
+       Absent or unusable counts are now a REFUSAL, not a pass. b21 let that
+       case through and called it "degrades safely"; it degrades toward running
+       delta on unverified state, which is the one direction this gate exists to
+       forbid. The stated asymmetry decides it: a wrong 0 costs ~1,294 reads
+       once, a wrong baseline costs orders that no screen will ever show again.
+       ====================================================================== */
+    var names=["orders","invoices","customers"];
+    var i,n,have;
+    for(i=0;i<names.length;i++){
+      n=names[i];have=((D&&D[n])||[]).length;
+      if(have===0){
+        console.log("[NDDELTA] REFUSED — "+n+" is EMPTY in memory. This is a cold load: D is rebuilt by the listeners, so a delta query would return only what changed and this device would silently hold ~20 records instead of the full set. Taking the FULL load.");
+        return 0;
+      }
+    }
+    var pub=_publishedCounts||null;
+    if(!pub){
+      console.log("[NDDELTA] REFUSED — the main document publishes no collection counts, so this device cannot prove it holds a COMPLETE set (non-empty is not the same as complete). Taking the FULL load.");
+      return 0;
+    }
+    for(i=0;i<names.length;i++){
+      n=names[i];have=((D&&D[n])||[]).length;
+      var want=Number(pub[n]);
+      if(!(typeof pub[n]==="number")||isNaN(want)||want<0){
+        console.log("[NDDELTA] REFUSED — published count for "+n+" is missing or not a number ("+JSON.stringify(pub[n])+"); an unusable count proves nothing. Taking the FULL load.");
+        return 0;
+      }
+      if(want>have){
+        console.log("[NDDELTA] REFUSED — drift detected: "+n+" local="+have+" published="+want+" (this device is missing records; taking the full load so nothing stays lost)");
+        return 0;
       }
     }
     return b.at;
@@ -2525,7 +2622,185 @@ function _auditUpdatedAtCoverage(){
   };
   step(0);
 }
+/* ===========================================================================
+   BOOT HYDRATION FROM localStorage (2026-08-04, b22) — the change that makes a
+   page refresh cost ~20 reads instead of ~1,294.
+
+   THE PROBLEM IT SOLVES. D is EMPTY on a cold page load; the collection
+   listeners are what fill it. Production, 2026-08-03 16:35:49Z:
+       startCloudListener called (cold)
+       snapshot received — localOrders=0
+       orders/hot: +432 new
+   So a delta query at that moment would return only what changed and the device
+   would hold ~20 records. _deltaBaselineOrZero() now refuses that outright — but
+   refusing means taking the 1,294-read full load EVERY time, which is the cost
+   we are trying to remove. Something has to make D complete BEFORE the gate is
+   consulted, without touching the network. That is this function.
+
+   THE DATA IS ALREADY THERE. autoSaveLocal() stores the LIVE D (not the
+   cutover-stripped DforSync), every minute and on every dirty(). All 432 orders,
+   433 invoices and 435 customers are on the device already. Reading them costs
+   nothing and asks Firestore for nothing.
+
+   WHY IT CANNOT RESURRECT A DELETED RECORD. Hydration goes through
+   _hydrateById(), the SAME function the listeners use, so it inherits the
+   _hybridTombstoned() check verbatim — a deleted or archived id is refused entry
+   here exactly as it is refused from a snapshot. _hybridDropArchived() then
+   sweeps again at flush time. Beyond that, DELTA_MAX_BASELINE_AGE_MS forces a
+   full reconcile after 7 days, so a tombstone that has since been trimmed cannot
+   keep a stale record alive indefinitely.
+
+   THE SHADOW IS THE HARD PART, AND WHY THE DIRTY LIST EXISTS.
+   _hybridShadow is "what the server last confirmed", and it is load-bearing in
+   two directions: a record whose _stableStr differs from its shadow gets
+   WRITTEN, and a key in the shadow with no matching record in D gets DELETED
+   server-side (_hybridReapDeletes). Hydrating D without addressing it gives two
+   equally unacceptable outcomes:
+     - shadow left empty  -> all ~1,300 records look locally edited -> a write
+       storm of ~1,300 documents per boot, against a 20,000/day write limit.
+     - shadow filled from the hydrated values -> a genuinely UNSYNCED edit (an
+       order taken while offline, not yet written) is marked as already saved and
+       is never sent. That is silent order loss, the exact failure this whole
+       project exists to prevent.
+   Neither is acceptable, so the autosave now also records WHICH ids were dirty
+   at save time (usually a handful, a few bytes). On boot the shadow is rebuilt
+   as "clean" for every hydrated record and then the dirty ids have their shadow
+   entry DELETED, which re-arms them for the next flush. Clean records stay
+   clean, unsynced records stay unsynced, and the shadow's delete-detection is
+   consistent because its keys are exactly the ids present in D.
+
+   NEVER OVERWRITES LIVE DATA. Each array is hydrated only if it is currently
+   EMPTY. If a listener has already delivered, hydration skips that collection
+   entirely — the server always wins over a local snapshot.
+   =========================================================================== */
+var _hydratedFromLocal=false;
+var _updatedAtMissing={};   // query label -> documents seen without _updatedAt (full path only)
+/* Record a delta baseline ONLY once every required collection has actually DELIVERED.
+
+   FIX (2026-08-04, b22) — b21 recorded the baseline synchronously right after calling
+   attach(), with the comment "the full path has just subscribed to the COMPLETE result
+   set". Subscribing is not delivering. A load that attached and then lost the network
+   recorded a baseline covering data it never received. In b21 that was largely masked:
+   the next boot found D empty and the full path ran again. With boot hydration it stops
+   being masked — D would be filled from the PREVIOUS session, the gate would pass, and
+   delta would silently skip every change in the gap.
+
+   The audit is evaluated at the same moment and from the same delivered documents, so a
+   baseline can only ever be written off a load that was both complete and clean. */
+function _maybeRecordFullLoadBaseline(){
+  try{
+    if(!HYBRID_DELTA_SYNC_LIVE)return;
+    if(!HYBRID_COLLECTIONS_LIVE||!HYBRID_CUSTOMERS_LIVE)return;
+    if(typeof _hybridInitialLoadDone!=="function"||!_hybridInitialLoadDone())return;
+    /* The new baseline is the moment the QUERIES WERE ISSUED, never the moment they
+       were delivered. Anything changed in between is then re-sent by the next delta —
+       a few duplicate documents, which the id-keyed merge absorbs silently. Using the
+       delivery time instead would leave that interval in neither load: a gap, and gaps
+       are how orders vanish. */
+    var at=_loadIssuedAt||Date.now();
+    if(_deltaMode){
+      /* Delta path: the audit cannot be re-evaluated from a subset, and the gate
+         already required a clean audit before this device reached delta mode. Advance
+         only after the delta listeners have actually delivered. */
+      _deltaRecordBaseline(at,true);
+      if(!_baselineLoggedThisLoad){
+        _baselineLoggedThisLoad=true;
+        console.log("[NDDELTA] delta load delivered — baseline advanced to "+new Date(at).toISOString());
+      }
+      return;
+    }
+    var miss=0,k;
+    for(k in _updatedAtMissing){if(Object.prototype.hasOwnProperty.call(_updatedAtMissing,k))miss+=(_updatedAtMissing[k]||0);}
+    if(miss>0){
+      try{localStorage.removeItem("nd_delta_audit_clean");}catch(_){}
+      if(!_auditDirtyReported){
+        _auditDirtyReported=true;
+        console.log("[NDDELTA] audit NOT clean — "+miss+" delivered document(s) carry no _updatedAt. A range query excludes those silently, so delta stays OFF on this device and the full load continues. Re-saving each affected record re-stamps it.");
+      }
+      return;
+    }
+    try{localStorage.setItem("nd_delta_audit_clean","1");}catch(_){}
+    _deltaRecordBaseline(at,true);
+    if(!_baselineLoggedThisLoad){
+      _baselineLoggedThisLoad=true;
+      console.log("[NDDELTA] full load DELIVERED and clean (0 documents missing _updatedAt) — baseline recorded. The next cold load on this device runs in delta mode: tens of reads, not ~1,294.");
+    }
+  }catch(_){}
+}
+var _auditDirtyReported=false,_baselineLoggedThisLoad=false,_loadIssuedAt=0;
+function _hybridDirtyIds(){
+  /* Ids whose in-memory state differs from what the server last confirmed.
+     Mirrors the flush's predicate EXACTLY (_hybridDerive first, then _stableStr,
+     compared against the shadow) — see _hybridFlushDocs. Any divergence between
+     the two would either resurrect a write storm or drop an edit. */
+  var out={orders:[],invoices:[],customers:[]};
+  try{
+    [["orders","o"],["invoices","i"],["customers","c"]].forEach(function(p){
+      var arrName=p[0];
+      (D[arrName]||[]).forEach(function(r){
+        if(!r||r.id==null)return;
+        try{_hybridDerive(p[1],r);}catch(_){}
+        var k=String(r.id);
+        if(_hybridShadow[arrName][k]!==_stableStr(r))out[arrName].push(k);
+      });
+    });
+  }catch(_){}
+  return out;
+}
+function _hydrateFromLocalSnapshot(){
+  if(_hydratedFromLocal)return false;
+  if(!HYBRID_COLLECTIONS_LIVE&&!HYBRID_CUSTOMERS_LIVE)return false;
+  var snap=null;
+  try{snap=autoSaveCheckLocal();}catch(_){return false;}
+  if(!snap||!snap.D)return false;
+  var names=[];
+  if(HYBRID_COLLECTIONS_LIVE){names.push("orders");names.push("invoices");}
+  if(HYBRID_CUSTOMERS_LIVE)names.push("customers");
+  var dirty=(snap.hybridDirty&&typeof snap.hybridDirty==="object")?snap.hybridDirty:{};
+  var report=[],anyLoaded=false;
+  names.forEach(function(n){
+    var src=snap.D[n];
+    if(!Array.isArray(src)||!src.length)return;
+    if(((D[n])||[]).length)return;          // live data already present — server wins
+    if(!D[n])D[n]=[];
+    // Wrap plain records as snapshot-like docs so _hydrateById (and with it the
+    // tombstone refusal and the merge semantics) can be reused unchanged.
+    var docs=[];
+    src.forEach(function(r){
+      if(!r||r.id==null)return;
+      docs.push({id:String(r.id),data:function(){return r;}});
+    });
+    if(!docs.length)return;
+    try{_hydrateById(D[n],docs,n+"/local-restore",n);}catch(_){return;}
+    // Shadow: every hydrated record is CLEAN by default...
+    try{
+      var tag=(n==="orders")?"o":(n==="invoices")?"i":"c";
+      (D[n]||[]).forEach(function(r){
+        if(!r||r.id==null)return;
+        try{_hybridDerive(tag,r);}catch(_){}
+        _hybridShadow[n][String(r.id)]=_stableStr(r);
+      });
+      // ...except those recorded as unsynced when the snapshot was written.
+      // Dropping the shadow entry is what re-arms them for the next flush.
+      var dl=Array.isArray(dirty[n])?dirty[n]:[];
+      dl.forEach(function(k){try{delete _hybridShadow[n][String(k)];}catch(_){}});
+      if(dl.length)_pendingLocalWrite=true;   // make sure a flush actually happens
+      report.push(n+"="+((D[n]||[]).length)+(dl.length?" ("+dl.length+" unsynced re-armed)":""));
+    }catch(_){}
+    anyLoaded=true;
+  });
+  if(!anyLoaded)return false;
+  _hydratedFromLocal=true;
+  console.log("[NDHYBRID] restored from this device's local snapshot at ZERO reads — "+report.join(", ")+
+    (snap.ts?"; saved "+snap.ts:"")+". The delta gate can now evaluate against a populated D instead of an empty one.");
+  try{refreshCurrentPage();}catch(_){}
+  return true;
+}
 function _hybridStartListeners(){
+  /* Hydrate BEFORE the gate is consulted. Order is the whole point: the gate's
+     first test is "is any array empty", and on a cold load the answer is yes
+     until this has run. */
+  try{_hydrateFromLocalSnapshot();}catch(_){}
   // EITHER flag can require listeners — they are independent cutovers, so this must not
   // gate on the orders/invoices flag alone or enabling customers first would leave
   // D.customers unhydrated while the read-side merge was already disabled.
@@ -2621,6 +2896,27 @@ function _hybridStartListeners(){
            so anything asking "has live data arrived yet?" needs this instead. Set before
            hydration so it is true even for a legitimately empty collection. */
         _hybridSeeded[arrName]=true;
+        /* AUTOMATIC _updatedAt COVERAGE AUDIT (2026-08-04, b22) — free, and always
+           current. A delta query is `where("_updatedAt",">",baseline)`, and Firestore
+           range filters SILENTLY EXCLUDE documents where the field is absent. Any
+           document without _updatedAt would therefore be invisible to every future
+           delta, permanently.
+
+           _auditUpdatedAtCoverage() checks exactly this, but it is a manual director
+           action that re-reads all ~1,294 documents. That is both a cost and a
+           liability: it is a point-in-time result that a later bad write can invalidate
+           without anyone re-running it.
+
+           The full load ALREADY delivers every one of those documents. Counting the
+           gaps here costs nothing, runs on every full load, and cannot go stale.
+           Recorded per LABEL (not per collection) so a re-delivery overwrites rather
+           than double-counts, and only on the FULL path — delta results are a subset by
+           definition and would report a meaningless zero. */
+        if(!_deltaMode){
+          var _miss=0;
+          docs.forEach(function(d){var v=d.data();if(!v||v._updatedAt==null)_miss++;});
+          _updatedAtMissing[label]=_miss;
+        }
         if(!D[arrName])D[arrName]=[];
         var n=_hydrateById(D[arrName],docs,label,arrName);
         // Keep the shadow in step with what the server told us, so hydration never
@@ -2631,6 +2927,8 @@ function _hybridStartListeners(){
           if(rec)_hybridShadow[arrName][String(v.id)]=_stableStr(rec);
         });
         if(n){try{refreshCurrentPage();}catch(_){}}
+        // Delivery-driven, not subscribe-driven — see _maybeRecordFullLoadBaseline.
+        try{_maybeRecordFullLoadBaseline();}catch(_){}
       },function(e){
         console.log("[NDHYBRID] listener error ("+label+"): "+((e&&e.code)||"unknown"));
       });
@@ -2651,6 +2949,9 @@ function _hybridStartListeners(){
      from last year. Dropping the window is what makes one query replace hot+open — a
      settlement change stamps _updatedAt, so orders/open has nothing left to catch. */
   var _deltaBase=0;
+  _loadIssuedAt=Date.now();          // becomes the NEXT baseline — see _maybeRecordFullLoadBaseline
+  _baselineLoggedThisLoad=false;
+  _updatedAtMissing={};              // this load's audit starts fresh
   try{_deltaBase=_deltaBaselineOrZero();}catch(_){_deltaBase=0;}
   if(_deltaBase>0){
     _deltaMode=true;_deltaBaselineAt=_deltaBase;
@@ -2666,9 +2967,12 @@ function _hybridStartListeners(){
       attach(FB_ORDERS_COL,FB_ORDERS_COL.where("_updatedAt",">",_bTs),"orders","orders/delta");
       attach(FB_INVOICES_COL,FB_INVOICES_COL.where("_updatedAt",">",_bTs),"invoices","invoices/delta");
       attach(FB_CUSTOMERS_COL,FB_CUSTOMERS_COL.where("_updatedAt",">",_bTs),"customers","customers/delta");
-      /* The baseline advances to NOW only once a delta subscription is actually attached.
-         Advancing it earlier would let a failed attach skip a window of changes for ever. */
-      _deltaRecordBaseline(Date.now(),true);
+      /* b22: the baseline is NOT advanced here. Attaching is not delivering — a delta
+         subscription that attaches and then loses the network would otherwise move the
+         baseline past changes it never received, and with boot hydration filling D from
+         the previous session there is nothing left to expose the gap. It is advanced in
+         _maybeRecordFullLoadBaseline(), from the snapshot callback, once every delta
+         collection has actually delivered. */
       return;
     }
   }
@@ -2693,14 +2997,14 @@ function _hybridStartListeners(){
      Recorded only when the audit has separately been run clean on this device: without
      that, any document missing _updatedAt would be invisible to every future delta. Both
      conditions must hold, and _deltaBaselineOrZero() re-checks the audit flag anyway. */
-  try{
-    var _auditOk=false;
-    try{_auditOk=(localStorage.getItem("nd_delta_audit_clean")==="1");}catch(_){}
-    if(HYBRID_DELTA_SYNC_LIVE&&_auditOk&&HYBRID_COLLECTIONS_LIVE&&HYBRID_CUSTOMERS_LIVE){
-      _deltaRecordBaseline(Date.now(),true);
-      console.log("[NDDELTA] full load subscribed — baseline recorded; the NEXT cold load on this device runs in delta mode");
-    }
-  }catch(_){}
+  /* REMOVED IN b22: the baseline used to be recorded HERE, synchronously, immediately
+     after attach() returned — i.e. on SUBSCRIBE, not on DELIVERY. See the block comment
+     on _maybeRecordFullLoadBaseline for why that is unsafe once boot hydration exists,
+     and why the audit is now evaluated from the delivered documents at the same instant.
+     The recording now happens inside the snapshot callback. Nothing replaces it here on
+     purpose — a baseline written before data arrives is exactly the bug. The per-load
+     state it needs (_loadIssuedAt, _baselineLoggedThisLoad, _updatedAtMissing) is reset
+     above, before the queries are issued, not after. */
   /* CUSTOMERS — deliberately NO hot window. Unlike orders, the customer directory is needed
      in FULL at all times: the order-creation search, every dropdown, rCusts, the debtors page
      and maskName all assume D.customers is complete. A windowed customer list would silently
@@ -4070,6 +4374,51 @@ function processWriteQueue(){
     // sentinel object for nothing.
     updatedAt:null
   };
+  /* COLLECTION COUNTS (2026-08-04, b22) — three integers that make delta sync safe.
+
+     WHY THIS EXISTS. _deltaBaselineOrZero() must prove a device holds a COMPLETE
+     set before it may run a delta query. "Arrays are non-empty" catches a cold
+     boot but cannot see a PARTIAL set (200 of 432 orders looks perfectly healthy).
+     The only zero-read way to know the true size is for the server to state it,
+     and the main document is already delivered to every device on every snapshot —
+     so this costs no extra read, and ~30 bytes of a 32 KB document.
+
+     TWO RULES, both load-bearing:
+
+     1. ONLY A DEVICE THAT HOLDS A COMPLETE SET MAY PUBLISH. A device still loading
+        would otherwise publish 200, and every other half-loaded device would then
+        see want(200) <= have(200), pass the gate, and run a delta on top of a
+        partial set — the gate would be actively certifying the corruption it was
+        built to stop. _hybridInitialLoadDone() is the existing predicate for
+        "every required collection has delivered", so it is the one used here.
+
+     2. NEVER PUBLISH A COUNT LOWER THAN THE ONE ALREADY PUBLISHED. Two devices
+        race; the slower one's snapshot may be a moment behind. Taking the max
+        means a stale device can only ever publish a count that is too HIGH, which
+        makes other devices refuse delta and take the full load. That is the safe
+        direction: it costs reads, it cannot lose records. A count that is too LOW
+        is the unsafe direction and this rule makes it unreachable.
+
+     Deletions therefore leave the published count high until a device that has
+     genuinely reconciled writes a lower one. Over-refusal for a while is the
+     intended, cheap failure mode — the 7-day baseline horizon already forces a
+     full reconcile independently. */
+  try{
+    if(typeof _hybridInitialLoadDone==="function"&&_hybridInitialLoadDone()){
+      var _pubPrev=_publishedCounts||{};
+      var _mk=function(name){
+        var mine=((D&&D[name])||[]).length;
+        var prev=Number(_pubPrev[name]);
+        return (!isNaN(prev)&&prev>mine)?prev:mine;   // rule 2 — max, never lower
+      };
+      var _counts={orders:_mk("orders"),invoices:_mk("invoices"),customers:_mk("customers")};
+      payload.collectionCounts=_counts;
+      /* Keep the module variable in step so THIS device's own gate sees the same
+         numbers it just published, without waiting for the snapshot to echo back. */
+      _publishedCounts=_counts;
+      _persistPublishedCounts(_counts);   // must outlive the page — see the declaration
+    }
+  }catch(_){}   // counts are an optimisation input; never let them break a write
   // Estimate document size — warn director before hitting 1MB Firestore limit
   var _sizeKB=0;
   try{
@@ -5097,6 +5446,20 @@ function startCloudListener(isWarmRefresh){
       FB_MY_LAST_WRITE_SERVER_TS=serverTime;
     }
     var weAreNewer=FB_MY_LAST_WRITE_SERVER_TS>=serverTime;
+    /* COLLECTION COUNTS (2026-08-04, b22) — carried across HERE, deliberately before
+       every arbitration branch below. The counts are not business data and take no
+       part in the newer/older contest: they are the server stating how many records
+       exist, which is true regardless of whose write won. Placing this after any of
+       the `return` paths below would leave a device that keeps losing arbitration
+       permanently without counts, and _deltaBaselineOrZero() would then refuse delta
+       for ever on exactly the devices that need it most.
+       Written by _buildWritePayload, and only ever by a device holding a complete set. */
+    try{
+      if(data.collectionCounts&&typeof data.collectionCounts==="object"){
+        _publishedCounts=data.collectionCounts;
+        _persistPublishedCounts(data.collectionCounts);   // survives the next page load
+      }
+    }catch(_){}
     console.log("[NDSYNC] snapshot received — isOwnWrite="+isOwnWrite+" weAreNewer="+weAreNewer+" remoteOrders="+(data.D.orders?data.D.orders.length:0)+" localOrders="+(D.orders?D.orders.length:0)+" FB_MY_LAST_WRITE_SERVER_TS="+FB_MY_LAST_WRITE_SERVER_TS+" serverTime="+serverTime);
 
     // ── FIELD-LEVEL SMART MERGE ─────────────────────────────────────────
@@ -15804,7 +16167,21 @@ function lsKey(){return "newdawn_autosave_"+(CU?CU.id+"_"+CU.role:"shared");}
 var _autoSaveFailReported=false;
 function autoSaveLocal(){
   try{
-    var snapshot={D:D,USERS:USERS,nOId:nOId,nIId:nIId,nCId:nCId,ts:new Date().toISOString(),setupDone:FB_SETUP_DONE};
+    /* hybridDirty (2026-08-04, b22) — the ids whose in-memory state had NOT yet been
+       confirmed written to the server at the moment this snapshot was taken.
+
+       WHY IT IS STORED. _hydrateFromLocalSnapshot() rebuilds D from this file at boot
+       and must also rebuild _hybridShadow, which is what the flush uses to decide what
+       still needs writing. Marking everything clean would silently discard an order
+       taken offline; marking everything dirty would rewrite ~1,300 documents on every
+       boot. This list is the difference between the two, and it is tiny — normally a
+       handful of ids, often none. See the block comment on _hydrateFromLocalSnapshot.
+
+       Failure here must never cost the autosave itself: without the list a restored
+       device simply treats everything as clean, which is exactly b21's behaviour. */
+    var _dirty=null;
+    try{if(HYBRID_COLLECTIONS_LIVE||HYBRID_CUSTOMERS_LIVE)_dirty=_hybridDirtyIds();}catch(_){_dirty=null;}
+    var snapshot={D:D,USERS:USERS,nOId:nOId,nIId:nIId,nCId:nCId,ts:new Date().toISOString(),setupDone:FB_SETUP_DONE,hybridDirty:_dirty};
     var json=JSON.stringify(snapshot);
     // Save to user-keyed slot (prevents staff save overwriting director data)
     localStorage.setItem(lsKey(),json);
