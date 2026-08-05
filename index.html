@@ -348,7 +348,7 @@ var APP_VERSION="2026-07-21-v35";
    was actually running.
    Bump this ONE line on every deploy. It is display-and-diagnostics only — nothing branches
    on it, no merge or money logic reads it, so it can never change behaviour. */
-var BUILD_STAMP="2026-08-04-hyb-b22.t4";
+var BUILD_STAMP="2026-08-05-hyb-b23";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -1432,7 +1432,20 @@ var _hybridShadow={orders:{},invoices:{},customers:{}};   // id -> JSON, last st
 /* Set while a bulk repair is rewriting records, so a write fired mid-operation cannot
    publish a count taken from a half-finished state. That is exactly how b22 published
    439 during the renumber and refused delta fleet-wide until it was reset by hand. */
+/* How far BEHIND the recorded baseline a delta query actually starts. Closes the
+   serverTimestamp-vs-client-clock race that made orders permanently invisible —
+   see the block at the Timestamp.fromMillis call. Idempotent by document id, so
+   the only cost is a few duplicate reads per boot. */
+var DELTA_WATERMARK_MARGIN_MS=5*60*1000;
 var _bulkOpInFlight=false;
+/* EVENTS WATERMARK (2026-08-04, b22.t5) — newest audit-event ts this device has seen.
+   Persisted so a page reload can ask for "events since" instead of re-reading the top
+   50 every time. Seeded at parse time, before any listener can run, for the same reason
+   _publishedCounts is: startAuditListener runs long before any snapshot handler. */
+var _auditWatermark=(function(){
+  try{var v=Number(localStorage.getItem("nd_audit_watermark"));return (isFinite(v)&&v>0)?v:0;}catch(_){return 0;}
+})();
+var _auditLogHydrated=false;   // set by _hydrateFromLocalSnapshot when D.auditLog was restored
 var _publishedCounts=(function(){
   try{
     var r=localStorage.getItem("nd_published_counts");
@@ -2804,6 +2817,21 @@ function _hydrateFromLocalSnapshot(){
     }catch(_){}
     anyLoaded=true;
   });
+  /* AUDIT LOG (2026-08-04, b22.t5) — restored for the same reason the collections are:
+     it is what lets the events listener ask for "events since" rather than re-reading
+     the top 50 on every page load. _selfHealFromEventSnapshots() reads D.auditLog, so
+     the union of (restored history + events since the watermark) must be at least as
+     complete as the top-50 window it replaces. It is: the heal only ever considers
+     events inside HEAL_RECENT_MS (5 minutes), and a watermark from this device's last
+     boot is far older than that.
+     Only restored when the live array is EMPTY — a delivered event always wins. */
+  try{
+    if(Array.isArray(snap.D.auditLog)&&snap.D.auditLog.length&&!((D.auditLog||[]).length)){
+      D.auditLog=JSON.parse(JSON.stringify(snap.D.auditLog));
+      _auditLogHydrated=true;
+      report.push("auditLog="+D.auditLog.length);
+    }
+  }catch(_){_auditLogHydrated=false;}
   if(!anyLoaded)return false;
   _hydratedFromLocal=true;
   console.log("[NDHYBRID] restored from this device's local snapshot at ZERO reads — "+report.join(", ")+
@@ -2982,12 +3010,49 @@ function _hybridStartListeners(){
   if(_deltaBase>0){
     _deltaMode=true;_deltaBaselineAt=_deltaBase;
     var _bTs=null;
-    try{_bTs=firebase.firestore.Timestamp.fromMillis(_deltaBase);}catch(_){_bTs=null;}
+    /* ===================================================================
+       WATERMARK SAFETY MARGIN (2026-08-05, b23) — CLOSES A PERMANENT
+       ORDER-LOSS PATH. This is the missing-orders bug.
+
+       THE DEFECT. _updatedAt is written as FieldValue.serverTimestamp(), so
+       the SERVER decides the value when the write lands. The baseline this
+       device records is _loadIssuedAt — the moment its own queries went out.
+       Those two clocks are not ordered with respect to each other.
+
+       The losing sequence, which needs no clock skew at all:
+         1. Device A places order #X. Its write is in flight.
+         2. Device B issues its delta queries at T and records baseline = T.
+         3. A's write lands. The server stamps _updatedAt = T-2s (the moment
+            the server accepted it, which is BEFORE B's query ran).
+         4. B's query had already executed, so it never saw #X.
+         5. B's NEXT delta asks for _updatedAt > T. Order #X carries T-2s.
+            T-2s is not > T.
+       Order #X is now invisible to Device B FOREVER — not late, not
+       eventually consistent. Gone, until something forces a full load. That
+       is the 1-2 orders a day being reconciled by hand.
+
+       WHY A MARGIN IS THE RIGHT FIX, not a workaround. Firestore merges the
+       result by document id through _hydrateById, which patches by id and
+       never duplicates. Re-receiving a record already held is therefore
+       IDEMPOTENT and free of side effects. So overlapping the window costs a
+       few extra document reads and buys a hard guarantee: any write whose
+       server timestamp landed within the margin of the baseline is re-sent.
+       Five minutes is far wider than any observed in-flight write here, and
+       at ~20 orders/day the overlap is a handful of documents per boot.
+
+       This is deliberately NOT solved by tightening the baseline. There is no
+       client-side instant that is provably >= every server timestamp already
+       assigned, because the client cannot observe the server's clock at the
+       moment it stamps. An overlap is the only sound answer. */
+    var _deltaFrom=Math.max(0,_deltaBase-DELTA_WATERMARK_MARGIN_MS);
+    try{_bTs=firebase.firestore.Timestamp.fromMillis(_deltaFrom);}catch(_){_bTs=null;}
     if(!_bTs){
       console.log("[NDDELTA] could not build a Timestamp for the baseline — falling back to the FULL load");
       _deltaMode=false;_deltaBaselineAt=0;
     }else{
-      console.log("[NDDELTA] DELTA MODE — baseline "+new Date(_deltaBase).toISOString()+
+      console.log("[NDDELTA] DELTA MODE — querying from "+new Date(_deltaFrom).toISOString()+
+        " (baseline "+new Date(_deltaBase).toISOString()+" minus a "+Math.round(DELTA_WATERMARK_MARGIN_MS/60000)+
+        "-min safety overlap, so a write whose server timestamp landed around the baseline cannot be missed)"+
         "; expecting tens of documents, not ~1,294. Local baseline: orders="+((D.orders||[]).length)+
         " invoices="+((D.invoices||[]).length)+" customers="+((D.customers||[]).length));
       attach(FB_ORDERS_COL,FB_ORDERS_COL.where("_updatedAt",">",_bTs),"orders","orders/delta");
@@ -5257,13 +5322,54 @@ function startAuditListener(){
   // Archives) — still gives full real-time updates for new events (the newest
   // event always sorts to the top and correctly triggers a live update),
   // just without ever re-reading unbounded history on every reconnect.
-  FB_AUDIT_UNSUB=FB_EVENTS_COL
-    .orderBy("ts","desc")
-    .limit(50) // owner-chosen: small business, live view used for spot-checking recent errors, not archiving — deep history stays fully available via Archives
+  /* EVENTS DELTA (2026-08-04, b22.t5) — the last big read cost, removed.
+
+     A fresh subscribe of the top-50 window costs 50 document reads, and a page reload
+     ALWAYS re-subscribes because it destroys all JS state. With hydration and the
+     collection delta in place this was ~50 of the ~51 reads a reload cost — the single
+     largest remaining line item, roughly 3,000/hour across the fleet.
+
+     WHY THIS IS SAFE FOR THE MISSING-ORDER NET, the only thing that matters here.
+     _selfHealFromEventSnapshots() rescues an order only from events inside
+     HEAL_RECENT_MS — FIVE MINUTES, floored by a 2-minute grace so the creating device's
+     own write has a fair chance to land first. (The prose inside that function says
+     "1 hour"; the constant is 5*60*1000. The constant is what runs.) The heal therefore
+     never looks at anything older than five minutes, and a watermark from this device's
+     previous boot is always older than that. Restored auditLog + events-since-watermark
+     is a SUPERSET of what the top-50 window supplied.
+
+     It is also strictly BETTER than limit(50) for a device that has been away: if more
+     than 50 events occurred while it was gone, the top-50 window silently truncates the
+     oldest; "everything since the watermark" does not.
+
+     THE FALLBACK. Delta needs BOTH halves of that union — a watermark AND a restored
+     auditLog. Missing either (first run, cleared browser, private window) takes the
+     ORIGINAL unchanged top-50 query. .limit(50) is kept on the delta as well, so a
+     pathological backlog can never turn one boot into an unbounded read. */
+  var _useDelta=(_auditWatermark>0&&_auditLogHydrated&&(D.auditLog||[]).length>0);
+  var _q=FB_EVENTS_COL.orderBy("ts","desc")
+    .limit(50); // owner-chosen: small business, live view used for spot-checking recent errors, not archiving — deep history stays fully available via Archives
+  if(_useDelta){
+    _q=FB_EVENTS_COL.where("ts",">",_auditWatermark).orderBy("ts","desc").limit(50);
+    console.log("[NDEVENTS] delta mode — events since "+new Date(_auditWatermark).toISOString()+
+      "; local history "+((D.auditLog||[]).length)+" entries. Heal window is "+Math.round(HEAL_RECENT_MS/60000)+" min, far inside this.");
+  }
+  FB_AUDIT_UNSUB=_q
     .onSnapshot(function(snap){
       AUDIT_RETRY_ATTEMPTS=0; // a good snapshot means the connection is healthy again
       var remote=[];
       snap.forEach(function(d){remote.push(d.data());});
+      /* Advance the watermark to the newest ts actually DELIVERED — never to Date.now().
+         The clock would skip anything written between the query and its delivery; the
+         delivered maximum cannot. Same rule as the collection baseline. */
+      try{
+        var _mx=_auditWatermark;
+        remote.forEach(function(e){var t=Number(e&&e.ts)||0;if(t>_mx)_mx=t;});
+        if(_mx>_auditWatermark){
+          _auditWatermark=_mx;
+          try{localStorage.setItem("nd_audit_watermark",String(_mx));}catch(_){}
+        }
+      }catch(_){}
       _mergeAuditEvents(remote);
       // ROOT-CAUSE CLOSURE (2026-07-29): the events just merged may carry a full
       // ORDER_PLACED snapshot for an order that never reached the main document —
