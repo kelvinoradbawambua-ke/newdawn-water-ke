@@ -348,7 +348,7 @@ var APP_VERSION="2026-07-21-v35";
    was actually running.
    Bump this ONE line on every deploy. It is display-and-diagnostics only — nothing branches
    on it, no merge or money logic reads it, so it can never change behaviour. */
-var BUILD_STAMP="2026-08-06-hyb-b24";
+var BUILD_STAMP="2026-08-07-hyb-b26";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -417,6 +417,78 @@ var D={customers:[],stock:[],orders:[],offers:[],invoices:[],routes:[],complaint
   auditLog:[]
 };
 var nOId=1001,nIId=2001,nCId=3001,nCmpId=4001;
+/* SEQUENTIAL-ID CEILING — THE COUNTER-POISONING ROOT CAUSE FIX   (2026-08-07, b25)
+   FOUND IN LIVE PRODUCTION. Order #1786084008622849 was created 2026-08-07 09:26 EAT
+   by the Date.now()*1000+random fallback in reserveNextOrderAndInvoiceIds (see the
+   PROVISIONAL ORDER NUMBERING block for why that fallback fired at all). That alone
+   is only an ugly number. What made it RECUR is this:
+
+   syncCounters (~line 17259) ratchets nOId to "the maximum order id that has EVER
+   existed" — deliberately, so a deleted top-numbered record can never have its id
+   reissued (the tombstone-collision fix of 2026-07-20). But that maximum is computed
+   with no upper bound, so ONE fallback id drags the local counter to 1786084008622850
+   on every device that holds the order. From there:
+     * reserveNextOrderId()'s offline path is `Promise.resolve(nOId++)` — it hands out
+       another 16-digit id, so the defect reproduces itself without another failure.
+     * reserveNextOrderAndInvoiceIds() seeds from `data.nOId ? data.nOId : nOId-1`.
+       If the counters document is ever absent or missing that field, the poisoned
+       LOCAL value is written to the SERVER counter and every device inherits
+       16-digit ids permanently. That is a fleet-wide, unrecoverable-by-itself state.
+
+   FIX: a real order/invoice number is sequential and small (~1,000-9,999 here). Any
+   id at or above this ceiling is, by construction, not a sequence number — it came
+   from the timestamp fallback — so it must not raise the sequence floor. Excluding it
+   does NOT weaken the reuse protection the ratchet exists for: the sequential counter
+   would need ~1.78e15 orders to reach that range, and the fallback itself is
+   Date.now()-based and strictly increasing, so a timestamp id can never be minted
+   twice. Reuse remains structurally impossible; only the poisoning is removed.
+
+   Deliberately NOT applied to nCId/nCmpId. Customer ids come from uid() (line ~594,
+   Date.now()*5000+salt) and are MEANT to be ~15 digits, so maxCust is legitimately
+   ~1.78e14 and always has been; nothing mints from nCId at all (verified: no nCId++
+   anywhere in this file). Excluding those would be a change with no defect behind it. */
+var SEQ_ID_MAX=1e12;
+/* Is v a real SEQUENCE number (small, positive) rather than a timestamp-fallback id? */
+function _isSeqId(v){var n=Number(v);return isFinite(n)&&n>0&&n<SEQ_ID_MAX;}
+/* Seed value for a counter transaction when the SERVER counter has no usable value.
+   Never returns a poisoned local counter — that is the path that would write a
+   16-digit floor to newdawn_counters/main and hand every device in the fleet
+   permanent 16-digit ids. Falls back to the known-safe floor instead, which the
+   transaction then increments; syncCounters() re-ratchets from the real records
+   immediately afterwards, so a floor that is momentarily too low self-corrects,
+   whereas one that is too high cannot. */
+function _seqCounterSeed(local,floor){
+  return _isSeqId(local)?Math.max(Number(local)-1,floor):floor;
+}
+/* DATA-DERIVED FLOOR — fixes a COLLISION RISK INTRODUCED BY THE b25 SEED GUARD.
+   (2026-08-07, found by reviewing my own change rather than by a test.)
+
+   The seed guard above correctly refuses a poisoned LOCAL counter. But the call sites
+   originally passed a bare constant as the floor (1000 / 2000 / 4000). That is wrong:
+   if the SERVER counter value also fails _isSeqId — which is exactly the fleet-wide
+   poisoning scenario the guard exists for — the transaction seeds from 1000 and issues
+   #1001, which can COLLIDE with an order that already exists. Two records sharing an id
+   is the #1204 failure class that cost a real order in 2026-07: whichever write lands
+   last silently overwrites the other.
+
+   b24, in that same scenario, produced a 16-digit id — ugly but UNIQUE. So the naive
+   floor traded uniqueness for prettiness, which is strictly worse. The floor must
+   therefore come from the data: the highest id that actually exists, counting tombstones
+   so a deleted top id is never reissued (the 2026-07-20 protection). Only SANE ids are
+   folded in, so a timestamp id cannot drag the floor back up and re-poison anything.
+
+   Worst case now: a floor slightly too LOW is impossible (it is a max over everything
+   present), and a floor too HIGH would only skip numbers, never reuse one. */
+function _seqFloorFor(kind){
+  var floor=kind==="o"?1000:(kind==="i"?2000:4000);
+  try{
+    var arr=kind==="o"?(D.orders||[]):(kind==="i"?(D.invoices||[]):(D.complaints||[]));
+    arr.forEach(function(r){if(r&&_isSeqId(r.id))floor=Math.max(floor,Number(r.id));});
+    var tomb=kind==="o"?D.deletedOrderIds:(kind==="i"?D.deletedInvoiceIds:null);
+    if(tomb)Object.keys(tomb).forEach(function(k){if(_isSeqId(k))floor=Math.max(floor,Number(k));});
+  }catch(_){}
+  return floor;
+}
 var CU=null,SU=null,PE="";
 // SECURITY FIX (2026-07-20): this codebase renders user-entered free text
 // (customer names, complaint details, notes) directly into innerHTML in
@@ -1863,15 +1935,22 @@ function _persistCustomerDoc(c){
       ref.set(_hybridStamp(c,"c"),{merge:true}).catch(function(){});
       return;
     }
-    fbDb.runTransaction(function(txn){
+    /* _ndSettleWithin (2026-08-07, b26): this runTransaction was UNBOUNDED, so on a frozen
+       or connection-dead tab it reached neither .then nor .catch and the retry below never
+       re-armed — the customer write was simply forgotten. See NDWRITE_SETTLE_TIMEOUT_MS.
+       Timeout only, no app-level retry: Firestore retries internally and this is a
+       whole-record write. _pendingLocalWrite is re-armed so a later flush rewrites it,
+       matching how the order/invoice write failures are handled. */
+    _ndSettleWithin(fbDb.runTransaction(function(txn){
       return txn.get(ref).then(function(doc){
         var remote=(doc&&doc.exists)?doc.data():null;
         // No remote copy yet -> nothing to union, write as-is.
         var merged=remote?_mergeCustomerCredit(c,remote):c;
         txn.set(ref,_hybridStamp(merged,"c"),{merge:true});
       });
-    }).catch(function(e){
-      console.log("[NDHYBRID] customer #"+c.id+" write failed ("+((e&&e.code)||"unknown")+") — will retry next flush");
+    }),NDWRITE_SETTLE_TIMEOUT_MS,"customer #"+c.id+" write").catch(function(e){
+      _pendingLocalWrite=true;   // re-arm, so a never-settling write is retried instead of forgotten
+      console.log("[NDHYBRID] customer #"+c.id+" write failed ("+((e&&e.code)||(e&&e.message)||"unknown")+") — retry re-armed");
     });
   }catch(_){}
 }
@@ -2298,6 +2377,21 @@ function _hybridFlushDocs(writesOnly){
     var liveO={};
     (D.orders||[]).forEach(function(o){
       if(!o||o.id==null)return;
+      /* HOLD BACK A PROVISIONALLY-NUMBERED ORDER (2026-08-07, b26).
+         An order created while the id counter was unreachable carries a temporary
+         number. Publishing it would put that number in front of every other device and
+         make the later renumber a cross-device rewrite — tombstones, deletes, and a
+         window where the same order exists under two numbers. Holding it costs nothing:
+         a device that cannot complete a counter transaction cannot publish documents
+         either, so this is exactly the window in which the order could not have left
+         the phone anyway. It stays durable via the localStorage autosave, the audit
+         snapshot and the outbox, and _drainPendingNumbers() publishes it the moment it
+         has a real number.
+         NOTE it is added to liveO first. liveO is what _hybridReapDeletes uses to decide
+         "in shadow, absent from D = deleted"; skipping the write must not make the order
+         look absent, or a pending order could be read as a deletion. It is not in the
+         shadow yet either (never written), so this is belt and braces. */
+      if(_isNumPending(o)){liveO[String(o.id)]=true;return;}
       // Derive BEFORE hashing: otherwise the write would add `settled` and the very next
       // flush would see a difference and rewrite every record, forever.
       _hybridDerive("o",o);
@@ -2329,6 +2423,9 @@ function _hybridFlushDocs(writesOnly){
     var liveI={};
     (D.invoices||[]).forEach(function(i){
       if(!i||i.id==null)return;
+      // Same hold-back as the orders block above — the pair travels together. Added to
+      // liveI first so a held invoice can never be read as a deletion.
+      if(_isNumPending(i)){liveI[String(i.id)]=true;return;}
       _hybridDerive("i",i);   // see the orders block above — derive before hashing
       var k=String(i.id),j=_stableStr(i);
       liveI[k]=true;
@@ -2402,6 +2499,16 @@ function _hybridFlushDocs(writesOnly){
    here — a divergence means one read path protects a field the other reverts. */
 var _HYDRATE_CUST_FIELDS=["name","phone","phone2","idno","estate","court","house","htype","road","zone","ctype","creditLimit","notes"];
 var _HYDRATE_ORDER_FIELDS=["cId","driver","notes","deliver","prod","stockId","qty","price","cost","date","prodConfirmed","bottle_before"];
+/* The customer PROFILE fields that _mergeCustomerCredit arbitrates by revision
+   (2026-08-07, b26). Kept beside _HYDRATE_ORDER_FIELDS deliberately — these are the two
+   arbitrated-field lists in this file and they should be read together.
+   This is exactly the set saveCust() edits, MINUS four deliberate exclusions:
+     waterCycle, cycleHistory — the water cycle is not to be touched
+     followups                — append-style list; field arbitration would drop entries
+     credit, creditLog        — merged additively above, which converges; arbitrating them
+                                would make it last-writer-wins and could lose a payment
+   See the block comment at the end of _mergeCustomerCredit for the full reasoning. */
+var _CUSTOMER_PROFILE_FIELDS=["name","phone","phone2","idno","estate","court","house","htype","road","zone","ctype","creditLimit","notes"];
 function _hydrateById(arr,docs,label,arrName){
   // Defensive: hydration runs inside an onSnapshot callback, where a throw would break the
   // listener for the rest of the session. Bad input is a no-op, never an exception.
@@ -3744,6 +3851,57 @@ function _mergeCustomerCredit(a,b){
   var result=Object.assign({},a||b);
   result.creditLog=mergedLog;
   result.credit=_round2(credit);
+  /* ============================================================================
+     PROFILE-FIELD REVISION ARBITRATION                          (2026-08-07, b26)
+
+     THE GAP. Basing the merge on `a` (local) above is the deliberate 2026-07-27 fix —
+     without it a director's just-made edit to a phone number, address or CREDIT LIMIT was
+     reverted to the stale server value by the very write meant to persist it. That fix is
+     correct and stays.
+
+     But it resolved the conflict in ONE direction and left the other open: if ANOTHER
+     device made a NEWER edit to the same customer, local values now win unconditionally
+     and that newer edit is silently overwritten on the server. Orders and invoices do not
+     have this problem — they arbitrate by _rev through _mergeRecordFields. Customers were
+     the one record type carrying revision stamps (saveCust calls _stampRecordEdit) while
+     never USING them. creditLimit is in that set, so this is money-adjacent.
+
+     Found by phase1_twodevice_harness.js (finding A1) once that harness was repaired —
+     it had been failing on a drifted anchor since before b24 and reporting nothing.
+
+     THE FIX. Reuse _mergeRecordFields, the SAME primitive orders use, rather than
+     restating the rule: _rev leads, _editedAt breaks an equal-revision tie, _editedBy
+     breaks an equal-timestamp tie, and it engages only when both sides carry a real
+     stamp — so legacy/unstamped customers are completely unaffected and keep today's
+     prefer-local behaviour exactly.
+
+     DELIBERATELY EXCLUDED, and this is not an oversight:
+       * waterCycle / cycleHistory — the water cycle is not to be touched. Excluding them
+         means their handling is byte-for-byte what it was before this change.
+       * followups — an append-style list; field-level arbitration would drop entries the
+         way a wholesale take would. Left exactly as-is.
+       * credit / creditLog — set above by additive union, which converges regardless of
+         which write lands last. Arbitrating them would REPLACE that with last-writer-wins
+         and could lose a concurrent payment. Deliberately untouched.
+     What remains is the profile set saveCust() actually edits, which is where the
+     reverting/overwriting problem lives. */
+  if(a&&b){
+    try{
+      var _arb=_mergeRecordFields(a,JSON.parse(JSON.stringify(b)),_CUSTOMER_PROFILE_FIELDS,"customer(profile)");
+      if(_arb){
+        _CUSTOMER_PROFILE_FIELDS.forEach(function(f){
+          if(Object.prototype.hasOwnProperty.call(_arb,f))result[f]=_arb[f];
+        });
+        /* Carry the WINNING revision stamps, so the next merge on this record arbitrates
+           from the revision that actually won rather than from the local one. Without
+           this the loser's rev would persist and the same conflict would be re-fought,
+           with a different answer each time. */
+        if(_arb._rev!=null)result._rev=_arb._rev;
+        if(_arb._editedAt!=null)result._editedAt=_arb._editedAt;
+        if(_arb._editedBy!=null)result._editedBy=_arb._editedBy;
+      }
+    }catch(_){}   // never throw on the write path — an un-arbitrated result is the old behaviour, not a loss
+  }
   return result;
 }
 function _mergeInvoicePayments(a,b){
@@ -4807,7 +4965,18 @@ function processWriteQueue(){
        Proof: _proofB_order_durability.js sections 3 and 7. */
     var _txnRef=FB_DOC_REF;
     if(!_txnRef){_abortWriteNoDocRef("atomic write");return;}
-    fbDb.runTransaction(function(txn){
+    /* _ndSettleWithin (2026-08-07, b26) — CLOSES HARNESS FINDING B2, open since 2026-07-30.
+       This runTransaction was UNBOUNDED. On a frozen tab or a dead connection it settles
+       NEITHER way, so the .then and the .catch below — and therefore _fallbackWrite(), the
+       durable queued write this whole path depends on — never ran at all. The 2026-07-30
+       outbox closed this for ORDERS only; the main document (stock, pendingPayments, team,
+       routes, tombstones) was still exposed.
+       Timeout only, NO app-level retry: Firestore retries internally and this is a
+       whole-document write, so a retry would multiply egress — the scarce resource here.
+       Safe against double-apply: the callback rebuilds DforSync fresh every attempt (see
+       the idempotency note above) and the no-op suppressor skips the write entirely if a
+       timed-out attempt had in fact committed. See NDWRITE_SETTLE_TIMEOUT_MS. */
+    _ndSettleWithin(fbDb.runTransaction(function(txn){
       if(!_txnRef)throw new Error("ND_NO_DOC_REF");
       return txn.get(_txnRef).then(function(freshDoc){
         var DforSync=_buildDforSync(); // FRESH each attempt - idempotent under retry
@@ -4872,7 +5041,7 @@ function processWriteQueue(){
         // comment at the top of _atomicWrite.
         txn.set(_txnRef,_finalPayload,{merge:true});
       });
-    }).then(function(){
+    }),NDWRITE_SETTLE_TIMEOUT_MS,"main document atomic write").then(function(){
       _lastFreshnessCheckTime=Date.now();
       console.log("[NDSYNC] processWriteQueue atomic transaction COMMITTED at "+new Date().toISOString());
       _onWriteSuccess();
@@ -4884,7 +5053,18 @@ function processWriteQueue(){
         FB_WRITING=false;_syncInFlight=null;
         return;
       }
-      if(_isTransientOffline(err)){
+      /* A TIMED-OUT transaction takes the DURABLE path, not the plain-failure path
+         (2026-08-07, b26). This is the half of finding B2 that matters: the reason the gap
+         was dangerous is that _fallbackWrite() — the durable queued write — never ran. A
+         non-settling transaction now rejects with ND_TIMEOUT, and the correct response is
+         exactly the offline response: queue it durably. Treating it as a generic failure
+         would re-arm a retry but leave nothing durable in the meantime, which is the
+         situation this fix exists to end. A plain set/update DOES enter Firestore's offline
+         queue (unlike a transaction), which is why the fallback survives where this did not. */
+      if(err&&/ND_TIMEOUT/.test(String(err.message||""))){
+        console.log("[NDSYNC] atomic write NEVER SETTLED within "+NDWRITE_SETTLE_TIMEOUT_MS+"ms (frozen tab or dead connection) — falling back to a durable queued write. This is the freeze-then-evict gap (finding B2) being caught rather than silently swallowed.");
+        _fallbackWrite();
+      }else if(_isTransientOffline(err)){
         console.log("[NDSYNC] atomic write unavailable (offline?) - falling back to a queued write: "+(err&&err.code));
         _fallbackWrite();
       }else{
@@ -5481,6 +5661,13 @@ function startCloudListener(isWarmRefresh){
     if(doc.metadata&&doc.metadata.fromCache===false){
       if(!_cloudServerConfirmed)console.log("[NDSYNC] server-confirmed snapshot — cloud-state decisions (self-heal) are now allowed");
       _cloudServerConfirmed=true;
+      /* NUMBER ANY PROVISIONAL ORDER (2026-08-07, b26). fromCache===false is the
+         strongest "we are genuinely talking to the server" signal in this file, which is
+         exactly the condition a counter transaction needs — so this is the natural
+         trigger and it needs no timer of its own. Returns immediately when nothing is
+         pending, which is the overwhelmingly common case. The fromCache guard itself is
+         only READ here; nothing about it is changed. */
+      try{if(_pendingNumberCount())_drainPendingNumbers();}catch(_){}
     }
     console.log("[NDSYNC] snapshot arrived — _cloudDataConfirmed=true, doc.exists="+doc.exists+", doc.metadata.fromCache="+(doc.metadata&&doc.metadata.fromCache));
     /* PERF FIX (2026-08-01) — FOUND IN LIVE PRODUCTION: login took ~20 s after a
@@ -6697,6 +6884,9 @@ function _initVisibilityRecovery(){
         // not the lighter warm refresh used for a brief tab-switch.
         _pausedForBackground=false;
         console.log("[NDSYNC] resuming after background pause — cold reconnect");
+        // b26: a phone that was offline while an order was placed most often comes back
+        // through here. Cheap no-op when nothing is pending.
+        try{if(_pendingNumberCount())_drainPendingNumbers();}catch(_){}
         startCloudListener(false);
       }else{
         // Force a completely fresh subscribe — guarantees current state is
@@ -9548,6 +9738,16 @@ function buildMods(){
     "<div class=\"mft\"><button class=\"btn\" onclick=\"cm('m-recon')\">Close</button></div>"+
   "</div></div>";
 
+  /* DORMANT CUSTOMERS MODAL (2026-08-07, b26). The dashboard alert counted dormant
+     customers correctly but set dest:"customers", so clicking "2 customer(s) have not
+     ordered in 30+ days" opened the full list of 440 with no indication of WHICH two.
+     Modelled on m-recon rather than inventing a new pattern. */
+  var mDormant="<div class=\"ov\" id=\"m-dormant\"><div class=\"modal\" style=\"max-width:820px\">"+
+    "<div class=\"mhd\"><div class=\"mttl\"><i class=\"ti ti-user-exclamation\" style=\"color:var(--gd);margin-right:7px\"></i>Customers who have stopped ordering</div><button class=\"mcls\" onclick=\"cm('m-dormant')\"><i class=\"ti ti-x\"></i></button></div>"+
+    "<div class=\"mbdy\" id=\"m-dormant-body\"></div>"+
+    "<div class=\"mft\"><button class=\"btn\" onclick=\"cm('m-dormant')\">Close</button></div>"+
+  "</div></div>";
+
   var mOf="<div class=\"ov\" id=\"m-of\"><div class=\"modal\">"+
     "<div class=\"mhd\"><div class=\"mttl\" id=\"m-of-title\"><i class=\"ti ti-tag\" style=\"color:var(--gd);margin-right:7px\"></i>New Promotion</div><button class=\"mcls\" onclick=\"cm('m-of')\"><i class=\"ti ti-x\"></i></button></div>"+
     "<div class=\"mbdy\"><div class=\"fg2\">"+
@@ -9715,7 +9915,7 @@ function buildMods(){
     "<div class=\"mbdy\" id=\"m-books-body\"></div>"+
     "<div class=\"mft\"><button class=\"btn\" onclick=\"cm('m-books')\">Close</button></div>"+
   "</div></div>";
-  el("mods").innerHTML=mC+mO+mOE+mDlv+mS+mRS+mOf+mIv+mPay+mCmp+mU+mSetup+mPin+mAssign+mFollowUp+mGeneric+mRecon+mHealReview+mBooks;
+  el("mods").innerHTML=mC+mO+mOE+mDlv+mS+mRS+mOf+mIv+mPay+mCmp+mU+mSetup+mPin+mAssign+mFollowUp+mGeneric+mRecon+mDormant+mHealReview+mBooks;
 }
 
 function rDash(){
@@ -9818,15 +10018,57 @@ function rDash(){
   var thisMonth=now2.getFullYear()+"-"+String(now2.getMonth()+1).padStart(2,"0");
   var lastMonthD=new Date(now2.getFullYear(),now2.getMonth()-1,1);
   var lastMonth=lastMonthD.getFullYear()+"-"+String(lastMonthD.getMonth()+1).padStart(2,"0");
-  var thisRev=del.filter(function(o){var dd=o.deliveredAt||o.date;return dd&&dd.startsWith(thisMonth);}).reduce(function(s,o){return s+o.qty*o.price;},0);
-  var lastRev=del.filter(function(o){var dd=o.deliveredAt||o.date;return dd&&dd.startsWith(lastMonth);}).reduce(function(s,o){return s+o.qty*o.price;},0);
-  if(can("vRev")&&lastRev>0){var tp=Math.round((thisRev-lastRev)/lastRev*100);if(Math.abs(tp)>=10){var tc=tp>0?"#27ae60":"#c0392b";alerts.push({t:"ni",i:(tp>0?"ti-trending-up":"ti-trending-down"),m:"Revenue "+(tp>0?"+":"")+tp+"% vs last month — KSh "+thisRev.toLocaleString()+" this month",dest:"reports"});}}
+  /* REVENUE ALERT — TWO DEFECTS FIXED (2026-08-07, b26). BOTH SEEN IN PRODUCTION on
+     2026-08-07, when the dashboard read "Revenue -73% vs last month — KSh 82,300 this
+     month" on the 7th of the month.
+
+     DEFECT 1 — IT COMPARED A PART-MONTH AGAINST A WHOLE MONTH. thisRev covered
+     1-7 August; lastRev covered ALL of July. Early in every month that arithmetic
+     alone produces a large negative number, so the alert cried collapse every month
+     and was therefore worth nothing — the "technically correct but useless in
+     practice" class. FIX: compare month-to-date against THE SAME DAYS of last month
+     (1-7 July vs 1-7 August). On the last day of a month it is a full comparison, and
+     on day 1 it is day 1 vs day 1.
+
+     DEFECT 2 — IT IGNORED WRITE-OFFS. The dashboard's own period revenue (see `rev`
+     above) and the monthly chart (mRevs) both subtract _writtenOffFor(...); these two
+     lines did not. So this alert's shilling figure disagreed with every other revenue
+     figure in the app — the exact "every view must agree" rule. FIX: subtract it here
+     too, using the same helper, so there is one definition of revenue.
+
+     Short months are handled by comparing DAY-OF-MONTH: on 31 March the cutoff for
+     February is day 31, which simply includes all of February. */
+  var _domToday=now2.getDate();
+  var _mtd=function(mon){
+    return del.filter(function(o){
+      var dd=o.deliveredAt||o.date;
+      if(!dd||!dd.startsWith(mon))return false;
+      var d=parseInt(String(dd).slice(8,10),10);
+      return !isNaN(d)&&d<=_domToday;   // same days of the month, so the two are comparable
+    });
+  };
+  var _thisOrds=_mtd(thisMonth),_lastOrds=_mtd(lastMonth);
+  var thisRev=_thisOrds.reduce(function(s,o){return s+o.qty*o.price;},0)-_writtenOffFor(_thisOrds);
+  var lastRev=_lastOrds.reduce(function(s,o){return s+o.qty*o.price;},0)-_writtenOffFor(_lastOrds);
+  if(can("vRev")&&lastRev>0){var tp=Math.round((thisRev-lastRev)/lastRev*100);if(Math.abs(tp)>=10){alerts.push({t:"ni",i:(tp>0?"ti-trending-up":"ti-trending-down"),m:"Revenue "+(tp>0?"+":"")+tp+"% vs the same "+_domToday+" day"+(_domToday===1?"":"s")+" of last month &mdash; KSh "+thisRev.toLocaleString()+" so far this month vs KSh "+lastRev.toLocaleString(),dest:"reports"});}}
   var churnDate=_ymd(new Date(Date.now()-30*86400000)); // local-safe
   // BOOKS (2026-07-30): a genuinely churned customer's LAST order is exactly
   // the one most likely to be archived by now — without the merge, the most
   // dormant customers would be the ones silently dropped from this alert.
-  var churned=(D.customers||[]).filter(function(cu){var lo=_dashOrdAll.filter(function(o){return o.cId===cu.id&&o.status==="Delivered";}).sort(function(a,b){return b.date>a.date?1:-1;})[0];return lo&&lo.date<churnDate;}).length;
-  if(churned>0)alerts.push({t:"nw",i:"ti-user-exclamation",m:churned+" customer(s) have not ordered in 30+ days",dest:"customers"});
+  /* ONE definition of "dormant", shared by the count and the list (2026-08-07, b26).
+     The predicate used to be inline here and produced only a COUNT, and the alert then
+     set dest:"customers" — so clicking "2 customer(s) have not ordered in 30+ days"
+     opened all 440 with no clue which two. The owner named this exact alert as the
+     example of a feature that is technically correct and useless in practice.
+     Extracting it means the number in the alert and the rows in the list are computed
+     by the same code and cannot drift apart, the same reason the debt figures were
+     consolidated onto custDebt/_invoiceOrderActive. _dormantCustomers() is defined next
+     to showDormantCustomers(); _dashOrdAll is passed in because it merges archived
+     orders, and a churned customer's last order is exactly the one most likely to be
+     archived (the 2026-07-30 BOOKS note). */
+  var _churnedList=_dormantCustomers(_dashOrdAll,churnDate);
+  var churned=_churnedList.length;
+  if(churned>0)alerts.push({t:"nw",i:"ti-user-exclamation",m:churned+" customer(s) have not ordered in 30+ days",act:"showDormantCustomers()"});
 
   var lowStock=(D.stock||[]).filter(function(s){return s.qty<=s.min;});
   lowStock.slice(0,3).forEach(function(s){alerts.push({t:"nw",i:"ti-alert-triangle",m:"Low stock: <strong>"+s.name+"</strong> &mdash; "+s.qty+" left (min "+s.min+")",dest:"stock"});});
@@ -9849,7 +10091,9 @@ function rDash(){
     }
   }
   (D.complaints||[]).filter(function(c){return c.status==="Open";}).slice(0,2).forEach(function(c){var cu=(D.customers||[]).find(function(x){return x.id===c.cId;});alerts.push({t:"nw",i:"ti-message-report",m:"Complaint: <strong>"+(cu?(can("vPhone")?cu.name:maskName(cu.name)):"?")+"</strong> &mdash; "+c.type,dest:"complaints"});});
-  (D.orders||[]).filter(function(o){return o.status==="Pending";}).slice(0,3).forEach(function(o){alerts.push({t:"ni",i:"ti-truck",m:"Pending: <strong>#"+o.id+"</strong> &mdash; "+custName(o.cId)+": "+o.qty+"&times; "+o.prod,dest:"orders"});});
+  // b26: _displayOrderNo so a provisional order reads "awaiting number" here too, not a
+  // raw 16-digit id. Swept after the Orders table — same pattern, three places.
+  (D.orders||[]).filter(function(o){return o.status==="Pending";}).slice(0,3).forEach(function(o){alerts.push({t:"ni",i:"ti-truck",m:"Pending: <strong>"+_displayOrderNo(o)+"</strong> &mdash; "+custName(o.cId)+": "+o.qty+"&times; "+o.prod,dest:"orders"});});
   // ALERTS (2026-07-21): missing-order reconciliation, surfaced automatically
   // rather than requiring the director to remember to run the check
   // manually. Computed fresh from the same _computeMissingOrders() the
@@ -9998,7 +10242,10 @@ function rDash(){
           ((D.orders||[]).length?
             "<div class=\"tw\"><table><thead><tr><th>#</th><th>Customer</th><th>Product</th><th style=\"text-align:right\">Total</th><th>Status</th></tr></thead><tbody>"+
             [].concat(D.orders).reverse().slice(0,6).map(function(o){return "<tr>"
-              +"<td style=\"font-weight:600;color:var(--tx2);font-size:11px\">#"+o.id+"</td>"
+              // b26: _displayOrderNo — the dashboard "Recent orders" card is the FIRST place
+              // a newly-placed order appears, so a raw provisional id here would be the very
+              // first thing an operator saw. Third and last of the three display sites.
+              +"<td style=\"font-weight:600;color:var(--tx2);font-size:11px\">"+_displayOrderNo(o)+"</td>"
               +"<td style=\"font-weight:700;color:var(--tx)\">"+custName(o.cId)+"</td>"
               +"<td style=\"color:var(--tx2);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:140px\">"+o.prod+"</td>"
               +"<td style=\"text-align:right;font-weight:700;color:var(--nv)\">"+kshS(o.qty*o.price)+"</td>"
@@ -11187,7 +11434,14 @@ function ordRows(fil){
   if(!fil.length)return "<tr><td colspan=\""+(can("vRev")?"11":"10")+"\"><div class=\"te\"><i class=\"ti ti-clipboard-list\"></i><p>No orders found</p></div></td></tr>";
   return fil.map(function(o){
     var c=(D.customers||[]).find(function(x){return x.id===o.cId;});
-    return "<tr><td style=\"font-weight:700\">#"+o.id+"</td>"+
+    /* b26: show "awaiting number" instead of a raw 16-digit provisional id. Displaying
+       the temporary number is what made this look like data corruption on the Orders
+       page — the operator sees #1786084008622849 next to #1521 and reasonably concludes
+       something is broken. The order IS fine; it just has no sequence number yet. The
+       real number appears here by itself once the phone has signal. */
+    return "<tr><td style=\"font-weight:700\">"+(_isNumPending(o)
+        ? "<span style=\"background:#fff3cd;color:#856404;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:700\" title=\"Saved on this phone. It takes its real order number automatically as soon as there is a connection.\">awaiting number</span>"
+        : "#"+o.id)+"</td>"+
       "<td><div style=\"font-weight:700\">"+(c?(can("vPhone")?c.name:maskName(c.name)):"&mdash;")+"</div><div class=\"ca\">"+(c?[c.court,c.house?"No."+c.house:""].filter(Boolean).join(" "):"")+"</div></td>"+
       "<td>"+o.prod+(o.prodConfirmed===false?" <span style=\"background:#fff3cd;color:#856404;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:700\">TBC</span>":"")+"</td><td style=\"font-weight:700\">"+o.qty+"</td>"+
       "<td>"+(can("vRev")?kshS(o.qty*o.price):"<span style=\"color:var(--tx2);font-size:11px\">—</span>")+"</td>"+
@@ -11736,6 +11990,285 @@ function checkCycleWarn(){
     +"<div style=\"font-size:10px;color:var(--tx2);margin-top:4px;text-align:right\">"+(next>=8?"Cycle resets after delivery":""+(8-next)+" more bottle"+(8-next===1?"":"s")+" to complete cycle")+"</div>"
     +"</div>";
 }
+/* ============================================================================
+   PROVISIONAL ORDER NUMBERING — THE 16-DIGIT-ID ROOT CAUSE FIX  (2026-08-07, b26)
+
+   THE DEFECT, CONFIRMED IN LIVE PRODUCTION. Order #1786084008622849 was created
+   2026-08-07 09:26 EAT. Its id decodes to exactly that instant, and its invoice
+   #1786084008622602 to the same millisecond, so both came from one
+   Date.now()*1000+random fallback expression. The read quota was NOT exhausted that
+   day, so the documented 2026-08-03 explanation does not apply.
+
+   WHY THE FALLBACK FIRED. Order id reservation is a Firestore runTransaction, and
+   this codebase already recorded the decisive fact during the 2026-07-30 payment-
+   outbox work: "runTransaction is never placed in Firestore's offline queue — only
+   plain set/update/delete are — so when a phone freezes mid-write the transaction
+   never settles, never rejects". Nobody applied that to id reservation, which sits
+   in the critical path of order creation. Two failure modes follow:
+
+     MODE A — the transaction REJECTS (no signal, dead spot). The old .catch minted a
+       16-digit id with no retry whatsoever. Also note the !FB_COUNTERS_REF early-out
+       never catches this: those globals are set once Firebase initialises and stay
+       set even with no connection, so an offline order goes down the transaction
+       path and gets branded. This is not a rare event — it is EVERY offline order.
+
+     MODE B — the transaction NEVER SETTLES (frozen/suspended phone). The .then()
+       never ran, so nothing was pushed to D.orders: no order, no invoice, no
+       auditLog, no _outboxPut. The order simply never existed. There is no
+       ORDER_PLACED audit entry, which is why the missing-order finder cannot see it
+       either — it works by comparing audit entries against live orders. Every one of
+       the six recovery nets sits DOWNSTREAM of a step that never ran. This is the
+       silent-loss mode, and it is the same root cause as the ugly numbers.
+
+   THE FIX: ORDER CREATION NO LONGER DEPENDS ON THE NETWORK.
+     1. _ndReserveBounded wraps the transaction so it ALWAYS settles — bounded
+        retries, each with a hard timeout. Mode B stops being possible: a hung
+        transaction now rejects and is handled instead of stranding the order.
+     2. If a real number cannot be obtained, the order is still recorded IMMEDIATELY
+        and durably, carrying a PROVISIONAL number and _numPending:true.
+     3. A record with _numPending is NOT published to Firestore (see
+        _hybridFlushDocs), so the provisional number never reaches another device.
+     4. _drainPendingNumbers() runs on the existing reconnect/retry triggers and
+        gives the order its real sequential number, then lets the normal flush
+        publish it.
+
+   WHY THIS KEEPS THE NUMBERING CONTIGUOUS, which the owner requires because a gap
+   is how they spot trouble fast: numbers are taken from the real counter one at a
+   time, exactly as before. Nothing is pre-reserved, so no number is ever allocated
+   and left unused. A phone with no signal simply waits rather than consuming a
+   number out of order.
+
+   WHY HOLDING THE RECORD BACK COSTS NOTHING. A device that cannot complete a
+   transaction also cannot publish documents — the wait is precisely the window in
+   which the order could not have left the phone anyway. It is durable throughout:
+   localStorage autosave carries it across a reload, and the audit snapshot plus the
+   outbox carry it for recovery.
+
+   WHY THE PROVISIONAL ID KEEPS THE Date.now()*1000 SHAPE rather than something more
+   obviously distinct: that shape is already field-proven to work end to end (the
+   09:26 order was placed AND delivered normally), already excluded from every
+   counter ratchet by SEQ_ID_MAX, and already recognised by _renumberTimestampIds.
+   Inventing a new id space — negative numbers, string prefixes — would put an
+   untested shape through ~17,000 lines that assume a positive numeric id. The
+   difference is that it is now TEMPORARY and PRIVATE to this device, which is what
+   actually made the old behaviour harmful.
+   ============================================================================ */
+var NDNUM_RESERVE_ATTEMPTS=3;      // bounded: must finish well inside the 15s button safety net
+var NDNUM_RESERVE_TIMEOUT_MS=3500; // a runTransaction that never settles is rejected at this point
+var NDNUM_RESERVE_BACKOFF_MS=400;  // 400ms then 800ms between attempts
+/* Always-settling wrapper. Firestore's own retry does not cover the never-settles
+   case, which is the whole point of this timeout. */
+function _ndSettleWithin(p,ms,label){
+  return new Promise(function(resolve,reject){
+    var done=false;
+    var t=setTimeout(function(){
+      if(done)return;done=true;
+      reject(new Error("ND_TIMEOUT after "+ms+"ms ("+label+") — the transaction never settled"));
+    },ms);
+    Promise.resolve(p).then(function(v){
+      if(done)return;done=true;clearTimeout(t);resolve(v);
+    },function(e){
+      if(done)return;done=true;clearTimeout(t);reject(e);
+    });
+  });
+}
+/* Bounded retry around a transaction factory. Each attempt gets a fresh promise —
+   a settled/rejected promise cannot be retried, so the factory is re-invoked. */
+function _ndReserveBounded(makePromise,label){
+  /* Communicate a missing factory by REJECTING rather than throwing synchronously.
+     Every caller handles rejection (that is how a provisional number gets issued), so
+     a rejection is handled correctly everywhere a throw would escape. This also keeps
+     the function-execution harness at its 89-TypeError baseline: the harness invokes
+     every top-level function with no arguments, and a new throwing function would raise
+     that count and blunt it as a regression signal for everything else. */
+  if(typeof makePromise!=="function"){
+    return Promise.reject(new Error("_ndReserveBounded called without a transaction factory ("+(label||"no label")+")"));
+  }
+  var attempt=0;
+  function tryOnce(){
+    attempt++;
+    var thisAttempt=attempt;
+    return _ndSettleWithin(makePromise(),NDNUM_RESERVE_TIMEOUT_MS,label).catch(function(err){
+      if(thisAttempt>=NDNUM_RESERVE_ATTEMPTS)throw err;
+      console.log("[NDNUM] "+label+" attempt "+thisAttempt+"/"+NDNUM_RESERVE_ATTEMPTS+" failed ("+((err&&err.message)||err)+") — retrying");
+      return new Promise(function(r){setTimeout(r,NDNUM_RESERVE_BACKOFF_MS*thisAttempt);}).then(tryOnce);
+    });
+  }
+  return tryOnce();
+}
+/* A provisional pair. The two ids are guaranteed DISTINCT — the old code called
+   Math.random() twice independently, so orderId and invoiceId collided about 1 time
+   in 1000, and the invoice dedupe in the freshness-check rescue keys off invoice id. */
+function _provisionalIdPair(reason){
+  var base=Date.now()*1000+Math.floor(Math.random()*1000);
+  return {orderId:base,invoiceId:base+1,provisional:true,reason:reason||"counter unreachable"};
+}
+function _provisionalSingleId(){
+  return Date.now()*1000+Math.floor(Math.random()*1000);
+}
+/* Is this record still waiting for its real sequential number? */
+function _isNumPending(rec){return !!(rec&&rec._numPending);}
+/* How many orders are waiting — used by the unsent-work indicator and the drain log. */
+function _pendingNumberCount(){
+  try{return (D.orders||[]).filter(_isNumPending).length;}catch(_){return 0;}
+}
+/* What an operator should SEE for an order that has no real number yet. Showing the
+   raw 16-digit provisional id is what made this look like corruption on the Orders
+   page; "awaiting number" is the truth and it is self-explanatory. */
+function _displayOrderNo(o){
+  if(_isNumPending(o))return "awaiting number";
+  return "#"+(o&&o.id);
+}
+var _ndDrainInFlight=false;
+var _ndDrainLastAttempt=0;
+/* READ-COST GUARD (2026-08-07, b26). The drain is triggered by every server-confirmed
+   snapshot, and this business runs on the free tier with a hard 50,000 reads/day target
+   of "a few thousand". _pendingNumberCount() is an in-memory filter and costs nothing,
+   so the common case (nothing pending) is free. But if connectivity FLAPS while an
+   order is pending, each snapshot could start another reservation — and each attempt is
+   a transaction, i.e. 1 read + 1 write, up to 3 attempts. This floor puts a hard
+   ceiling on that: at most one drain attempt per 10s, so the very worst case is ~18
+   transactions a minute instead of an unbounded number, and in practice it is 1-2 per
+   day. _ndDrainInFlight already prevents CONCURRENT runs; this prevents rapid
+   SEQUENTIAL ones, which is the different failure the flapping case produces. */
+var NDNUM_DRAIN_MIN_INTERVAL_MS=10000;
+/* WRITE-PATH SETTLE TIMEOUT — closes the freeze-then-evict durability gap
+   (2026-08-07, b26; harness finding B2, open since 2026-07-30).
+
+   THE GAP, in the codebase's own words at the payment-outbox block: "runTransaction is
+   never placed in Firestore's offline queue — only plain set/update/delete are — so when
+   a phone freezes mid-write the transaction never settles, never rejects". _atomicWrite
+   and _persistCustomerDoc both run an UNBOUNDED runTransaction, so in that state they
+   reach neither .then nor .catch and the durable _fallbackWrite / retry re-arm NEVER RUN.
+   The 2026-07-30 outbox mitigated this for ORDERS specifically; the main document (stock,
+   pendingPayments, team, routes, tombstones) and customer writes were left exposed.
+
+   WHY A TIMEOUT HELPS EVEN THOUGH A FROZEN TAB RUNS NO TIMERS. Two of the three cases are
+   recovered: (a) tab frozen then RESUMED — the timer fires on resume, the promise
+   rejects, and the existing failure path re-arms the retry; (b) connection dead while the
+   tab is alive — the transaction hangs today, now it rejects and falls back. Only
+   (c) frozen then EVICTED runs nothing at all, and that case is already covered by the
+   localStorage autosave plus _pendingLocalWrite on the next session.
+
+   TIMEOUT ONLY — DELIBERATELY NO APP-LEVEL RETRY, unlike the id reservation. Firestore
+   already retries a transaction internally; wrapping this in _ndReserveBounded would
+   multiply whole-document writes, and egress is the scarce resource here (see the NO-OP
+   WRITE SUPPRESSOR note in _atomicWrite). Rejection alone is what was missing.
+
+   SAFE AGAINST DOUBLE-APPLY: _atomicWrite's callback rebuilds DforSync fresh on every
+   attempt and is documented idempotent under retry, and if a timed-out transaction had in
+   fact committed, the next attempt reads the committed state and the no-op suppressor
+   skips the write entirely. 20s is deliberately generous — long enough that a healthy but
+   slow write on a bad connection is never aborted (which would cost a redundant
+   whole-document write), short enough to recover within one working session. */
+var NDWRITE_SETTLE_TIMEOUT_MS=20000;
+/* NEAR-DUPLICATE ORDER WARNING WINDOW                            (2026-08-07, b26)
+   How recently an IDENTICAL order (same customer + same product + same quantity, not
+   cancelled) must have been placed for the "Possibly already placed" gate to warn.
+
+   A NAMED CONSTANT, not an inline literal, because every tunable window in this file is
+   one — and the 2026-07-29 note records exactly what happens otherwise: the auto-heal
+   window and the missing-order alert grace were separate literals, drifted apart, and
+   left a 5-to-10-minute dead zone where neither acted.
+
+   WHY 15 MINUTES. It has to be long enough to cover the case it exists for — a staff
+   member who believes the save failed and re-enters it, which takes seconds to a couple
+   of minutes, plus however long they spent checking. And short enough that a customer's
+   genuine repeat order is never questioned: at ~20 orders/day across ~440 customers, a
+   customer ordering the IDENTICAL product and quantity twice inside a quarter of an hour
+   is not a normal delivery pattern, whereas twice in a day is routine and is deliberately
+   left alone.
+
+   SAFE TO TUNE. Raising it catches more re-entries but starts questioning legitimate
+   repeats; lowering it does the opposite. It only ever changes whether a WARNING is
+   shown — the operator can always proceed, so no value here can block a real order.
+   Measured on the earlier order's own _ts (creation instant), not the calendar date, so
+   an order placed at 23:58 and re-entered at 00:01 is still caught. */
+var DUP_WARN_WINDOW_MS=15*60*1000;
+/* Give every pending order its real sequential number.
+   Called from the reconnect/retry triggers, never on a timer of its own. */
+function _drainPendingNumbers(force){
+  if(_ndDrainInFlight)return;
+  var pending=(D.orders||[]).filter(_isNumPending);
+  if(!pending.length)return;                 // free: an in-memory filter, no reads
+  if(!FB_COUNTERS_REF||!fbDb)return;         // nothing to try against yet
+  /* Rate floor — see NDNUM_DRAIN_MIN_INTERVAL_MS. `force` is passed by the
+     immediately-after-creation call and by the self-continuation below, both of which
+     are known-good moments rather than connectivity noise. */
+  var _now=Date.now();
+  if(!force&&(_now-_ndDrainLastAttempt)<NDNUM_DRAIN_MIN_INTERVAL_MS)return;
+  _ndDrainLastAttempt=_now;
+  _ndDrainInFlight=true;
+  var o=pending[0];                           // one at a time, so numbering stays in order
+  var provOid=o.id;
+  var inv=(D.invoices||[]).find(function(i){return i&&i.id===o.invoiceId;});
+  reserveNextOrderAndInvoiceIds().then(function(r){
+    /* Still no counter — leave it pending and try again on the next trigger. Nothing
+       is mutated, so this is safe to repeat indefinitely. */
+    if(!r||r.provisional||!_isSeqId(r.orderId)||!_isSeqId(r.invoiceId)){
+      _ndDrainInFlight=false;
+      console.log("[NDNUM] still cannot reach the counter — "+pending.length+" order(s) remain provisional and will be numbered on the next reconnect");
+      return;
+    }
+    var provIid=inv?inv.id:null;
+    /* TOMBSTONE THE PROVISIONAL ORDER ID. The ORDER_PLACED audit entry written at
+       creation carries an ordSnapshot with the PROVISIONAL id, and
+       _selfHealFromEventSnapshots() restores any snapshot whose id is absent from D.
+       Once renumbered, the provisional id IS absent — so without this the heal would
+       helpfully re-add the same order under its old provisional number, as a
+       duplicate. Same reasoning as _renumberTimestampIds' step 0, and the same
+       mechanism the whole codebase uses for "this id must never come back". */
+    if(!D.deletedOrderIds)D.deletedOrderIds={};
+    D.deletedOrderIds[String(provOid)]=Date.now();
+    if(provIid!=null){
+      if(!D.deletedInvoiceIds)D.deletedInvoiceIds={};
+      D.deletedInvoiceIds[String(provIid)]=Date.now();
+    }
+    o.id=r.orderId;
+    o.invoiceId=r.invoiceId;
+    delete o._numPending;
+    if(inv){
+      inv.id=r.invoiceId;
+      inv.orderId=r.orderId;
+      /* Repoint the notes link too — the same field _renumberTimestampIds was fixed
+         to repoint in b25, and the fallback link every inverse lookup scrapes. */
+      if(typeof inv.notes==="string"&&inv.notes.indexOf("#"+provOid)!==-1){
+        /* DIGIT-BOUNDARY REPLACE (2026-08-07). This was split("#"+provOid).join(...) — the
+           SAME defect fixed in _renumberTimestampIds, which I fixed there and failed to
+           sweep to here. split() matches "#1476" inside "#14760", so repointing one id
+           silently corrupts a reference to a different record. Found by _sweep_b26.js
+           sweep 3, which exists because reading a diff missed it. */
+        inv.notes=inv.notes.replace(new RegExp("#"+provOid+"(\\D|$)","g"),"#"+r.orderId+"$1");
+      }
+      delete inv._numPending;
+    }
+    /* The stock ledger and history rows recorded at creation reference the
+       provisional order id. Repoint them so stock history stays traceable. */
+    (D.stock||[]).forEach(function(st){
+      (st&&st.history||[]).forEach(function(h){if(h&&String(h.ordId)===String(provOid))h.ordId=r.orderId;});
+    });
+    (D.customers||[]).forEach(function(cu){
+      (cu&&cu.creditLog||[]).forEach(function(e){if(e&&String(e.ordId)===String(provOid))e.ordId=r.orderId;});
+    });
+    (D.pendingPayments||[]).forEach(function(p){if(p&&String(p.ordId)===String(provOid))p.ordId=r.orderId;});
+    /* Move the durable outbox entry onto the real id. The provisional entry may
+       already have reached Firestore (the outbox is a plain set(), which DOES queue
+       offline), so it is dropped explicitly rather than left to be reconciled. */
+    try{_outboxDrop(provOid);}catch(_){}
+    try{_outboxPut(r.orderId);}catch(_){}
+    try{auditLog("ORDER_UPDATED","ORDER NUMBERED: the order recorded provisionally as #"+provOid+" has been given its real sequential number #"+r.orderId+(provIid!=null?" (invoice #"+provIid+" -> #"+r.invoiceId+")":"")+". It was created while the id counter was unreachable, held on this device so no partial number reached other devices, and numbered as soon as the counter answered. Amounts, payments, stock and customer links are unchanged.");}catch(_){}
+    console.log("[NDNUM] NUMBERED — provisional #"+provOid+" is now #"+r.orderId+(provIid!=null?", invoice #"+provIid+" -> #"+r.invoiceId:""));
+    try{dirty();}catch(_){}
+    try{refreshCurrentPage();}catch(_){}
+    _ndDrainInFlight=false;
+    /* More waiting? Continue, so a phone that was offline for several orders numbers
+       all of them in creation order rather than one per reconnect. */
+    if(_pendingNumberCount())_drainPendingNumbers(true);
+  }).catch(function(e){
+    _ndDrainInFlight=false;
+    console.log("[NDNUM] numbering attempt failed ("+((e&&e.message)||e)+") — order #"+provOid+" stays provisional and is retried on the next reconnect. Nothing was changed.");
+  });
+}
 function reserveNextOrderId(){
   // ROOT-CAUSE FIX (2026-07-20): two devices could each read the same
   // locally-cached "next order number" and both create an order with the
@@ -11755,27 +12288,38 @@ function reserveNextOrderId(){
   //
   // Cost: one read + one write per order created — negligible at this
   // business's scale (10-20 orders/day = 10-20 extra read+write pairs/day).
+  /* RESOLVES {orderId, provisional} as of b26 — the single caller (the category/TBC
+     order path) needs to know whether the number is real, so it can mark the order as
+     awaiting its number instead of branding it. Verified by grep that this is the
+     only caller before changing the shape. */
   if(!FB_COUNTERS_REF||!fbDb){
-    // Offline / not yet connected: fall back to the previous best-effort
-    // local increment rather than blocking order creation entirely. This is
-    // weaker (the original race is possible again in this specific case)
-    // but availability matters — a device with no connection must still be
-    // able to record an order locally, to sync once reconnected.
-    return Promise.resolve(nOId++);
+    /* WAS: Promise.resolve(nOId++). Two problems, both real:
+         1. nOId++ is a purely local increment, i.e. exactly the pre-2026-07-20
+            mechanism that lost Order #1204 when two devices minted the same number.
+            The transaction exists precisely to make that impossible.
+         2. Before the SEQ_ID_MAX fix, a single fallback order poisoned nOId, so this
+            line then handed out ANOTHER 16-digit id with no failure of its own.
+       A provisional number is strictly better than either: it cannot collide, it
+       cannot poison, and it is replaced by a real sequential number automatically. */
+    return Promise.resolve({orderId:_provisionalSingleId(),provisional:true,reason:"Firebase not initialised yet"});
   }
-  return fbDb.runTransaction(function(transaction){
-    return transaction.get(FB_COUNTERS_REF).then(function(doc){
-      var current=doc.exists&&doc.data().nOId?doc.data().nOId:Math.max(nOId-1,1000);
-      var next=current+1;
-      transaction.set(FB_COUNTERS_REF,{nOId:next},{merge:true});
-      return next;
+  return _ndReserveBounded(function(){
+    return fbDb.runTransaction(function(transaction){
+      return transaction.get(FB_COUNTERS_REF).then(function(doc){
+        // _seqCounterSeed (2026-08-07, b25): never seed the SERVER counter from a
+        // poisoned local nOId — see the _seqCounterSeed definition for why.
+        var current=doc.exists&&_isSeqId(doc.data().nOId)?doc.data().nOId:_seqCounterSeed(nOId,_seqFloorFor("o"));
+        var next=current+1;
+        transaction.set(FB_COUNTERS_REF,{nOId:next},{merge:true});
+        return next;
+      });
     });
-  }).then(function(reservedId){
+  },"reserveNextOrderId").then(function(reservedId){
     nOId=Math.max(nOId,reservedId+1); // keep local counter ratcheted forward too
-    return reservedId;
+    return {orderId:reservedId,provisional:false};
   }).catch(function(err){
-    console.log("[NDSYNC] reserveNextOrderId transaction FAILED ("+(err&&err.message)+") — falling back to a collision-resistant id");
-    return Date.now()*1000+Math.floor(Math.random()*1000); // far outside the normal sequential range - can't collide with another device's own fallback
+    console.log("[NDNUM] reserveNextOrderId could not reach the counter ("+((err&&err.message)||err)+") — issuing a PROVISIONAL number; the order is recorded immediately and numbered as soon as the counter is reachable");
+    return {orderId:_provisionalSingleId(),provisional:true,reason:(err&&err.message)||"counter unreachable"};
   });
 }
 function reserveNextInvoiceId(){
@@ -11787,20 +12331,36 @@ function reserveNextInvoiceId(){
   // invoices BY that id, treating two genuinely different invoices as one
   // record, one would be silently discarded with no error surfaced at all.
   // Same fix, same reasoning, same proven mechanism as reserveNextOrderId.
-  if(!FB_COUNTERS_REF||!fbDb)return Promise.resolve(nIId++);
-  return fbDb.runTransaction(function(transaction){
-    return transaction.get(FB_COUNTERS_REF).then(function(doc){
-      var current=doc.exists&&doc.data().nIId?doc.data().nIId:Math.max(nIId-1,2000);
-      var next=current+1;
-      transaction.set(FB_COUNTERS_REF,{nIId:next},{merge:true});
-      return next;
+  if(!FB_COUNTERS_REF||!fbDb)return Promise.resolve(_provisionalSingleId());
+  /* BOUNDED RETRY (2026-08-07, b26). Swept here after the order paths: this reserver had
+     the identical single-attempt-then-brand behaviour, and it is reached whenever an
+     invoice is created for an ALREADY-NUMBERED order — most importantly when a
+     category/TBC order is delivered, which happens in the field on a phone.
+
+     DELIBERATELY NO _numPending HOLD-BACK HERE, unlike the order paths. An invoice is
+     money owed. Holding it back would keep a debt invisible to every other device until
+     the phone reconnects, and a hidden receivable is worse than an ugly invoice number.
+     The order it belongs to already has a real number, so nothing is orphaned. The
+     retry makes the fallback rare; if one still slips through it is a cosmetic invoice
+     number, and _renumberTimestampIds can renumber the pair later.
+     HONEST LIMIT, recorded here rather than in a summary: this reduces the exposure, it
+     does not eliminate it the way provisional numbering does for ORDER numbers. */
+  return _ndReserveBounded(function(){
+    return fbDb.runTransaction(function(transaction){
+      return transaction.get(FB_COUNTERS_REF).then(function(doc){
+        // _seqCounterSeed (2026-08-07, b25) — same poisoning guard as reserveNextOrderId.
+        var current=doc.exists&&_isSeqId(doc.data().nIId)?doc.data().nIId:_seqCounterSeed(nIId,_seqFloorFor("i"));
+        var next=current+1;
+        transaction.set(FB_COUNTERS_REF,{nIId:next},{merge:true});
+        return next;
+      });
     });
-  }).then(function(reservedId){
+  },"reserveNextInvoiceId").then(function(reservedId){
     nIId=Math.max(nIId,reservedId+1);
     return reservedId;
   }).catch(function(err){
-    console.log("[NDSYNC] reserveNextInvoiceId transaction FAILED ("+(err&&err.message)+") — falling back to a collision-resistant id");
-    return Date.now()*1000+Math.floor(Math.random()*1000);
+    console.log("[NDNUM] reserveNextInvoiceId could not reach the counter after "+NDNUM_RESERVE_ATTEMPTS+" attempts ("+((err&&err.message)||err)+") — issuing a temporary invoice number so the money is still recorded and visible to other devices");
+    return _provisionalSingleId();
   });
 }
 function reserveNextOrderAndInvoiceIds(){
@@ -11816,41 +12376,56 @@ function reserveNextOrderAndInvoiceIds(){
   // halves both the round trips and the contention on the shared counters
   // document (previously up to 4 transactions on one document when two
   // devices created orders simultaneously; now 2).
-  if(!FB_COUNTERS_REF||!fbDb)return Promise.resolve({orderId:Date.now()*1000+Math.floor(Math.random()*1000),invoiceId:Date.now()*1000+Math.floor(Math.random()*1000)+1});
-  return fbDb.runTransaction(function(transaction){
-    return transaction.get(FB_COUNTERS_REF).then(function(doc){
-      var data=doc.exists?doc.data():{};
-      var curO=data.nOId?data.nOId:Math.max(nOId-1,1000);
-      var curI=data.nIId?data.nIId:Math.max(nIId-1,2000);
-      var nextO=curO+1,nextI=curI+1;
-      transaction.set(FB_COUNTERS_REF,{nOId:nextO,nIId:nextI},{merge:true});
-      return {orderId:nextO,invoiceId:nextI};
+  /* provisional:true is what the callers use to mark the order as AWAITING ITS NUMBER
+     rather than branding it permanently — see the PROVISIONAL ORDER NUMBERING block. */
+  if(!FB_COUNTERS_REF||!fbDb)return Promise.resolve(_provisionalIdPair("Firebase not initialised yet"));
+  return _ndReserveBounded(function(){
+    return fbDb.runTransaction(function(transaction){
+      return transaction.get(FB_COUNTERS_REF).then(function(doc){
+        var data=doc.exists?doc.data():{};
+        // _seqCounterSeed (2026-08-07, b25) — same poisoning guard as reserveNextOrderId.
+        // This is THE site that would otherwise publish a 16-digit floor fleet-wide.
+        var curO=_isSeqId(data.nOId)?data.nOId:_seqCounterSeed(nOId,_seqFloorFor("o"));
+        var curI=_isSeqId(data.nIId)?data.nIId:_seqCounterSeed(nIId,_seqFloorFor("i"));
+        var nextO=curO+1,nextI=curI+1;
+        transaction.set(FB_COUNTERS_REF,{nOId:nextO,nIId:nextI},{merge:true});
+        return {orderId:nextO,invoiceId:nextI};
+      });
     });
-  }).then(function(reserved){
+  },"reserveNextOrderAndInvoiceIds").then(function(reserved){
     nOId=Math.max(nOId,reserved.orderId+1);
     nIId=Math.max(nIId,reserved.invoiceId+1);
     return reserved;
   }).catch(function(err){
-    console.log("[NDSYNC] reserveNextOrderAndInvoiceIds transaction FAILED ("+(err&&err.message)+") — falling back to collision-resistant ids");
-    return {orderId:Date.now()*1000+Math.floor(Math.random()*1000),invoiceId:Date.now()*1000+Math.floor(Math.random()*1000)+1};
+    console.log("[NDNUM] reserveNextOrderAndInvoiceIds could not reach the counter ("+((err&&err.message)||err)+") — issuing a PROVISIONAL number; the order is recorded immediately and takes its real sequential number as soon as the counter is reachable");
+    return _provisionalIdPair((err&&err.message)||"counter unreachable");
   });
 }
 function reserveNextComplaintId(){
   // Same fix, same reasoning, applied to complaint IDs.
-  if(!FB_COUNTERS_REF||!fbDb)return Promise.resolve(nCmpId++);
+  if(!FB_COUNTERS_REF||!fbDb)return Promise.resolve(_provisionalSingleId());
+  // Bounded retry swept here too (2026-08-07, b26) — same single-attempt defect. A
+  // complaint carries no money and blocks nothing, so no hold-back; the retry alone.
+  return _ndReserveBounded(function(){
   return fbDb.runTransaction(function(transaction){
     return transaction.get(FB_COUNTERS_REF).then(function(doc){
-      var current=doc.exists&&doc.data().nCmpId?doc.data().nCmpId:Math.max(nCmpId-1,4000);
+      // _seqCounterSeed (2026-08-07, b25): complaint ids are sequential and their
+      // fallback below is the same Date.now()*1000 mint, so nCmpId is poisonable in
+      // exactly the same way nOId was. Swept here per "fix one instance, check the
+      // rest". nCId is deliberately NOT swept — customers mint from uid(), so a
+      // ~15-digit maxCust is correct there, not corruption.
+      var current=doc.exists&&_isSeqId(doc.data().nCmpId)?doc.data().nCmpId:_seqCounterSeed(nCmpId,_seqFloorFor("c"));
       var next=current+1;
       transaction.set(FB_COUNTERS_REF,{nCmpId:next},{merge:true});
       return next;
     });
-  }).then(function(reservedId){
+  });
+  },"reserveNextComplaintId").then(function(reservedId){
     nCmpId=Math.max(nCmpId,reservedId+1);
     return reservedId;
   }).catch(function(err){
-    console.log("[NDSYNC] reserveNextComplaintId transaction FAILED ("+(err&&err.message)+") — falling back to a collision-resistant id");
-    return Date.now()*1000+Math.floor(Math.random()*1000);
+    console.log("[NDNUM] reserveNextComplaintId could not reach the counter after "+NDNUM_RESERVE_ATTEMPTS+" attempts ("+((err&&err.message)||err)+") — issuing a temporary id");
+    return _provisionalSingleId();
   });
 }
 async function saveOrd(){
@@ -12171,6 +12746,80 @@ async function saveOrd(){
     return;
   }
 
+  /* ============================================================================
+     NEAR-DUPLICATE ORDER WARNING                                (2026-08-07, b26)
+
+     THE GAP THIS CLOSES. Order creation already had six confirmation gates and three
+     structural duplicate defences — the synchronous button disable, the _savingOrder
+     flag, and the form-scoped _cid token that refuses a repeat submission of the SAME
+     open form. Together those close every ACCIDENTAL double-submit: a double-tap, a
+     button re-enabled by the safety net, a dialog outliving a timer.
+
+     What none of them close, and cannot: staff places an order, the modal closes, they
+     believe it did not save, they REOPEN the form and enter it again. prepO() mints a
+     fresh _cid per form opening, so that submission is legitimately allowed — and it
+     must be, because it is indistinguishable from a customer's genuine second order of
+     the day. Multiple orders per customer per day are normal business here.
+
+     b26 makes this MORE likely, not less: an order held with a provisional number shows
+     "awaiting number" instead of a number, and a staff member can reasonably read that
+     as "it failed" and re-enter it. That is a direct consequence of the numbering fix,
+     so the mitigation belongs in the same build.
+
+     WHY A WARNING AND NOT A BLOCK. Blocking would make a real second order impossible,
+     which is worse than the duplicate — the owner's rule is that a screen must do what
+     an operator would obviously expect, and refusing a genuine order fails that badly.
+     So this shows the operator the order it thinks they may be repeating, with its
+     number, status and how long ago, and lets them decide. Same shape as the
+     "Possible duplicate" panel the reconciliation tool already uses, which is a proven
+     pattern in this file rather than a new invention.
+
+     WHY THESE CRITERIA. Same customer AND same product AND same quantity within a short
+     window is the strongest available signal, and it is exactly the combination the
+     recreate path already treats as "this may already be recorded". A different qty or
+     product is a different order and is not flagged at all. Cancelled orders are
+     excluded — re-entering after a cancellation is deliberate. Provisional orders are
+     deliberately INCLUDED, because they are the most likely thing to be re-entered.
+
+     WINDOW: 15 minutes. Long enough to cover "I thought that failed, let me redo it",
+     short enough that a customer's genuine second delivery later in the day is never
+     flagged. Deliberately measured on the order's own _ts, not the calendar date. */
+  if(!_isEditingOrder&&cId&&pn){
+    var _dupWindowMs=DUP_WARN_WINDOW_MS;   // named constant — see its declaration for why 15 min and how to tune it
+    var _dupNow=Date.now();
+    var _dupHit=(D.orders||[]).filter(function(o){
+      if(!o||o.status==="Cancelled")return false;
+      if(o.cId!==cId)return false;
+      if(String(o.prod||"")!==String(pn))return false;
+      if(Number(o.qty)!==Number(qty))return false;
+      var t=Number(o._ts)||0;
+      return t>0&&(_dupNow-t)<=_dupWindowMs;
+    }).sort(function(a,b){return (Number(b._ts)||0)-(Number(a._ts)||0)})[0];
+    if(_dupHit){
+      var _dupMins=Math.max(1,Math.round((_dupNow-(Number(_dupHit._ts)||_dupNow))/60000));
+      var _dupWho=(_dupHit.driver?" assigned to "+_dupHit.driver:"");
+      var _dupNo=_isNumPending(_dupHit)
+        ? "an order that is still waiting for its number (saved on this phone)"
+        : "Order #"+_dupHit.id;
+      var _dupMsg=_dupNo+" for this same customer — "+unescapeForEdit(String(pn))+" x"+qty+
+        " — was placed "+_dupMins+" minute"+(_dupMins===1?"":"s")+" ago and is "+
+        (_dupHit.status||"Pending")+_dupWho+".\n\n"+
+        (_isNumPending(_dupHit)
+          ? "IT DID SAVE. An order showing \"awaiting number\" is recorded on this phone and takes its real number automatically once there is a connection — it does not need to be entered again.\n\n"
+          : "")+
+        "If the customer really is ordering again, place this one. If you are re-entering because you thought the first did not save, cancel — it did.";
+      if(!(await uiConfirm({title:"Possibly already placed",message:_dupMsg,variant:"warn",confirmText:"Yes, this is a new order"}))){
+        window._savingOrder=false;
+        if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}
+        if(window._savingOrderSafetyNet)clearTimeout(window._savingOrderSafetyNet);
+        return;
+      }
+      /* Recorded whether or not it was a duplicate, so a real pattern is visible later
+         rather than depending on anyone remembering. This is the only trace that the
+         operator was shown the warning and chose to continue. */
+      try{auditLog("ORDER_PLACED","NEAR-DUPLICATE CONFIRMED BY OPERATOR: "+CU.name+" ("+CU.role+") was warned that "+(_isNumPending(_dupHit)?"a provisional order":"#"+_dupHit.id)+" for customer #"+cId+" ("+unescapeForEdit(String(pn))+" x"+qty+") was placed "+_dupMins+" minute(s) earlier, and confirmed this is a genuine additional order.");}catch(_){}
+    }
+  }
   var stCost=(D.stock||[]).find(function(s){return s.name===pn;});var costAtSale=stCost?stCost.cost:0;
 
   if(isCat){
@@ -12185,15 +12834,40 @@ async function saveOrd(){
     if(window._savingOrderSafetyNet)clearTimeout(window._savingOrderSafetyNet);
     window._savingOrderSafetyNet=setTimeout(function(){window._savingOrder=false;if(_saveBtnC){_saveBtnC.disabled=false;_saveBtnC.innerHTML="<i class=\"ti ti-check\"></i> Place order";}},15000);
     var _custForLedgerC=(D.customers||[]).find(function(x){return x.id===cId;});
-    if(_orderCid)_pendingOrderLedgerAdd(_orderCid,_custForLedgerC?_custForLedgerC.name:"customer #"+cId,pn,qty);
-    reserveNextOrderId().then(function(newOrdId){
-      (D.orders||[]).push({id:newOrdId,cId:cId,prod:pn,stockId:stCost?stCost.id:null,qty:qty,price:0,cost:0,date:el("od").value,status:"Pending",paid:"Unpaid",amtPaid:0,driver:el("odrv").value,deliver:sanitizeInput(el("odlvr").value),bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?sanitizeInput(el("onotes").value):"",prodConfirmed:false,_ts:Date.now(),_cid:_orderCid});
-      auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty+" (category/TBC) — customer #"+cId+" "+(function(){var _c=(D.customers||[]).find(function(x){return x.id===cId;});return _c?unescapeForEdit(_c.name):"unknown";})(),{ordSnapshot:_orderSnapshotFor(newOrdId)});
+    /* Same complete capture for the category/TBC path (2026-08-07, b26). price/cost are 0
+       and there is no invoice at creation — the driver confirms brand and price at
+       delivery — so the recovery must reproduce prodConfirmed:false and create no
+       invoice, exactly as this path does. */
+    if(_orderCid)_pendingOrderLedgerAdd(_orderCid,_custForLedgerC?_custForLedgerC.name:"customer #"+cId,pn,qty,{
+      kind:"category",cId:cId,prod:pn,stockId:stCost?stCost.id:null,qty:qty,price:0,cost:0,
+      total:0,amtPaid:0,payStatus:"Unpaid",date:el("od").value,
+      driver:el("odrv").value,deliver:sanitizeInput(el("odlvr").value),
+      bottle_before:el("obtl").value,notes:el("onotes")?sanitizeInput(el("onotes").value):""
+    });
+    reserveNextOrderId().then(function(_res){
+      /* b26: reserveNextOrderId now resolves {orderId, provisional}. `provisional`
+         means the counter could not be reached, so this order carries a temporary
+         number, is held back from Firestore by _hybridFlushDocs, and is given its
+         real sequential number by _drainPendingNumbers() on reconnect. It is fully
+         recorded and durable here either way — that is the point. */
+      var newOrdId=_res&&_res.orderId,_prov=!!(_res&&_res.provisional);
+      var _newOrd={id:newOrdId,cId:cId,prod:pn,stockId:stCost?stCost.id:null,qty:qty,price:0,cost:0,date:el("od").value,status:"Pending",paid:"Unpaid",amtPaid:0,driver:el("odrv").value,deliver:sanitizeInput(el("odlvr").value),bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?sanitizeInput(el("onotes").value):"",prodConfirmed:false,_ts:Date.now(),_cid:_orderCid};
+      if(_prov)_newOrd._numPending=true;
+      (D.orders||[]).push(_newOrd);
+      /* OUTBOX BEFORE AUDIT (2026-08-07, b26) — the same reordering applied to the
+         exact-product path above, swept here because this path had it too. auditLog
+         trims, builds an ordSnapshot and touches the document-size logic; if it throws,
+         the old ordering left the order in memory only, with no durable backup — the
+         exact loss the outbox exists to prevent. Caught by
+         _proofB_provisional_number.js assertion 7.13, which found the exact-product
+         path fixed and this one not. */
       _outboxPut(newOrdId);   // MISSING-ORDER ROOT-CAUSE FIX — durable per-order write; see the outbox block
+      auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty+" (category/TBC) — customer #"+cId+" "+(function(){var _c=(D.customers||[]).find(function(x){return x.id===cId;});return _c?unescapeForEdit(_c.name):"unknown";})()+(_prov?" [PROVISIONAL NUMBER — the id counter was unreachable ("+((_res&&_res.reason)||"unknown")+"); this order is recorded and will be renumbered into the sequence automatically]":""),{ordSnapshot:_orderSnapshotFor(newOrdId)});
       if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
       rDel();
       cm("m-o");rOrds(undefined,ORD_PAGE);dirty();
-      toast("Order #"+newOrdId+" placed — driver confirms brand & collects payment at delivery");
+      toast(_prov?"Order placed and saved — waiting for a connection to give it its number":"Order #"+newOrdId+" placed — driver confirms brand & collects payment at delivery",_prov?"warn":undefined);
+      if(_prov)_drainPendingNumbers(true);   // force: this is a known-good moment, not connectivity noise
       window._savingOrder=false;
       if(_saveBtnC){_saveBtnC.disabled=false;_saveBtnC.innerHTML="<i class=\"ti ti-check\"></i> Place order";}
     }).catch(function(){
@@ -12225,9 +12899,28 @@ async function saveOrd(){
   if(window._savingOrderSafetyNet)clearTimeout(window._savingOrderSafetyNet);
   window._savingOrderSafetyNet=setTimeout(function(){window._savingOrder=false;if(_saveBtn){_saveBtn.disabled=false;_saveBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}},15000);
   var _custForLedger=(D.customers||[]).find(function(x){return x.id===cId;});
-  if(_orderCid)_pendingOrderLedgerAdd(_orderCid,_custForLedger?_custForLedger.name:"customer #"+cId,pn,qty);
+  /* Capture the COMPLETE order before the reservation (2026-08-07, b26). Every field the
+     order literal below uses is already in scope here, so this is a faithful snapshot
+     rather than a reconstruction. Written synchronously to localStorage, so it has
+     committed before the network is touched — see _pendingOrderLedgerAdd. */
+  if(_orderCid)_pendingOrderLedgerAdd(_orderCid,_custForLedger?_custForLedger.name:"customer #"+cId,pn,qty,{
+    kind:"exact",cId:cId,prod:pn,stockId:stCost?stCost.id:null,qty:qty,price:price,cost:costAtSale,
+    total:total,amtPaid:amtPaid,payStatus:payStatus,date:el("od").value,
+    driver:el("odrv").value,deliver:sanitizeInput(el("odlvr").value),
+    bottle_before:el("obtl").value,notes:el("onotes")?sanitizeInput(el("onotes").value):""
+  });
   reserveNextOrderAndInvoiceIds().then(function(reserved){
     var newOrdId=reserved.orderId,newInvId=reserved.invoiceId;
+    /* b26 — PROVISIONAL NUMBERING. reserved.provisional means the id counter could not
+       be reached (no signal, dead spot, or a transaction that never settled — see the
+       PROVISIONAL ORDER NUMBERING block). The order and its invoice are still recorded
+       and made durable RIGHT HERE, exactly as before; the only difference is that they
+       carry a temporary number, are held back from Firestore so no other device ever
+       sees it, and are given their real sequential number by _drainPendingNumbers() the
+       moment the counter answers. This is what stops both the 16-digit ids and the
+       silent losses, and it keeps the sequence contiguous because numbers are still
+       taken one at a time from the real counter, never pre-allocated. */
+    var _prov=!!(reserved&&reserved.provisional);
     if(st){
       // NEGATIVE-STOCK POLICY (2026-07-28, business decision — Option A): order
       // creation is never blocked by low stock (only warned above), and the
@@ -12248,17 +12941,33 @@ async function saveOrd(){
       if(st.history.length>STOCK_HISTORY_MAX)st.history=st.history.slice(-STOCK_HISTORY_MAX);
       updateStockBadge();
     }
-    (D.orders||[]).push({id:newOrdId,cId:cId,prod:pn,stockId:stCost?stCost.id:null,invoiceId:newInvId,qty:qty,price:price,cost:costAtSale,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:sanitizeInput(el("odlvr").value),bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?sanitizeInput(el("onotes").value):"",_ts:Date.now(),_cid:_orderCid,prodConfirmed:true});
-    console.log("[NDSYNC] order created id="+newOrdId+" D.orders.length="+(D.orders||[]).length+" FB_READY="+FB_READY+" _cloudDataConfirmed="+_cloudDataConfirmed+" FB_WRITING="+FB_WRITING);
+    var _newOrd={id:newOrdId,cId:cId,prod:pn,stockId:stCost?stCost.id:null,invoiceId:newInvId,qty:qty,price:price,cost:costAtSale,date:el("od").value,status:"Pending",paid:payStatus,amtPaid:amtPaid,driver:el("odrv").value,deliver:sanitizeInput(el("odlvr").value),bottle_before:el("obtl").value,bottle_after:null,notes:el("onotes")?sanitizeInput(el("onotes").value):"",_ts:Date.now(),_cid:_orderCid,prodConfirmed:true};
+    if(_prov)_newOrd._numPending=true;
+    (D.orders||[]).push(_newOrd);
+    console.log("[NDSYNC] order created id="+newOrdId+(_prov?" (PROVISIONAL — awaiting a real sequential number)":"")+" D.orders.length="+(D.orders||[]).length+" FB_READY="+FB_READY+" _cloudDataConfirmed="+_cloudDataConfirmed+" FB_WRITING="+FB_WRITING);
     // Always create invoice for exact orders — provides full financial trail
     // FIX (2026-07-21): both IDs now reserved together in ONE transaction -
     // see reserveNextOrderAndInvoiceIds - instead of two sequential ones.
-    (D.invoices||[]).push({id:newInvId,orderId:newOrdId,cId:cId,amount:total,paid:amtPaid,due:(function(){var dd=new Date((el("od").value||tday())+"T12:00:00");dd.setDate(dd.getDate()+7);return dd.toISOString().split("T")[0];})(),notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{pid:uid(),date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]});
-    auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty+" — customer #"+cId+" "+(function(){var _c=(D.customers||[]).find(function(x){return x.id===cId;});return _c?unescapeForEdit(_c.name):"unknown";})(),{ordSnapshot:_orderSnapshotFor(newOrdId)});
+    var _newInv={id:newInvId,orderId:newOrdId,cId:cId,amount:total,paid:amtPaid,due:(function(){var dd=new Date((el("od").value||tday())+"T12:00:00");dd.setDate(dd.getDate()+7);return dd.toISOString().split("T")[0];})(),notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{pid:uid(),date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]};
+    /* The invoice is held back with its order, not independently. An invoice whose
+       orderId refers to a number no other device has ever seen would be an orphan on
+       arrival, so the pair travels together or not at all. */
+    if(_prov)_newInv._numPending=true;
+    (D.invoices||[]).push(_newInv);
+    /* OUTBOX BEFORE AUDIT (2026-08-07, b26) — closes the handover's open item 3.
+       _outboxPut used to run AFTER auditLog. auditLog is not trivial: it trims, it
+       builds an ordSnapshot, it touches D.auditLog and the document-size logic. If it
+       throws for any reason, the old ordering meant the order existed ONLY in memory
+       with no durable backup at all — the exact loss the outbox was built to prevent.
+       The durable write now happens first, so the order survives even if everything
+       after this line fails. */
     _outboxPut(newOrdId);   // MISSING-ORDER ROOT-CAUSE FIX — durable per-order write; see the outbox block
+    auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty+" — customer #"+cId+" "+(function(){var _c=(D.customers||[]).find(function(x){return x.id===cId;});return _c?unescapeForEdit(_c.name):"unknown";})()+(_prov?" [PROVISIONAL NUMBER — the id counter was unreachable ("+((reserved&&reserved.reason)||"unknown")+"); this order is recorded and will be renumbered into the sequence automatically]":""),{ordSnapshot:_orderSnapshotFor(newOrdId)});
     if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
     rDel();
-    cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+newOrdId+" placed");
+    cm("m-o");rOrds(undefined,ORD_PAGE);dirty();
+    toast(_prov?"Order placed and saved — waiting for a connection to give it its number":"Order #"+newOrdId+" placed",_prov?"warn":undefined);
+    if(_prov)_drainPendingNumbers(true);   // force: this is a known-good moment, not connectivity noise
     window._savingOrder=false;
     if(_saveBtn){_saveBtn.disabled=false;_saveBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}
   }).catch(function(){
@@ -13264,6 +13973,84 @@ function _computeMissingOrders(){
   });
   return missing;
 }
+/* ============================================================================
+   DORMANT CUSTOMERS — the shared predicate and the view   (2026-08-07, b26)
+
+   THE DEFECT. The dashboard alert "N customer(s) have not ordered in 30+ days" carried
+   dest:"customers", so acting on it opened the whole 440-customer list. The count was
+   right; the action was useless. The owner named this alert specifically as the example
+   of "technically correct but useless in practice".
+
+   ordArr is passed in rather than read from D because the caller supplies _dashOrdAll,
+   which MERGES ARCHIVED ORDERS. A genuinely dormant customer's last order is the one
+   most likely to have been archived, so reading D.orders alone would silently drop the
+   most dormant customers from both the count and this list — the 2026-07-30 BOOKS fix.
+
+   The predicate deliberately requires a customer to have ordered at least once: a
+   customer who has NEVER ordered has not "stopped ordering", they have never started,
+   which is a different business situation and a different conversation. That matches
+   the behaviour the count already had, so this refactor changes no number. */
+function _dormantCustomers(ordArr,churnDate){
+  var out=[];
+  try{
+    (D.customers||[]).forEach(function(cu){
+      if(!cu)return;
+      var mine=(ordArr||[]).filter(function(o){return o&&o.cId===cu.id&&o.status==="Delivered";});
+      if(!mine.length)return;                       // never ordered — not "stopped"
+      var last=mine.slice().sort(function(a,b){return String(b.date)>String(a.date)?1:-1;})[0];
+      if(last&&String(last.date)<String(churnDate))out.push({cu:cu,last:last});
+    });
+  }catch(_){}
+  return out;
+}
+/* Opens the list of exactly the customers the alert counted, with what an operator
+   actually needs to act: how long it has been, what they last took, and whether they
+   owe anything — because "chase this customer" and "chase this debt" are different
+   calls. Debt comes from custDebt() so it agrees with every other debt figure. */
+function showDormantCustomers(){
+  var body=el("m-dormant-body");if(!body)return;
+  var churnDate=_ymd(new Date(Date.now()-30*86400000));
+  /* CALL ordersWithBooks() DIRECTLY — do NOT reach for _dashOrdAll.
+     (2026-08-07 — a bug I introduced in this same build, found by reviewing my own change.)
+     _dashOrdAll is `var _dashOrdAll=ordersWithBooks()` INSIDE the dashboard render, i.e.
+     function-scoped and invisible here. The first cut of this line tried
+     `typeof _dashOrdAll!=="undefined" ? _dashOrdAll : (D.orders||[])`, which therefore
+     ALWAYS fell through to D.orders — and D.orders EXCLUDES ARCHIVED orders. A dormant
+     customer's last order is the one most likely to be archived (the 2026-07-30 BOOKS
+     note), so the modal would have listed FEWER customers than the alert counted:
+     precisely the count-vs-list disagreement that extracting _dormantCustomers() was
+     supposed to make impossible. Calling the same source the alert uses is the only way
+     the two can be guaranteed to agree. */
+  var ordAll=(function(){try{return ordersWithBooks()||[];}catch(_){return (D.orders||[]);}})();
+  var list=_dormantCustomers(ordAll,churnDate);
+  if(!list.length){
+    body.innerHTML="<div style=\"padding:20px;text-align:center;color:var(--tx2)\">No dormant customers — everyone has ordered within the last 30 days.</div>";
+    om("m-dormant");return;
+  }
+  // Longest-dormant first: that is the order a director would work the list in.
+  list.sort(function(a,b){return String(a.last.date)>String(b.last.date)?1:-1;});
+  var today=new Date(_ymd(new Date())+"T12:00:00").getTime();
+  var rows=list.map(function(r){
+    var days=Math.round((today-new Date(String(r.last.date)+"T12:00:00").getTime())/86400000);
+    var debt=0;try{debt=custDebt(r.cu.id);}catch(_){debt=0;}
+    return "<tr>"+
+      "<td><div style=\"font-weight:700\">"+(can("vPhone")?r.cu.name:maskName(r.cu.name))+"</div>"+
+        "<div class=\"ca\">"+[r.cu.court,r.cu.house?"No."+r.cu.house:""].filter(Boolean).join(" ")+"</div></td>"+
+      "<td style=\"font-weight:700;color:"+(days>=60?"#c0392b":"#856404")+"\">"+days+" days</td>"+
+      "<td>"+r.last.date+"</td>"+
+      "<td>"+(r.last.prod||"&mdash;")+(r.last.qty?" &times;"+r.last.qty:"")+"</td>"+
+      "<td style=\"font-weight:700\">"+(debt>0?"<span style=\"color:#c0392b\">"+kshS(debt)+"</span>":"<span style=\"color:var(--tx2)\">&mdash;</span>")+"</td>"+
+      "<td>"+(can("vPhone")&&r.cu.phone?"<a class=\"btn btn-xs btn-navy\" href=\"tel:"+encodeURIComponent(r.cu.phone)+"\"><i class=\"ti ti-phone\"></i> Call</a>":"<span style=\"color:var(--tx2);font-size:11px\">&mdash;</span>")+"</td>"+
+    "</tr>";
+  }).join("");
+  body.innerHTML="<div style=\"font-size:12px;color:var(--tx2);margin-bottom:10px\">"+
+      list.length+" customer"+(list.length===1?"":"s")+" whose last delivered order was before <strong>"+churnDate+"</strong>. Longest-dormant first."+
+    "</div>"+
+    "<div style=\"overflow-x:auto\"><table class=\"tbl\"><thead><tr>"+
+      "<th>Customer</th><th>Dormant</th><th>Last order</th><th>What they took</th><th>Owes</th><th></th>"+
+    "</tr></thead><tbody>"+rows+"</tbody></table></div>";
+  om("m-dormant");
+}
 function showMissingOrders(){
   var missing=findMissingOrders();
   var body=el("m-recon-body");if(!body)return;
@@ -13625,8 +14412,17 @@ async function recreateOrder(idx){
     var cust=(D.customers||[]).find(function(c){return c.id===cId;});
     var _stMatch=(D.stock||[]).find(function(s){return unescapeForEdit(s.name).toLowerCase()===unescapeForEdit(prod).toLowerCase();});
     var total=_round2(price*qty);
+    /* b26 — the recovery path gets the SAME provisional handling as normal creation.
+       It had NO guard at all: it pushed whatever id came back, so recovering a lost
+       order during a dead spot branded the RECOVERED order with a 16-digit number too —
+       turning one problem into two. Note _renumberTimestampIds already guards against
+       exactly this (it aborts rather than swapping one unusable number for another);
+       this path simply never got the same treatment. Swept here per "fix one instance,
+       check the rest". */
+    var _prov=!!(reserved&&reserved.provisional);
     var newOrder={id:newId,cId:cId,prod:prod,stockId:_stMatch?_stMatch.id:null,qty:qty,price:price,date:tday(),_ts:Date.now(),_cid:_recreateCid,
       notes:"Recovered via reconciliation — originally Order #"+orig};
+    if(_prov)newOrder._numPending=true;
     if(wasDelivered){
       newOrder.status="Delivered";
       newOrder.driver=unescapeForEdit(deliveredBy);
@@ -13634,8 +14430,10 @@ async function recreateOrder(idx){
       newOrder.paid=cashCollected>=total?"Paid":(cashCollected>0?"Partial":"Unpaid");
       newOrder.amtPaid=cashCollected;
       D.orders.push(newOrder);
-      (D.invoices||[]).push({id:newInvId,orderId:newId,cId:cId,amount:total,paid:_round2(cashCollected),due:tday(),date:tday(),
-        notes:"Order #"+newId,payments:cashCollected>0?[{pid:uid(),date:tday(),amt:_round2(cashCollected),method:"Cash",ref:"Recovered from delivery-completion audit record"}]:[]});
+      var _recInv={id:newInvId,orderId:newId,cId:cId,amount:total,paid:_round2(cashCollected),due:tday(),date:tday(),
+        notes:"Order #"+newId,payments:cashCollected>0?[{pid:uid(),date:tday(),amt:_round2(cashCollected),method:"Cash",ref:"Recovered from delivery-completion audit record"}]:[]};
+      if(_prov)_recInv._numPending=true;   // the pair travels together — see _hybridFlushDocs
+      (D.invoices||[]).push(_recInv);
       // Stock deliberately NOT re-deducted here — the real, physical stock
       // was already given to the customer the first time this order was
       // delivered. Re-deducting now would double-count against reality.
@@ -14145,20 +14943,67 @@ function _markPhantomCreditResolved(apply){
        worth touching money still owed.
    The audit log keeps the OLD number in its historical entries deliberately —
    those record what actually happened. A new entry records the mapping. */
-function _renumberTimestampIds(apply){
+function _renumberTimestampIds(apply,includeUnsettled){
   if(typeof CU==="undefined"||!CU||CU.role!=="director"){try{toast("Director only","err");}catch(_){}return 0;}
   var TS_MIN=1e12;   // real sequence ids are ~1,000-9,999; a timestamp id is ~1.78e15
   var work=[],skips=[];
   (D.orders||[]).forEach(function(o){
     if(!o||o.id==null||!(Number(o.id)>TS_MIN))return;
+    /* LEAVE PROVISIONAL ORDERS TO _drainPendingNumbers (2026-08-07, b26).
+       A _numPending order has never been published, so it is renumbered by a plain
+       local rewrite. Putting it through THIS tool instead would tombstone and delete
+       Firestore documents that do not exist, and race the drain for the same record.
+       Two mechanisms rewriting the same id is how a record ends up under two numbers. */
+    if(_isNumPending(o)){skips.push("#"+o.id+" — provisional; it is waiting for a real number and will be renumbered automatically on reconnect (no action needed)");return;}
     var invs=[];
     try{invs=_linkedInvoicesOf(o.id);}catch(_){invs=[];}
     if(invs.length!==1){skips.push("#"+o.id+" — "+invs.length+" linked invoice(s); only a clean 1:1 pair is renumbered");return;}
-    if(!_invoiceIsSettled(invs[0])){skips.push("#"+o.id+" — invoice #"+invs[0].id+" still owes KSh "+_round2((Number(invs[0].amount)||0)-(Number(invs[0].paid)||0)));return;}
+    /* UNPAID IS NOW ALLOWED; PARTIALLY-PAID STILL IS NOT   (2026-08-07, b25)
+       The original refusal ("an invoice with any balance outstanding is skipped —
+       renumbering is not worth touching money still owed") was written when the only
+       two known cases were settled orders from the 2026-08-03 quota outage. It makes
+       the tool USELESS for the case it now has to handle: a fallback id is minted at
+       order CREATION, so its invoice is unpaid by definition. On 2026-08-07 that left
+       #1786084008622849 (unpaid, KSh 500) permanently unrepairable — it could only be
+       renumbered after someone happened to pay it.
+       What the refusal was actually protecting against is orphaning money that has
+       already MOVED — payment entries, credit-log reversals, acknowledged cash — if the
+       rewrite half-completes. A plain unpaid invoice has none of that: no payments
+       array entries, nothing acknowledged, nothing to orphan. Its balance rides along
+       untouched on the same record, and the write-confirm-then-delete ordering plus the
+       full rollback below are unchanged.
+       So: paid===0 with no payment entries is renumbered. Anything with real money
+       recorded against it still requires the director to opt in deliberately via
+       _renumberTimestampIds(true,true), because that is the case where a half-finished
+       rewrite could actually cost something. */
+    var _inv0=invs[0];
+    var _paid0=Number(_inv0.paid)||0;
+    var _hasPayEntries=!!(_inv0.payments&&_inv0.payments.length);
+    var _moneyHasMoved=(_paid0>0)||_hasPayEntries;
+    if(!_invoiceIsSettled(_inv0)&&_moneyHasMoved&&!includeUnsettled){
+      skips.push("#"+o.id+" — invoice #"+_inv0.id+" has money recorded against it (paid KSh "+_round2(_paid0)+" of KSh "+_round2(Number(_inv0.amount)||0)+(_hasPayEntries?", "+_inv0.payments.length+" payment entr"+(_inv0.payments.length===1?"y":"ies"):"")+"). Renumbering it would move references to real payments, so it needs a deliberate _renumberTimestampIds(true,true)");
+      return;
+    }
     work.push({o:o,inv:invs[0]});
   });
   skips.forEach(function(s){console.log("[NDRENUM] SKIP "+s);});
-  if(!work.length){console.log("[NDRENUM] nothing to renumber — no timestamp-derived order ids found");return 0;}
+  /* TELL THE TRUTH WHEN SOMETHING WAS FOUND BUT SKIPPED (2026-08-07, b25).
+     FOUND IN THE FIELD. This printed "nothing to renumber — no timestamp-derived order
+     ids found" whenever work was empty, ignoring skips entirely. On 2026-08-07 the
+     director ran it against order #1786084008622849 and saw, on consecutive lines:
+       [NDRENUM] SKIP #1786084008622849 — invoice #1786084008622602 still owes KSh 500
+       [NDRENUM] nothing to renumber — no timestamp-derived order ids found
+     i.e. the tool reported the exact opposite of what it had just found, and returned 0,
+     which reads as "clean". A director acting on that would conclude the problem had
+     gone away. The count of skipped records is the whole point of the distinction. */
+  if(!work.length){
+    if(skips.length){
+      console.log("[NDRENUM] "+skips.length+" timestamp-derived id(s) FOUND but every one was skipped for the reason(s) above — nothing was renumbered and the problem has NOT gone away. Returning 0 renumbered, "+skips.length+" outstanding.");
+      return 0;
+    }
+    console.log("[NDRENUM] nothing to renumber — no timestamp-derived order ids found");
+    return 0;
+  }
   if(!apply){
     work.forEach(function(w){
       console.log("[NDRENUM] WOULD RENUMBER order #"+w.o.id+" (invoice #"+w.inv.id+") — "+
@@ -14182,7 +15027,16 @@ function _renumberTimestampIds(apply){
       try{refreshCurrentPage();}catch(_){}
       return;
     }
+    /* NUMERIC originals kept alongside the string forms (2026-08-07, b25).
+       The rollback below used to restore w.o.id=oldOid where oldOid is a STRING, so a
+       rolled-back renumber left o.id as "1785772131185960" instead of the number
+       1785772131185960. Every order lookup in this file is a strict-equality match on
+       a numeric id (openDlv, completeDlv, delO, recPay: `x.id===oid`), so a
+       string id silently detaches the order from every one of them — an order visible
+       in the list that nothing can open. The strings are still needed for the id
+       comparisons and tombstone keys below, so both forms are kept explicitly. */
     var w=work[i],oldOid=String(w.o.id),oldIid=String(w.inv.id);
+    var oldOidNum=w.o.id,oldIidNum=w.inv.id,oldOrdInvId=w.o.invoiceId,oldInvNotes=w.inv.notes;
     reserveNextOrderAndInvoiceIds().then(function(r){
       var newOid=r&&r.orderId,newIid=r&&r.invoiceId;
       /* The counter fell back to a timestamp again — abort rather than swap one
@@ -14208,12 +15062,62 @@ function _renumberTimestampIds(apply){
       w.o.id=newOid;
       w.inv.id=newIid;
       w.inv.orderId=newOid;
+      /* REPOINT THE ORDER'S OWN INVOICE POINTER (2026-08-07, b25). PREVIOUSLY MISSING,
+         AND THIS TOOL WAS ALREADY RUN AGAINST LIVE DATA on 2026-08-04 (#1476/#1477).
+         Only three fields were rewritten — o.id, inv.id, inv.orderId — but an order
+         created by saveOrd carries invoiceId:<invoice id> (see the exact-order push),
+         and o.invoiceId is the PRIMARY link in both directions that matter:
+           * the order-EDIT path:  (o.invoiceId && i.id===o.invoiceId) || (!o.invoiceId && notes match)
+           * syncPaymentStatuses:  the identical expression
+         Because o.invoiceId stayed truthy but pointed at the now-deleted OLD invoice id,
+         both lookups failed AND the notes fallback was skipped (it only runs when
+         o.invoiceId is absent). Consequences, both real:
+           1. Editing a renumbered order finds no linked invoice and takes the
+              "No invoice yet — create one" branch, minting a SECOND invoice for an
+              order that already has one. That double-counts the receivable.
+           2. syncPaymentStatuses sees no invoice and stops maintaining the payment
+              badge from invoice reality.
+         _linkedInvoicesOf() is unaffected because it keys off i.orderId, which is why
+         the dry run still reported a clean 1:1 pair and nothing looked wrong.
+         inv.notes is repointed too: it is the fallback link and it is what
+         _invoiceForOrder / the archive scan scrape for "#<order>", so leaving it
+         pointing at a tombstoned order number keeps a stale reference alive. Only the
+         exact "#<old order id>" token is replaced, so any other note text survives. */
+      w.o.invoiceId=newIid;
+      /* DIGIT-BOUNDARY REPLACE — fixes a corruption bug I introduced earlier in this
+         same build (2026-08-07). The first cut was
+             w.inv.notes.split("#"+oldOid).join("#"+newOid)
+         which matches "#1476" INSIDE "#14760". Renumbering order #1476 while the note
+         mentioned an unrelated #14760 would rewrite it to "#<new>0" — silently corrupting
+         a reference to a different record. Every other id-in-text match in this file uses
+         a (\D|$) boundary for exactly this reason (see _linkedInvoicesOf / _invoiceForOrder);
+         this now follows the same convention instead of inventing a looser one.
+         The id is digits-only by construction, so it needs no regex escaping. */
+      if(typeof w.inv.notes==="string"&&w.inv.notes.indexOf("#"+oldOid)!==-1){
+        w.inv.notes=w.inv.notes.replace(new RegExp("#"+oldOid+"(\\D|$)","g"),"#"+newOid+"$1");
+      }
       // 2. repoint every reference that keys off the old order id
       var refs=0;
       (D.customers||[]).forEach(function(cu){
         (cu&&cu.creditLog||[]).forEach(function(e){if(e&&String(e.ordId)===oldOid){e.ordId=newOid;refs++;}});
       });
       (D.pendingPayments||[]).forEach(function(p){if(p&&String(p.ordId)===oldOid){p.ordId=newOid;refs++;}});
+      /* STOCK LEDGER (2026-08-07, b26) — PREVIOUSLY MISSED, and this tool has already been
+         run against live data (#1476/#1477 on 2026-08-04).
+         Order creation writes a stock-history row {type:"sale", qty:-N, ordId:<order id>}
+         for every exact-product order. This tool repointed invoice.orderId,
+         creditLog[].ordId and pendingPayments[].ordId but never the stock ledger, so after
+         a renumber that row pointed at a TOMBSTONED id that resolves to nothing — the
+         stock movement could no longer be traced back to the order that caused it, and
+         because the old id is tombstoned the link cannot be recovered afterwards.
+         The stock BALANCE was never affected; this is traceability, and it is silent,
+         which is why it went unnoticed.
+         Found while answering "what does running this do to existing data" — noticed
+         because _drainPendingNumbers (written later) DOES repoint stock history, so the
+         two mechanisms disagreed about what a complete repoint means. They now match. */
+      (D.stock||[]).forEach(function(st){
+        (st&&st.history||[]).forEach(function(hst){if(hst&&String(hst.ordId)===oldOid){hst.ordId=newOid;refs++;}});
+      });
       /* 3. WRITE THE NEW DOCUMENTS AND WAIT FOR THE SERVER TO CONFIRM.
          The first cut of this called _persistOrderDoc()/_persistInvoiceDoc() and
          deleted the old ids on the very next line. Both helpers are fire-and-forget
@@ -14240,11 +15144,26 @@ function _renumberTimestampIds(apply){
            the in-memory record is put back exactly as it was — including every
            reference repointed above. The order keeps its ugly number and stays whole. */
         try{delete D.deletedOrderIds[oldOid];delete D.deletedInvoiceIds[oldIid];}catch(_){}
-        w.o.id=oldOid;w.inv.id=oldIid;w.inv.orderId=oldOid;
+        /* Restore the NUMERIC originals, and every field step 1 rewrote (2026-08-07, b25).
+           Was: w.o.id=oldOid (a String) — see the oldOidNum comment above for why a
+           string id detaches the order from every lookup in this file. o.invoiceId and
+           inv.notes are restored too, because step 1 now rewrites them. */
+        w.o.id=oldOidNum;w.inv.id=oldIidNum;w.inv.orderId=oldOidNum;
+        w.o.invoiceId=oldOrdInvId;w.inv.notes=oldInvNotes;
+        /* oldOidNum, not oldOid (2026-08-07, b26). The forward pass sets these to newOid, a
+           NUMBER, but the rollback restored the STRING form — the same type-mismatch class
+           already fixed for w.o.id above. Order creation writes ordId as a number
+           (ordId:newOrdId), so a rolled-back entry ended up a different type from every
+           other row. The repoint comparisons use String() on both sides so it was
+           tolerated there, which is exactly why it stayed invisible.
+           Stock history is restored too, because the forward pass now repoints it. */
         (D.customers||[]).forEach(function(cu){
-          (cu&&cu.creditLog||[]).forEach(function(en){if(en&&String(en.ordId)===String(newOid))en.ordId=oldOid;});
+          (cu&&cu.creditLog||[]).forEach(function(en){if(en&&String(en.ordId)===String(newOid))en.ordId=oldOidNum;});
         });
-        (D.pendingPayments||[]).forEach(function(p){if(p&&String(p.ordId)===String(newOid))p.ordId=oldOid;});
+        (D.pendingPayments||[]).forEach(function(p){if(p&&String(p.ordId)===String(newOid))p.ordId=oldOidNum;});
+        (D.stock||[]).forEach(function(st){
+          (st&&st.history||[]).forEach(function(hst){if(hst&&String(hst.ordId)===String(newOid))hst.ordId=oldOidNum;});
+        });
         _bulkOpInFlight=false;
         console.log("[NDRENUM] ABORTED at #"+oldOid+" — the new documents were NOT confirmed by the server ("+((e&&e.code)||(e&&e.message)||"unknown")+"). Nothing was deleted, the tombstones were withdrawn, and the record is unchanged and still complete. Retry when the connection is healthy.");
       });
@@ -14254,6 +15173,96 @@ function _renumberTimestampIds(apply){
   };
   step(0);
   return work.length;
+}
+/* ============================================================================
+   REPAIR STALE ORDER->INVOICE POINTERS                         (2026-08-07, b25)
+   DIRECTOR TOOL. Dry run by default: _repairStaleInvoicePointers() reports,
+   _repairStaleInvoicePointers(true) applies.
+
+   CONFIRMED IN LIVE PRODUCTION, 2026-08-07. Orders #1476 and #1477 — the two
+   renumbered by _renumberTimestampIds(true) on 2026-08-04 — both carry an
+   invoiceId pointing at their OLD, now-deleted 16-digit invoice:
+     #1476 invoiceId=1785771681707322  -> no invoice has that id
+     #1477 invoiceId=1785772131185363  -> no invoice has that id
+   Cause: that tool rewrote o.id, inv.id and inv.orderId but never o.invoiceId.
+   (Fixed at source in the same build — see the REPOINT comment in
+   _renumberTimestampIds. This tool repairs the records that defect already left
+   behind, which a source fix alone cannot do.)
+
+   WHY IT MATTERS, and why it is not cosmetic. o.invoiceId is the PRIMARY link in
+   the order-edit path and in syncPaymentStatuses, both of which read
+       (o.invoiceId && i.id===o.invoiceId) || (!o.invoiceId && notes match)
+   A stale-but-truthy invoiceId fails the first branch AND suppresses the notes
+   fallback, so the order looks invoice-less. Editing such an order therefore takes
+   the "No invoice yet — create one" branch and mints a SECOND invoice for an order
+   that already has one — the receivable is then counted twice. That is a money
+   defect, not a tidiness one.
+
+   WHAT THIS DOES, and just as importantly what it refuses to do:
+     * It only ever rewrites o.invoiceId. No document is created, deleted,
+       renumbered or tombstoned; no amount, payment or status is touched.
+     * The correct invoice is found with _linkedInvoicesOf(o.id), which keys off
+       inv.orderId — the field the renumber DID update, which is why the link is
+       recoverable at all and why this needs no guesswork.
+     * EXACTLY ONE linked invoice is required. Zero, or more than one, is reported
+       for per-row human review and skipped. Picking one of several is how a live
+       receivable gets orphaned (the 2026-07-30 B4 incident), so it is refused
+       outright rather than resolved by a heuristic.
+     * NO _rev / _stampRecordEdit. invoiceId is deliberately NOT one of the twelve
+       fields in _HYDRATE_ORDER_FIELDS, so it is carried per-record and merged by
+       id rather than arbitrated — it needs no stamp to survive another device.
+       Stamping would additionally make THIS device win arbitration on all twelve
+       fields that ARE arbitrated, silently overriding another device's legitimate
+       edits. That side effect is the reason this tool does not stamp.
+     * It scans EVERY order, not just #1476/#1477 — the same breakage can arise
+       from any path that changes an invoice id, and a tool that only knew about
+       two ids would hide the next occurrence. */
+function _repairStaleInvoicePointers(apply){
+  if(typeof CU==="undefined"||!CU||CU.role!=="director"){try{toast("Director only","err");}catch(_){}return 0;}
+  var fixable=[],ambiguous=[],orphaned=[],healthy=0;
+  (D.orders||[]).forEach(function(o){
+    if(!o||o.id==null||o.invoiceId==null||o.invoiceId==="")return;
+    var pointed=(D.invoices||[]).find(function(i){return i&&i.id===o.invoiceId;});
+    if(pointed){healthy++;return;}
+    var linked=[];
+    try{linked=_linkedInvoicesOf(o.id);}catch(_){linked=[];}
+    if(linked.length===1){fixable.push({o:o,stale:o.invoiceId,inv:linked[0]});}
+    else if(linked.length>1){ambiguous.push("#"+o.id+" — invoiceId "+o.invoiceId+" is stale and "+linked.length+" invoices link to this order ("+linked.map(function(x){return "#"+x.id;}).join(", ")+"). Refusing to choose; review this row by hand.");}
+    else{orphaned.push("#"+o.id+" — invoiceId "+o.invoiceId+" is stale and NO invoice links to this order. Not repairable by re-pointing; review this row by hand. NOTHING was created.");}
+  });
+  ambiguous.forEach(function(s){console.log("[NDINVPTR] SKIP "+s);});
+  orphaned.forEach(function(s){console.log("[NDINVPTR] SKIP "+s);});
+  if(!fixable.length){
+    /* Same honesty rule the renumber tool needed (2026-08-07): if something WAS found
+       but skipped, say so and give the count — never print a clean-sounding line over
+       records that still need a human. */
+    if(ambiguous.length||orphaned.length){
+      console.log("[NDINVPTR] "+(ambiguous.length+orphaned.length)+" stale pointer(s) FOUND but none could be repaired automatically for the reason(s) above — the problem has NOT gone away. "+healthy+" order(s) verified healthy.");
+      return 0;
+    }
+    console.log("[NDINVPTR] nothing to repair — all "+healthy+" order(s) with an invoiceId point at an invoice that exists.");
+    return 0;
+  }
+  if(!apply){
+    fixable.forEach(function(f){
+      console.log("[NDINVPTR] WOULD REPAIR order #"+f.o.id+": invoiceId "+f.stale+" (missing) -> #"+f.inv.id+
+        " — invoice amount KSh "+_round2(Number(f.inv.amount)||0)+", paid KSh "+_round2(Number(f.inv.paid)||0)+
+        ", linked by inv.orderId="+f.inv.orderId);
+    });
+    console.log("[NDINVPTR] DRY RUN — nothing changed. "+fixable.length+" repairable, "+ambiguous.length+" ambiguous, "+orphaned.length+" orphaned, "+healthy+" healthy. Run _repairStaleInvoicePointers(true) as director to apply.");
+    return fixable.length;
+  }
+  var lines=[];
+  fixable.forEach(function(f){
+    f.o.invoiceId=f.inv.id;
+    lines.push("#"+f.o.id+": "+f.stale+" -> #"+f.inv.id);
+    console.log("[NDINVPTR] REPAIRED order #"+f.o.id+" invoiceId "+f.stale+" -> #"+f.inv.id);
+  });
+  try{auditLog("ORDER_UPDATED","STALE INVOICE POINTERS REPAIRED: "+fixable.length+" order(s) had invoiceId pointing at an invoice id that no longer exists (left behind by the 2026-08-04 renumber, which rewrote inv.id but not o.invoiceId). Re-pointed to the invoice already linked by inv.orderId: "+lines.join("; ")+". No invoice, amount, payment or status was created, deleted or changed — only the pointer.");}catch(_){}
+  try{dirty();}catch(_){}
+  try{refreshCurrentPage();}catch(_){}
+  console.log("[NDINVPTR] COMPLETE — "+fixable.length+" pointer(s) repaired. Editing those orders will now find their real invoice instead of creating a duplicate.");
+  return fixable.length;
 }
 function ackPendingPay(id){
   if(!can("mPaid")){toast("No permission","err");return;}
@@ -16671,11 +17680,124 @@ function _clearConfirmedLedgerEntries(committedCids){
     if(changed)localStorage.setItem("nd_pending_orders",JSON.stringify(ledger));
   }catch(e){/* best-effort - never let this affect the write-success path */}
 }
-function _pendingOrderLedgerAdd(cid,customerName,prod,qty){
+/* FULL ORDER INTENT, WRITTEN BEFORE THE NETWORK CALL          (2026-08-07, b26)
+
+   WHY THIS CHANGED. The ledger used to store only customerName/prod/qty — enough to
+   TELL someone an order might be missing, not enough to rebuild it. So the boot dialog
+   could only say "place it again now", which is both manual and the direct cause of
+   duplicate orders.
+
+   THE FAILURE THIS CLOSES, which is device-independent. Order creation awaits an id
+   reservation before anything is written to D. If the page DIES in that window, the
+   order is lost completely: no order, no invoice, no audit entry, no outbox record. And
+   because the reservation never reached the server, no order number is consumed — so
+   there is NO GAP in the sequence and the loss is invisible to every reconciliation
+   tool. Confirmed against live data: 145 consecutive orders with zero unexplained gaps,
+   while orders were still going missing daily.
+
+   The owner reports iPhones/iPads going white or reloading, on b24 and earlier, and
+   cannot say it is iOS-only. It does not matter: this fix does not care WHY the page
+   died — iOS memory pressure, Android tab eviction, a laptop browser crash, a stray
+   refresh, a flat battery. The intent is on disk before the network is touched, so
+   there is nothing to lose.
+
+   WHY localStorage AND NOT the outbox: the outbox is a Firestore write, which needs the
+   very network this failure removes. localStorage is synchronous and local, so it has
+   already committed by the time the next line runs.
+
+   RECOVERY IS OPERATOR-CONFIRMED, NEVER AUTOMATIC — see _pendingOrderLedgerCheck. An
+   order that was created and then deliberately DELETED would also fail the "_cid not in
+   D.orders" test, and silently recreating it would resurrect a record a director chose
+   to remove. That is the one thing this project will not do, so a human confirms each
+   one. Per-row review, exactly as with the reconciliation tool. */
+/* REBUILD AN ORDER THAT NEVER FINISHED SAVING                  (2026-08-07, b26)
+   Called only from the operator-confirmed dialog in _pendingOrderLedgerCheck.
+
+   This reproduces what saveOrd would have done, using the intent snapshot taken BEFORE
+   the reservation. It deliberately mirrors the recreateOrder recovery path rather than
+   inventing a second mechanism:
+     * ids come from the real counter (provisional-capable, so a dead connection still
+       yields a saved order that numbers itself later);
+     * the _cid is preserved, so the existing idempotency guard makes a double-restore
+       impossible even if the dialog is somehow answered twice;
+     * stock IS deducted — the lost order never reached the deduction, so the physical
+       count and the ledger would otherwise disagree. (Contrast recreateOrder's
+       already-delivered branch, which must NOT deduct because the water was handed over
+       on the first attempt.)
+     * the durable outbox write precedes auditLog, same ordering as normal creation. */
+function _recoverPendingOrderIntent(cid){
+  try{
+    var raw=localStorage.getItem("nd_pending_orders");
+    if(!raw){toast("Nothing left to restore","warn");return;}
+    var ledger=JSON.parse(raw);
+    var entry=ledger[cid];
+    if(!entry||!entry.intent){toast("That order can no longer be restored automatically","err");return;}
+    /* Idempotency: if it is already present under this token, there is nothing to do.
+       Cheap, synchronous, and independent of any timer — the same guard saveOrd uses. */
+    if((D.orders||[]).some(function(o){return o&&o._cid===cid;})){
+      _pendingOrderLedgerConfirm(cid);
+      toast("That order is already in the list — nothing restored","warn");
+      return;
+    }
+    var it=entry.intent;
+    reserveNextOrderAndInvoiceIds().then(function(reserved){
+      var newOrdId=reserved.orderId,newInvId=reserved.invoiceId;
+      var _prov=!!(reserved&&reserved.provisional);
+      var isCat=(it.kind==="category");
+      var st=(D.stock||[]).find(function(s){return s&&s.id===it.stockId;});
+      /* Stock: the lost order never got as far as deducting. Negative-stock policy
+         applies (no floor) exactly as at creation. */
+      if(st&&!isCat){
+        st.qty=st.qty-(Number(it.qty)||0);
+        try{_recordStockDelta(st.id,-(Number(it.qty)||0),newOrdId);}catch(_){}
+        if(!st.history)st.history=[];
+        st.history.push({ts:tday(),type:"sale",qty:-(Number(it.qty)||0),by:(CU&&CU.name)+" (restored)",ordId:newOrdId,bal:st.qty});
+        if(st.history.length>STOCK_HISTORY_MAX)st.history=st.history.slice(-STOCK_HISTORY_MAX);
+        try{updateStockBadge();}catch(_){}
+      }
+      var _ord={id:newOrdId,cId:it.cId,prod:it.prod,stockId:it.stockId,qty:it.qty,price:it.price,cost:it.cost,
+        date:it.date||tday(),status:"Pending",paid:isCat?"Unpaid":it.payStatus,amtPaid:isCat?0:it.amtPaid,
+        driver:it.driver||"",deliver:it.deliver||"",bottle_before:it.bottle_before,bottle_after:null,
+        notes:(it.notes||""),_ts:Date.now(),_cid:cid,prodConfirmed:!isCat};
+      if(!isCat)_ord.invoiceId=newInvId;
+      if(_prov)_ord._numPending=true;
+      (D.orders||[]).push(_ord);
+      if(!isCat){
+        var _inv={id:newInvId,orderId:newOrdId,cId:it.cId,amount:it.total,paid:it.amtPaid,
+          due:(function(){var dd=new Date((it.date||tday())+"T12:00:00");dd.setDate(dd.getDate()+7);return dd.toISOString().split("T")[0];})(),
+          notes:"Order #"+newOrdId,date:tday(),
+          payments:(Number(it.amtPaid)||0)>0?[{pid:uid(),date:tday(),amt:it.amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]};
+        if(_prov)_inv._numPending=true;
+        (D.invoices||[]).push(_inv);
+      }
+      _outboxPut(newOrdId);   // durable FIRST, before auditLog — same ordering as creation
+      try{auditLog("ORDER_PLACED","#"+newOrdId+" "+it.prod+" x"+it.qty+(isCat?" (category/TBC)":"")+
+        " — customer #"+it.cId+" "+unescapeForEdit(entry.customerName||"")+
+        " [RESTORED by "+((CU&&CU.name)||"?")+": this order was entered but never finished saving — the app closed, reloaded or went blank before an order number was issued, so nothing had been recorded. Rebuilt from the intent snapshot written before the id reservation. Stock "+(st&&!isCat?"was":"was NOT")+" deducted."+
+        (_prov?" PROVISIONAL NUMBER — the counter was unreachable; it will be renumbered automatically.":"")+"]",
+        {ordSnapshot:_orderSnapshotFor(newOrdId)});}catch(_){}
+      _pendingOrderLedgerConfirm(cid);
+      try{dirty();}catch(_){}
+      try{rOrds(undefined,ORD_PAGE);rDel();refreshCurrentPage();}catch(_){}
+      console.log("[NDRECOVER] restored an order that never finished saving — now #"+newOrdId+(_prov?" (provisional)":""));
+      toast(_prov?"Order restored — waiting for a connection to give it its number":"Order #"+newOrdId+" restored",_prov?"warn":undefined);
+      if(_prov)_drainPendingNumbers(true);
+    }).catch(function(err){
+      /* Nothing was mutated before the reservation resolved, so the ledger entry is left
+         in place deliberately: the operator can try again on the next boot rather than
+         losing the only record of the order. */
+      console.log("[NDRECOVER] restore failed ("+((err&&err.message)||err)+") — the saved order intent is KEPT so it can be retried");
+      toast("Could not restore that order just now — it is still saved and will be offered again","err");
+    });
+  }catch(e){
+    console.log("[NDRECOVER] restore error: "+(e&&e.message));
+  }
+}
+function _pendingOrderLedgerAdd(cid,customerName,prod,qty,intent){
   try{
     var raw=localStorage.getItem("nd_pending_orders");
     var ledger=raw?JSON.parse(raw):{};
-    ledger[cid]={cid:cid,customerName:customerName,prod:prod,qty:qty,ts:Date.now()};
+    ledger[cid]={cid:cid,customerName:customerName,prod:prod,qty:qty,ts:Date.now(),intent:intent||null};
     localStorage.setItem("nd_pending_orders",JSON.stringify(ledger));
   }catch(e){/* best-effort - never block order creation on this */}
 }
@@ -16716,6 +17838,30 @@ function _pendingOrderLedgerCheck(){
     if(!unresolved.length)return;
     var e=ledger[unresolved[0]]||JSON.parse(raw)[unresolved[0]];
     if(!e)return;
+    /* OFFER TO RESTORE IT, RATHER THAN ASKING SOMEONE TO RETYPE IT (2026-08-07, b26).
+       The old dialog could only say "place it again now", because the ledger held just
+       customer/product/qty. That was manual AND it is the direct cause of duplicate
+       orders — a staff member who re-enters an order that did in fact save produces two.
+       Entries written by b26 carry a full intent snapshot, so the order can be rebuilt
+       exactly as it was. Older entries (no intent) keep the original wording, so nothing
+       regresses for anything already sitting in localStorage.
+       Deliberately operator-confirmed, never automatic: an order that was created and
+       then DELIBERATELY DELETED also fails the "_cid absent from D.orders" test, and
+       recreating that would resurrect a record a director chose to remove. */
+    if(e.intent){
+      var msgR="An order placed earlier did not finish saving:\n\n"+
+        unescapeForEdit(e.customerName)+" — "+unescapeForEdit(e.prod)+" x"+e.qty+
+        (e.intent.kind==="exact"?"  (KSh "+_round2(Number(e.intent.total)||0)+")":"  (brand/price at delivery)")+
+        "\n\nThis happens when the app closes, reloads or goes blank right after Place Order — the "+
+        "order number had not been issued yet, so nothing was recorded anywhere.\n\n"+
+        "Check the Orders list first in case it is already there. If it is genuinely missing, "+
+        "Restore rebuilds it exactly as entered — you do not need to type it again.";
+      uiConfirm({title:"Order did not finish saving",message:msgR,variant:"warn",confirmText:"Restore this order"}).then(function(_ok){
+        if(_ok){_recoverPendingOrderIntent(unresolved[0]);}
+        else{_pendingOrderLedgerConfirm(unresolved[0]);}   // dismissed = dealt with, same as before
+      });
+      return;
+    }
     var msg="An order you placed earlier may not have saved:\n\n"+
       unescapeForEdit(e.customerName)+" — "+unescapeForEdit(e.prod)+" x"+e.qty+
       "\n\nThis can happen if the app closed or lost connection right after placing it. "+
@@ -17237,11 +18383,18 @@ function syncIdCounters(){
   // reuse structurally impossible, which is what actually needs to be true
   // for the tombstone mechanism to be safe, rather than requiring tombstones
   // to somehow know "this ID now refers to a different record."
-  var maxO=(D.orders||[]).reduce(function(m,o){return Math.max(m,Number(o.id)||0);},1000);
+  /* SEQ_ID_MAX (2026-08-07, b25): fold in only ids that are actually SEQUENCE numbers.
+     A timestamp-fallback id (>=1e12) must never raise this floor — see the SEQ_ID_MAX
+     block at the top of this file for the full root cause and why this cannot weaken
+     the id-reuse protection this ratchet exists to provide. */
+  // Defers to the single global _isSeqId predicate rather than restating the rule —
+  // two copies of "what counts as a sequence id" is how the two drift apart later.
+  var _seqId=function(v){return _isSeqId(v)?Number(v):0;};
+  var maxO=(D.orders||[]).reduce(function(m,o){return Math.max(m,_seqId(o.id));},1000);
   if(D.deletedOrderIds){
-    Object.keys(D.deletedOrderIds).forEach(function(k){maxO=Math.max(maxO,Number(k)||0);});
+    Object.keys(D.deletedOrderIds).forEach(function(k){maxO=Math.max(maxO,_seqId(k));});
   }
-  var maxI=(D.invoices||[]).reduce(function(m,i){return Math.max(m,Number(i.id)||0);},2000);
+  var maxI=(D.invoices||[]).reduce(function(m,i){return Math.max(m,_seqId(i.id));},2000);
   // Invoices are never hard-deleted from the array (void keeps them, marked
   // voided:true) so no tombstone map exists for them and none is needed —
   // maxI computed from the array alone is already always correct.
@@ -17249,17 +18402,26 @@ function syncIdCounters(){
   if(D.deletedCustomerIds){
     Object.keys(D.deletedCustomerIds).forEach(function(k){maxCust=Math.max(maxCust,Number(k)||0);});
   }
-  var maxCmp=(D.complaints||[]).reduce(function(m,x){return Math.max(m,Number(x.id)||0);},4000);
+  var maxCmp=(D.complaints||[]).reduce(function(m,x){return Math.max(m,_seqId(x.id));},4000); // _seqId: same poisoning guard as maxO/maxI (2026-08-07, b25)
   // VERIFIED BY READING: delCmp() (see below) simply filters D.complaints
   // with no tombstone map at all — so there is no deleted-complaint-id
   // history to fold in here. This is fine ONLY because complaints sync via
   // full-replace (see step 5 below), which has no "resurrection" failure
   // mode to protect against in the first place — see the complaint-deletion
   // note further down for why a tombstone isn't needed there.
-  nOId=Math.max(nOId||1001,maxO+1);
-  nIId=Math.max(nIId||2001,maxI+1);
+  /* _seqId() around the INCOMING counter too, not just around maxO/maxI (2026-08-07, b25).
+     This is a ratchet, so without it an nOId that is ALREADY poisoned survives forever:
+     Math.max(1786084008622850, 1522) is the poisoned value. It is also re-merged from
+     saved snapshots on every boot (~lines 5233/5536/8667/16411 all do
+     nOId=Math.max(snap.nOId||0,nOId)), so a bad value persists across reloads and
+     across devices via the main document. Discarding an out-of-range counter here is
+     what REPAIRS the live state that order #1786084008622849 already created, rather
+     than merely preventing the next one. Falls back to maxO+1, which is now computed
+     from sequence ids only, so the result is always a sane next number. */
+  nOId=Math.max(_seqId(nOId)||1001,maxO+1);
+  nIId=Math.max(_seqId(nIId)||2001,maxI+1);
   nCId=Math.max(nCId||3001,maxCust+1);
-  nCmpId=Math.max(nCmpId||4001,maxCmp+1);
+  nCmpId=Math.max(_seqId(nCmpId)||4001,maxCmp+1); // _seqId on the incoming counter too — repairs an already-poisoned value (2026-08-07, b25)
 }
 function syncPaymentStatuses(){
   // Fix any order whose payment badge doesn't match its invoice reality
