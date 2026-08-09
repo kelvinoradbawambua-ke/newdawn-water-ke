@@ -391,77 +391,6 @@ var BUILD_STAMP="ND47-1";
    for non-fatal errors (the banner is dismissible); it simply guarantees the
    user is never stranded on a blank screen with no way forward. */
 window._ndErrCount=0;
-/* ── WHITE-SCREEN INSTRUMENT (2026-08-09, ND47-1) ──────────────────────────────
-   HANDOVER_2026-08-08 §4.3 proposed this and it was never built. It is an INSTRUMENT,
-   NOT A FIX — the root cause of the iPad white screen is still not established, and
-   §4.1 records two confident wrong diagnoses already made about it. Do not let this
-   file's existence be mistaken for the bug being solved.
-
-   WHY IT HAS TO EXIST: the director cannot open a console on that device, so any
-   diagnostic that only writes to console.log is worthless for this bug. This reports
-   ON SCREEN, in plain English, at the next login.
-
-   HOW IT WORKS: one small localStorage key records what the app was doing; a second
-   records whether the session ended cleanly. The clean flag is cleared once per session
-   at first activity and set on a proper logout. If the app dies mid-use — white screen,
-   crash, tab killed by iOS for memory — the flag is never set, and the next login can
-   say exactly what was happening.
-
-   DELIBERATELY CHEAP. The suspected cause is a memory/storage ceiling, so an instrument
-   that writes a lot would make the thing it is measuring worse. Both keys are tiny and
-   OVERWRITTEN, never appended, so this costs a fixed ~80 bytes forever — against
-   autoSaveLocal, which stringifies the entire dataset twice (HANDOVER_2026-08-08 §4.2).
-   Fully try/caught: a storage failure must never take the app down, least of all on the
-   device that is already short of storage. */
-var ND_CRUMB_KEY="nd_last_action", ND_CRUMB_CLEAN="nd_clean_exit";
-function _ndCrumb(what){
-  try{
-    localStorage.setItem(ND_CRUMB_KEY,JSON.stringify({w:String(what||"").slice(0,60),at:Date.now()}));
-    /* RE-ARM on every action. Without this the flag would be a one-shot: a normal tab close
-       fires pagehide and sets "clean", and any crash AFTER that point would go unrecorded.
-       Re-arming on each action means the flag always reflects the CURRENT activity, so the
-       only way it stays "0" is a session that stopped without pagehide ever firing — which
-       is exactly the hard-kill signature we are hunting (white screen / iOS memory kill). */
-    localStorage.setItem(ND_CRUMB_CLEAN,"0");
-  }catch(_){}
-}
-function _ndCrumbSessionStart(){try{localStorage.setItem(ND_CRUMB_CLEAN,"0");}catch(_){}}
-function _ndCrumbCleanExit(){try{localStorage.setItem(ND_CRUMB_CLEAN,"1");}catch(_){}}
-/* Returns {w,at} if the PREVIOUS session ended without a clean logout, else null. */
-function _ndCrumbLastCrash(){
-  try{
-    if(localStorage.getItem(ND_CRUMB_CLEAN)!=="0")return null;   // clean, or never started
-    var raw=localStorage.getItem(ND_CRUMB_KEY);if(!raw)return null;
-    var c=JSON.parse(raw);
-    if(!c||!c.w||!c.at)return null;
-    return c;
-  }catch(_){return null;}
-}
-/* Plain-English on-screen report. Reuses the proven banner shape from
-   _ndShowErrorBanner rather than inventing a second overlay mechanism. */
-function _ndCrumbReportIfCrashed(){
-  try{
-    var c=_ndCrumbLastCrash();
-    if(!c)return false;
-    _ndCrumbSessionStart();   // consume it — report once, not on every login
-    if(!document.body)return false;
-    var when=new Date(c.at);
-    var hh=String(when.getHours()).padStart(2,"0")+":"+String(when.getMinutes()).padStart(2,"0");
-    var b=document.createElement("div");
-    b.id="nd-crumb-banner";
-    b.style.cssText="position:fixed;top:0;left:0;right:0;z-index:2147483646;background:#8e44ad;color:#fff;"+
-      "padding:10px 14px;font-family:system-ui,sans-serif;font-size:13px;display:flex;gap:12px;"+
-      "align-items:center;flex-wrap:wrap;box-shadow:0 2px 8px rgba(0,0,0,.25)";
-    b.innerHTML="<span style=\"font-weight:700\">ℹ️ This device stopped unexpectedly last time.</span>"+
-      "<span style=\"opacity:.95\">It was <strong>"+String(c.w).replace(/[<>&]/g,"")+"</strong> at "+hh+
-      ". Nothing was lost — your data is saved. Please tell Kelvin what you were doing.</span>"+
-      "<button onclick=\"var e=document.getElementById('nd-crumb-banner');if(e)e.remove();\" "+
-      "style=\"background:#fff;color:#8e44ad;border:none;border-radius:6px;padding:7px 16px;font-weight:700;cursor:pointer\">Got it</button>";
-    document.body.appendChild(b);
-    console.log("[NDCRUMB] previous session ended uncleanly while: "+c.w+" at "+when.toISOString());
-    return true;
-  }catch(_){return false;}
-}
 function _ndShowErrorBanner(detail){
   try{
     window._ndErrCount++;
@@ -3063,6 +2992,12 @@ function _maybeRecordFullLoadBaseline(){
       return;
     }
     try{localStorage.setItem("nd_delta_audit_clean","1");}catch(_){}
+    /* A FULL load has now been delivered, so this device provably holds everything the hot
+       window contains. That is the ONLY state in which it is entitled to publish a count
+       LOWER than the one already published — see the count-publish guard in
+       _buildWritePayload. Without this release the guard would be a ratchet with no way
+       down, which is exactly the b22.t2 failure that had to be reverted in production. */
+    _fullLoadDeliveredThisSession=true;
     _deltaRecordBaseline(at,true);
     if(!_baselineLoggedThisLoad){
       _baselineLoggedThisLoad=true;
@@ -3071,6 +3006,10 @@ function _maybeRecordFullLoadBaseline(){
   }catch(_){}
 }
 var _auditDirtyReported=false,_baselineLoggedThisLoad=false,_loadIssuedAt=0;
+/* Set only when a FULL load has actually been delivered in THIS session. Deliberately not
+   persisted: it is a statement about the data in memory right now, and a stale "yes" from a
+   previous page load would re-open the exact hole it exists to close. */
+var _fullLoadDeliveredThisSession=false;
 function _hybridDirtyIds(){
   /* Ids whose in-memory state differs from what the server last confirmed.
      Mirrors the flush's predicate EXACTLY (_hybridDerive first, then _stableStr,
@@ -4885,11 +4824,64 @@ function processWriteQueue(){
          reflect correctly, and the stuck-high state is unreachable. */
       var _mk=function(name){return ((D&&D[name])||[]).length;};
       var _counts={orders:_mk("orders"),invoices:_mk("invoices"),customers:_mk("customers")};
-      payload.collectionCounts=_counts;
-      /* Keep the module variable in step so THIS device's own gate sees the same
-         numbers it just published, without waiting for the snapshot to echo back. */
-      _publishedCounts=_counts;
-      _persistPublishedCounts(_counts);   // must outlive the page — see the declaration
+      /* ROOT-CAUSE FIX (2026-08-09, ND47-1) — A BEHIND DEVICE WAS DESTROYING THE DRIFT
+         DETECTOR, INCLUDING ITS OWN. Found in live production, and it was showing the
+         director two different sets of money on two screens at once.
+
+         CONFIRMED FIELD EVIDENCE, 2026-08-09: the laptop held orders=507 invoices=508 and
+         correctly REFUSED delta ("drift detected: invoices local=508 published=510"). The
+         iPad held orders=499 invoices=500 — further behind still — and sailed into DELTA
+         MODE. Dashboards disagreed on real money: revenue 1,500 vs 0, outstanding debt
+         47,150 across 43 customers vs 41,900 across 36.
+
+         THE MECHANISM. This block published `D[name].length` unconditionally and then set
+         `_publishedCounts=_counts`, with the old comment cheerfully explaining that this
+         keeps "THIS device's own gate seeing the same numbers it just published". That is
+         precisely the defect. The gate's drift test is `published > local`. Once a device
+         that is MISSING records publishes its own short count and caches it, local and
+         published are equal by construction, the test can never fire again, and delta runs
+         forever against a baseline that has already advanced past the records it never
+         received — so those records are excluded PERMANENTLY. The device silently keeps a
+         wrong set of books.
+         It is contagious, too: the short count lands in the shared document, so the next
+         device to boot compares itself against the count of the most out-of-date device in
+         the fleet and stops refusing as well.
+
+         THE FIX, and why it is not the b22.t2 ratchet that had to be reverted. Publishing a
+         LOWER count than is already published is a claim only a device that holds everything
+         is entitled to make. So: publish freely when nothing is published yet, or when the
+         new counts are >= the published ones (growth, the normal case); publish a LOWER
+         count ONLY after a full load has actually been delivered this session, which proves
+         completeness. Legitimate shrinkage — deletions, archiving, a renumber — still
+         propagates, because all of those run on a device that loaded the collections.
+         b22.t2's ratchet was `max(mine, published)` with NO release at all, so one transient
+         wrong-high value was permanent and disabled delta fleet-wide. `_fullLoadDelivered
+         ThisSession` is that missing release.
+         A device that declines to publish here is left facing the HIGHER published count on
+         its next boot — so its own drift check fires, it takes the full load, and it repairs
+         itself. Refusing to publish is what makes it recover. */
+      var _pubNow=_publishedCounts||null;
+      var _lower=false;
+      if(_pubNow){
+        ["orders","invoices","customers"].forEach(function(k){
+          var w=Number(_pubNow[k]);
+          if(typeof _pubNow[k]==="number"&&!isNaN(w)&&_counts[k]<w)_lower=true;
+        });
+      }
+      if(_lower&&!_fullLoadDeliveredThisSession){
+        console.log("[NDDELTA] counts NOT published — this device holds fewer records than the "+
+          "document already advertises (mine "+JSON.stringify(_counts)+" vs published "+
+          JSON.stringify(_pubNow)+") and has not completed a full load this session. Publishing "+
+          "would erase the drift detector that is about to make this device repair itself.");
+      }else{
+        payload.collectionCounts=_counts;
+        /* Keep the module variable in step so THIS device's own gate sees the same
+           numbers it just published, without waiting for the snapshot to echo back.
+           Safe ONLY because of the guard above: we now reach this line either holding a
+           complete set, or publishing counts that are not lower than the ones already there. */
+        _publishedCounts=_counts;
+        _persistPublishedCounts(_counts);   // must outlive the page — see the declaration
+      }
     }
   }catch(_){}   // counts are an optimisation input; never let them break a write
   // Estimate document size — warn director before hitting 1MB Firestore limit
@@ -9143,21 +9135,6 @@ async function checkAutoSaveRecovery(){
 function buildApp(){
   // Add ARIA role to main app container
   var root=el("root");if(root)root.setAttribute("role","application");
-  /* WHITE-SCREEN INSTRUMENT (2026-08-09, ND47-1). Report a previous unclean shutdown the
-     moment the app is up, then re-arm for this session. Deliberately AFTER root exists so
-     the banner has a body to attach to, and wrapped so a reporting failure can never stop
-     the app from building — the instrument must never become the outage.
-     `pagehide` marks a NORMAL departure (tab closed, navigated away, app switched); it does
-     NOT fire on an iOS memory kill or a renderer crash, which is precisely the discrimination
-     this bug needs. _ndCrumb re-arms on every action, so the flag tracks current activity. */
-  try{
-    _ndCrumbReportIfCrashed();
-    _ndCrumbSessionStart();
-    if(!window._ndCrumbBound){
-      window._ndCrumbBound=true;
-      window.addEventListener("pagehide",function(){_ndCrumbCleanExit();});
-    }
-  }catch(_){}
   var pages=[
     {k:"dashboard",ic:"ti-layout-dashboard",lb:"Dashboard"},
     {k:"customers",ic:"ti-users",lb:"Customers"},
@@ -9562,10 +9539,6 @@ var LOGOUT_FLUSH_MAX_MS=6000; // hard cap on how long teardown waits for a rescu
            documents. Flip to false to revert entirely; nothing else needs changing. */
 var KEEP_SUBSCRIPTION_ON_LOGOUT=true;
 function logout(){
-  /* A deliberate logout is the definition of a clean exit — see _ndCrumb. Set FIRST, so
-     that even if something later in this function throws, the session is still recorded
-     as having ended on purpose and the director is not shown a false crash report. */
-  _ndCrumbCleanExit();
   stopAutoSaveLoop();
   // Stop idle timer for ALL roles immediately
   stopIdleWatcher();
@@ -9850,7 +9823,6 @@ function _finishLogoutTeardown(){
 }
 function nav(p,btn){
   if(!can(p))return;
-  _ndCrumb("opening the "+p+" tab");   // white-screen instrument — see _ndCrumb
   document.querySelectorAll(".pg").forEach(function(x){x.classList.remove("act");});
   document.querySelectorAll("#tnav button").forEach(function(x){x.classList.remove("act");});
   var pg=el("pg-"+p);if(pg)pg.classList.add("act");
@@ -10767,7 +10739,7 @@ async function saveCust(){
       _stampRecordEdit(c);
       auditLog("CUSTOMER_UPDATED","Customer updated by "+CU.name+" ("+CU.role+"): "+n);
       if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
-cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer updated");
+dirty();cm("m-c");rCusts(undefined,CUST_PAGE);toast("Customer updated");
       return;
     }
   }
@@ -10796,7 +10768,7 @@ cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer updated");
   auditLog("CUSTOMER_ADDED","#"+_newCustId+" "+n+" added by "+CU.name+" ("+CU.role+")",{custSnapshot:_customerSnapshotFor(_newCustId)});
   ["cn","cph","cph2","cid","cestate","ccourt","chouse","croad","czone","cnotes"].forEach(function(id){el(id).value="";});el("ccl").value="0";
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
-cm("m-c");rCusts(undefined,CUST_PAGE);dirty();toast("Customer added");
+dirty();cm("m-c");rCusts(undefined,CUST_PAGE);toast("Customer added");
 }
 function editCust(id){
   if(!can("eCust"))return;
@@ -12036,7 +12008,7 @@ function saveOrdEdit(){
   if(o.status==="Delivered")o.bottle_after=el("oe-btl").value;else o.bottle_before=el("oe-btl").value;
   o.notes=sanitizeInput(el("oe-notes").value);
   auditLog("ORDER_UPDATED","Order #"+oid+" updated by "+CU.name+" ("+CU.role+")");
-  cm("m-oe");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+oid+" updated");
+  dirty();cm("m-oe");rOrds(undefined,ORD_PAGE);toast("Order #"+oid+" updated");
 }
 function calcO(){
   var opEl=el("op");
@@ -12988,7 +12960,7 @@ async function saveOrd(){
         linkedInv.paid=_round2(amtPaid);
         if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
         auditLog("ORDER_UPDATED","Order #"+o.id+" edited by "+CU.name+" ("+CU.role+")");
-        cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+o.id+" updated");
+        dirty();cm("m-o");rOrds(undefined,ORD_PAGE);toast("Order #"+o.id+" updated");
       }else{
         // FIX (2026-07-21): atomic reservation for this new-invoice-on-edit path too
         reserveNextInvoiceId().then(function(newInvId){
@@ -12996,7 +12968,7 @@ async function saveOrd(){
           o.invoiceId=newInvId;
           if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
           auditLog("ORDER_UPDATED","Order #"+o.id+" edited by "+CU.name+" ("+CU.role+")");
-          cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+o.id+" updated");
+          dirty();cm("m-o");rOrds(undefined,ORD_PAGE);toast("Order #"+o.id+" updated");
         });
       }
     }else{
@@ -13034,7 +13006,7 @@ async function saveOrd(){
         linkedInv.paid=paidTarget;
         if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
         auditLog("ORDER_UPDATED","Order #"+o.id+" edited by "+CU.name+" ("+CU.role+")");
-        cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+o.id+" updated");
+        dirty();cm("m-o");rOrds(undefined,ORD_PAGE);toast("Order #"+o.id+" updated");
       }else{
         // No invoice yet — create one, same atomic-reservation path the
         // payStatus!=="Paid" branch uses, so a Paid order always has a record.
@@ -13043,7 +13015,7 @@ async function saveOrd(){
           o.invoiceId=newInvId;
           if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
           auditLog("ORDER_UPDATED","Order #"+o.id+" edited by "+CU.name+" ("+CU.role+")");
-          cm("m-o");rOrds(undefined,ORD_PAGE);dirty();toast("Order #"+o.id+" updated");
+          dirty();cm("m-o");rOrds(undefined,ORD_PAGE);toast("Order #"+o.id+" updated");
         });
       }
     }
@@ -13169,7 +13141,7 @@ async function saveOrd(){
       auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty+" (category/TBC) — customer #"+cId+" "+(function(){var _c=(D.customers||[]).find(function(x){return x.id===cId;});return _c?unescapeForEdit(_c.name):"unknown";})()+(_prov?" [PROVISIONAL NUMBER — the id counter was unreachable ("+((_res&&_res.reason)||"unknown")+"); this order is recorded and will be renumbered into the sequence automatically]":""),{ordSnapshot:_orderSnapshotFor(newOrdId)});
       if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
       rDel();
-      cm("m-o");rOrds(undefined,ORD_PAGE);dirty();
+      dirty();cm("m-o");rOrds(undefined,ORD_PAGE);
       toast(_prov?"Order placed and saved — waiting for a connection to give it its number":"Order #"+newOrdId+" placed — driver confirms brand & collects payment at delivery",_prov?"warn":undefined);
       if(_prov)_drainPendingNumbers(true);   // force: this is a known-good moment, not connectivity noise
       window._savingOrder=false;
@@ -13269,7 +13241,7 @@ async function saveOrd(){
     auditLog("ORDER_PLACED","#"+newOrdId+" "+pn+" x"+qty+" — customer #"+cId+" "+(function(){var _c=(D.customers||[]).find(function(x){return x.id===cId;});return _c?unescapeForEdit(_c.name):"unknown";})()+(_prov?" [PROVISIONAL NUMBER — the id counter was unreachable ("+((reserved&&reserved.reason)||"unknown")+"); this order is recorded and will be renumbered into the sequence automatically]":""),{ordSnapshot:_orderSnapshotFor(newOrdId)});
     if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
     rDel();
-    cm("m-o");rOrds(undefined,ORD_PAGE);dirty();
+    dirty();cm("m-o");rOrds(undefined,ORD_PAGE);
     toast(_prov?"Order placed and saved — waiting for a connection to give it its number":"Order #"+newOrdId+" placed",_prov?"warn":undefined);
     if(_prov)_drainPendingNumbers(true);   // force: this is a known-good moment, not connectivity noise
     window._savingOrder=false;
@@ -14131,7 +14103,7 @@ function saveSt(){
       _stampRecordEdit(s);
       auditLog("STOCK_UPDATED","Product saved by "+CU.name+" ("+CU.role+"): "+n+(s.isWater?" [water cycle product]":""));
       if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
-cm("m-s");rStock();dirty();
+dirty();cm("m-s");rStock();
       // Re-sync water cycles after isWater change (targeted, no race with dirty)
       if(s.isWater)setTimeout(syncWaterCycles,1500);
       toast(n+" updated"+(s.isWater?" — water cycle tracking enabled":""));
@@ -14139,7 +14111,7 @@ cm("m-s");rStock();dirty();
     }
   }
   (D.stock||[]).push({id:uid(),name:n,size:sanitizeInput(el("ss").value),price:_round2(parseFloat(el("sp").value)||0),cost:_round2(parseFloat(el("sc").value)||0),qty:parseInt(el("sq").value)||0,min:parseInt(el("sm").value)||10,isWater:el("sw")&&el("sw").checked?true:false});
-  ["sn","ss","sp","sc","sq","sm"].forEach(function(id){el(id).value="";});cm("m-s");rStock();dirty();toast(n+" added");
+  ["sn","ss","sp","sc","sq","sm"].forEach(function(id){el(id).value="";});dirty();cm("m-s");rStock();toast(n+" added");
 }
 function editSt(id){
   if(!can("eSt"))return;
@@ -14829,7 +14801,7 @@ function delS(id){
   // UI/UX (2026-07-28): native confirm() -> in-app dialog; body unchanged.
   uiConfirm({title:"Remove product",message:msg,variant:"danger",confirmText:"Remove product"}).then(function(_ok){
     if(!_ok)return;
-    D.stock=(D.stock||[]).filter(function(x){return x.id!==id;});rStock();dirty();toast(unescapeForEdit(s.name)+" removed from stock");
+    D.stock=(D.stock||[]).filter(function(x){return x.id!==id;});dirty();rStock();toast(unescapeForEdit(s.name)+" removed from stock");
   });
 }
 
@@ -15007,13 +14979,13 @@ function saveInv(){
       // payment reference could hijack — see _orderForInvoice for the full mechanism.
       var _o5=_orderForInvoice(i);
       if(_o5){if(i.paid>=i.amount){_o5.paid="Paid";}else if(i.paid>0){_o5.paid="Partial";}else{_o5.paid="Unpaid";}_o5.amtPaid=i.paid;}
-      cm("m-iv");rInvs(undefined,INV_PAGE);dirty();toast("Invoice #"+editId+" updated");
+      dirty();cm("m-iv");rInvs(undefined,INV_PAGE);toast("Invoice #"+editId+" updated");
       return;
     }
   }
   reserveNextInvoiceId().then(function(newInvId){
     (D.invoices||[]).push({id:newInvId,cId:cId,amount:a,paid:p,due:el("ivd").value,notes:sanitizeInput(el("ivn").value),date:tday(),payments:p>0?[{date:tday(),amt:p,method:"Cash",ref:"Opening"}]:[]});
-    el("iva").value="";el("ivp").value="0";el("ivn").value="";cm("m-iv");rInvs(undefined,INV_PAGE);dirty();toast("Invoice created");
+    el("iva").value="";el("ivp").value="0";el("ivn").value="";dirty();cm("m-iv");rInvs(undefined,INV_PAGE);toast("Invoice created");
   });
 }
 /* Step 2 of the acknowledgement rule — see the block comment inside ackPendingPay().
@@ -16094,13 +16066,13 @@ function saveCmp(){
       var cs2=el("cmp-c-search");if(cs2){cs2.disabled=false;cs2.value="";}
       if(el("cmp-c"))el("cmp-c").value="";
       if(editIdEl)editIdEl.value="";
-      cm("m-cmp");rCmps(undefined,CMP_PAGE);dirty();toast("Complaint updated");return;
+      dirty();cm("m-cmp");rCmps(undefined,CMP_PAGE);toast("Complaint updated");return;
     }
   }
   reserveNextComplaintId().then(function(newCmpId){
     (D.complaints||[]).push({id:newCmpId,cId:parseInt(el("cmp-c").value),type:el("cmp-t").value,details:det,action:sanitizeInput(el("cmp-act").value),status:el("cmp-s").value,date:el("cmp-d").value,_ts:Date.now()});el("cmp-det").value="";el("cmp-act").value="";auditLog("COMPLAINT_LOGGED","Complaint logged by "+CU.name+" ("+CU.role+"): "+el("cmp-t").value);
     if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
-    cm("m-cmp");rCmps(undefined,CMP_PAGE);dirty();toast("Complaint logged");
+    dirty();cm("m-cmp");rCmps(undefined,CMP_PAGE);toast("Complaint logged");
   });
 }
 function editCmp(id){
@@ -16122,7 +16094,7 @@ function editCmp(id){
   var ct=el("cmp-t");if(ct)ct.value=cmp.type||"Water quality";
   om("m-cmp");
 }
-function resolveCmp(id){if(!can("mCmp")){toast("Only managers can resolve complaints","err");return;}var c=(D.complaints||[]).find(function(x){return x.id===id;});if(c)c.status="Resolved";rCmps(undefined,CMP_PAGE);if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();dirty();toast("Complaint resolved");}
+function resolveCmp(id){if(!can("mCmp")){toast("Only managers can resolve complaints","err");return;}var c=(D.complaints||[]).find(function(x){return x.id===id;});if(c)c.status="Resolved";rCmps(undefined,CMP_PAGE);if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))dirty();rDash();toast("Complaint resolved");}
 function delCmp(id){if(!can("dCmp")){toast("Only managers can delete complaints","err");return;}var cmp=(D.complaints||[]).find(function(x){return x.id===id;});if(!cmp)return;var cu=(D.customers||[]).find(function(x){return x.id===cmp.cId;});var cmpText=unescapeForEdit(cmp.details||"");var msg="Delete complaint from "+(cu?(can("vPhone")?unescapeForEdit(cu.name):"this customer"):"unknown")+"?\n\n\""+cmpText.slice(0,80)+(cmpText.length>80?"…":"")+"\"\n\nThis cannot be undone.";
   // UI/UX (2026-07-28): native confirm() -> in-app dialog; body unchanged.
   uiConfirm({title:"Delete complaint",message:msg,variant:"danger",confirmText:"Delete complaint"}).then(function(_ok){
@@ -16136,7 +16108,7 @@ function delCmp(id){if(!can("dCmp")){toast("Only managers can delete complaints"
     if(!D.deletedComplaintIds)D.deletedComplaintIds={};
     D.deletedComplaintIds[id]=Date.now();
     _recentlyDeletedComplaintIds[id]=Date.now();
-    D.complaints=(D.complaints||[]).filter(function(c){return c.id!==id;});rCmps(undefined,CMP_PAGE);if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();dirty();
+    D.complaints=(D.complaints||[]).filter(function(c){return c.id!==id;});rCmps(undefined,CMP_PAGE);if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))dirty();rDash();
   });
 }
 
@@ -16241,17 +16213,17 @@ function saveOff(){
       o.title=t;o.disc=Math.max(0,Math.min(100,parseInt(el("ofd").value)||0));o.minqty=parseInt(el("ofmq").value)||1;
       o.prod=sanitizeInput(el("ofp").value);o.start=el("ofs").value;o.end=el("ofe").value;o.desc=sanitizeInput(el("ofdesc").value);
       _stampRecordEdit(o); // F1 EXTENSION (2026-07-30): see saveSt — disc feeds order pricing, so a rejected edit here mis-prices real sales on every other device
-      cm("m-of");rOffers();dirty();toast("Offer updated");
+      dirty();cm("m-of");rOffers();toast("Offer updated");
       return;
     }
   }
   (D.offers||[]).push({id:uid(),title:t,disc:Math.max(0,Math.min(100,parseInt(el("ofd").value)||0)),minqty:parseInt(el("ofmq").value)||1,prod:sanitizeInput(el("ofp").value),start:el("ofs").value,end:el("ofe").value,desc:sanitizeInput(el("ofdesc").value),active:true});
-  el("oft").value="";el("ofd").value="";el("ofmq").value="1";el("ofdesc").value="";cm("m-of");rOffers();dirty();toast("Offer created");
+  el("oft").value="";el("ofd").value="";el("ofmq").value="1";el("ofdesc").value="";dirty();cm("m-of");rOffers();toast("Offer created");
 }
 // F1 EXTENSION (2026-07-30): `active` is in _offPreserveFields, so an un-stamped toggle
 // was reverted cross-device exactly like a disc edit — a promotion switched off on the
 // iPad silently came back on, and kept discounting orders on every other device.
-function togOf(id){if(!can("aOff"))return;var o=(D.offers||[]).find(function(x){return x.id===id;});if(o){o.active=!o.active;_stampRecordEdit(o);}rOffers();dirty();}
+function togOf(id){if(!can("aOff"))return;var o=(D.offers||[]).find(function(x){return x.id===id;});if(o){o.active=!o.active;_stampRecordEdit(o);}dirty();rOffers();}
 function editOf(id){
   if(!can("eOff"))return;
   var o=(D.offers||[]).find(function(x){return x.id===id;});if(!o)return;
@@ -16280,7 +16252,7 @@ function delOf(id){if(!can("dOff"))return;var of=(D.offers||[]).find(function(x)
     if(!D.deletedOfferIds)D.deletedOfferIds={};
     D.deletedOfferIds[id]=Date.now();
     _recentlyDeletedOfferIds[id]=Date.now();
-    D.offers=(D.offers||[]).filter(function(o){return o.id!==id;});auditLog("DATA_EXPORTED","Offer deleted by "+CU.name+" ("+CU.role+"): "+of.prod+" "+of.disc+"%");rOffers();dirty();toast("Offer removed");
+    D.offers=(D.offers||[]).filter(function(o){return o.id!==id;});auditLog("DATA_EXPORTED","Offer deleted by "+CU.name+" ("+CU.role+"): "+of.prod+" "+of.disc+"%");dirty();rOffers();toast("Offer removed");
   });
 }
 
@@ -17431,7 +17403,7 @@ function delU(id){if(!can("mUsers"))return;var toDel=(USERS||[]).find(function(u
     if(!D.deletedUserIds)D.deletedUserIds={};
     D.deletedUserIds[id]=Date.now();
     _recentlyDeletedUserIds[id]=Date.now();
-    USERS=(USERS||[]).filter(function(u){return u.id!==id;});rUsers();dirty();
+    USERS=(USERS||[]).filter(function(u){return u.id!==id;});dirty();rUsers();
   });
 }
 
@@ -17937,9 +17909,24 @@ function autoSaveLocal(){
     var json=JSON.stringify(snapshot);
     // Save to user-keyed slot (prevents staff save overwriting director data)
     localStorage.setItem(lsKey(),json);
-    // Also save to shared slot for cross-user recovery (autoSaveCheckLocal falls back
-    // to this, and the doc-missing recovery path reads it — do not remove it).
-    localStorage.setItem("newdawn_autosave_shared",json);
+    /* STORAGE FIX (2026-08-09, ND47-1) — THIS WROTE THE ENTIRE DATASET TWICE.
+       The shared slot used to hold a byte-for-byte SECOND COPY of `json`. At the director's
+       live volumes (507 orders + 508 invoices + 442 customers + audit) that snapshot is on
+       the order of 650 KB, so every autosave pushed ~1.3 MB into localStorage — half of it
+       redundant — and did it SYNCHRONOUSLY on the main thread, twice, on every dirty().
+       On iOS that store is SQLite-backed and the write blocks; on a device whose tab is
+       already being killed for memory, doubling the largest write in the app is indefensible.
+       WHY A POINTER IS SAFE. The shared slot has exactly ONE reader, autoSaveCheckLocal
+       (~line 18167), and its only job is cross-user recovery: user B on this handset finding
+       user A's snapshot. A pointer satisfies that completely — B follows it to A's key, which
+       is still present. The two keys always held identical bytes, so nothing is lost that was
+       ever distinguishable. The one case a pointer cannot serve — A's key deleted while the
+       shared key survives — cannot arise from any path in this app: clearing storage removes
+       both, and nothing deletes lsKey() selectively.
+       Kept deliberately tiny and versioned so a future reader can tell a pointer from a
+       legacy full copy without guessing. Halves this app's localStorage footprint. */
+    localStorage.setItem("newdawn_autosave_shared",
+      JSON.stringify({__ndPtr:1,key:lsKey(),ts:snapshot.ts}));
     return true;
   }catch(e){
     if(!_autoSaveFailReported){
@@ -18193,6 +18180,20 @@ function autoSaveCheckLocal(){
   try{
     // Prefer user-keyed slot (most relevant to this user)
     var raw=localStorage.getItem(lsKey())||localStorage.getItem("newdawn_autosave_shared");
+    /* POINTER FOLLOW (2026-08-09, ND47-1). autoSaveLocal no longer stores a second full copy
+       of the snapshot in the shared slot — it stores {__ndPtr:1,key:<lsKey>} instead, which
+       halves this app's localStorage footprint (see the note there). Follow it here.
+       Backwards compatible on purpose: a device upgrading from b26 still has a LEGACY full
+       copy sitting in that slot, and it must keep working until the next autosave replaces
+       it. A full copy has no __ndPtr, so it falls straight through untouched. If the pointer
+       is ever dangling, fall through to the sessionStorage path below rather than returning
+       a half-parsed object — a recovery path must never hand back something shaped wrong. */
+    try{
+      if(raw&&raw.indexOf("__ndPtr")!==-1){
+        var _p=JSON.parse(raw);
+        raw=(_p&&_p.__ndPtr&&_p.key)?localStorage.getItem(_p.key):null;
+      }
+    }catch(_){raw=null;}
     if(!raw){
       // Try sessionStorage as fallback
       try{raw=sessionStorage.getItem("newdawn_session_backup");}catch(e2){}
