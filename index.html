@@ -379,7 +379,7 @@ var APP_VERSION="47";
    (~line 2764, `stamp:BUILD_STAMP`) but NEVER read back or compared — grep for `.stamp`
    comparisons returns nothing — so renaming the build costs ZERO extra Firestore reads
    and cannot force a full re-load on any device. */
-var BUILD_STAMP="ND47-4";
+var BUILD_STAMP="ND47-5";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -1655,6 +1655,31 @@ function _eventsWatermarkFloor(){
   return new Date(Math.max(0,t-EVENTS_WATERMARK_MARGIN_MS)).toISOString();
 }
 var _auditLogHydrated=false;   // set by _hydrateFromLocalSnapshot when D.auditLog was restored
+/* PARSE-TIME SEED (2026-08-09, ND47-5) — the correct fix for the events delta, replacing the
+   ND47-3 attempt that moved hydration earlier and destroyed the zero-read boot.
+
+   THE PROBLEM. startAuditListener must decide "do I have a local auditLog to union against?"
+   but it runs BEFORE _hydrateFromLocalSnapshot, so _auditLogHydrated is false and D.auditLog
+   is empty at decision time. Delta could therefore never be selected. Moving hydration
+   forward fixed the ordering and broke hydration itself, because lsKey() does not resolve to
+   the signed-in user before login (proven in production, 14:51 console).
+
+   THE FIX. Do not move any work. Record a TINY, separate fact at save time — just the entry
+   COUNT — and read it back at parse time, exactly the pattern _publishedCounts and
+   _auditWatermark already use. ~4 bytes, one localStorage key. It answers the only question
+   the gate actually needs: "will this device have an audit history once hydration runs?"
+
+   WHY IT IS SOUND. The union's second half is consumed by _selfHealFromEventSnapshots, which
+   runs on EVENT DELIVERY — always after hydration has completed. So the gate needs to predict
+   availability, not require it to be present yet. The count does exactly that, and costs
+   nothing: no snapshot parse, no extra read, no reordering of anything.
+
+   DELIBERATELY NOT parsing the stored snapshot here to count entries — that would deserialise
+   ~650 KB at parse time on the device that is already short of memory, which is the opposite
+   of what this build is trying to achieve. */
+var _localAuditLogN=(function(){
+  try{var v=Number(localStorage.getItem("nd_auditlog_n"));return (isFinite(v)&&v>0)?v:0;}catch(_){return 0;}
+})();
 var _publishedCounts=(function(){
   try{
     var r=localStorage.getItem("nd_published_counts");
@@ -5783,7 +5808,14 @@ function startAuditListener(){
      shares with everything else. My proofs asserted the ordering was correct and never asked
      what moving hydration before login would do to hydration itself. */
   var _eventsFrom=_eventsWatermarkFloor();
-  var _useDelta=(!!_eventsFrom&&_auditLogHydrated&&(D.auditLog||[]).length>0);
+  /* The audit-history half of the union is satisfied by EITHER the live array (when this runs
+     after hydration, e.g. a re-subscribe from the Data tab) OR the parse-time count recorded
+     by the last autosave (the cold-boot case, where hydration has not run yet). Both are
+     statements about the same thing; the second is simply the one available this early.
+     Before ND47-5 only the live array was consulted, so on a cold boot the answer was always
+     "no history" and the delta was unreachable — see the seed's declaration. */
+  var _haveAuditHistory=(_auditLogHydrated&&(D.auditLog||[]).length>0)||_localAuditLogN>0;
+  var _useDelta=(!!_eventsFrom&&_haveAuditHistory);
   var _q=FB_EVENTS_COL.orderBy("ts","desc")
     .limit(50); // owner-chosen: small business, live view used for spot-checking recent errors, not archiving — deep history stays fully available via Archives
   if(_useDelta){
@@ -17942,6 +17974,11 @@ function autoSaveLocal(){
     var json=JSON.stringify(snapshot);
     // Save to user-keyed slot (prevents staff save overwriting director data)
     localStorage.setItem(lsKey(),json);
+    /* Companion to _localAuditLogN (see its declaration). Written here, beside the snapshot
+       it describes, so the two can never disagree: if the snapshot was stored, the count of
+       what is in it was stored in the same breath. ~4 bytes. Read at parse time by
+       startAuditListener, which runs long before hydration and cannot ask D. */
+    try{localStorage.setItem("nd_auditlog_n",String(((D&&D.auditLog)||[]).length));}catch(_){}
     /* STORAGE FIX (2026-08-09, ND47-1) — THIS WROTE THE ENTIRE DATASET TWICE.
        The shared slot used to hold a byte-for-byte SECOND COPY of `json`. At the director's
        live volumes (507 orders + 508 invoices + 442 customers + audit) that snapshot is on
