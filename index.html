@@ -379,7 +379,7 @@ var APP_VERSION="47";
    (~line 2764, `stamp:BUILD_STAMP`) but NEVER read back or compared — grep for `.stamp`
    comparisons returns nothing — so renaming the build costs ZERO extra Firestore reads
    and cannot force a full re-load on any device. */
-var BUILD_STAMP="ND47-3";
+var BUILD_STAMP="ND47-4";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -5765,7 +5765,23 @@ function startAuditListener(){
      Hydration is idempotent (guarded by _hydratedFromLocal at the top of the function) and
      is already called from _hybridStartListeners, so pulling it forward here runs it once,
      costs nothing, and simply guarantees the union's second half exists before we ask. */
-  try{_hydrateFromLocalSnapshot();}catch(_){}
+  /* REVERTED (2026-08-09, ND47-4) — the fix above CAUSED A WORSE REGRESSION IN PRODUCTION.
+     ND47-3 called _hydrateFromLocalSnapshot() here to make the events-delta condition see a
+     hydrated auditLog. It does run earlier — but startAuditListener runs BEFORE login, so
+     lsKey() does not yet resolve to the signed-in user's slot. The call consumed the one-shot
+     path, and the director's 14:51 console shows the consequence plainly:
+         (no "restored from this device's local snapshot at ZERO reads" line at all)
+         [NDDELTA] REFUSED — orders is EMPTY in memory ... Taking the FULL load.
+     That is ~1,294 documents read on every cold boot — trading a ~2,300-read/day saving for a
+     far larger loss, and breaking the zero-read boot that has been working since b22.
+     The events delta stays in FULL MODE until this is solved properly, which costs 50 reads a
+     boot and is strictly better than what ND47-3 did. The correct fix is to seed the
+     auditLog-availability flag at PARSE TIME from localStorage — exactly how _publishedCounts
+     and _auditWatermark are already seeded — rather than moving hydration earlier. That needs
+     its own build and its own proof; it is not going into a hotfix.
+     RULE THIS COST ME: a change that makes one path cheaper must be measured on the path it
+     shares with everything else. My proofs asserted the ordering was correct and never asked
+     what moving hydration before login would do to hydration itself. */
   var _eventsFrom=_eventsWatermarkFloor();
   var _useDelta=(!!_eventsFrom&&_auditLogHydrated&&(D.auditLog||[]).length>0);
   var _q=FB_EVENTS_COL.orderBy("ts","desc")
