@@ -379,7 +379,7 @@ var APP_VERSION="47";
    (~line 2764, `stamp:BUILD_STAMP`) but NEVER read back or compared — grep for `.stamp`
    comparisons returns nothing — so renaming the build costs ZERO extra Firestore reads
    and cannot force a full re-load on any device. */
-var BUILD_STAMP="ND47-2";
+var BUILD_STAMP="ND47-3";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -5749,6 +5749,23 @@ function startAuditListener(){
   /* `_auditWatermark>0` was a NUMERIC test on a value that is now (and in the data always
      was) an ISO string. A non-empty ISO string is the correct truthiness test; the shape
      was already validated when it was read from localStorage. */
+  /* ORDERING FIX (2026-08-09, ND47-2) — THE EVENTS DELTA WAS STILL DEAD AFTER THE TYPE FIX.
+     Confirmed from the director's 2026-08-09 14:41 console, four boots after the type fix
+     shipped. The log prints, in this order:
+         5764  [NDEVENTS] full mode — no usable watermark yet
+         3091  restored from this device's local snapshot ... auditLog=178
+     startAuditListener runs BEFORE _hydrateFromLocalSnapshot. So at the moment _useDelta was
+     evaluated, _auditLogHydrated was still false and D.auditLog was still empty — the delta
+     could never be chosen, no matter how correct the watermark was. The watermark itself was
+     fine; the CONDITION was being asked too early.
+     This is the same shape as the b22 counts race (_hybridStartListeners running before
+     _publishedCounts was assigned) — a consumer evaluated before its producer, which is why
+     it survived a green proof suite twice: every assertion tested the logic, none tested the
+     ORDER the browser actually runs it in.
+     Hydration is idempotent (guarded by _hydratedFromLocal at the top of the function) and
+     is already called from _hybridStartListeners, so pulling it forward here runs it once,
+     costs nothing, and simply guarantees the union's second half exists before we ask. */
+  try{_hydrateFromLocalSnapshot();}catch(_){}
   var _eventsFrom=_eventsWatermarkFloor();
   var _useDelta=(!!_eventsFrom&&_auditLogHydrated&&(D.auditLog||[]).length>0);
   var _q=FB_EVENTS_COL.orderBy("ts","desc")
