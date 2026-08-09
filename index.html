@@ -336,7 +336,21 @@ var FB_HEARTBEAT_TIMER=null;
 var FB_BACKUP_TIMER=null;
 var FB_LAST_HOURLY=0;
 var FB_LAST_DAILY=0;
-var APP_VERSION="2026-07-21-v35";
+/* APP_VERSION (renamed 2026-08-09, ND47-1) — was "2026-07-21-v35" since 2026-07-21.
+   Changed on the director's EXPLICIT instruction, which is the only thing that lifts the
+   standing "never bump APP_VERSION" rule. Two deliberate changes:
+     1. The date prefix is gone. It was the ORIGIN date of v35, not the date of the build
+        the user was looking at, so on the login page it read as a staleness signal that
+        was never true — the app looked 3 weeks old on the day it shipped.
+     2. It is now the bare number, so the login page's `"v"+APP_VERSION` renders exactly
+        "v47" and nothing else, which is what was asked for.
+   STILL display-only. Verified at the time of this change: five references in the whole
+   file — this declaration, the login render (~7328), the in-app render (~8960) and the
+   SYNC_HEALTH audit line (~5178). Nothing branches on it, no merge, money, migration,
+   cache or localStorage key reads it, so this cannot change behaviour.
+   The "do not bump" rule still stands for every future session — it is re-pinned to "47"
+   across all 16 _proofB_*.js files so an ACCIDENTAL bump still fails the suite loudly. */
+var APP_VERSION="47";
 /* BUILD STAMP (2026-07-30) — deliberately SEPARATE from APP_VERSION, which is frozen by
    standing instruction and must not be bumped. It exists to solve a concrete operational
    problem: this app already renders APP_VERSION with the tooltip "check this after every
@@ -347,8 +361,25 @@ var APP_VERSION="2026-07-21-v35";
    edits and strips their revision stamps, and there was no way to tell which build a phone
    was actually running.
    Bump this ONE line on every deploy. It is display-and-diagnostics only — nothing branches
-   on it, no merge or money logic reads it, so it can never change behaviour. */
-var BUILD_STAMP="2026-08-07-hyb-b26";
+   on it, no merge or money logic reads it, so it can never change behaviour.
+
+   NAMING SCHEME (2026-08-09, director's choice) — "ND47-1", "ND47-2", "ND47-3", ...
+   The old "<date>-hyb-b<n>" form retired with the hybrid cutover it was named after; "hyb"
+   no longer describes anything, and the leading date duplicated information the counter
+   already carries. The new form is ND + the APP_VERSION shown on the login page + a build
+   counter within that version. Two properties are the whole point and must be preserved:
+     - it CANNOT repeat across differing content. A same-day rebuild takes the next counter,
+       so two files can never carry the same stamp. Four files in this folder have been
+       called index.html at different times and that ambiguity already caused one wrong-build
+       upload — this stamp is the only reliable way to tell which bytes are actually live.
+     - it is TIED to the login page. The screens read "v47" and "v47 · ND47-1", so a support
+       conversation over the phone cannot mix up the version and the build.
+   When APP_VERSION next changes, the counter restarts at -1 (e.g. v48 -> ND48-1).
+   VERIFIED at the time of this change: the stamp is written into the delta baseline
+   (~line 2764, `stamp:BUILD_STAMP`) but NEVER read back or compared — grep for `.stamp`
+   comparisons returns nothing — so renaming the build costs ZERO extra Firestore reads
+   and cannot force a full re-load on any device. */
+var BUILD_STAMP="ND47-1";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -360,6 +391,77 @@ var BUILD_STAMP="2026-08-07-hyb-b26";
    for non-fatal errors (the banner is dismissible); it simply guarantees the
    user is never stranded on a blank screen with no way forward. */
 window._ndErrCount=0;
+/* ── WHITE-SCREEN INSTRUMENT (2026-08-09, ND47-1) ──────────────────────────────
+   HANDOVER_2026-08-08 §4.3 proposed this and it was never built. It is an INSTRUMENT,
+   NOT A FIX — the root cause of the iPad white screen is still not established, and
+   §4.1 records two confident wrong diagnoses already made about it. Do not let this
+   file's existence be mistaken for the bug being solved.
+
+   WHY IT HAS TO EXIST: the director cannot open a console on that device, so any
+   diagnostic that only writes to console.log is worthless for this bug. This reports
+   ON SCREEN, in plain English, at the next login.
+
+   HOW IT WORKS: one small localStorage key records what the app was doing; a second
+   records whether the session ended cleanly. The clean flag is cleared once per session
+   at first activity and set on a proper logout. If the app dies mid-use — white screen,
+   crash, tab killed by iOS for memory — the flag is never set, and the next login can
+   say exactly what was happening.
+
+   DELIBERATELY CHEAP. The suspected cause is a memory/storage ceiling, so an instrument
+   that writes a lot would make the thing it is measuring worse. Both keys are tiny and
+   OVERWRITTEN, never appended, so this costs a fixed ~80 bytes forever — against
+   autoSaveLocal, which stringifies the entire dataset twice (HANDOVER_2026-08-08 §4.2).
+   Fully try/caught: a storage failure must never take the app down, least of all on the
+   device that is already short of storage. */
+var ND_CRUMB_KEY="nd_last_action", ND_CRUMB_CLEAN="nd_clean_exit";
+function _ndCrumb(what){
+  try{
+    localStorage.setItem(ND_CRUMB_KEY,JSON.stringify({w:String(what||"").slice(0,60),at:Date.now()}));
+    /* RE-ARM on every action. Without this the flag would be a one-shot: a normal tab close
+       fires pagehide and sets "clean", and any crash AFTER that point would go unrecorded.
+       Re-arming on each action means the flag always reflects the CURRENT activity, so the
+       only way it stays "0" is a session that stopped without pagehide ever firing — which
+       is exactly the hard-kill signature we are hunting (white screen / iOS memory kill). */
+    localStorage.setItem(ND_CRUMB_CLEAN,"0");
+  }catch(_){}
+}
+function _ndCrumbSessionStart(){try{localStorage.setItem(ND_CRUMB_CLEAN,"0");}catch(_){}}
+function _ndCrumbCleanExit(){try{localStorage.setItem(ND_CRUMB_CLEAN,"1");}catch(_){}}
+/* Returns {w,at} if the PREVIOUS session ended without a clean logout, else null. */
+function _ndCrumbLastCrash(){
+  try{
+    if(localStorage.getItem(ND_CRUMB_CLEAN)!=="0")return null;   // clean, or never started
+    var raw=localStorage.getItem(ND_CRUMB_KEY);if(!raw)return null;
+    var c=JSON.parse(raw);
+    if(!c||!c.w||!c.at)return null;
+    return c;
+  }catch(_){return null;}
+}
+/* Plain-English on-screen report. Reuses the proven banner shape from
+   _ndShowErrorBanner rather than inventing a second overlay mechanism. */
+function _ndCrumbReportIfCrashed(){
+  try{
+    var c=_ndCrumbLastCrash();
+    if(!c)return false;
+    _ndCrumbSessionStart();   // consume it — report once, not on every login
+    if(!document.body)return false;
+    var when=new Date(c.at);
+    var hh=String(when.getHours()).padStart(2,"0")+":"+String(when.getMinutes()).padStart(2,"0");
+    var b=document.createElement("div");
+    b.id="nd-crumb-banner";
+    b.style.cssText="position:fixed;top:0;left:0;right:0;z-index:2147483646;background:#8e44ad;color:#fff;"+
+      "padding:10px 14px;font-family:system-ui,sans-serif;font-size:13px;display:flex;gap:12px;"+
+      "align-items:center;flex-wrap:wrap;box-shadow:0 2px 8px rgba(0,0,0,.25)";
+    b.innerHTML="<span style=\"font-weight:700\">ℹ️ This device stopped unexpectedly last time.</span>"+
+      "<span style=\"opacity:.95\">It was <strong>"+String(c.w).replace(/[<>&]/g,"")+"</strong> at "+hh+
+      ". Nothing was lost — your data is saved. Please tell Kelvin what you were doing.</span>"+
+      "<button onclick=\"var e=document.getElementById('nd-crumb-banner');if(e)e.remove();\" "+
+      "style=\"background:#fff;color:#8e44ad;border:none;border-radius:6px;padding:7px 16px;font-weight:700;cursor:pointer\">Got it</button>";
+    document.body.appendChild(b);
+    console.log("[NDCRUMB] previous session ended uncleanly while: "+c.w+" at "+when.toISOString());
+    return true;
+  }catch(_){return false;}
+}
 function _ndShowErrorBanner(detail){
   try{
     window._ndErrCount++;
@@ -661,9 +763,67 @@ function vName(){return can("vPhone");}
 // mathematically perfect guarantee against every conceivable case - but it
 // is a substantial, tested improvement, not just a different-looking
 // formula.
+/* LONGEVITY FIX (2026-08-09, ND47-1) — uid() WAS 175 DAYS FROM SILENTLY BREAKING MONEY IDS.
+   Measured, not estimated (_uid_longevity.js, executed):
+     Number.MAX_SAFE_INTEGER = 9007199254740991
+     Date.now()*5000 on 2026-08-09 = 8931311511380000   -> only 0.84% headroom left
+     last exactly-representable mint = 2027-01-31T23:57:30Z
+   Past that instant, doubles above 2^53 are spaced 2 apart, so the low digits —
+   _uidSalt*10+_uidCounter, i.e. THE ENTIRE cross-device collision defence — are
+   rounded away. Executed one month past the crossover: the 5000 distinct entropy
+   slots collapse to 2501. A 50% loss, silent, on ids that key PAYMENTS (pid),
+   CREDIT LOG entries (cid) and pendingPayments. Two staff devices could mint the
+   same payment id, and the reversal/ack paths look payments up by exact pid match
+   (recPay/reversePayment/ackPendingPay) — so the WRONG payment gets reversed.
+   Today the loss is exactly 0, so this is a genuine FUTURE defect, not a present
+   one; that distinction is asserted in _proofB_uid_longevity.js section 1.
+
+   THE FIX: subtract a fixed epoch before scaling. Same shape, same multiplier, and
+   crucially the SAME 5000 entropy slots — the comment above records that the salt/
+   counter split was settled by real collision simulation, and CLAUDE.md forbids
+   weakening a proven protection, so the entropy is deliberately NOT traded away for
+   headroom. Ceiling moves from 2027-01-31 to 2075-11-27: a 49-year extension.
+
+   HONEST LIMIT, stated rather than glossed: this is not infinite. Epoch-relative ids
+   climb toward the 8.77e15 band occupied by ids minted in the ~3-week window of
+   2026-07-21..2026-08-09, reaching it in 2075. That is 49 years away and structurally
+   harmless (a 2075 payment id would have to land in the same invoice's payments array
+   as a 2026 one), but it is a boundary, not an absence of one. Asserted in section 5.
+
+   IDS ALREADY MINTED ARE NOT TOUCHED. Every lookup in this file is an exact-match
+   (p.pid===pid, x.cid===cid, x.id===id) — never a range or a magnitude test — so old
+   and new ids coexist safely. Verified: zero sorts anywhere on pid or cid.
+   The ONE ordering dependency that did exist is the customer "recent" sort; it is
+   fixed in the same change via _uidTimeOf (see ~line 10357). */
+var UID_EPOCH=1577836800000; // 2020-01-01T00:00:00Z — fixed forever; changing it re-ranges every future id
 var _uidSalt=Math.floor(Math.random()*500);
 var _uidCounter=0;
-function uid(){_uidCounter=(_uidCounter+1)%10;return Date.now()*5000+_uidSalt*10+_uidCounter;}
+function uid(){_uidCounter=(_uidCounter+1)%10;return (Date.now()-UID_EPOCH)*5000+_uidSalt*10+_uidCounter;}
+/* Decode the mint time (ms) from a uid()-minted id of ANY of the three eras this app
+   has now had. Needed because the epoch shift makes new ids numerically LOWER than
+   era-2 ids, so "sort by id descending" is no longer "most recent first".
+     era 1  id <  1e15    second-precision, floor(Date.now()/1000)*100000+salt
+                          INFERRED, not recovered from source control: this shape is the one
+                          that reproduces live customer id #178351101951567 exactly, and it
+                          decodes to 2026-07-08T11:43:39Z — a plausible creation date that
+                          sits before the 2026-07-21 millisecond-precision rewrite, which is
+                          the corroboration. The ONLY property the sort depends on is that
+                          era-1 ids decode OLDER than era-2 ids, and that holds for any
+                          divisor of this magnitude, so an imprecise legacy divisor cannot
+                          misorder the list. Asserted in _proofB_uid_longevity.js 4.2/4.4.
+     era 2  id >= 8.7e15  Date.now()*5000+salt*10+counter   (2026-07-21 .. 2026-08-09)
+     era 3  otherwise     (Date.now()-UID_EPOCH)*5000+...   (2026-08-09 onward)
+   The 8.7e15 threshold is stable until era-3 ids reach it in 2075 — the same boundary
+   documented above, deliberately the same number so the two cannot drift apart. */
+var UID_ERA2_MIN=8.7e15;
+var UID_ERA3_MIN=1e15;
+function _uidTimeOf(id){
+  var n=Number(id);
+  if(!isFinite(n)||n<=0)return 0;
+  if(n>=UID_ERA2_MIN)return Math.floor(n/5000);
+  if(n>=UID_ERA3_MIN)return Math.floor(n/5000)+UID_EPOCH;
+  return Math.floor(n/100000)*1000;
+}
 // FIX (2026-07-21): no monetary value was ever rounded anywhere in the app -
 // every paid/amount figure ran on raw float sums. Mostly whole-shilling
 // usage has masked this so far, but the union-merge fixes built today
@@ -1514,9 +1674,57 @@ var _bulkOpInFlight=false;
    Persisted so a page reload can ask for "events since" instead of re-reading the top
    50 every time. Seeded at parse time, before any listener can run, for the same reason
    _publishedCounts is: startAuditListener runs long before any snapshot handler. */
+/* TYPE FIX (2026-08-09, ND47-1) — THE EVENTS DELTA WAS INERT IN PRODUCTION.
+   auditLog() writes `ts:new Date().toISOString()` — a STRING. The watermark advance
+   below did `Number(e.ts)||0`, and Number("2026-08-09T07:33:14.954Z") is NaN, so every
+   event scored 0, `_mx > _auditWatermark` was 0>0, and the watermark was NEVER persisted.
+   _auditWatermark therefore read back 0 on every boot, _useDelta was permanently false,
+   and EVERY boot paid the full 50-document read. Confirmed against the director's
+   2026-08-09 console log: not one "[NDEVENTS] delta mode" line appears, and that line
+   prints whenever delta engages. The whole b22.t5 saving — ~45% of the daily read budget
+   — has been built, documented, asserted and delivering nothing.
+   This is the exact "audit ts is an ISO string in some paths and a number in others" trap
+   already recorded in HANDOVER_2026-08-06 §7; it was written down as a diagnostic gotcha
+   but never checked against this code.
+
+   THE SECOND, WORSE HALF: had the watermark ever been set, `where("ts",">",<number>)`
+   against a string-typed field returns NOTHING in Firestore (numbers sort before strings
+   in its type ordering). The events feed _selfHealFromEventSnapshots(), the missing-order
+   recovery net, so a "working" watermark would have silently blinded it. The bug was only
+   harmless because it was total.
+
+   FIX: keep the watermark as the ISO STRING it always was in the data. ISO-8601 UTC from
+   toISOString() is fixed-width (24 chars, always 'Z'), so lexicographic order IS
+   chronological order and Firestore's string ordering does the right thing with no
+   migration. Legacy numeric values in localStorage are rejected by the shape test. */
 var _auditWatermark=(function(){
-  try{var v=Number(localStorage.getItem("nd_audit_watermark"));return (isFinite(v)&&v>0)?v:0;}catch(_){return 0;}
+  try{var v=localStorage.getItem("nd_audit_watermark");
+      return (typeof v==="string"&&/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(v))?v:"";}
+  catch(_){return "";}
 })();
+/* Safety overlap, same reasoning as DELTA_WATERMARK_MARGIN_MS for the collections (b23).
+   `ts` is a CLIENT clock value written by whichever staff phone created the event, while
+   the watermark is the newest ts THIS device was delivered. Two phones' clocks differ, so
+   an event written by a device running a few minutes behind can carry a ts BELOW our
+   watermark and be excluded by `>` forever — the identical permanent-exclusion race the
+   collection delta already fixed. 15 minutes rather than 5: events are tiny, ~20 orders a
+   day means an overlap of this size re-reads one or two documents, and the downside of
+   missing one is a missing order. Still hard-bounded by the 50-document cap on the query.
+   (Deliberately NOT writing that cap in its code form here: _domain_audit.js counts query
+   limiters with a raw regex as a read-cost guard, and a comment containing the literal
+   inflated the count to 15 and failed a check that was doing its job correctly.) */
+var EVENTS_WATERMARK_MARGIN_MS=15*60*1000;
+/* Early-warning threshold for the one unbounded structure in the main document — see the
+   doc-size composition logger. 200 entries is ~43 KB against a 1024 KB ceiling, i.e. it
+   fires with the document ~4% consumed by this array and decades of margin, not at a cliff.
+   Observed on 2026-08-07 and 2026-08-09: 28 entries, unchanged. */
+var PENDING_PAY_WARN_AT=200;
+function _eventsWatermarkFloor(){
+  if(!_auditWatermark)return "";
+  var t=Date.parse(_auditWatermark);
+  if(!isFinite(t))return "";
+  return new Date(Math.max(0,t-EVENTS_WATERMARK_MARGIN_MS)).toISOString();
+}
 var _auditLogHydrated=false;   // set by _hydrateFromLocalSnapshot when D.auditLog was restored
 var _publishedCounts=(function(){
   try{
@@ -5229,6 +5437,26 @@ function pruneOldBackups(prefix,keepCount){
 function runAutoBackup(){
   if(!CU||CU.role!=="director")return; // backups director-only
   if(!FB_READY||!FB_BACKUP_COL||!FB_DOC_REF)return;
+  /* OFFLINE GUARD (2026-08-09, ND47-1) — HANDOVER_2026-08-08 open item 5: the idle-logout
+     backup "fails repeatedly when offline, retries forever, never lands"
+     (writeBackup -> runAutoBackup -> logout -> _idleExpire).
+     WHY IT MATTERS MORE THAN A NOISY LOG: writeBackup does FB_BACKUP_COL.doc(id).set(payload)
+     with the FULL backup snapshot, and Firestore offline persistence does not fail that call
+     — it QUEUES it in IndexedDB. Every idle expiry on a disconnected phone therefore parks
+     another complete copy of the dataset in local storage. On the iPad already sitting near
+     its memory/storage ceiling (HANDOVER_2026-08-08 §4) that is a plausible contributor, and
+     it is pure waste everywhere else.
+     _cloudServerConfirmed is the codebase's own established "the SERVER has actually spoken"
+     flag (line ~289) — the same signal the logout final-push and the self-heal already gate
+     on, so this reuses a proven predicate rather than inventing a connectivity test.
+     NOT a behaviour change when online: the flag is set by the first server snapshot, which
+     arrives within seconds, and runAutoBackup is already re-fired on a 10s timer (~line 5484)
+     and on reconnect — so a backup deferred here is taken moments later, not skipped. */
+  if(typeof _cloudServerConfirmed!=="undefined"&&!_cloudServerConfirmed){
+    console.log("[NDBACKUP] deferred — no server-confirmed snapshot yet (offline or still connecting). "+
+      "Avoids queueing a full dataset copy into IndexedDB on every idle logout.");
+    return;
+  }
   var isEmpty=(!D.customers||(D.customers||[]).length===0)&&(!D.orders||(D.orders||[]).length===0);
   if(isEmpty)return;
   var now=new Date();
@@ -5526,13 +5754,23 @@ function startAuditListener(){
      auditLog. Missing either (first run, cleared browser, private window) takes the
      ORIGINAL unchanged top-50 query. .limit(50) is kept on the delta as well, so a
      pathological backlog can never turn one boot into an unbounded read. */
-  var _useDelta=(_auditWatermark>0&&_auditLogHydrated&&(D.auditLog||[]).length>0);
+  /* `_auditWatermark>0` was a NUMERIC test on a value that is now (and in the data always
+     was) an ISO string. A non-empty ISO string is the correct truthiness test; the shape
+     was already validated when it was read from localStorage. */
+  var _eventsFrom=_eventsWatermarkFloor();
+  var _useDelta=(!!_eventsFrom&&_auditLogHydrated&&(D.auditLog||[]).length>0);
   var _q=FB_EVENTS_COL.orderBy("ts","desc")
     .limit(50); // owner-chosen: small business, live view used for spot-checking recent errors, not archiving — deep history stays fully available via Archives
   if(_useDelta){
-    _q=FB_EVENTS_COL.where("ts",">",_auditWatermark).orderBy("ts","desc").limit(50);
-    console.log("[NDEVENTS] delta mode — events since "+new Date(_auditWatermark).toISOString()+
-      "; local history "+((D.auditLog||[]).length)+" entries. Heal window is "+Math.round(HEAL_RECENT_MS/60000)+" min, far inside this.");
+    // Query from the OVERLAPPED floor, not the bare watermark — see EVENTS_WATERMARK_MARGIN_MS.
+    _q=FB_EVENTS_COL.where("ts",">",_eventsFrom).orderBy("ts","desc").limit(50);
+    console.log("[NDEVENTS] delta mode — events since "+_eventsFrom+
+      " (watermark "+_auditWatermark+" minus a "+Math.round(EVENTS_WATERMARK_MARGIN_MS/60000)+
+      "-min clock-skew overlap); local history "+((D.auditLog||[]).length)+
+      " entries. Heal window is "+Math.round(HEAL_RECENT_MS/60000)+" min, far inside this.");
+  }else{
+    console.log("[NDEVENTS] full mode — top 50 events (no usable watermark yet). This is the "+
+      "expected first-boot path; if it repeats on EVERY boot the watermark is not persisting.");
   }
   FB_AUDIT_UNSUB=_q
     .onSnapshot(function(snap){
@@ -5542,12 +5780,23 @@ function startAuditListener(){
       /* Advance the watermark to the newest ts actually DELIVERED — never to Date.now().
          The clock would skip anything written between the query and its delivery; the
          delivered maximum cannot. Same rule as the collection baseline. */
+      /* THE DEFECT (2026-08-09, ND47-1): this was `Number(e&&e.ts)||0`. Event ts is an ISO
+         STRING, so Number() gave NaN, `||0` gave 0, nothing ever beat the watermark and it
+         was NEVER written to localStorage — leaving the delta permanently off. Compare as
+         strings, which is what the data is; fixed-width ISO-8601 UTC sorts lexicographically
+         in chronological order. Entries whose ts is not that exact shape are IGNORED for
+         watermark purposes rather than coerced, so one malformed legacy event can never
+         drag the watermark forward past events this device has not actually seen. */
       try{
         var _mx=_auditWatermark;
-        remote.forEach(function(e){var t=Number(e&&e.ts)||0;if(t>_mx)_mx=t;});
-        if(_mx>_auditWatermark){
+        var _isoRe=/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+        remote.forEach(function(e){
+          var t=(e&&typeof e.ts==="string"&&_isoRe.test(e.ts))?e.ts:"";
+          if(t&&t>_mx)_mx=t;
+        });
+        if(_mx&&_mx>_auditWatermark){
           _auditWatermark=_mx;
-          try{localStorage.setItem("nd_audit_watermark",String(_mx));}catch(_){}
+          try{localStorage.setItem("nd_audit_watermark",_mx);}catch(_){}
         }
       }catch(_){}
       _mergeAuditEvents(remote);
@@ -8201,6 +8450,30 @@ function _checkDocSize(sizeKB,payload){
         .map(function(p){return p.k+" "+Math.round(p.kb)+"KB("+p.n+")";}).join(" · ")+
         (restKB>=0.5?" · everything else "+Math.round(restKB)+"KB":"")+
         " · TOMBSTONES "+tombKB.toFixed(1)+"KB("+tombN+" entries — grows forever, never shrinks; see HANDOVER 12.4E)");
+      /* UNBOUNDED-GROWTH EARLY WARNING (2026-08-09, ND47-1).
+         D.pendingPayments is NEVER removed from — verified mechanically: zero reassignments,
+         zero splices, zero filter-reassigns anywhere in the file. Entries are pushed at
+         delivery and acked IN PLACE, so the array only ever grows. It is the only unbounded
+         structure in the 1 MB main document apart from tombstones, and tombstones are ~17
+         bytes against ~215 here.
+         NOT PRUNED IN THIS BUILD, deliberately. A plain delete is UNSAFE: the snapshot merge
+         rescues local-only entries back ("RESCUED pending payment id=..."), so a device still
+         holding a stale UNACKED copy would resurrect a deleted entry as unacked and it could
+         be acknowledged a second time — real money, applied twice. A safe prune therefore
+         needs either a tombstone consulted inside the merge, or COMPACTION (keep id+ack+ordId,
+         drop the rest), which the merge already tolerates because `lp.ack && !rp.ack` makes a
+         local ack beat a stale remote. Compaction needs a full audit of every field read from
+         an acked entry (pendRef reads p.ordId regardless of ack) and belongs in its own build.
+         Measured accrual so far is ZERO: the director's console read pendingPayments 6KB(28)
+         on both 2026-08-07 and 2026-08-09. This warning exists so that if the rate ever
+         changes it is seen years before it matters, rather than discovered at the ceiling. */
+      var _ppN=(D.pendingPayments||[]).length;
+      if(_ppN>=PENDING_PAY_WARN_AT){
+        console.log("[NDSYNC] pendingPayments is at "+_ppN+" entries (~"+Math.round(_ppN*215/1024)+
+          "KB) and is NEVER pruned. Threshold "+PENDING_PAY_WARN_AT+". This does not break "+
+          "anything yet — it is the early warning for the one unbounded structure in the main "+
+          "document. See HANDOVER_2026-08-09 for the compaction design.");
+      }
     }
     var lvl=sizeKB>=950?3:(sizeKB>=850?2:(sizeKB>=700?1:0));
     if(lvl<=_docSizeAlertLevel)return;
@@ -8870,6 +9143,21 @@ async function checkAutoSaveRecovery(){
 function buildApp(){
   // Add ARIA role to main app container
   var root=el("root");if(root)root.setAttribute("role","application");
+  /* WHITE-SCREEN INSTRUMENT (2026-08-09, ND47-1). Report a previous unclean shutdown the
+     moment the app is up, then re-arm for this session. Deliberately AFTER root exists so
+     the banner has a body to attach to, and wrapped so a reporting failure can never stop
+     the app from building — the instrument must never become the outage.
+     `pagehide` marks a NORMAL departure (tab closed, navigated away, app switched); it does
+     NOT fire on an iOS memory kill or a renderer crash, which is precisely the discrimination
+     this bug needs. _ndCrumb re-arms on every action, so the flag tracks current activity. */
+  try{
+    _ndCrumbReportIfCrashed();
+    _ndCrumbSessionStart();
+    if(!window._ndCrumbBound){
+      window._ndCrumbBound=true;
+      window.addEventListener("pagehide",function(){_ndCrumbCleanExit();});
+    }
+  }catch(_){}
   var pages=[
     {k:"dashboard",ic:"ti-layout-dashboard",lb:"Dashboard"},
     {k:"customers",ic:"ti-users",lb:"Customers"},
@@ -9274,6 +9562,10 @@ var LOGOUT_FLUSH_MAX_MS=6000; // hard cap on how long teardown waits for a rescu
            documents. Flip to false to revert entirely; nothing else needs changing. */
 var KEEP_SUBSCRIPTION_ON_LOGOUT=true;
 function logout(){
+  /* A deliberate logout is the definition of a clean exit — see _ndCrumb. Set FIRST, so
+     that even if something later in this function throws, the session is still recorded
+     as having ended on purpose and the director is not shown a false crash report. */
+  _ndCrumbCleanExit();
   stopAutoSaveLoop();
   // Stop idle timer for ALL roles immediately
   stopIdleWatcher();
@@ -9558,6 +9850,7 @@ function _finishLogoutTeardown(){
 }
 function nav(p,btn){
   if(!can(p))return;
+  _ndCrumb("opening the "+p+" tab");   // white-screen instrument — see _ndCrumb
   document.querySelectorAll(".pg").forEach(function(x){x.classList.remove("act");});
   document.querySelectorAll("#tnav button").forEach(function(x){x.classList.remove("act");});
   var pg=el("pg-"+p);if(pg)pg.classList.add("act");
@@ -10354,8 +10647,19 @@ function rCusts(q,pg,sort,type){
     }
     if(sort2==="name"){return(a.name||"").localeCompare(b.name||"");}
     if(sort2==="nodebts"){return (debtMap[a.id]||0)-(debtMap[b.id]||0);}
-    // recent = by ID desc (most recently added)
-    return b.id-a.id;
+    /* recent = most recently added.
+       LONGEVITY FIX (2026-08-09, ND47-1): this was `b.id-a.id`, which silently assumed
+       "higher customer id = newer customer". That assumption dies with the UID_EPOCH
+       re-range: a customer created after 2026-08-09 gets an id around 1.04e15, which is
+       NUMERICALLY LOWER than the ~8.93e15 ids minted between 2026-07-21 and 2026-08-09.
+       Left as `b.id-a.id`, every customer added from now on would sort BELOW that
+       three-week batch — permanently, and getting worse with each new customer, so the
+       "Recent" view would stop showing the newest customer first. Decoding the mint time
+       first orders all three id eras correctly and keeps doing so after the epoch change.
+       This is the only ordering dependency on a uid()-minted id in the file: a sweep for
+       sorts on pid/cid found zero, and the other `a.id-b.id` comparators all sort ORDERS,
+       whose ids come from the sequential counter, not uid(). */
+    return _uidTimeOf(b.id)-_uidTimeOf(a.id);
   });
   var paged=paginate(fil,CUST_PAGE);
   var sortBtn=function(v,lbl){return "<button onclick=\"rCusts(undefined,0,'"+v+"')\" style=\"padding:5px 9px;font-size:11px;border:1.5px solid "+(sort2===v?"var(--nv)":"var(--bd)")+";background:"+(sort2===v?"var(--nv)":"#fff")+";color:"+(sort2===v?"#fff":"var(--tx)")+";border-radius:6px;cursor:pointer;font-weight:"+(sort2===v?"700":"400")+"\">"+lbl+"</button>";};
@@ -16891,8 +17195,19 @@ function rExcel(){
       "</div>"+
       "<div style=\"background:#fff8e1;border:1px solid #f39c12;border-radius:8px;padding:10px 14px;flex:1;min-width:160px\">"+
         "<div style=\"font-size:11px;color:#856404;font-weight:700;margin-bottom:3px\">ENTRY SIZE</div>"+
-        "<div style=\"font-size:20px;font-weight:900;color:#f39c12\">~200B</div>"+
-        "<div style=\"font-size:10px;color:#666\">"+AUDIT_HOT_MAX+" entries ≈ 40KB of "+
+        /* CORRECTED (2026-08-09, ND47-1) — this read "~200B" and "200 entries ≈ 40KB".
+           Both were wrong by 4x. Measured from the director's live console on 2026-08-09:
+           `auditLog 16KB(20)` = ~800 bytes per entry, because ORDER_PLACED,
+           DELIVERY_COMPLETE and PAYMENT_RECORDED each carry a full `ordSnapshot` (which is
+           deliberate — it is what _selfHealFromEventSnapshots rescues a missing order from).
+           The number on screen is what the director budgets against, so a 4x understatement
+           is a real defect even though nothing is broken. Only the newest 20 entries travel
+           in the main document (DforSync.auditLog = slice(-20)), so state the figure that
+           actually consumes the 1 MB ceiling rather than AUDIT_HOT_MAX, which is the
+           in-memory/Archives cap and never hits the document. */
+        "<div style=\"font-size:20px;font-weight:900;color:#f39c12\">~800B</div>"+
+        "<div style=\"font-size:10px;color:#666\">20 in the live doc ≈ 16KB · "+AUDIT_HOT_MAX+
+          " kept in Archives · "+
           "<span style=\"color:#27ae60;font-weight:700\">FREE</span> quota</div>"+
       "</div>"+
     "</div>"+
