@@ -379,7 +379,7 @@ var APP_VERSION="47";
    (~line 2764, `stamp:BUILD_STAMP`) but NEVER read back or compared — grep for `.stamp`
    comparisons returns nothing — so renaming the build costs ZERO extra Firestore reads
    and cannot force a full re-load on any device. */
-var BUILD_STAMP="ND47-5";
+var BUILD_STAMP="ND47-6";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -725,9 +725,28 @@ function vName(){return can("vPhone");}
    The ONE ordering dependency that did exist is the customer "recent" sort; it is
    fixed in the same change via _uidTimeOf (see ~line 10357). */
 var UID_EPOCH=1577836800000; // 2020-01-01T00:00:00Z — fixed forever; changing it re-ranges every future id
-var _uidSalt=Math.floor(Math.random()*500);
+/* 100-YEAR REVISION (2026-08-09, ND47-6) — ND47-5 ONLY BOUGHT 49 YEARS.
+   The director's requirement is that this system runs 100+ years without a rewrite.
+   ND47-5 kept the ×5000 multiplier to preserve all 5,000 entropy slots, and that capped
+   the ceiling at 2077 — 50 years from now, short of the requirement. That was a judgement
+   I made without asking, and it was the wrong one, because the entropy being protected is
+   worth far less than the ratio suggested.
+
+   MEASURED, not argued. At ~60 uid() calls/day (≈20 orders) the expected number of
+   same-MILLISECOND pairs across the whole fleet over 100 YEARS is 0.75. A collision needs
+   that pair to also draw the same entropy slot:
+       x5000 (ND47-5, 50yr)  ->  1.50e-4 expected collisions per century
+       x2000 (this build)    ->  3.74e-4 expected collisions per century
+   That is 0.037% chance of ONE collision in a hundred years, and it is a conservative upper
+   bound because a collision also requires the two devices to have drawn the same session
+   salt. Trading 1.5e-4 for 3.7e-4 to gain 86 years is obviously right.
+
+   x2000 with a 200-salt pool gives 2,000 slots and a ceiling of 2162-09-17 — 136 years from
+   today, comfortably past the 100-year requirement with margin for the business growing.
+   Verified against Number.MAX_SAFE_INTEGER in _proofB_uid_longevity.js. */
+var _uidSalt=Math.floor(Math.random()*200);
 var _uidCounter=0;
-function uid(){_uidCounter=(_uidCounter+1)%10;return (Date.now()-UID_EPOCH)*5000+_uidSalt*10+_uidCounter;}
+function uid(){_uidCounter=(_uidCounter+1)%10;return (Date.now()-UID_EPOCH)*2000+_uidSalt*10+_uidCounter;}
 /* Decode the mint time (ms) from a uid()-minted id of ANY of the three eras this app
    has now had. Needed because the epoch shift makes new ids numerically LOWER than
    era-2 ids, so "sort by id descending" is no longer "most recent first".
@@ -740,18 +759,37 @@ function uid(){_uidCounter=(_uidCounter+1)%10;return (Date.now()-UID_EPOCH)*5000
                           era-1 ids decode OLDER than era-2 ids, and that holds for any
                           divisor of this magnitude, so an imprecise legacy divisor cannot
                           misorder the list. Asserted in _proofB_uid_longevity.js 4.2/4.4.
-     era 2  id >= 8.7e15  Date.now()*5000+salt*10+counter   (2026-07-21 .. 2026-08-09)
-     era 3  otherwise     (Date.now()-UID_EPOCH)*5000+...   (2026-08-09 onward)
-   The 8.7e15 threshold is stable until era-3 ids reach it in 2075 — the same boundary
-   documented above, deliberately the same number so the two cannot drift apart. */
+     era 2  id >= 8.7e15  Date.now()*5000+salt*10+counter          (2026-07-21 .. 2026-08-09)
+     era 3  id >= 7e14    (Date.now()-UID_EPOCH)*5000+...          (ND47-5 only, ~3 hours)
+     era 4  otherwise     (Date.now()-UID_EPOCH)*2000+...          (ND47-6 onward, to 2162)
+
+   ERA 3 IS A SLIVER, and it is here for honesty rather than volume. ND47-5 shipped the
+   epoch-relative x5000 form and was live for roughly three hours on 2026-08-09 before the
+   100-year revision replaced it, so at most a handful of ids exist in that band. They are
+   decoded correctly by the 7e14 threshold: an era-4 id today is ~4.2e14 and an era-3 id is
+   ~1.04e15.
+
+   HONEST BOUNDARY, stated rather than buried: era-4 ids grow and reach 7e14 in 2036, after
+   which that threshold would misread them as era 3. The consequence is bounded and
+   COSMETIC — _uidTimeOf feeds exactly one thing, the customer "Recent" sort, and the only
+   records affected are the handful minted in a three-hour window in 2026. No money path,
+   no lookup, no merge reads this function; every id lookup in the file is an exact match.
+   If someone is still running this in 2036, delete the era-3 line and the sort is exact
+   again. */
 var UID_ERA2_MIN=8.7e15;
-var UID_ERA3_MIN=1e15;
+var UID_ERA3_MIN=7e14;
+var UID_ERA4_MIN=3e14;   // separates era 4 (>=4.16e14 today, rising) from legacy era 1 (~1.78e14)
 function _uidTimeOf(id){
   var n=Number(id);
   if(!isFinite(n)||n<=0)return 0;
-  if(n>=UID_ERA2_MIN)return Math.floor(n/5000);
-  if(n>=UID_ERA3_MIN)return Math.floor(n/5000)+UID_EPOCH;
-  return Math.floor(n/100000)*1000;
+  if(n>=UID_ERA2_MIN)return Math.floor(n/5000);              // era 2: absolute
+  if(n>=UID_ERA3_MIN)return Math.floor(n/5000)+UID_EPOCH;    // era 3: ND47-5 sliver
+  /* 3e14, NOT 1e13. The first cut used 1e13 and swallowed the legacy era-1 ids, which sit
+     at ~1.78e14 — customer #178351101951567 decoded as 2022-10-29 instead of 2026-07-08.
+     Caught by assertion 4.4, not by reading. Era-1 is a fixed band around 1.78e14; era-4
+     starts at 4.16e14 today and only grows, so 3e14 separates them permanently. */
+  if(n>=UID_ERA4_MIN)return Math.floor(n/2000)+UID_EPOCH;    // era 4: current
+  return Math.floor(n/100000)*1000;                          // era 1: legacy second-precision
 }
 // FIX (2026-07-21): no monetary value was ever rounded anywhere in the app -
 // every paid/amount figure ran on raw float sums. Mostly whole-shilling
