@@ -379,7 +379,7 @@ var APP_VERSION="47";
    (~line 2764, `stamp:BUILD_STAMP`) but NEVER read back or compared — grep for `.stamp`
    comparisons returns nothing — so renaming the build costs ZERO extra Firestore reads
    and cannot force a full re-load on any device. */
-var BUILD_STAMP="ND47-6";
+var BUILD_STAMP="ND47-6a";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -438,13 +438,20 @@ var FB_WRITE_QUEUE=[];
 var FB_WRITING=false;
 
 var R={
-  director:{label:"Director",c:"#1a1560",bg:"#e2d9f3",p:{dashboard:1,customers:1,orders:1,delivery:1,stock:1,invoices:1,debts:1,complaints:1,offers:1,reports:1,excel:1,users:1,vRev:1,vProfit:1,vCost:1,vInv:1,vDebt:1,aCust:1,eCust:1,dCust:1,aOrd:1,eOrd:1,dOrd:1,aSt:1,eSt:1,dSt:1,aOff:1,eOff:1,dOff:1,aInv:1,eInv:1,mPaid:1,ePrice:1,exp:1,rest:1,mUsers:1,aCmp:1,dCmp:1,mCmp:1,vPhone:1}},
-  manager:{label:"Manager",c:"#185FA5",bg:"#d1ecf1",p:{dashboard:1,customers:1,orders:1,delivery:1,stock:1,invoices:1,debts:1,complaints:1,offers:1,reports:1,excel:0,users:0,vRev:1,vProfit:0,vCost:0,vInv:1,vDebt:1,aCust:1,eCust:1,dCust:0,aOrd:1,eOrd:1,dOrd:0,aSt:1,eSt:1,dSt:0,aOff:1,eOff:1,dOff:0,aInv:1,eInv:1,mPaid:1,ePrice:0,exp:0,rest:0,mUsers:0,aCmp:1,dCmp:1,mCmp:1,vPhone:1}},
-  staff:{label:"Staff",c:"#856404",bg:"#fff3cd",p:{dashboard:1,customers:1,orders:1,delivery:1,stock:1,invoices:0,debts:0,complaints:1,offers:0,reports:0,excel:0,users:0,vRev:0,vProfit:0,vCost:0,vInv:0,vDebt:0,aCust:0,eCust:0,dCust:0,aOrd:1,eOrd:0,dOrd:0,aSt:0,eSt:0,dSt:0,aOff:0,eOff:0,dOff:0,aInv:0,eInv:0,mPaid:0,ePrice:0,exp:0,rest:0,mUsers:0,aCmp:1,dCmp:0,mCmp:0,vPhone:0}},
-  driver:{label:"Driver",c:"#534AB7",bg:"#ede9f8",p:{dashboard:0,customers:0,orders:0,delivery:1,stock:0,invoices:0,debts:0,complaints:1,offers:0,reports:0,excel:0,users:0,vRev:0,vProfit:0,vCost:0,vInv:0,vDebt:0,aCust:0,eCust:0,dCust:0,aOrd:0,eOrd:0,dOrd:0,aSt:0,eSt:0,dSt:0,aOff:0,eOff:0,dOff:0,aInv:0,eInv:0,mPaid:0,ePrice:0,exp:0,rest:0,mUsers:0,aCmp:1,dCmp:0,mCmp:0,vPhone:0}}
+  director:{label:"Director",c:"#1a1560",bg:"#e2d9f3",p:{dashboard:1,customers:1,orders:1,delivery:1,stock:1,invoices:1,debts:1,complaints:1,offers:1,reports:1,excel:1,users:1,vRev:1,vProfit:1,vCost:1,vInv:1,vDebt:1,aCust:1,eCust:1,dCust:1,aOrd:1,eOrd:1,dOrd:1,aSt:1,eSt:1,dSt:1,aOff:1,eOff:1,dOff:1,aInv:1,eInv:1,mPaid:1,ePrice:1,exp:1,rest:1,mRecon:1,mUsers:1,aCmp:1,dCmp:1,mCmp:1,vPhone:1}},
+  manager:{label:"Manager",c:"#185FA5",bg:"#d1ecf1",p:{dashboard:1,customers:1,orders:1,delivery:1,stock:1,invoices:1,debts:1,complaints:1,offers:1,reports:1,excel:0,users:0,vRev:1,vProfit:0,vCost:0,vInv:1,vDebt:1,aCust:1,eCust:1,dCust:0,aOrd:1,eOrd:1,dOrd:0,aSt:1,eSt:1,dSt:0,aOff:1,eOff:1,dOff:0,aInv:1,eInv:1,mPaid:1,ePrice:0,exp:0,rest:0,mRecon:0,mUsers:0,aCmp:1,dCmp:1,mCmp:1,vPhone:1}},
+  staff:{label:"Staff",c:"#856404",bg:"#fff3cd",p:{dashboard:1,customers:1,orders:1,delivery:1,stock:1,invoices:0,debts:0,complaints:1,offers:0,reports:0,excel:0,users:0,vRev:0,vProfit:0,vCost:0,vInv:0,vDebt:0,aCust:0,eCust:0,dCust:0,aOrd:1,eOrd:0,dOrd:0,aSt:0,eSt:0,dSt:0,aOff:0,eOff:0,dOff:0,aInv:0,eInv:0,mPaid:0,ePrice:0,exp:0,rest:0,mRecon:0,mUsers:0,aCmp:1,dCmp:0,mCmp:0,vPhone:0}},
+  driver:{label:"Driver",c:"#534AB7",bg:"#ede9f8",p:{dashboard:0,customers:0,orders:0,delivery:1,stock:0,invoices:0,debts:0,complaints:1,offers:0,reports:0,excel:0,users:0,vRev:0,vProfit:0,vCost:0,vInv:0,vDebt:0,aCust:0,eCust:0,dCust:0,aOrd:0,eOrd:0,dOrd:0,aSt:0,eSt:0,dSt:0,aOff:0,eOff:0,dOff:0,aInv:0,eInv:0,mPaid:0,ePrice:0,exp:0,rest:0,mRecon:0,mUsers:0,aCmp:1,dCmp:0,mCmp:0,vPhone:0}}
 };
 var USERS=[{id:1,name:"Director",role:"director",pin:"1234",ini:"DR",col:"#1a1560"}];
 var D={customers:[],stock:[],orders:[],offers:[],invoices:[],routes:[],complaints:[],pendingPayments:[],
+  /* compactedPaymentIds (2026-08-11, ND47-6a) — id -> compaction timestamp. Same shape and
+     same lifecycle as deletedOrderIds/deletedCustomerIds, and pruned by the same
+     pruneOldTombstones() 90-day cycle. It exists so _compactAckedPayments() can remove a
+     long-settled cash record from the live document WITHOUT the two rescue merges putting
+     it straight back. See _compactAckedPayments for the measurement that made this
+     necessary. */
+  compactedPaymentIds:{},
   auditLog:[]
 };
 var nOId=1001,nIId=2001,nCId=3001,nCmpId=4001;
@@ -888,6 +895,43 @@ function btl(v){if(!v||v==="Good")return "<span class=\"badge bg\">Good</span>";
 // reference, different length). Neither alone covers both failure modes;
 // together they do, while a call with truly nothing changed (same
 // reference AND same length) still correctly skips the rebuild.
+/* CUSTOMER LOOKUP INDEX (2026-08-11, ND47-6a) — the customer twin of _getOrdByIdIndex
+   below, and invalidated by exactly the same reference+length pair for the same reasons
+   (identity catches a wholesale reassignment, length catches an in-place push).
+
+   WHY IT WAS ADDED. `(D.customers||[]).find(function(x){return x.id===o.cId;})` appears
+   about twenty times in this file. Most are single lookups and are O(customers) — fine.
+   But six sit INSIDE a loop over an archive-merged array, which makes them
+   O(orders x customers) against an array that grows with total business history and never
+   shrinks. The worst, in the zone report, is O(zones x orders x customers). At today's
+   volume these are milliseconds; at the modelled year-100 volume the Excel export and the
+   reports tab would stop completing. That is the same defect class already fixed in
+   _dormantCustomers this build, so it is fixed the same way — one shared primitive rather
+   than six in-place patches.
+
+   NO BOOKS DIMENSION. Unlike orders, customers are never archived: there is no
+   customersWithBooks(), so the merged-array complication that _getOrdByIdIndex has to
+   handle simply does not arise here.
+
+   SAFE AGAINST EDITS. The map stores object REFERENCES, so renaming a customer is picked
+   up immediately — the cached entry and the live record are the same object. Only the SET
+   of customers is cached, and that is what the invalidation checks. */
+var _custByIdCache=null,_custByIdCacheArr=null,_custByIdCacheLen=-1;
+function _getCustByIdIndex(){
+  var arr=(D&&D.customers)||[];
+  if(_custByIdCache&&_custByIdCacheArr===arr&&_custByIdCacheLen===arr.length)return _custByIdCache;
+  _custByIdCache={};
+  arr.forEach(function(c){if(c&&c.id!=null)_custByIdCache[c.id]=c;});
+  _custByIdCacheArr=arr;_custByIdCacheLen=arr.length;
+  return _custByIdCache;
+}
+/* Returns the customer record for an id, or undefined — deliberately the SAME contract as
+   the .find() it replaces, so every call site keeps its existing `c?c.name:""` handling and
+   no truthiness check anywhere needs revisiting. */
+function custById(id){
+  if(id==null)return undefined;
+  return _getCustByIdIndex()[id];
+}
 var _ordByIdCache=null,_ordByIdCacheArr=null,_ordByIdCacheLen=-1,_ordByIdCacheBooksVer=-1;
 function _getOrdByIdIndex(){
   // BOOKS (2026-07-30): found while wiring the customer statement to read archived
@@ -4589,6 +4633,17 @@ function processWriteQueue(){
           if(!fp.id)return;
           var localIdx=localPPMap[fp.id];
           if(localIdx===undefined){
+            /* TOMBSTONE CHECK (2026-08-11, ND47-6a) — see _compactAckedPayments. Without
+               this, an entry this device deliberately compacted would be rescued straight
+               back from a server copy that has not caught up yet, and could then be
+               acknowledged a second time. Absence is only evidence of loss when the record
+               was not removed ON PURPOSE. */
+            var _ctA=(D.compactedPaymentIds&&D.compactedPaymentIds[String(fp.id)])||
+                     (DforSync.compactedPaymentIds&&DforSync.compactedPaymentIds[String(fp.id)]);
+            if(_ctA){
+              console.log("[NDSYNC] freshness check did NOT rescue pending payment id="+fp.id+" — it was deliberately compacted (acknowledged and settled), not lost");
+              return;
+            }
             DforSync.pendingPayments.push(fp);
             console.log("[NDSYNC] freshness check RESCUED pending payment id="+fp.id+" that would otherwise have been dropped by this write");
             return;
@@ -5626,8 +5681,41 @@ function pruneOldTombstones(){
       if(D.deletedCustomerIds[k]<cutoff){delete D.deletedCustomerIds[k];prunedC++;}
     });
   }
-  if(prunedO>0||prunedC>0){
-    console.log("[NDSYNC] pruneOldTombstones — removed "+prunedO+" order tombstone(s), "+prunedC+" customer tombstone(s) older than 90 days");
+  /* deletedInvoiceIds ADDED to the prune (2026-08-11, ND47-6a) — found by _system_audit.js.
+     This function was written on 2026-07-20 for the two tombstone maps that existed then;
+     deletedInvoiceIds was introduced on 2026-07-26 for the recovery-duplicate dedup and the
+     prune was never extended to cover it. It has therefore been growing forever inside the
+     main document, which is the exact size problem the rest of this function exists to
+     prevent — the sibling case that got missed when the pattern was first fixed.
+
+     Safe on identical reasoning to the order map directly above: syncIdCounters() makes id
+     reuse structurally impossible, so an aged-out deletion tombstone is merely wasteful,
+     not a correctness risk, and 90 days far exceeds any realistic stale-device window.
+     NOTE the deliberate asymmetry — archivedOrderIds/archivedInvoiceIds are NOT pruned here
+     and must not be, because the books still read them to resolve archived records. */
+  var prunedI=0;
+  if(D.deletedInvoiceIds){
+    Object.keys(D.deletedInvoiceIds).forEach(function(k){
+      if(D.deletedInvoiceIds[k]<cutoff){delete D.deletedInvoiceIds[k];prunedI++;}
+    });
+  }
+  /* Compaction markers age out on the SAME 90-day cycle (2026-08-11, ND47-6a), which is
+     what keeps the map itself from becoming a new forever-growing field — the exact problem
+     the compaction was built to solve. The retention is genuinely 180 days end to end: an
+     entry is only compacted 90 days AFTER it was acknowledged, and its marker then lives a
+     further 90. A device would have to be more than half a year stale to resurrect one,
+     which is twice the protection the order and customer tombstones above already rely on. */
+  var prunedP=0;
+  if(D.compactedPaymentIds){
+    Object.keys(D.compactedPaymentIds).forEach(function(k){
+      if(D.compactedPaymentIds[k]<cutoff){delete D.compactedPaymentIds[k];prunedP++;}
+    });
+  }
+  /* prunedI is in this condition deliberately: dirty() is what persists the pruned map, so
+     omitting it would delete invoice tombstones in memory only and let them come straight
+     back on the next snapshot — a prune that silently does nothing. */
+  if(prunedO>0||prunedC>0||prunedI>0||prunedP>0){
+    console.log("[NDSYNC] pruneOldTombstones — removed "+prunedO+" order tombstone(s), "+prunedC+" customer tombstone(s), "+prunedI+" invoice tombstone(s), "+prunedP+" payment-compaction marker(s) older than 90 days");
     dirty(); // goes through the normal, already-safe debounced write path
   }
 }
@@ -6369,6 +6457,19 @@ function startCloudListener(isWarmRefresh){
           if(!D.deletedOrderIds[k])D.deletedOrderIds[k]=data.D.deletedOrderIds[k];
         });
       }
+      /* The SAME union for compaction markers (2026-08-11, ND47-6a). Mirrors the order and
+         invoice tombstone unions above exactly, and for the identical reason: whichever
+         device ran _compactAckedPayments() holds the only record that those entries were
+         removed deliberately. Without this union that knowledge would never converge, and
+         a second device — which still holds the entries locally — would rescue every one of
+         them on its next snapshot, silently undoing the compaction. The union must run
+         BEFORE the pendingPayments rescue below, which is why it sits in this block. */
+      if(data.D.compactedPaymentIds){
+        if(!D.compactedPaymentIds)D.compactedPaymentIds={};
+        Object.keys(data.D.compactedPaymentIds).forEach(function(k){
+          if(!D.compactedPaymentIds[k])D.compactedPaymentIds[k]=data.D.compactedPaymentIds[k];
+        });
+      }
       // FIX (2026-07-26): the same union for INVOICE deletion markers. Without
       // it, a recovery-duplicate invoice tombstone (set by the dedup below)
       // stayed local to whichever device ran the dedup and never converged, so
@@ -6612,6 +6713,16 @@ function startCloudListener(isWarmRefresh){
         Object.keys(_localPpMap).forEach(function(k){
           var lp=_localPpMap[k];
           if(_remotePpIds[lp.id])return;
+          /* TOMBSTONE CHECK (2026-08-11, ND47-6a) — the twin of the guard in the freshness
+             check; see _compactAckedPayments. Consults BOTH maps because the compaction may
+             have been performed by the other device, in which case the tombstone arrives in
+             this very snapshot while our local copy of the entry still exists. */
+          var _ctB=(data.D.compactedPaymentIds&&data.D.compactedPaymentIds[String(lp.id)])||
+                   (D.compactedPaymentIds&&D.compactedPaymentIds[String(lp.id)]);
+          if(_ctB){
+            console.log("[NDSYNC] snapshot merge did NOT rescue pending payment id="+lp.id+" — tombstoned as compacted (acknowledged and settled) rather than lost");
+            return;
+          }
           D.pendingPayments.push(lp);
           _anyRescueThisSync=true;
           console.log("[NDSYNC] snapshot merge RESCUED pending payment id="+lp.id+" that would otherwise have been silently dropped (not yet in remote)");
@@ -8594,6 +8705,137 @@ function _checkDocSize(sizeKB,payload){
    is recovered from existing data rather than only from new movements. Runs after
    cloud data has arrived (never against an empty D) and marks nothing dirty on its
    own — the next ordinary write carries it. */
+/* PENDING-PAYMENT COMPACTION (2026-08-11, ND47-6a) — the last unbounded growth vector in
+   the main document, closed on the director's decision after it was MEASURED rather than
+   guessed at.
+
+   THE MEASUREMENT that forced this. D.pendingPayments is appended to on every staff/driver
+   cash collection and is NEVER removed from — acknowledging sets pp.ack=true and leaves the
+   record in place. Verified mechanically: zero filter-reassignments, zero splices, zero
+   deletes anywhere in this file. On 2026-08-11 the director's live console read:
+
+       30 entries, 30 acknowledged, 0 unacknowledged
+       2026-07-11 -> 2026-08-11 = 32 days  ->  0.94 entries/day
+       headroom ~4,701 entries              ->  13.7 YEARS to the 1 MB document cap
+
+   An earlier reading of "28 entries, flat over two days" had been taken to mean the array
+   was not growing; it was in fact sampling two days of a once-a-day process. 13.7 years is
+   a measured fact, and it is the ONLY item in this system that failed the director's
+   100-year requirement — reads are flat, storage is ~196 years, uid() reaches 2162, order
+   ids are effectively unlimited, auditLog is capped at 20 and stock history is trimmed by
+   _trimStockHistories below. The 1 MB cap is a per-document Firestore limit, so it applies
+   on Blaze too; paying does not move it.
+
+   WHY THIS IS SAFE, when "just delete the acknowledged ones" would NOT be. Two separate
+   merge paths (the snapshot merge and the freshness check) deliberately RESCUE any
+   pendingPayment that exists locally but not remotely, because the alternative is losing
+   the only record of physical cash in a staff member's hand. Both were written against the
+   stated assumption "pending payments are never deleted anywhere in this app, so a
+   local-only record is always safe to rescue". Deleting entries without telling those two
+   paths would make that assumption FALSE, and a stale device would resurrect compacted
+   records — as ack:false if its copy predated the acknowledgement, so the same cash could
+   be acknowledged twice. This function therefore records every compacted id in
+   D.compactedPaymentIds, and both rescue paths consult it before resurrecting.
+
+   That is the proven tombstone pattern this codebase already uses for orders, invoices and
+   customers — ADDING a tombstone where none existed, not replacing a tombstone check with
+   an age heuristic, which the absolute rules forbid.
+
+   THE RETENTION MATHS. An entry is only eligible once it has been ACKNOWLEDGED and is older
+   than PENDING_PAY_COMPACT_DAYS (90). Its tombstone then lives a further 90 days before
+   pruneOldTombstones() clears it on the same cycle as every other tombstone. So a device
+   would have to be more than 180 days stale to resurrect anything — twice the protection
+   the order and customer tombstones already provide, and far beyond the "phone left in a
+   drawer" window that comment reasons about.
+
+   RESULT: both the array and its tombstone map reach a steady state instead of growing.
+   At the measured 0.94/day that is ~85 live entries (~18 KB) and ~85 tombstones (~2 KB),
+   flat forever, against 987 KB of headroom. The main document goes from 13.7 years to
+   unbounded. */
+var PENDING_PAY_COMPACT_DAYS=90;
+/* THE ELIGIBILITY TEST, DEFINED ONCE (2026-08-11, ND47-6a). Both the real compaction and
+   the director's read-only preview call this and nothing else. It is a separate function
+   for exactly the reason the revenue comparison was consolidated earlier in this build: a
+   preview that answers "what would be removed?" using its own copy of the rule is a
+   preview of a DIFFERENT rule the moment either copy is edited, and here that would mean
+   showing the director one set of cash records and deleting another.
+
+   Returns true only when the entry is (a) well-formed enough to be tombstoned, (b) already
+   ACKNOWLEDGED, and (c) acknowledged longer ago than the retention window. Anything it
+   cannot confidently judge — no id, no parseable date — returns false and is KEPT. */
+function _paymentCompactable(p,cutoffMs){
+  if(!p||p.id==null)return false;      // malformed — cannot be tombstoned, so never remove it
+  /* ONLY acknowledged money leaves the live document. An unacknowledged entry is cash the
+     director has not yet confirmed receiving, and it must stay visible and alerting no
+     matter how old it is — age is not evidence that money was received. */
+  if(!p.ack)return false;
+  /* Date it from the ACKNOWLEDGEMENT, not the collection: an entry collected long ago but
+     acknowledged yesterday is a fresh decision and must not be compacted today. Both fields
+     are local YYYY-MM-DD strings (tday()). Anything unparseable is KEPT. */
+  var stamp=p.ackedDate||p.date;
+  var t=stamp?new Date(String(stamp)+"T12:00:00").getTime():NaN;
+  if(!isFinite(t))return false;
+  return t<cutoffMs;
+}
+/* READ-ONLY PREVIEW — changes nothing, writes nothing, syncs nothing. Exists so the
+   director can see exactly which cash records the next boot would compact, before trusting
+   it. Deliberately reports the WHOLE picture, including why each remaining entry is being
+   kept, because "nothing would be compacted" is only reassuring if you can see the rule
+   that produced it. */
+function previewPaymentCompaction(){
+  try{
+    var arr=(D&&D.pendingPayments)||[];
+    if(!arr.length){console.log("[NDPREVIEW] pendingPayments is empty — nothing to compact.");return 0;}
+    var cutoffMs=Date.now()-PENDING_PAY_COMPACT_DAYS*24*60*60*1000;
+    var go=[],stayUnacked=[],stayRecent=[],stayOdd=[];
+    arr.forEach(function(p){
+      if(_paymentCompactable(p,cutoffMs)){go.push(p);return;}
+      if(!p||p.id==null||!(p.ackedDate||p.date))stayOdd.push(p);
+      else if(!p.ack)stayUnacked.push(p);
+      else stayRecent.push(p);
+    });
+    console.log("[NDPREVIEW] DRY RUN — nothing has been changed.");
+    console.log("  total entries              : "+arr.length);
+    console.log("  WOULD BE COMPACTED         : "+go.length+"   (acknowledged more than "+PENDING_PAY_COMPACT_DAYS+" days ago)");
+    console.log("  kept — not yet acknowledged: "+stayUnacked.length+"   <-- live cash, never compacted at any age");
+    console.log("  kept — acknowledged recently: "+stayRecent.length);
+    console.log("  kept — no usable date/id   : "+stayOdd.length);
+    go.forEach(function(p){
+      console.log("    would remove  id="+p.id+"  KSh "+p.amt+"  collected by "+(p.collectedBy||"?")+
+                  "  acked "+(p.ackedDate||p.date)+"  (order #"+p.ordId+")");
+    });
+    if(!go.length)console.log("  -> nothing is old enough yet. Oldest acknowledgement on file: "+
+      arr.map(function(p){return p.ackedDate||p.date||"";}).filter(Boolean).sort()[0]);
+    console.log("  after compaction the document would hold "+(arr.length-go.length)+" entr"+
+      ((arr.length-go.length)===1?"y":"ies")+"; the removed ids stay tombstoned for "+
+      PENDING_PAY_COMPACT_DAYS+" days so no device can resurrect them.");
+    return go.length;
+  }catch(e){console.log("[NDPREVIEW] failed: "+(e&&e.message));return -1;}
+}
+function _compactAckedPayments(){
+  try{
+    if(!D||!Array.isArray(D.pendingPayments)||!D.pendingPayments.length)return 0;
+    if(!D.compactedPaymentIds)D.compactedPaymentIds={};
+    var cutoffMs=Date.now()-PENDING_PAY_COMPACT_DAYS*24*60*60*1000;
+    var kept=[],compacted=0;
+    D.pendingPayments.forEach(function(p){
+      if(!_paymentCompactable(p,cutoffMs)){kept.push(p);return;}
+      D.compactedPaymentIds[String(p.id)]=Date.now();
+      compacted++;
+    });
+    if(!compacted)return 0;
+    D.pendingPayments=kept;
+    console.log("[NDSYNC] pendingPayments compacted — "+compacted+" acknowledged entr"+
+      (compacted===1?"y":"ies")+" older than "+PENDING_PAY_COMPACT_DAYS+" days moved out of the live "+
+      "document (tombstoned, so no device can resurrect them); "+kept.length+" remain, of which "+
+      kept.filter(function(x){return x&&!x.ack;}).length+" still await acknowledgement.");
+    auditLog("DATA_EXPORTED","Document hygiene: "+compacted+" acknowledged cash-custody record(s) older than "+
+      PENDING_PAY_COMPACT_DAYS+" days were compacted out of the live document. Every one had already been "+
+      "acknowledged and applied to invoices; no balance, payment or customer record changed. The money history "+
+      "remains in the audit trail (CASH_ACKNOWLEDGED entries).");
+    return compacted;
+  }catch(_){return 0;}
+}
 function _trimStockHistories(){
   try{
     if(!D||!D.stock||!D.stock.length)return 0;
@@ -8780,6 +9022,12 @@ function _selfHealUnsyncedLocalRecords(){
     if(window._selfHealDone)return; // once per session
     window._selfHealDone=true;
     _trimStockHistories();                                         // Firestore headroom (safe: write-only data)
+    /* Same gate, same reasoning, same once-per-session placement as the stock trim above:
+       we are already past !_cloudDataConfirmed && !_cloudServerConfirmed, so this never runs
+       against a cache-only view of the document. That matters — compacting from a stale
+       snapshot could tombstone an entry whose acknowledgement had not actually reached the
+       server yet. Runs AFTER the self-heal rails have confirmed live data is loaded. */
+    _compactAckedPayments();                                       // last unbounded main-doc field
     if(!_healLiveStateLooksLoaded("LOCAL"))return;                 // RAIL 2
     var snap=_healSourceSnapshot();
     if(!snap||!snap.D)return;
@@ -10110,6 +10358,14 @@ function buildMods(){
      customers correctly but set dest:"customers", so clicking "2 customer(s) have not
      ordered in 30+ days" opened the full list of 440 with no indication of WHICH two.
      Modelled on m-recon rather than inventing a new pattern. */
+  /* Revenue comparison drill-down (2026-08-11, ND47-6a) — the destination for the revenue
+     alert, which previously navigated to Reports where the comparison it quoted did not
+     exist. Same shell as mDormant so there is one modal pattern, not two. */
+  var mRevCmp="<div class=\"ov\" id=\"m-revcmp\"><div class=\"modal\" style=\"max-width:820px\">"+
+    "<div class=\"mhd\"><div class=\"mttl\"><i class=\"ti ti-trending-up\" style=\"color:var(--gd);margin-right:7px\"></i>Revenue — this month vs the same days last month</div><button class=\"mcls\" onclick=\"cm('m-revcmp')\"><i class=\"ti ti-x\"></i></button></div>"+
+    "<div class=\"mbdy\" id=\"m-revcmp-body\"></div>"+
+    "<div class=\"mft\"><button class=\"btn\" onclick=\"cm('m-revcmp')\">Close</button></div>"+
+  "</div></div>";
   var mDormant="<div class=\"ov\" id=\"m-dormant\"><div class=\"modal\" style=\"max-width:820px\">"+
     "<div class=\"mhd\"><div class=\"mttl\"><i class=\"ti ti-user-exclamation\" style=\"color:var(--gd);margin-right:7px\"></i>Customers who have stopped ordering</div><button class=\"mcls\" onclick=\"cm('m-dormant')\"><i class=\"ti ti-x\"></i></button></div>"+
     "<div class=\"mbdy\" id=\"m-dormant-body\"></div>"+
@@ -10283,7 +10539,7 @@ function buildMods(){
     "<div class=\"mbdy\" id=\"m-books-body\"></div>"+
     "<div class=\"mft\"><button class=\"btn\" onclick=\"cm('m-books')\">Close</button></div>"+
   "</div></div>";
-  el("mods").innerHTML=mC+mO+mOE+mDlv+mS+mRS+mOf+mIv+mPay+mCmp+mU+mSetup+mPin+mAssign+mFollowUp+mGeneric+mRecon+mDormant+mHealReview+mBooks;
+  el("mods").innerHTML=mC+mO+mOE+mDlv+mS+mRS+mOf+mIv+mPay+mCmp+mU+mSetup+mPin+mAssign+mFollowUp+mGeneric+mRecon+mDormant+mRevCmp+mHealReview+mBooks;
 }
 
 function rDash(){
@@ -10347,26 +10603,16 @@ function rDash(){
   // UNPAID remainder at the time of voiding is subtracted — if part of the
   // invoice was genuinely paid before being voided, that portion was real
   // money collected and must still count.
-  function _writtenOffFor(orders){
-    var ids={};orders.forEach(function(o){ids[o.id]=true;});
-    return _dashInvAll.filter(function(i){
-      if(!i.voided)return false;
-      if(i.orderId)return ids[i.orderId];
-      // L1 FIX (2026-07-30): was notes-ONLY (so an invoice linked by orderId was never
-      // matched here at all) AND took the first "#digits" a payment ref could hijack.
-      var _mo=_linkedOrderIdOf(i);
-      return _mo!=null&&!!ids[_mo];
-    }).reduce(function(a,i){return a+(i.amount-i.paid);},0);
-  }
+
   var wkRevs=wkDays.map(function(_,i){
     var d=new Date(weekStart);d.setDate(weekStart.getDate()+i);
     var ds=_ymd(d); // local-safe — must match order dates for chart bars to populate correctly
     var dayOrds=del.filter(function(o){var dd=o.deliveredAt||o.date;return dd===ds;});
-    return dayOrds.reduce(function(a,o){return a+o.qty*o.price;},0)-_writtenOffFor(dayOrds);
+    return dayOrds.reduce(function(a,o){return a+o.qty*o.price;},0)-_writtenOffFor(dayOrds,_dashInvAll);
   });
   var wkMax=Math.max.apply(null,wkRevs.concat([1]));
   var todayDow=dow===0?6:dow-1; // 0=Mon…6=Sun
-  var rev=periodDel.reduce(function(a,o){return a+o.qty*o.price;},0)-_writtenOffFor(periodDel);
+  var rev=periodDel.reduce(function(a,o){return a+o.qty*o.price;},0)-_writtenOffFor(periodDel,_dashInvAll);
   var cost=periodDel.reduce(function(a,o){return a+o.qty*(o.cost||0);},0);
   var pend=(D.orders||[]).filter(function(o){return o.status==="Pending"||o.status==="Processing";}).length;
   var low=(D.stock||[]).filter(function(s){return s.qty<=s.min;}).length;
@@ -10378,14 +10624,17 @@ function rDash(){
   var mRevs=mns.map(function(_,i){
     var m2=String(i+1).padStart(2,"0");
     var mOrds=del.filter(function(o){var dd=o.deliveredAt||o.date;return dd&&dd.startsWith(yr+"-"+m2);});
-    return mOrds.reduce(function(a,o){return a+o.qty*o.price;},0)-_writtenOffFor(mOrds);
+    return mOrds.reduce(function(a,o){return a+o.qty*o.price;},0)-_writtenOffFor(mOrds,_dashInvAll);
   });
   var mMax=Math.max.apply(null,mRevs.concat([1]));
   var alerts=[];
   var now2=new Date();
-  var thisMonth=now2.getFullYear()+"-"+String(now2.getMonth()+1).padStart(2,"0");
-  var lastMonthD=new Date(now2.getFullYear(),now2.getMonth()-1,1);
-  var lastMonth=lastMonthD.getFullYear()+"-"+String(lastMonthD.getMonth()+1).padStart(2,"0");
+  /* thisMonth / lastMonthD / lastMonth were declared here and are GONE (2026-08-11,
+     ND47-6a): they existed only to feed the duplicated month-to-date filter that this
+     build deleted, and _revenueCompare derives its own from the date passed in. Removed
+     rather than left in place, because a dead variable named `thisMonth` sitting directly
+     above a revenue alert is an invitation for a later edit to use it and quietly
+     reintroduce the second implementation. */
   /* REVENUE ALERT — TWO DEFECTS FIXED (2026-08-07, b26). BOTH SEEN IN PRODUCTION on
      2026-08-07, when the dashboard read "Revenue -73% vs last month — KSh 82,300 this
      month" on the 7th of the month.
@@ -10406,19 +10655,31 @@ function rDash(){
 
      Short months are handled by comparing DAY-OF-MONTH: on 31 March the cutoff for
      February is day 31, which simply includes all of February. */
-  var _domToday=now2.getDate();
-  var _mtd=function(mon){
-    return del.filter(function(o){
-      var dd=o.deliveredAt||o.date;
-      if(!dd||!dd.startsWith(mon))return false;
-      var d=parseInt(String(dd).slice(8,10),10);
-      return !isNaN(d)&&d<=_domToday;   // same days of the month, so the two are comparable
-    });
-  };
-  var _thisOrds=_mtd(thisMonth),_lastOrds=_mtd(lastMonth);
-  var thisRev=_thisOrds.reduce(function(s,o){return s+o.qty*o.price;},0)-_writtenOffFor(_thisOrds);
-  var lastRev=_lastOrds.reduce(function(s,o){return s+o.qty*o.price;},0)-_writtenOffFor(_lastOrds);
-  if(can("vRev")&&lastRev>0){var tp=Math.round((thisRev-lastRev)/lastRev*100);if(Math.abs(tp)>=10){alerts.push({t:"ni",i:(tp>0?"ti-trending-up":"ti-trending-down"),m:"Revenue "+(tp>0?"+":"")+tp+"% vs the same "+_domToday+" day"+(_domToday===1?"":"s")+" of last month &mdash; KSh "+thisRev.toLocaleString()+" so far this month vs KSh "+lastRev.toLocaleString(),dest:"reports"});}}
+  /* ONE IMPLEMENTATION (2026-08-11, ND47-6a). This block used to duplicate, line for line,
+     the month-to-date filter and the gross-minus-write-offs arithmetic that _revenueCompare
+     also performs — two copies of the same money calculation, which is precisely how the
+     alert and the drill-down it opens end up disagreeing after any later edit to one of
+     them. The duplicate is deleted; both now read from the single function. It also means
+     the alert inherits _revenueCompare's argument type-guards: the two _writtenOffFor calls
+     here were UNPROTECTED, so a throw inside them blanked the entire dashboard render. */
+  var _rc=_revenueCompare(del,now2);
+  var _domToday=_rc.domToday;
+  var thisRev=_rc.thisRev,lastRev=_rc.lastRev;
+  if(can("vRev")){
+    if(_rc.dataBad){
+      /* FAIL VISIBLY (director's decision, 2026-08-11): a broken revenue figure must never
+         render as a plausible number. No percentage is shown at all, because there is no
+         trustworthy figure to compute one from. */
+      alerts.push({t:"nr",i:"ti-alert-triangle",m:"Revenue comparison unavailable &mdash; "+_rc.problem+" Hard-refresh, then reopen.",act:"showRevenueCompare()"});
+    }else if(_rc.woBad){
+      /* Gross is real information, so it is shown — but marked overstated, because an
+         authoritative-looking revenue number that is too high is the worst outcome here. */
+      alerts.push({t:"nw",i:"ti-alert-circle",m:"Revenue figures are GROSS and overstated &mdash; write-offs could not be calculated. KSh "+_rc.thisGross.toLocaleString()+" this month before write-offs. Do not use for a decision.",act:"showRevenueCompare()"});
+    }else if(lastRev>0){
+      var tp=Math.round((thisRev-lastRev)/lastRev*100);
+      if(Math.abs(tp)>=10)alerts.push({t:"ni",i:(tp>0?"ti-trending-up":"ti-trending-down"),m:"Revenue "+(tp>0?"+":"")+tp+"% vs the same "+_domToday+" day"+(_domToday===1?"":"s")+" of last month &mdash; KSh "+thisRev.toLocaleString()+" so far this month vs KSh "+lastRev.toLocaleString(),act:"showRevenueCompare()"});
+    }
+  }
   var churnDate=_ymd(new Date(Date.now()-30*86400000)); // local-safe
   // BOOKS (2026-07-30): a genuinely churned customer's LAST order is exactly
   // the one most likely to be archived by now — without the merge, the most
@@ -10436,7 +10697,18 @@ function rDash(){
      archived (the 2026-07-30 BOOKS note). */
   var _churnedList=_dormantCustomers(_dashOrdAll,churnDate);
   var churned=_churnedList.length;
-  if(churned>0)alerts.push({t:"nw",i:"ti-user-exclamation",m:churned+" customer(s) have not ordered in 30+ days",act:"showDormantCustomers()"});
+  /* PERMISSION FIX (2026-08-11, ND47-6a) — this was the ONLY alert with no role gate.
+     Spotted by the director on a live staff screen: revenue, profit and outstanding debt
+     were all correctly masked ("Revenue hidden for your role"), yet a driver was shown
+     "9 customer(s) have not ordered in 30+ days" and could click through to
+     showDormantCustomers(), which lists customer names, days dormant, last order and
+     custDebt(). That is customer-relationship and debt intelligence, not delivery
+     information — the same class as the debt alerts three lines below, which have always
+     been gated on vDebt. Gated identically so the two cannot drift apart.
+     Deliberately NOT gated on vRev: this is about who owes and who has stopped buying,
+     which is the debt permission, not the revenue one. Low-stock alerts stay ungated
+     because staff already see Stock levels on their own dashboard. */
+  if(churned>0&&can("vDebt"))alerts.push({t:"nw",i:"ti-user-exclamation",m:churned+" customer(s) have not ordered in 30+ days",act:"showDormantCustomers()"});
 
   var lowStock=(D.stock||[]).filter(function(s){return s.qty<=s.min;});
   lowStock.slice(0,3).forEach(function(s){alerts.push({t:"nw",i:"ti-alert-triangle",m:"Low stock: <strong>"+s.name+"</strong> &mdash; "+s.qty+" left (min "+s.min+")",dest:"stock"});});
@@ -10458,7 +10730,7 @@ function rDash(){
       if(pendingPay.length>3)alerts.push({t:"nw",i:"ti-cash",m:(pendingPay.length-3)+" more pending cash collection(s) awaiting acknowledgement",dest:"invoices"});
     }
   }
-  (D.complaints||[]).filter(function(c){return c.status==="Open";}).slice(0,2).forEach(function(c){var cu=(D.customers||[]).find(function(x){return x.id===c.cId;});alerts.push({t:"nw",i:"ti-message-report",m:"Complaint: <strong>"+(cu?(can("vPhone")?cu.name:maskName(cu.name)):"?")+"</strong> &mdash; "+c.type,dest:"complaints"});});
+  (D.complaints||[]).filter(function(c){return c.status==="Open";}).slice(0,2).forEach(function(c){var cu=custById(c.cId);alerts.push({t:"nw",i:"ti-message-report",m:"Complaint: <strong>"+(cu?(can("vPhone")?cu.name:maskName(cu.name)):"?")+"</strong> &mdash; "+c.type,dest:"complaints"});});
   // b26: _displayOrderNo so a provisional order reads "awaiting number" here too, not a
   // raw 16-digit id. Swept after the Orders table — same pattern, three places.
   (D.orders||[]).filter(function(o){return o.status==="Pending";}).slice(0,3).forEach(function(o){alerts.push({t:"ni",i:"ti-truck",m:"Pending: <strong>"+_displayOrderNo(o)+"</strong> &mdash; "+custName(o.cId)+": "+o.qty+"&times; "+o.prod,dest:"orders"});});
@@ -10510,7 +10782,10 @@ function rDash(){
   // The settling risk this grace exists for is unaffected: it guards the brief
   // ~5s (!isOwnWrite||!weAreNewer) sync window, and 5 minutes is still ~60x that.
   var _alertGraceTs=Date.now()-HEAL_RECENT_MS; // settling grace == the auto-heal window (see above)
-  if(can("rest")){
+  /* mRecon, not rest (2026-08-11, ND47-6a) — the alert, the view it opens
+     (showMissingOrders) and the action behind it (recreateOrder) now all enforce the SAME
+     dedicated permission, so no future edit can gate one of the three differently. */
+  if(can("mRecon")){
     var _missingForAlert=(_computeMissingOrders()||[]).filter(function(m){var _t=new Date(m.ts).getTime();return _t>=_alertCutoffTs&&_t<=_alertGraceTs;});
     if(_missingForAlert.length){
       alerts.push({t:"nr",i:"ti-file-alert",m:_missingForAlert.length+" recent order(s) in the audit log have no matching live order &mdash; needs your review",act:"nav(\'data\',null);showMissingOrders()"});
@@ -10704,6 +10979,26 @@ function rCusts(q,pg,sort,type){
   var del=_custOrdAll.filter(function(o){return o.status==="Delivered";});
   var revMap={};var delCusts=del;delCusts.forEach(function(o){revMap[o.cId]=(revMap[o.cId]||0)+o.qty*o.price;});
   var debtMap={};(D.customers||[]).forEach(function(cu){debtMap[cu.id]=custDebt(cu.id);});
+  /* GROUPED ONCE PER RENDER (2026-08-11, ND47-6a). The three lookups inside the row map
+     below each scanned an ARCHIVE-MERGED array in full, once per visible row. Page size is
+     50, so the cost was 50 x (all orders + all invoices) every time the Customers tab drew.
+     Linear rather than quadratic, so it degrades gracefully — but measured on this exact
+     shape it is 6ms today, 276ms at year-10 volume and 2,943ms at year-100 volume: a
+     visibly stalling tab well inside the lifespan this system is held to. Grouping once
+     makes every row an O(1) lookup. Same primitive and same deterministic tie-break as the
+     debtors table and the dormant list.
+     PLACED HERE, after _custInvAll is declared — an earlier draft sat beside _custOrdAll on
+     the line above it, where var-hoisting would have made _custInvAll undefined and thrown
+     on .forEach. The build script refused that write. */
+  var _cOrdsBy={},_cPaysBy={};
+  (_custOrdAll||[]).forEach(function(o){if(!o||o.cId==null)return;var k=String(o.cId);(_cOrdsBy[k]||(_cOrdsBy[k]=[])).push(o);});
+  (_custInvAll||[]).forEach(function(i){
+    if(!i||i.cId==null||!i.payments||!i.payments.length)return;
+    var k=String(i.cId);if(!_cPaysBy[k])_cPaysBy[k]=[];_cPaysBy[k].push.apply(_cPaysBy[k],i.payments);
+  });
+  Object.keys(_cPaysBy).forEach(function(k){_cPaysBy[k].sort(function(a,b){return b.date>a.date?1:-1;});});
+  var _cLastDlv=_latestOrderByCustomer(_custOrdAll,true);
+
   // FIX (2026-07-25): the debt and nodebts sorts below used to call
   // custDebt() directly inside the comparator, completely ignoring the
   // debtMap already built one line above - meaning an O(invoices x orders)
@@ -10777,9 +11072,9 @@ function rCusts(q,pg,sort,type){
       "<tbody>"+
         (paged.items.length?paged.items.map(function(c){
           var debt=(debtMap[c.id]||0);
-          var ords=_custOrdAll.filter(function(o){return o.cId===c.id;});
-          var lastOrd=ords.filter(function(o){return o.status==="Delivered";}).sort(function(a,b){return b.date>a.date?1:-1;})[0];
-          var allPays=_custInvAll.filter(function(i){return i.cId===c.id&&i.payments&&i.payments.length;}).reduce(function(a,i){return a.concat(i.payments);},[]).sort(function(a,b){return b.date>a.date?1:-1;});
+          var ords=_cOrdsBy[String(c.id)]||[];
+          var lastOrd=_cLastDlv[String(c.id)];
+          var allPays=_cPaysBy[String(c.id)]||[];
           var lp=allPays[0];
           return "<tr class=\""+(debt>0?"dr":"")+"\">"+
             "<td><div style=\"font-weight:700\">"+(can("vPhone")?c.name:maskName(c.name))+"</div><div class=\"ca\">"+cAddr(c)+"</div>"+(c.waterCycle>0||(c.waterCycle===0&&c.cycleHistory&&c.cycleHistory.length>0)?"<div style=\"margin-top:3px\"><span class=\"badge ba\" style=\"cursor:pointer;font-size:9px\" onclick=\"showCycleHistory("+c.id+")\" title=\"Water cycle\"><i class=\"ti ti-droplet\"></i> "+c.waterCycle+"/8</span></div>":"")+"</td>"+
@@ -14000,7 +14295,7 @@ function rDel(q){
   // the merge or it silently shrinks as history is archived.
   var totalDel=(ordersWithBooks()||[]).filter(function(o){return o.status==="Delivered";}).length;
   var q2=DEL_Q||"";
-  var pendFil=q2?pend.filter(function(o){var cu=(D.customers||[]).find(function(x){return x.id===o.cId;});var lq=sanitizeInput(q2).toLowerCase();return(cu&&((can("vPhone")&&cu.name&&cu.name.toLowerCase().indexOf(lq)!==-1)||cAddr(cu).toLowerCase().indexOf(lq)!==-1))||String(o.id).indexOf(DEL_Q)!==-1||(o.prod&&o.prod.toLowerCase().indexOf(lq)!==-1)||(o.driver&&o.driver.toLowerCase().indexOf(lq)!==-1);}):pend;
+  var pendFil=q2?pend.filter(function(o){var cu=custById(o.cId);var lq=sanitizeInput(q2).toLowerCase();return(cu&&((can("vPhone")&&cu.name&&cu.name.toLowerCase().indexOf(lq)!==-1)||cAddr(cu).toLowerCase().indexOf(lq)!==-1))||String(o.id).indexOf(DEL_Q)!==-1||(o.prod&&o.prod.toLowerCase().indexOf(lq)!==-1)||(o.driver&&o.driver.toLowerCase().indexOf(lq)!==-1);}):pend;
   // Partial render: build shell once, only update results on search
   if(!el("del-srch")){
     pg.innerHTML=
@@ -14369,15 +14664,390 @@ function _computeMissingOrders(){
    customer who has NEVER ordered has not "stopped ordering", they have never started,
    which is a different business situation and a different conversation. That matches
    the behaviour the count already had, so this refactor changes no number. */
+/* ORPHANED COLLECTION DOCUMENTS — director tool. (2026-08-11, ND47-6a)
+
+   THE PROBLEM, visible in every console log of 2026-08-09/10:
+     invoices/hot: +0 new, 0 updated (2 deleted/archived record(s) refused re-entry
+                   — the collection still holds them)
+   Those documents are TOMBSTONED, so _hydrateById correctly refuses them on every device
+   and they can never come back into D. But nothing deletes them from Firestore, and
+   _hybridReapDeletes cannot: it only deletes what is "in the shadow and absent from D",
+   and a record that was never hydrated is in no device's shadow. They are unreachable.
+
+   WHY IT IS NOT COSMETIC. The published invoice count is written by whichever device last
+   completed a full load, and a device that loaded the collection counts what the QUERY
+   returned. That is why the fleet advertises invoices=529 while every device holds 527.
+   The delta gate then reads 527 < 529 as drift, refuses delta, and takes a FULL LOAD —
+   ~1,294 documents. The director's laptop did exactly that repeatedly on 2026-08-10.
+   Removing the two orphans removes the mismatch and the recurring full loads with it.
+
+   SAFETY, deliberately strict — this deletes live documents:
+     - DRY RUN BY DEFAULT. Nothing is deleted unless called with (true).
+     - It deletes ONLY ids that are already in deletedOrderIds/deletedInvoiceIds or
+       archivedOrderIds/archivedInvoiceIds. A tombstone is the director's own prior
+       decision that the record is gone; this is finishing that action, not making a new one.
+     - It refuses any id that is currently present in D. If it is live in memory it is not
+       an orphan, whatever the tombstone says, and the tombstone is the thing in doubt.
+     - Per-row logging of every id, before and after, so the action is auditable.
+     - No age heuristic, no count heuristic, no bulk sweep — CLAUDE.md forbids all three
+       as deletion criteria, and none is used here. */
+var ORPHAN_MAX_PER_RUN=5;   // same ceiling as HYBRID_MAX_DELETES_PER_FLUSH, same reasoning
+function _purgeOrphanedDocs(apply){
+  /* ---- RAIL 1: who ---- */
+  if(!CU||CU.role!=="director"){console.log("[NDORPHAN] director only");return 0;}
+  if(!FB_ORDERS_COL||!FB_INVOICES_COL){console.log("[NDORPHAN] collections not live");return 0;}
+  /* ---- RAIL 2: this device must hold a COMPLETE picture ----
+     The whole test is "tombstoned AND absent from D". On a device whose D is partial that
+     test is a lie: an id can be absent simply because this device never loaded it.
+     _hybridInitialLoadDone() is NOT sufficient on its own — since the delta sync went live it
+     returns true after a *delta* snapshot too, and a delta only carries records changed since
+     the watermark, so almost every id in the database is legitimately "absent from D". That
+     is precisely the trap the counts-publish guard hit, and it is answered by the same flag:
+     _fullLoadDeliveredThisSession is set only by _maybeRecordFullLoadBaseline(), i.e. only
+     when this session genuinely received the entire collection. Both are required. */
+  if(typeof _hybridInitialLoadDone!=="function"||!_hybridInitialLoadDone()){
+    console.log("[NDORPHAN] REFUSED — this device has not completed its initial collection load. "+
+                "'Absent from D' would not mean 'absent from the database'.");return 0;}
+  if(!_fullLoadDeliveredThisSession){
+    console.log("[NDORPHAN] REFUSED — this session booted from a delta/local snapshot, not a full "+
+                "collection load. D holds only part of the database, so 'absent from D' proves "+
+                "nothing. Hard-refresh to force a full load, then run this again.");return 0;}
+  if(typeof _cloudServerConfirmed!=="undefined"&&!_cloudServerConfirmed){
+    console.log("[NDORPHAN] REFUSED — no server-confirmed snapshot yet. Cannot judge cloud state.");return 0;}
+  if(!((D&&D.orders)||[]).length||!((D&&D.invoices)||[]).length){
+    console.log("[NDORPHAN] REFUSED — orders or invoices are EMPTY in memory. That is a load "+
+                "failure, not a database full of orphans.");return 0;}
+  /* ---- RAIL 3: what ----
+     DELETION tombstones ONLY. archivedOrderIds/archivedInvoiceIds are deliberately NOT
+     included: an archived record has been moved into the books, ordersWithBooks() merges it
+     back for history and statements, and its collection document may still be the source of
+     that. Deleting an archived record is destroying history, which is the opposite of what a
+     tombstone for it means. A tombstone in deletedOrderIds is the director's own prior
+     decision that the record should not exist; this only finishes that action. */
+  var plan=[];
+  var scan=function(col,arrName,tombMap,label){
+    var liveIds={};((D&&D[arrName])||[]).forEach(function(r){if(r&&r.id!=null)liveIds[String(r.id)]=1;});
+    Object.keys((D&&D[tombMap])||{}).forEach(function(k){
+      if(liveIds[String(k)])return;            // present in D — live, not an orphan
+      plan.push({col:col,id:String(k),label:label,why:tombMap});
+    });
+  };
+  scan(FB_ORDERS_COL,"orders","deletedOrderIds","order");
+  scan(FB_INVOICES_COL,"invoices","deletedInvoiceIds","invoice");
+  if(!plan.length){console.log("[NDORPHAN] nothing to purge.");return 0;}
+  /* ---- RAIL 4: volume ----
+     A correct state has a handful of orphans. Dozens means the premise is wrong — a bad
+     tombstone map, a partial load that slipped the checks above — and the right response to
+     "I think I should delete 40 records" is always to stop, never to proceed carefully. */
+  if(plan.length>ORPHAN_MAX_PER_RUN){
+    console.log("[NDORPHAN] REFUSED — "+plan.length+" candidates exceeds the cap of "+ORPHAN_MAX_PER_RUN+
+                ". That many orphans means the premise is wrong, not that there is a lot to clean. "+
+                "Nothing deleted. Investigate before raising this cap.");
+    plan.slice(0,10).forEach(function(p){console.log("   would have considered "+p.label+" #"+p.id);});
+    return 0;}
+  console.log("[NDORPHAN] "+plan.length+" candidate(s) — VERIFYING each against Firestore before any delete:");
+  /* ---- RAIL 5: verify the actual document, one read each ----
+     Everything above reasons from THIS DEVICE's memory. Before deleting anything we read the
+     real document and confirm three things: it exists, its id matches the id we intend to
+     delete, and it is still tombstoned at the moment of deletion. A candidate that does not
+     exist is skipped rather than deleted — a no-op delete would be harmless, but skipping it
+     keeps the count honest. Costs one read per candidate; the cap makes that at most 5. */
+  var verified=[],checked=0;
+  plan.forEach(function(p){
+    p.col.doc(p.id).get().then(function(snap){
+      checked++;
+      var ok=true,why="";
+      if(!snap.exists){ok=false;why="no such document (already gone)";}
+      else{
+        var v=snap.data()||{};
+        if(String(v.id)!==p.id){ok=false;why="document id mismatch ("+v.id+")";}
+        else if(!((D[p.why]||{})[p.id])){ok=false;why="tombstone disappeared mid-run";}
+      }
+      if(!ok){console.log("   SKIP "+p.label+" #"+p.id+" — "+why);}
+      else{
+        verified.push(p);
+        console.log("   OK   "+p.label+" #"+p.id+" — exists, id matches, still tombstoned");
+      }
+      if(checked===plan.length)_orphanFinish(verified,apply);
+    }).catch(function(e){
+      checked++;console.log("   SKIP "+p.label+" #"+p.id+" — read failed ("+((e&&e.code)||"unknown")+")");
+      if(checked===plan.length)_orphanFinish(verified,apply);
+    });
+  });
+  return plan.length;
+}
+function _orphanFinish(verified,apply){
+  if(!verified.length){console.log("[NDORPHAN] nothing verified — nothing to delete.");return;}
+  if(!apply){
+    console.log("[NDORPHAN] DRY RUN — "+verified.length+" verified orphan(s), NOTHING DELETED.");
+    console.log("[NDORPHAN] Run _purgeOrphanedDocs(true) to apply. Tombstones are kept either way, "+
+                "so nothing can re-enter afterwards.");
+    return;}
+  verified.forEach(function(p){
+    p.col.doc(p.id).delete()
+      .then(function(){console.log("[NDORPHAN] deleted "+p.label+" #"+p.id);})
+      .catch(function(e){console.log("[NDORPHAN] FAILED "+p.label+" #"+p.id+" — "+((e&&e.code)||"unknown"));});
+  });
+  try{auditLog("SYNC_HEALTH","Orphaned collection documents purged by "+CU.name+" — "+verified.length+
+    " tombstoned id(s): "+verified.map(function(p){return p.label+" #"+p.id;}).join(", ")+
+    ". Each was verified to exist and still be tombstoned immediately before deletion. Tombstones retained.");}catch(_){}
+  console.log("[NDORPHAN] "+verified.length+" delete(s) issued. Re-run the dry run to confirm they are gone.");
+  console.log("[NDORPHAN] The published count corrects on the next device that completes a full load.");
+}
+/* REVENUE COMPARISON — ONE definition, shared by the alert and its drill-down.
+   (2026-08-11, ND47-6a)
+
+   THE DEFECT THIS CLOSES. The dashboard alert reads e.g. "Revenue +129% vs the same 11 days
+   of last month — KSh 130,250 vs KSh 57,000", and clicking it went to Reports, which shows
+   no such comparison. The number was right and the destination was useless — the identical
+   shape to the dormant-customer alert that counted N and navigated to all 441.
+
+   WHY A SHARED FUNCTION rather than recomputing in the view: a headline figure and the rows
+   behind it that are calculated twice will eventually disagree, and this one is money. This
+   is the same reason _dormantCustomers() was extracted, and the same reason every debt figure
+   in this app goes through custDebt()/_invoiceOrderActive().
+
+   THE ARITHMETIC IS UNCHANGED — moved, not rewritten:
+     - SAME DAYS OF MONTH. Comparing 1-11 Aug against ALL of July made every early month read
+       as a collapse (the live "-73%" of 2026-08-07). Day-of-month cutoff also handles short
+       months: on 31 March the February cutoff is day 31, which simply includes all of it.
+     - WRITE-OFFS SUBTRACTED, via _writtenOffFor, because the dashboard's own period revenue
+       and the monthly chart both subtract them. One definition of revenue, everywhere.
+   Both properties are pinned by _proofB_alerts.js sections 1a-1d, which drive this same
+   calculation with a fixture where a FLAT business used to report -62%. */
+/* MOVED TO TOP LEVEL (2026-08-11, ND47-6a) — this was a NESTED function inside rDash(),
+   closing over rDash's local _dashInvAll. That was fine while rDash was its only caller.
+   It stopped being fine when _revenueCompare was extracted OUT of rDash earlier in this
+   build: _revenueCompare is top level, so _writtenOffFor was not in its scope at all, and
+   its two calls sit inside try/catch. The ReferenceError was therefore swallowed, woBad was
+   set, and the revenue alert and its drill-down would have shown 'GROSS and overstated'
+   PERMANENTLY instead of the real comparison.
+
+   The proof suite did not catch it because _proofB_revenue_failvisible.js INJECTED a
+   _writtenOffFor into its test context — it supplied the very thing the runtime was
+   missing, so it tested a scope that never exists. The proof now extracts this real
+   function and asserts it is top level.
+
+   invArr is optional so rDash can hand over the array it has already built (no extra work,
+   byte-identical behaviour there) while any other caller gets the archive-merged list. */
+function _writtenOffFor(orders,invArr){
+  var invs=Array.isArray(invArr)?invArr:(function(){
+    try{return (typeof invoicesWithBooks==="function"?invoicesWithBooks():(D.invoices||[]))||[];}
+    catch(_){return (D&&D.invoices)||[];}
+  })();
+  var ids={};(Array.isArray(orders)?orders:[]).forEach(function(o){if(o&&o.id!=null)ids[o.id]=true;});
+  return invs.filter(function(i){
+      if(!i||!i.voided)return false;
+      if(i.orderId)return !!ids[i.orderId];
+      var _mo=_linkedOrderIdOf(i);
+      return _mo!=null&&!!ids[_mo];
+    }).reduce(function(a,i){return a+((Number(i.amount)||0)-(Number(i.paid)||0));},0);
+}
+function _revenueCompare(del,now){
+  /* Type-check BOTH arguments, not truthiness. `now||new Date()` accepted any truthy value
+     and then threw "n.getFullYear is not a function"; `(del||[])` has the identical hole —
+     it only substitutes for falsy values, so a non-array (a string, an object, a number)
+     passes straight through and throws "(del||[]).filter is not a function" on the next
+     line. Both were found by the execution harness, not by reading the code. A money
+     function must not depend on its caller passing the right shape. Returning zeroed
+     figures for a bad argument is correct here: the caller gets "no revenue in that
+     period", which is visibly wrong on screen, rather than a thrown exception that blanks
+     the whole dashboard render. */
+  var n=(now&&typeof now.getFullYear==="function")?now:new Date();
+  var rows=Array.isArray(del)?del:[];
+  var thisMonth=n.getFullYear()+"-"+String(n.getMonth()+1).padStart(2,"0");
+  var lm=new Date(n.getFullYear(),n.getMonth()-1,1);
+  var lastMonth=lm.getFullYear()+"-"+String(lm.getMonth()+1).padStart(2,"0");
+  var domToday=n.getDate();
+  var mtd=function(mon){
+    return rows.filter(function(o){
+      /* String(dd) before .startsWith for the same reason as the argument guards above: a
+         date stored as a number (or a Firestore Timestamp) would throw, not just mismatch. */
+      var dd=o&&(o.deliveredAt||o.date);
+      if(!dd||!String(dd).startsWith(mon))return false;
+      var d=parseInt(String(dd).slice(8,10),10);
+      return !isNaN(d)&&d<=domToday;   // same days of the month, so the two are comparable
+    });
+  };
+  var tO=mtd(thisMonth),lO=mtd(lastMonth);
+  var gross=function(l){return l.reduce(function(s,o){return s+(Number(o.qty)||0)*(Number(o.price)||0);},0);};
+  /* FAIL VISIBLY, NEVER SILENTLY (2026-08-11, ND47-6a — the director's explicit choice).
+     The first version swallowed both failure modes into a 0. A zero is indistinguishable
+     from "a genuinely quiet month", so a broken figure looked like a real business result.
+     Two DIFFERENT failures need two DIFFERENT treatments:
+
+       dataBad  — `del` was not an array, so there are no orders to total. Every figure is
+                  meaningless. The caller must HIDE the numbers and say so.
+       woBad    — _writtenOffFor() threw, so write-offs are unknown. The gross totals are
+                  still correct; net is unknown and whatever we show is OVERSTATED. Hiding
+                  this would be wrong too — gross is real information — so the caller SHOWS
+                  the figure and marks it overstated. An overstated revenue figure that
+                  looks authoritative is the single most dangerous thing this function can
+                  produce, which is why it gets its own flag rather than sharing dataBad. */
+  var dataBad=!Array.isArray(del);
+  var tW=0,lW=0,woBad=false;
+  try{tW=_writtenOffFor(tO);}catch(_){tW=0;woBad=true;}
+  try{lW=_writtenOffFor(lO);}catch(_){lW=0;woBad=true;}
+  var thisRev=gross(tO)-tW,lastRev=gross(lO)-lW;
+  return {thisMonth:thisMonth,lastMonth:lastMonth,domToday:domToday,
+          thisOrds:tO,lastOrds:lO,
+          thisGross:gross(tO),lastGross:gross(lO),thisWO:tW,lastWO:lW,
+          thisRev:thisRev,lastRev:lastRev,
+          ok:(!dataBad&&!woBad),dataBad:dataBad,woBad:woBad,
+          problem:(dataBad?"Order data did not load correctly on this device."
+                  :woBad?"Write-offs could not be calculated — figures are GROSS and overstated.":""),
+          pct:(lastRev>0?Math.round((thisRev-lastRev)/lastRev*100):null)};
+}
+/* The drill-down the alert now opens. Shows exactly the comparison the alert claims —
+   day by day, both months side by side, with the write-off adjustment visible so the
+   totals reconcile to the dashboard rather than being a fourth revenue figure. */
+function showRevenueCompare(){
+  if(!can("vRev")){toast("Revenue is hidden for your role","err");return;}
+  var body=el("m-revcmp-body");if(!body)return;
+  var _all=[];try{_all=(typeof ordersWithBooks==="function")?ordersWithBooks():(D.orders||[]);}catch(_){_all=(D.orders||[]);}
+  var del=_all.filter(function(o){return o&&o.status==="Delivered";});
+  var r=_revenueCompare(del,new Date());
+  /* FAIL VISIBLY (2026-08-11, ND47-6a). dataBad means there are no trustworthy figures at
+     all, so the table is not drawn — rendering a grid of zeroes here would read as "a very
+     quiet month" rather than "this is broken", which is exactly the silent-wrong-number
+     outcome the director rejected. woBad is different: the daily gross figures below ARE
+     correct, only the write-off deduction is missing, so the table IS drawn with a standing
+     banner above it saying the totals are overstated. */
+  if(r.dataBad){
+    body.innerHTML="<div style=\"padding:28px;text-align:center\">"+
+      "<i class=\"ti ti-alert-triangle\" style=\"font-size:38px;color:#c0392b;display:block;margin-bottom:12px\"></i>"+
+      "<div style=\"font-weight:800;font-size:15px;color:#c0392b;margin-bottom:6px\">Revenue comparison unavailable</div>"+
+      "<div style=\"font-size:13px;color:var(--tx2);line-height:1.6\">"+r.problem+
+      "<br>No figures are shown because none of them would be trustworthy."+
+      "<br><br>Hard-refresh the page, wait for orders to finish loading, then reopen this.</div></div>";
+    om("m-revcmp");return;
+  }
+  var _woBanner=r.woBad?("<div style=\"background:#fef3e2;border:1px solid #b9770e;border-radius:8px;padding:10px 12px;margin-bottom:12px\">"+
+      "<div style=\"font-weight:800;font-size:13px;color:#b9770e\"><i class=\"ti ti-alert-circle\"></i> Gross only &mdash; write-offs could not be calculated</div>"+
+      "<div style=\"font-size:12px;color:var(--tx2);margin-top:4px\">Every total below is BEFORE bad debt is deducted, so actual net revenue is lower than shown. Do not use these figures for a decision.</div></div>"):"";
+  var byDay=function(list){var m={};list.forEach(function(o){var dd=String(o.deliveredAt||o.date).slice(8,10);
+    m[dd]=(m[dd]||0)+(Number(o.qty)||0)*(Number(o.price)||0);});return m;};
+  var tD=byDay(r.thisOrds),lD=byDay(r.lastOrds);
+  var rows="";
+  for(var d=1;d<=r.domToday;d++){
+    var k=String(d).padStart(2,"0");
+    var a=tD[k]||0,b=lD[k]||0;
+    if(!a&&!b)continue;
+    var diff=a-b;
+    rows+="<tr><td>"+d+"</td>"+
+      "<td style=\"text-align:right\">"+(b?kshS(b):"&mdash;")+"</td>"+
+      "<td style=\"text-align:right\">"+(a?kshS(a):"&mdash;")+"</td>"+
+      "<td style=\"text-align:right;color:"+(diff>0?"var(--gn)":(diff<0?"var(--rd)":"var(--tx2)"))+"\">"+
+        (diff>0?"+":"")+(diff?kshS(diff):"&mdash;")+"</td></tr>";
+  }
+  if(!rows)rows="<tr><td colspan=\"4\" style=\"text-align:center;color:var(--tx2);padding:14px\">No delivered orders in either period yet.</td></tr>";
+  var pctTxt=(r.pct===null)?"no comparable revenue last month":((r.pct>0?"+":"")+r.pct+"%");
+  body.innerHTML=
+    _woBanner+
+    "<div style=\"font-size:12px;color:var(--tx2);margin-bottom:10px\">Comparing the <strong>first "+r.domToday+
+      " day"+(r.domToday===1?"":"s")+"</strong> of "+r.thisMonth+" against the <strong>same days</strong> of "+r.lastMonth+
+      ". Part-month against part-month, so the two are comparable. Write-offs are subtracted on both sides, "+
+      "which is why these totals match the dashboard.</div>"+
+    "<div style=\"display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px\">"+
+      "<div style=\"flex:1;min-width:150px;border:1px solid var(--bd);border-radius:8px;padding:10px\">"+
+        "<div style=\"font-size:11px;color:var(--tx2)\">"+r.lastMonth+" (same days)</div>"+
+        "<div style=\"font-size:18px;font-weight:800\">"+kshS(r.lastRev)+"</div>"+
+        (r.lastWO?"<div style=\"font-size:10px;color:var(--tx2)\">gross "+kshS(r.lastGross)+" &minus; written off "+kshS(r.lastWO)+"</div>":"")+
+      "</div>"+
+      "<div style=\"flex:1;min-width:150px;border:1px solid var(--bd);border-radius:8px;padding:10px\">"+
+        "<div style=\"font-size:11px;color:var(--tx2)\">"+r.thisMonth+" so far</div>"+
+        "<div style=\"font-size:18px;font-weight:800\">"+kshS(r.thisRev)+"</div>"+
+        (r.thisWO?"<div style=\"font-size:10px;color:var(--tx2)\">gross "+kshS(r.thisGross)+" &minus; written off "+kshS(r.thisWO)+"</div>":"")+
+      "</div>"+
+      "<div style=\"flex:1;min-width:150px;border:1px solid var(--bd);border-radius:8px;padding:10px\">"+
+        "<div style=\"font-size:11px;color:var(--tx2)\">Change</div>"+
+        "<div style=\"font-size:18px;font-weight:800;color:"+((r.pct||0)>0?"var(--gn)":((r.pct||0)<0?"var(--rd)":"inherit"))+"\">"+pctTxt+"</div>"+
+        "<div style=\"font-size:10px;color:var(--tx2)\">"+r.thisOrds.length+" vs "+r.lastOrds.length+" delivered orders</div>"+
+      "</div>"+
+    "</div>"+
+    "<div style=\"overflow-x:auto\"><table class=\"tbl\"><thead><tr>"+
+      "<th>Day</th><th style=\"text-align:right\">"+r.lastMonth+"</th>"+
+      "<th style=\"text-align:right\">"+r.thisMonth+"</th><th style=\"text-align:right\">Difference</th>"+
+    "</tr></thead><tbody>"+rows+"</tbody></table></div>";
+  om("m-revcmp");
+}
+/* LATEST ORDER PER CUSTOMER, IN ONE PASS (2026-08-11, ND47-6a).
+   "Which was this customer's most recent order?" is asked in three places — the dormant
+   list, the debtors table, and the credit-balance table — and all three answered it the
+   same expensive way: for EVERY customer, scan the whole order array, then sort the
+   matches. The debtors table additionally did `[].concat(_debtOrdAll)`, allocating a full
+   copy of the array per customer. All three are handed ordersWithBooks(), which merges the
+   archive and therefore grows with total business history and never shrinks, so the cost is
+   O(customers x orders) forever. Measured on the dormant list before this change:
+   1,200 customers x 24,000 orders took 1,913 ms; the single-pass form takes 6 ms.
+
+   One primitive, three callers, so the answer cannot differ between screens either.
+
+   TIE-BREAK is deliberate and deterministic: on two orders sharing the same date the
+   highest id wins. Ids are sequential, so that genuinely is the later order of that day.
+   The code this replaces sorted with `String(b.date)>String(a.date)?1:-1`, a comparator
+   that never returns 0 — for same-date orders V8's result is arbitrary, and an equivalence
+   harness caught it returning different rows for identical data across runs. Being
+   bug-compatible with that was not a goal.
+
+   deliveredOnly: the dormant list means "has not ORDERED in 30+ days" and must ignore
+   pending/cancelled rows; the debtors tables want the last order of any status. */
+function _latestOrderByCustomer(ordArr,deliveredOnly){
+  /* Array.isArray, not `ordArr||[]` — the THIRD time this exact hole has been found in this
+     build (after _revenueCompare's `del` and `now`). `x||[]` substitutes only for FALSY
+     values, so a string, an object or a number passes straight through and throws
+     "(ordArr || []).forEach is not a function" on the next line. Caught by the execution
+     harness, not by reading. Returning an empty index for a bad argument is right here: the
+     caller shows "no last order" rather than blanking the whole screen it renders into. */
+  var latest={};
+  (Array.isArray(ordArr)?ordArr:[]).forEach(function(o){
+    if(!o||o.cId==null)return;
+    if(deliveredOnly&&o.status!=="Delivered")return;
+    var k=String(o.cId),cur=latest[k];
+    if(!cur){latest[k]=o;return;}
+    var d=String(o.date),cd=String(cur.date);
+    if(d>cd||(d===cd&&Number(o.id)>Number(cur.id)))latest[k]=o;
+  });
+  return latest;
+}
 function _dormantCustomers(ordArr,churnDate){
+  /* SINGLE-PASS INDEX (2026-08-11, ND47-6a) — this was O(customers x orders) plus a full
+     sort per customer, and it runs on EVERY dashboard render.
+
+       was:  for each customer -> filter ALL orders -> sort the matches -> take [0]
+       now:  one pass over orders building cId -> latest delivered order, then O(1) lookup
+
+     Why it mattered enough to change: at today's 444 customers x 528 orders that is ~234k
+     comparisons, which is genuinely fine. But this is the shape that does not survive the
+     100-year question the director asked. At the modelled year-100 volume (730,000 orders)
+     with a few thousand customers it is billions of comparisons per render — the dashboard
+     would simply stop opening, and it would degrade gradually so nobody could point at the
+     day it broke. The new form is O(orders + customers): ~1.2M ops at year 100, flat in
+     customer count. Same output, no behaviour change.
+
+     Extends the memoised-index idiom already used by _getOrdByIdIndex() (see the note at
+     the "invoked once per customer in several debt/..." comment) rather than inventing a
+     new mechanism. Not memoised here on purpose: ordArr is archive-merged and differs
+     between callers, so a cache keyed on nothing would be a correctness bug.
+
+     TIE-BREAK — deliberately NOT bug-compatible with the old code. The old comparator
+     `String(b.date)>String(a.date)?1:-1` never returns 0, so for two orders on the SAME
+     day it is an inconsistent comparator and V8's sort result is arbitrary: an equivalence
+     harness (_proofB_dormant_perf.js) found it picking different same-date orders across
+     runs of identical data. Which customers are dormant was never affected — that depends
+     only on the max DATE, which both forms agree on — but the order shown as "last" could
+     differ between two orders placed on the same day. Replicating arbitrary behaviour is
+     not a goal, so this picks the highest id among same-date orders: ids are sequential, so
+     that is genuinely the later order of that day, and it is deterministic. */
   var out=[];
   try{
+    var latest={};                                   // cId -> latest delivered order
+    latest=_latestOrderByCustomer(ordArr,true);      // Delivered only — see the helper
     (D.customers||[]).forEach(function(cu){
       if(!cu)return;
-      var mine=(ordArr||[]).filter(function(o){return o&&o.cId===cu.id&&o.status==="Delivered";});
-      if(!mine.length)return;                       // never ordered — not "stopped"
-      var last=mine.slice().sort(function(a,b){return String(b.date)>String(a.date)?1:-1;})[0];
-      if(last&&String(last.date)<String(churnDate))out.push({cu:cu,last:last});
+      var last=latest[String(cu.id)];
+      if(!last)return;                              // never ordered — not "stopped"
+      if(String(last.date)<String(churnDate))out.push({cu:cu,last:last});
     });
   }catch(_){}
   return out;
@@ -14386,7 +15056,31 @@ function _dormantCustomers(ordArr,churnDate){
    actually needs to act: how long it has been, what they last took, and whether they
    owe anything — because "chase this customer" and "chase this debt" are different
    calls. Debt comes from custDebt() so it agrees with every other debt figure. */
-function showDormantCustomers(){
+var DORMANT_PAGE=0;
+function showDormantCustomers(pg){
+  /* PAGINATION (2026-08-11, ND47-6a) — the director's point: this list can only grow.
+     It rendered EVERY dormant customer with list.map(), which is fine at 9 and a wall of
+     rows at 100+. With 444 customers and a 30-day window, a slow season could put a large
+     fraction of the book in here at once. Uses the SAME paginate()/pgBar() primitive as
+     Orders, Customers, Invoices and Complaints (PAGE_SIZE=50) rather than inventing a
+     second scheme — one page cap for the whole app, and the "longest-dormant first" sort
+     stays applied to the WHOLE list before slicing, so page 1 is always the customers who
+     have been gone longest. That ordering is the point of the view. */
+  /* ROLE GATE ON THE FUNCTION ITSELF (2026-08-11, ND47-6a) — not just on the alert that
+     opens it. The alert is gated on can("vDebt"), but an alert is only ONE way in: an
+     onclick built at runtime, a pgBar link, or a stale modal left mounted from a previous
+     session all reach this function directly, and it renders every dormant customer's
+     name and order history. showRevenueCompare() already gates itself internally for
+     exactly this reason; this was the inconsistent one. Gated on the SAME permission as
+     the alert so the two cannot drift apart — if the alert is hidden for a role, the view
+     behind it must be closed for that role too. */
+  if(!can("vDebt")){toast("Customer account data is hidden for your role","err");return;}
+  /* Reset to page 1 on a FRESH open; keep the page only when pgBar navigates (2026-08-11,
+     ND47-6a). Previously `if(pg!==undefined)DORMANT_PAGE=pg;` left the module-level page
+     wherever it was last, so closing the list on page 3 and reopening it landed on page 3
+     again — hiding the longest-dormant customers, who are the entire point of the view and
+     are always on page 1. An alert click must always show the worst cases first. */
+  DORMANT_PAGE=(pg!==undefined)?pg:0;
   var body=el("m-dormant-body");if(!body)return;
   var churnDate=_ymd(new Date(Date.now()-30*86400000));
   /* CALL ordersWithBooks() DIRECTLY — do NOT reach for _dashOrdAll.
@@ -14409,7 +15103,8 @@ function showDormantCustomers(){
   // Longest-dormant first: that is the order a director would work the list in.
   list.sort(function(a,b){return String(a.last.date)>String(b.last.date)?1:-1;});
   var today=new Date(_ymd(new Date())+"T12:00:00").getTime();
-  var rows=list.map(function(r){
+  var _dPaged=paginate(list,DORMANT_PAGE);
+  var rows=_dPaged.items.map(function(r){
     var days=Math.round((today-new Date(String(r.last.date)+"T12:00:00").getTime())/86400000);
     var debt=0;try{debt=custDebt(r.cu.id);}catch(_){debt=0;}
     return "<tr>"+
@@ -14427,10 +15122,26 @@ function showDormantCustomers(){
     "</div>"+
     "<div style=\"overflow-x:auto\"><table class=\"tbl\"><thead><tr>"+
       "<th>Customer</th><th>Dormant</th><th>Last order</th><th>What they took</th><th>Owes</th><th></th>"+
-    "</tr></thead><tbody>"+rows+"</tbody></table></div>";
+    "</tr></thead><tbody>"+rows+"</tbody></table></div>"+
+    /* pgBar renders nothing when everything fits on one page, so at today's 9 customers
+       the view looks exactly as it does now. It only appears once the list outgrows a page. */
+    pgBar(_dPaged.page,_dPaged.pages,_dPaged.total,"showDormantCustomers(");
   om("m-dormant");
 }
 function showMissingOrders(){
+  /* ROLE GATE ON THE FUNCTION ITSELF (2026-08-11, ND47-6a) — same fix and same reasoning
+     as showDormantCustomers. The alert that opens this is director-gated, but the alert is
+     only one way in. This view lists customer names, products and prices for orders being
+     reconciled, and every row offers a Recreate button.
+
+     PERMISSION (2026-08-11, ND47-6a): "mRecon", a dedicated permission, NOT "rest".
+     The first version of this gate borrowed "rest" (Restore backup) because it happened to
+     be director-only. That was the wrong thing done because it was the easy thing: the name
+     does not describe the use, and a future session reading can("rest") on an order-CREATION
+     path would reasonably misread it. can() resolves against the hardcoded R table, not
+     against stored user records, so a new permission takes effect immediately with no
+     migration and no possibility of locking anyone out. */
+  if(!can("mRecon")){toast("Order reconciliation is restricted to a director","err");return;}
   var missing=findMissingOrders();
   var body=el("m-recon-body");if(!body)return;
   if(!missing.length){body.innerHTML="<div style=\'padding:20px;text-align:center;color:var(--tx2)\'>No missing orders found — audit log matches live orders.</div>";om("m-recon");return;}
@@ -14717,6 +15428,14 @@ function restoreMissingOrderExact(idx){
   });
 }
 async function recreateOrder(idx){
+  /* ROLE GATE (2026-08-11, ND47-6a) — this had NO permission check of any kind, and it is
+     a genuine order-CREATION path: it writes an order, and on the invoice path an invoice
+     with a price. Its only entry point is the reconciliation modal, which is gated, so it
+     was never exposed in practice — but a write path must carry its own gate rather than
+     inheriting one from whatever happened to open it. That is precisely the assumption
+     that failed for showDormantCustomers. "mRecon" matches showMissingOrders above, so all
+     three (alert, view, action) enforce one permission and cannot drift apart. */
+  if(!can("mRecon")){toast("Order reconciliation is restricted to a director","err");return;}
   var row=document.querySelector("[data-idx=\'"+idx+"\']");if(!row)return;
   var cId=parseInt(row.querySelector(".recon-cust-search").value)||0;
   var prod=sanitizeInput(row.querySelector(".recon-prod").value.trim());
@@ -14920,7 +15639,7 @@ function rInvs(q,pg){
   // would have no way to explain. Identical to D.invoices with zero books loaded.
   var _invAllForList=invoicesWithBooks();
   var fil=[].concat(_invAllForList).reverse();
-  if(q2){var lq=sanitizeInput(q2).toLowerCase();fil=fil.filter(function(i){var c=(D.customers||[]).find(function(x){return x.id===i.cId;});return(c&&(can("vPhone")&&c.name&&c.name.toLowerCase().indexOf(lq)!==-1))||String(i.id).indexOf(q2)!==-1||String(i.amount).indexOf(q2)!==-1;});}
+  if(q2){var lq=sanitizeInput(q2).toLowerCase();fil=fil.filter(function(i){var c=custById(i.cId);return(c&&(can("vPhone")&&c.name&&c.name.toLowerCase().indexOf(lq)!==-1))||String(i.id).indexOf(q2)!==-1||String(i.amount).indexOf(q2)!==-1;});}
   var paged=paginate(fil,INV_PAGE);
   // Show pending cash payments requiring acknowledgement (director/manager only)
   var pendingBanner="";
@@ -14992,7 +15711,17 @@ function filterInvs(f){
   // is a separate render path over the same list, so it needs the same reach.
   var fil=[].concat(invoicesWithBooks()).reverse();
   if(f==="Paid")fil=fil.filter(function(i){return i.paid>=i.amount;});
-  else if(f==="Unpaid")fil=fil.filter(function(i){return i.paid<i.amount&&(!i.due||i.due>=td);});
+  /* SAME FIX AS "Overdue" BELOW, applied to its sibling (2026-08-11, ND47-6a — found by
+     _system_audit.js). On 2026-07-28 the Overdue filter was corrected to exclude voided
+     invoices and invoices whose order was cancelled or deleted, because "overdue" must mean
+     COLLECTABLE and past due. Unpaid was left as a bare i.paid<i.amount, so a voided
+     invoice — or one belonging to a cancelled order — still listed here as money owed. That
+     contradicts the project rule that every debt figure matches custDebt()/
+     _invoiceOrderActive(), and it is the classic missed sibling: one instance of a pattern
+     fixed, the structurally identical one beside it left alone.
+     Nothing becomes unreachable — the "All" option applies no filter, so voided invoices
+     are still visible there; they simply stop being counted as unpaid. */
+  else if(f==="Unpaid")fil=fil.filter(function(i){return i.paid<i.amount&&(!i.due||i.due>=td)&&!i.voided&&_invoiceOrderActive(i);});
   else if(f==="Overdue")fil=fil.filter(function(i){return i.paid<i.amount&&i.due&&i.due<td&&!i.voided&&_invoiceOrderActive(i);}); // FIX (2026-07-28): "overdue" means collectable + past due — exclude voided (written-off) and cancelled/deleted-order invoices, matching the debtors-page KPI and custDebt.
   var paged=paginate(fil,0);
   var tb=el("itbody");if(tb)tb.innerHTML=invRows(paged.items);
@@ -15869,6 +16598,11 @@ function rDebts(q,pg){
   // blank for exactly the customers this screen most wants to reassure a director
   // about.
   var _debtOrdAll=ordersWithBooks();
+  /* Built ONCE for the whole render (2026-08-11, ND47-6a). The two call sites below each
+     used to run [].concat(_debtOrdAll).filter(...).sort(...) PER CUSTOMER — a full copy of
+     the archive-merged order array, then a scan, then a sort, for every row on the page.
+     See _latestOrderByCustomer for the measurement and the deterministic tie-break. */
+  var _debtLastOrd=_latestOrderByCustomer(_debtOrdAll,false);
   var debtors=(D.customers||[]).map(function(c){
     // Period-scoped debt: find orders in this period and their unpaid invoices
     var allInvs=(D.invoices||[]).filter(function(i){return i.cId===c.id&&i.paid<i.amount&&!i.voided&&_invoiceOrderActive(i);});
@@ -15907,7 +16641,7 @@ function rDebts(q,pg){
        change can show "gross vs net" side by side without recomputing. */
     var _cr=(c.credit>0)?c.credit:0;
     var debt=Math.max(0,_grossDebt-_cr);
-    var lastOrd=[].concat(_debtOrdAll).filter(function(o){return o.cId===c.id;}).sort(function(a,b){return b.date>a.date?1:-1;})[0];
+    var lastOrd=_debtLastOrd[String(c.id)];
     var ov=periodInvs.filter(function(i){return i.due&&i.due<td;}).length;
     var old2=periodInvs.length?periodInvs.map(function(i){return i.due;}).filter(Boolean).sort()[0]:null;
     return{c:c,debt:debt,gross:_grossDebt,credit:_cr,lastOrd:lastOrd,invCount:periodInvs.length,ov:ov,oldest:old2};
@@ -15918,7 +16652,7 @@ function rDebts(q,pg){
     debtors=D.customers
       .filter(function(cu){return cu.credit>0;})
       .map(function(cu){
-        var lastOrd=[].concat(_debtOrdAll).filter(function(o){return o.cId===cu.id;}).sort(function(a,b){return b.date>a.date?1:-1;})[0];
+        var lastOrd=_debtLastOrd[String(cu.id)];
         return {c:cu,debt:custDebt(cu.id),credit:cu.credit||0,lastOrd:lastOrd,ov:0,oldest:null};
       })
       .sort(function(a,b){return b.credit-a.credit;});
@@ -16024,7 +16758,7 @@ function rCmps(q,pg){
   var q2=CMP_Q||"";
   var pgEl=el("pg-complaints");if(!pgEl)return;
   var fil=[].concat(D.complaints).reverse();
-  if(q2){var lq=sanitizeInput(q2).toLowerCase();var _canSearchName=can("vPhone");fil=fil.filter(function(c){var cu=(D.customers||[]).find(function(x){return x.id===c.cId;});return(_canSearchName&&cu&&cu.name&&cu.name.toLowerCase().indexOf(lq)!==-1)||(c.type&&c.type.toLowerCase().indexOf(lq)!==-1)||(c.details&&c.details.toLowerCase().indexOf(lq)!==-1);});}
+  if(q2){var lq=sanitizeInput(q2).toLowerCase();var _canSearchName=can("vPhone");fil=fil.filter(function(c){var cu=custById(c.cId);return(_canSearchName&&cu&&cu.name&&cu.name.toLowerCase().indexOf(lq)!==-1)||(c.type&&c.type.toLowerCase().indexOf(lq)!==-1)||(c.details&&c.details.toLowerCase().indexOf(lq)!==-1);});}
   var paged=paginate(fil,CMP_PAGE);
   if(!el("cmp-srch")){
     pgEl.innerHTML=
@@ -16373,13 +17107,13 @@ function exportReportXL(){
     if(!byProd[o.prod])byProd[o.prod]={Product:unescapeForEdit(o.prod),Units:0,Revenue:0};
     byProd[o.prod].Units+=o.qty;byProd[o.prod].Revenue+=o.qty*o.price;});
   var byCust={};delivered.forEach(function(o){
-    var cu=(D.customers||[]).find(function(x){return x.id===o.cId;});var n=cu?cu.name:"Unknown";
+    var cu=custById(o.cId);var n=cu?cu.name:"Unknown";
     if(!byCust[n])byCust[n]={Customer:cu?unescapeForEdit(cu.name):"Unknown",Orders:0,Revenue:0};
     byCust[n].Orders++;byCust[n].Revenue+=o.qty*o.price;});
   var wb=XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(Object.values(byProd)),"By Product");
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(Object.values(byCust).sort(function(a,b){return b.Revenue-a.Revenue;})),"By Customer");
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(delivered.map(function(o){var cu=(D.customers||[]).find(function(x){return x.id===o.cId;});return{Date:o.deliveredAt||o.date,Order:o.id,Customer:cu?unescapeForEdit(cu.name):"",Product:unescapeForEdit(o.prod),Qty:o.qty,Price:o.price,Revenue:o.qty*o.price,Driver:unescapeForEdit(o.driver||""),Payment:o.paid};})),"Orders Detail");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(delivered.map(function(o){var cu=custById(o.cId);return{Date:o.deliveredAt||o.date,Order:o.id,Customer:cu?unescapeForEdit(cu.name):"",Product:unescapeForEdit(o.prod),Qty:o.qty,Price:o.price,Revenue:o.qty*o.price,Driver:unescapeForEdit(o.driver||""),Payment:o.paid};})),"Orders Detail");
   // Driver performance sheet
   var drvMap2={};delivered.forEach(function(o){var d=o.completedBy||o.driver||"Unassigned";var asgn=o.driver||"Unassigned";if(!drvMap2[d])drvMap2[d]={"Completed By":unescapeForEdit(d),"Assigned Driver":asgn===d?"(same)":unescapeForEdit(asgn),Deliveries:0,Units:0,Revenue:0};drvMap2[d].Deliveries++;drvMap2[d].Units+=o.qty;drvMap2[d].Revenue+=o.qty*o.price;});
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(Object.values(drvMap2).sort(function(a,b){return b.Deliveries-a.Deliveries;})),"Driver Performance");
@@ -16549,7 +17283,7 @@ function rReports(){
         "<div class=\"tw\"><table><thead><tr><th>Area</th><th>Customers</th><th>Orders</th></tr></thead><tbody>"+
         (zones.length?zones.map(function(z){
           var cu=(D.customers||[]).filter(function(c){return c.estate===z||c.zone===z;}).length;
-          var or=del.filter(function(o){var cu2=(D.customers||[]).find(function(x){return x.id===o.cId;});return cu2&&(cu2.estate===z||cu2.zone===z);}).length;
+          var or=del.filter(function(o){var cu2=custById(o.cId);return cu2&&(cu2.estate===z||cu2.zone===z);}).length;
           return "<tr><td>"+z+"</td><td>"+cu+"</td><td>"+or+"</td></tr>";
         }).join(""):"<tr><td colspan=\"3\" style=\"text-align:center;padding:18px;color:var(--tx2)\">No area data yet</td></tr>")+
         "</tbody></table></div>"+
@@ -17381,7 +18115,7 @@ function rExcel(){
 function rUsers(){
   var pg=el("pg-users");if(!pg)return;
   if(!can("mUsers")){pg.innerHTML="<div style=\"padding:60px;text-align:center\"><i class=\"ti ti-lock\" style=\"font-size:38px;color:var(--bd);display:block;margin-bottom:12px\"></i><p style=\"font-size:14px;font-weight:700;color:var(--tx2)\">Director access required</p></div>";return;}
-  var perms=[["View revenue","vRev"],["View profit/costs","vProfit"],["View debts","vDebt"],["View invoice amounts","vInv"],["Add orders","aOrd"],["Edit orders","eOrd"],["Delete orders","dOrd"],["Add customers","aCust"],["Edit customers","eCust"],["Delete customers","dCust"],["Add products","aSt"],["Edit products","eSt"],["Manage offers","aOff"],["Edit offers","eOff"],["Add invoices","aInv"],["Edit invoices","eInv"],["Mark invoices paid","mPaid"],["Log complaints","aCmp"],["Export/backup","exp"],["Restore backup","rest"],["Manage team","mUsers"]];
+  var perms=[["View revenue","vRev"],["View profit/costs","vProfit"],["View debts","vDebt"],["View invoice amounts","vInv"],["Add orders","aOrd"],["Edit orders","eOrd"],["Delete orders","dOrd"],["Add customers","aCust"],["Edit customers","eCust"],["Delete customers","dCust"],["Add products","aSt"],["Edit products","eSt"],["Manage offers","aOff"],["Edit offers","eOff"],["Add invoices","aInv"],["Edit invoices","eInv"],["Mark invoices paid","mPaid"],["Log complaints","aCmp"],["Export/backup","exp"],["Restore backup","rest"],["Reconcile missing orders","mRecon"],["Manage team","mUsers"]];
   pg.innerHTML=
     "<div class=\"ph\"><h1>Team Management</h1><p>"+(USERS||[]).length+" members</p></div>"+
     "<div class=\"toolbar\"><button class=\"btn btn-gold\" onclick=\"om('m-u')\"><i class=\"ti ti-plus\"></i> Add team member</button></div>"+
@@ -17520,7 +18254,7 @@ function buildBackupWB(){
     // "System (sync)", erasing who/when. Real data: 8 customers have already earned one.
     WaterCycle:c.waterCycle||0,
     CycleHistoryJSON:(c.cycleHistory&&c.cycleHistory.length)?JSON.stringify(c.cycleHistory):""};})),"Customers");
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((ordersWithBooks()||[]).map(function(o){var c=(D.customers||[]).find(function(x){return x.id===o.cId;});return{ID:o.id,CustomerID:o.cId,CustomerName:c?unescapeForEdit(c.name):"",Product:unescapeForEdit(o.prod),StockID:o.stockId||"",InvoiceID:o.invoiceId||"",Qty:o.qty,UnitPrice:o.price,Total:o.qty*o.price,Date:o.date,Status:o.status,Payment:o.paid,AmtPaid:o.amtPaid||0,Driver:unescapeForEdit(o.driver||""),DeliveryAddr:unescapeForEdit(o.deliver||""),BottleBefore:o.bottle_before||"",BottleAfter:o.bottle_after||"",Notes:unescapeForEdit(o.notes||""),
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((ordersWithBooks()||[]).map(function(o){var c=custById(o.cId);return{ID:o.id,CustomerID:o.cId,CustomerName:c?unescapeForEdit(c.name):"",Product:unescapeForEdit(o.prod),StockID:o.stockId||"",InvoiceID:o.invoiceId||"",Qty:o.qty,UnitPrice:o.price,Total:o.qty*o.price,Date:o.date,Status:o.status,Payment:o.paid,AmtPaid:o.amtPaid||0,Driver:unescapeForEdit(o.driver||""),DeliveryAddr:unescapeForEdit(o.deliver||""),BottleBefore:o.bottle_before||"",BottleAfter:o.bottle_after||"",Notes:unescapeForEdit(o.notes||""),
     // B6 (2026-07-30): deliveredAt orders the water-cycle tally and feeds archive age;
     // prodConfirmed gates whether stock was ever deducted. Both were silently dropped,
     // so a restored order could mis-order cycles or double-restore stock on delete.
@@ -17534,7 +18268,7 @@ function buildBackupWB(){
   // D.invoices here would make a "full" backup silently incomplete the moment
   // any history is archived. Both sheets now read through the merged accessors
   // (identical to the raw D arrays with zero books loaded).
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((invoicesWithBooks()||[]).map(function(i){var c=(D.customers||[]).find(function(x){return x.id===i.cId;});var lp=(i.payments||[]).slice().sort(function(a,b){return b.date>a.date?1:-1;})[0];return{ID:i.id,OrderID:i.orderId||"",CustomerID:i.cId,CustomerName:c?unescapeForEdit(c.name):"",Amount:i.amount,Paid:i.paid,Balance:i.amount-i.paid,DueDate:i.due,IssueDate:i.date,Notes:unescapeForEdit(i.notes||""),LastPayDate:lp?lp.date:"",LastPayAmt:lp?lp.amt:0,LastPayMethod:lp?unescapeForEdit(lp.method||""):"",
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((invoicesWithBooks()||[]).map(function(i){var c=custById(i.cId);var lp=(i.payments||[]).slice().sort(function(a,b){return b.date>a.date?1:-1;})[0];return{ID:i.id,OrderID:i.orderId||"",CustomerID:i.cId,CustomerName:c?unescapeForEdit(c.name):"",Amount:i.amount,Paid:i.paid,Balance:i.amount-i.paid,DueDate:i.due,IssueDate:i.date,Notes:unescapeForEdit(i.notes||""),LastPayDate:lp?lp.date:"",LastPayAmt:lp?lp.amt:0,LastPayMethod:lp?unescapeForEdit(lp.method||""):"",
     /* B6 FIX (2026-07-30) — THIS WORKBOOK WAS NOT A SAFE RESTORE SOURCE.
        Found by analysing the owner's real 2026-07-31 backup: the Invoices sheet carried
        NO voided flag and only a LastPay* SUMMARY, never the payments array. So a
@@ -17548,7 +18282,7 @@ function buildBackupWB(){
        backups are not invalidated. */
     Voided:(i.voided?"Yes":"No"),
     PaymentsJSON:(i.payments&&i.payments.length)?JSON.stringify(i.payments):""};})),"Invoices");
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.complaints||[]).map(function(c){var cu=(D.customers||[]).find(function(x){return x.id===c.cId;});return{ID:c.id,CustomerID:c.cId,CustomerName:cu?unescapeForEdit(cu.name):"",Type:c.type,Details:unescapeForEdit(c.details||""),ActionTaken:unescapeForEdit(c.action||""),Status:c.status,Date:c.date};})),"Complaints");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.complaints||[]).map(function(c){var cu=custById(c.cId);return{ID:c.id,CustomerID:c.cId,CustomerName:cu?unescapeForEdit(cu.name):"",Type:c.type,Details:unescapeForEdit(c.details||""),ActionTaken:unescapeForEdit(c.action||""),Status:c.status,Date:c.date};})),"Complaints");
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((D.routes||[]).map(function(r){return{Name:unescapeForEdit(r.name||""),Driver:unescapeForEdit(r.driver||""),Vehicle:unescapeForEdit(r.vehicle||""),Zone:unescapeForEdit(r.zone||""),Days:r.days};})),"DeliveryRoutes");
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet((USERS||[]).map(function(u){return{ID:u.id,Name:unescapeForEdit(u.name),Role:u.role,Initials:u.ini};})),"Team");
   // FIX (2026-07-21): format-version marker, so a future import can detect
@@ -17908,7 +18642,24 @@ function sendEmailBackup(manual){
     customers:(D.customers||[]).length,
     orders:(D.orders||[]).length,
     pending:(D.orders||[]).filter(function(o){return o.status==="Pending"||o.status==="Processing";}).length,
-    revenue:"KSh "+((D.orders||[]).filter(function(o){return o.status==="Delivered";}).reduce(function(s,o){return s+o.qty*o.price;},0)).toLocaleString(),
+    /* FIX (2026-08-11, ND47-6a) — this emailed revenue figure disagreed with EVERY other
+       revenue figure in the app, in two directions at once:
+         - it never subtracted write-offs, so bad debt was counted as income (OVERstated);
+         - it read D.orders instead of ordersWithBooks(), so archived orders were missing
+           entirely (UNDERstated).
+       The debt line directly below was corrected twice, on 2026-07-28 and 2026-07-29, to
+       match custDebt() exactly. The revenue line beside it was never touched — the same
+       missed-sibling pattern as the Unpaid invoice filter fixed elsewhere in this build.
+       Now uses the same archive-merged set and the same _writtenOffFor() as the dashboard
+       and the reports page, so the nightly email agrees with what is on screen. */
+    revenue:(function(){
+      try{
+        var _all=(typeof ordersWithBooks==="function"?ordersWithBooks():(D.orders||[]))||[];
+        var _del=_all.filter(function(o){return o&&o.status==="Delivered";});
+        var _gross=_del.reduce(function(a,o){return a+(Number(o.qty)||0)*(Number(o.price)||0);},0);
+        return "KSh "+(_gross-_writtenOffFor(_del)).toLocaleString();
+      }catch(_){return "unavailable";}
+    })(),
     // FIX (2026-07-28): match custDebt's collectable set — exclude fully-paid,
     // voided (written-off) and cancelled/deleted-order invoices — so the emailed
     // "total debt" agrees with the debtors page instead of overstating it.
@@ -18389,10 +19140,10 @@ function xSheet(name){
     // BOOKS (2026-07-30): this is a director-triggered export of the same data
     // the full backup covers — read through the merged accessors for the same
     // reason (identical to the raw D arrays with zero books loaded).
-    "Orders":(ordersWithBooks()||[]).map(function(o){var c=(D.customers||[]).find(function(x){return x.id===o.cId;});return{OrderID:o.id,Customer:c?unescapeForEdit(c.name):"",Product:unescapeForEdit(o.prod),Qty:o.qty,Total:o.qty*o.price,Date:o.date,Status:o.status,Payment:o.paid,Bottle:o.bottle_after||o.bottle_before||""};}),
+    "Orders":(ordersWithBooks()||[]).map(function(o){var c=custById(o.cId);return{OrderID:o.id,Customer:c?unescapeForEdit(c.name):"",Product:unescapeForEdit(o.prod),Qty:o.qty,Total:o.qty*o.price,Date:o.date,Status:o.status,Payment:o.paid,Bottle:o.bottle_after||o.bottle_before||""};}),
     "Stock":(D.stock||[]).map(function(s){return{Product:unescapeForEdit(s.name),Size:unescapeForEdit(s.size),Price:s.price,InStock:s.qty,MinLevel:s.min,Status:s.qty<=s.min?"Low":"OK"};}),
-    "Invoices":(invoicesWithBooks()||[]).map(function(i){var c=(D.customers||[]).find(function(x){return x.id===i.cId;});return{Invoice:i.id,Customer:c?unescapeForEdit(c.name):"",Amount:i.amount,Paid:i.paid,Balance:i.amount-i.paid,Due:i.due,Status:i.paid>=i.amount?"Paid":i.due<td?"Overdue":"Unpaid"};}),
-    "Complaints":(D.complaints||[]).map(function(c){var cu=(D.customers||[]).find(function(x){return x.id===c.cId;});return{Customer:cu?unescapeForEdit(cu.name):"",Type:unescapeForEdit(c.type),Details:unescapeForEdit(c.details),Status:c.status,Date:c.date};}),
+    "Invoices":(invoicesWithBooks()||[]).map(function(i){var c=custById(i.cId);return{Invoice:i.id,Customer:c?unescapeForEdit(c.name):"",Amount:i.amount,Paid:i.paid,Balance:i.amount-i.paid,Due:i.due,Status:i.paid>=i.amount?"Paid":i.due<td?"Overdue":"Unpaid"};}),
+    "Complaints":(D.complaints||[]).map(function(c){var cu=custById(c.cId);return{Customer:cu?unescapeForEdit(cu.name):"",Type:unescapeForEdit(c.type),Details:unescapeForEdit(c.details),Status:c.status,Date:c.date};}),
     "Offers":(D.offers||[]).map(function(o){return{Title:unescapeForEdit(o.title),Discount:o.disc+"%",Active:o.active?"Yes":"No",Expires:o.end};})
   };
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(sheets[name]||[]),name);
