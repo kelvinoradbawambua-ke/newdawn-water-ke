@@ -379,7 +379,7 @@ var APP_VERSION="47";
    (~line 2764, `stamp:BUILD_STAMP`) but NEVER read back or compared — grep for `.stamp`
    comparisons returns nothing — so renaming the build costs ZERO extra Firestore reads
    and cannot force a full re-load on any device. */
-var BUILD_STAMP="ND47-6a";
+var BUILD_STAMP="ND47-12";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -753,7 +753,34 @@ var UID_EPOCH=1577836800000; // 2020-01-01T00:00:00Z — fixed forever; changing
    Verified against Number.MAX_SAFE_INTEGER in _proofB_uid_longevity.js. */
 var _uidSalt=Math.floor(Math.random()*200);
 var _uidCounter=0;
-function uid(){_uidCounter=(_uidCounter+1)%10;return (Date.now()-UID_EPOCH)*2000+_uidSalt*10+_uidCounter;}
+/* UID EXHAUSTION (2026-08-12). The old form wrapped the counter at 10, so a single session
+   could mint only TEN unique ids per millisecond. Measured: 25 calls in one burst gave 10
+   unique and 15 collisions; 100 calls gave 20 unique and 80 collisions. Normal UI use is
+   safe (a few calls per millisecond), but mergeXL and restoreXL mint pid:uid() per imported
+   row in a tight synchronous loop, so importing 50 payment rows produced ~10 distinct pids.
+   Two executed consequences: two genuinely different payments sharing a pid merged into one
+   (KSh 700 lost as a "duplicate"), and a recycled pid colliding with a reversal tombstone
+   silently deleted a NEW payment — the better the reversal fix works, the worse that gets.
+
+   THE AUDITOR FRAMED THIS AS A TRADE-OFF FOR THE DIRECTOR: widen the counter and the id
+   values grow, pulling the 2162 ceiling closer. That dilemma is avoidable, so it is not put
+   to them. The multiplier stays at 2000 and the salt keeps its 200 buckets — the layout is
+   unchanged. Instead, when a millisecond's ten slots are spent, the generator borrows the
+   NEXT millisecond (the standard monotonic-clock technique). Ids stay unique, stay ordered,
+   stay inside the same numeric envelope, and _uidTimeOf still decodes them.
+   COST: the virtual clock runs ahead of real time by 1ms per 10 ids minted in a burst.
+   Importing 1,000 rows drifts 100ms. A million bulk ids over the system's whole life drifts
+   100 seconds. Against a 136-year ceiling that is nothing, so nothing is traded away. */
+var _uidLastMs=0;
+function uid(){
+  var ms=Date.now()-UID_EPOCH;
+  if(ms>_uidLastMs){_uidLastMs=ms;_uidCounter=0;}
+  else{
+    _uidCounter++;
+    if(_uidCounter>9){_uidLastMs++;_uidCounter=0;}   // borrow the next millisecond
+  }
+  return _uidLastMs*2000+_uidSalt*10+_uidCounter;
+}
 /* Decode the mint time (ms) from a uid()-minted id of ANY of the three eras this app
    has now had. Needed because the epoch shift makes new ids numerically LOWER than
    era-2 ids, so "sort by id descending" is no longer "most recent first".
@@ -806,14 +833,43 @@ function _uidTimeOf(id){
 // more relevant by today's own changes. Rounds to the nearest cent (2dp)
 // while staying a number, not a string, so downstream arithmetic and
 // comparisons continue to work exactly as before.
-function _round2(n){return Math.round((n||0)*100)/100;}
+/* NON-FINITE TRAP (2026-08-12, round-3 finding K). _round2(Infinity) returned Infinity
+   and _round2(NaN) returned 0 only by accident of ||0. Every money total in this file
+   passes through here, so this is the cheapest place to stop a non-finite value from
+   propagating into a balance, an invoice or a sync payload. */
+function _round2(n){var v=Math.round((n||0)*100)/100;return isFinite(v)?v:0;}
+/* ORDER PAID-STATUS, ONE DEFINITION (2026-08-12, round-3 finding J).
+   Seven sites independently computed o.paid from an invoice total and none of them
+   checked o.status, so acknowledging cash against a CANCELLED order marked it "Paid".
+   Fuzzing caught it as the impossible state (status==="Cancelled" && paid==="Paid").
+   Revenue was never affected — cancelled orders are excluded from the delivered basis —
+   but a cancelled order reading Paid on screen is exactly the kind of thing that gets
+   a real order re-entered or a real debt written off by mistake.
+   Callers pass the invoice figures; this owns the rule. */
+function _ordPaidStatus(o,paidAmt,totalAmt){
+  if(!o)return;
+  var p=_round2(paidAmt||0),t=_round2(totalAmt||0);
+  if(o.status==="Cancelled"){o.paid=(p>0)?"Partial":"Unpaid";return;}
+  if(t>0&&p>=t){o.paid="Paid";}else if(p>0){o.paid="Partial";}else{o.paid="Unpaid";}
+}
 // FIX (2026-07-21): found through adversarial testing before deploy - plain
 // Number() silently returns 0 for comma-formatted numbers like "5,000",
 // which is an extremely common way spreadsheets format currency amounts.
 // Using bare Number() for the XLSX import coercion fix would have quietly
 // replaced one silent-corruption bug (string concatenation) with another
 // (comma-formatted amounts zeroing out entirely). Strips separators first.
-function _numCoerce(v){return Number(String(v==null?"":v).replace(/,/g,""))||0;}
+/* TRAILING MINUS AND NON-FINITE (2026-08-12, round-3 finding K).
+   "1500-" is accounting notation for negative 1,500 and appears in pasted spreadsheet
+   cells and some bank exports. Number("1500-") is NaN, and the ||0 turned it silently
+   into ZERO — a 1,500 swing with no error. Number("1e999") is Infinity, which the ||0
+   does NOT catch (Infinity is truthy), so it propagated into money arithmetic and
+   poisoned every total downstream. Both now resolve to a real finite number. */
+function _numCoerce(v){
+  var t=String(v==null?"":v).replace(/,/g,"").trim();
+  if(/^-?[\d.]+-$/.test(t))t="-"+t.slice(0,-1);   // "1500-" -> "-1500"
+  var n=Number(t);
+  return isFinite(n)?n:0;
+}
 function fmt(d){if(!d)return"-";var s=String(d);if(s.length===10)s+="T12:00:00";return new Date(s).toLocaleDateString("en-GB",{day:"2-digit",month:"short",year:"numeric"});}
 function ksh(v){return can("vRev")?"KSh "+Number(v).toLocaleString():"<span class=\"hv\">"+String.fromCharCode(8226,8226,8226,8226)+"</span>";}
 function kshS(v){return can("vRev")?"KSh "+Number(v).toLocaleString():"KSh "+String.fromCharCode(8226,8226,8226,8226);}
@@ -1069,7 +1125,28 @@ function _linkedInvoiceOf(ordId,invArr){
    i.e. the first-match free-text scrape a payment reference could hijack. In recPay that
    miss was the worst: the order kept showing Unpaid, no durable ordSnapshot was attached to
    the PAYMENT_RECORDED event, and _resolvePendingCashFor never ran — so staff cash stayed
-   pending and could be acknowledged a SECOND time, double-counting real money. */
+   pending and could be acknowledged a SECOND time, double-counting real money.
+
+   CORRECTION (2026-08-12) — THIS COMMENT WAS WRONG, AND ITS WRONGNESS IS WHY THE BUG
+   SURVIVED. It named six sites as migrated to the canonical helpers. An independent audit,
+   verified line by line against the file, found that ackPendingPay — named here as fixed —
+   still ran the raw notes scrape, and that FIVE further sites had never been migrated at
+   all and were not even listed: cancelO, _openCancelDisposition, _finishCancelO,
+   completeDlv and _computeMissingOrders. A future session reading this comment would
+   reasonably have skipped re-checking them, which is exactly what happened.
+
+   ALL ELEVEN SITES NOW USE _linkedInvoicesOf / _linkedOrderIdOf. Verified not by reading
+   this comment but by _proofB_invoice_lookup.js, which extracts each function from the
+   shipped bytes and asserts (a) no raw notes scrape remains in it, (b) the canonical helper
+   is used, (c) the customer check survives, (d) ackPendingPay's !voided and
+   _invoiceOrderActive guards survive, and (e) the lookup resolves BEFORE hasPaid is decided.
+   That assertion set is the record now — not this paragraph. If a site is ever added,
+   the proof fails; a comment cannot.
+
+   THE TWO REMAINING RAW SCRAPES ARE DELIBERATE and are not defects: the sites that read
+   `(o.invoiceId && i.id===o.invoiceId) || (!o.invoiceId && <scrape>)` try the structured
+   pointer FIRST and fall back only when it is genuinely absent, which is the same contract
+   the canonical helper implements. */
 function _orderForInvoice(inv){
   var _oid=_linkedOrderIdOf(inv);
   if(_oid==null)return null;
@@ -1948,7 +2025,24 @@ function _outboxDeliverPayment(d,acc){
     var pid=d.pid,invId=d.invId,p=d.payment;
     if(!pid||invId==null||!p)return;
     if(D.reversedPayPids&&D.reversedPayPids[pid]){_outboxDropPayment(pid);acc.skipped.push(pid+":reversed");return;}
-    if(D.deletedInvoiceIds&&D.deletedInvoiceIds[invId]){_outboxDropPayment(pid);acc.skipped.push(pid+":invoice-deleted");return;}
+    if(D.deletedInvoiceIds&&D.deletedInvoiceIds[invId]){
+      /* Round-4: was a silent drop. See the note above _fix_round4o.js reasoning — a
+         cancel on a stale device can tombstone an invoice that another device has just
+         taken cash against, and this line is where that cash record died without a word. */
+      try{
+        var _lostAmt=_round2((p&&p.amt)||0);
+        if(_lostAmt>0.005){
+          auditLog("PAYMENT_RECORDED","CASH RECORD DROPPED: a queued payment of KSh "+_lostAmt.toLocaleString()+
+            " (payment id "+pid+") could not be delivered because Invoice #"+invId+" was deleted — most likely "+
+            "cancelled on another device that had not yet seen this payment. The money was really collected. "+
+            "Re-enter it against the correct invoice, or record it as customer credit, after checking with "+
+            "whoever took it. This entry exists because the payment is now gone from the queue.");
+          try{toast("A payment of KSh "+_lostAmt.toLocaleString()+" could not be delivered — its invoice was "+
+            "deleted elsewhere. See the audit log.","err");}catch(_){}
+        }
+      }catch(_){}
+      _outboxDropPayment(pid);acc.skipped.push(pid+":invoice-deleted");return;
+    }
     if(D.archivedInvoiceIds&&D.archivedInvoiceIds[invId]){_outboxDropPayment(pid);acc.skipped.push(pid+":invoice-archived");return;}
     var inv=(D.invoices||[]).find(function(x){return x&&x.id===invId;});
     if(!inv){acc.skipped.push(pid+":invoice-absent");return;}   // KEPT on purpose — see above
@@ -1962,7 +2056,7 @@ function _outboxDeliverPayment(d,acc){
     // Keep the linked order's badge honest, the same way recPay does.
     var _o=_orderForInvoice(inv);
     if(_o){
-      if(inv.paid>=inv.amount)_o.paid="Paid"; else if(inv.paid>0)_o.paid="Partial"; else _o.paid="Unpaid";
+      _ordPaidStatus(_o,inv.paid,inv.amount);   // round-3 finding J: one definition
       _o.amtPaid=inv.paid;
     }
     acc.restored.push({pid:pid,invId:invId,amt:(_p.amt||0)});
@@ -4030,14 +4124,35 @@ var _lastFreshnessCheckTime=0; // Tier 2: tracks the last REAL server-freshness 
 // no longer dependent on remembering to flag every individual "critical"
 // action by name.
 var _lastCheckedIdSet=null;
-var _stockQtyDeltas={}; // stock id -> net quantity change since last confirmed sync (e.g. -3 for a sale, +10 for a restock)
+/* DURABLE PENDING STOCK DELTAS (2026-08-12, round-3 finding I). Restored from
+   localStorage so an eviction, crash or reload between a stock change and its confirmed
+   write does not silently revert the deduction. Wrapped: a corrupt or unavailable store
+   must degrade to the old in-memory behaviour, never throw during boot. */
+function _loadStockDeltas(key){
+  try{
+    var raw=localStorage.getItem(key);
+    if(!raw)return {};
+    var o=JSON.parse(raw);
+    return (o&&typeof o==="object"&&!Array.isArray(o))?o:{};
+  }catch(_){return {};}
+}
+var _stockQtyDeltas=_loadStockDeltas("nd_stock_deltas"); // stock id -> net quantity change since last confirmed sync (e.g. -3 for a sale, +10 for a restock)
 // LAYER 1 (2026-07-21): stock id -> { orderId -> delta }. Tracks WHICH order
 // caused each pending, unconfirmed stock change - not just which product.
 // Needed to precisely reverse a specific discarded edit's stock effect (see
 // the merge logic where an incoming Delivered snapshot overwrites a local
 // edit) without guessing at or disturbing any other legitimate delta on the
 // same product from a different order.
-var _stockDeltasByOrder={};
+/* Same treatment for the per-order breakdown: it is what _onWriteSuccess uses to
+   subtract exactly what was sent, so losing it while _stockQtyDeltas survived would
+   leave the aggregate un-clearable. The two must persist and restore together. */
+var _stockDeltasByOrder=_loadStockDeltas("nd_stock_deltas_by_order");
+function _persistStockDeltas(){
+  try{
+    localStorage.setItem("nd_stock_deltas",JSON.stringify(_stockQtyDeltas||{}));
+    localStorage.setItem("nd_stock_deltas_by_order",JSON.stringify(_stockDeltasByOrder||{}));
+  }catch(_){}
+}
 // ITEM 3 (2026-07-21): stock has a unique risk the freshness-skip needed a
 // dedicated fix for - its changes are numeric DELTAS that accumulate
 // silently if skipped. Customers/invoices/complaints don't share that exact
@@ -4190,10 +4305,33 @@ function _mergeInvoicePayments(a,b){
   // DIFFERED, dropped a second equal-amount payment recorded concurrently on
   // another device. Additive + always-merge makes both survive and converge.
   var paid=(a&&typeof a.paid==="number")?a.paid:0;
+  /* REVERSAL TOMBSTONE (2026-08-12) — the critical finding of the executed audit.
+     reversePayment writes D.reversedPayPids[pid] and its comment claimed the tombstone
+     "travels in D and every device honours it". It did not: the map was WRITTEN in
+     reversePayment and READ in exactly one place, _outboxDeliverPayment. This union never
+     consulted it, so a device that had not yet received the reversal re-admitted the
+     payment on its next sync — in BOTH merge directions, so no ordering saved it.
+     Reproduced: director reverses KSh 400, debt correctly returns to 1000, then merge
+     puts paid back to 400 and debt to 600. The audit log showed the reversal while the
+     data contradicted it.
+     The union itself is deliberate and stays — concurrent cash must never be arbitrated
+     away. A reversal is not a conflict: it is an explicit, director-only, audited
+     decision to un-record money, and it outranks a stale copy. Same map, same doctrine
+     and the same check _outboxDeliverPayment already performs. Also filters payments
+     already sitting in `a`, so a tombstone arriving from the other side still wins. */
+  var _revd=(typeof D!=="undefined"&&D&&D.reversedPayPids)?D.reversedPayPids:null;
+  function _isReversed(p){return !!(_revd&&p&&p.pid!=null&&_revd[p.pid]);}
+  if(_revd){
+    var _keptLocal=[],_dropped=0;
+    merged.forEach(function(p){if(_isReversed(p)){_dropped++;paid-=(p.amt||0);}else{_keptLocal.push(p);}});
+    if(_dropped){merged=_keptLocal;seen={};merged.forEach(function(p){seen[_payKey(p)]=true;});}
+  }
   ((b&&b.payments)||[]).forEach(function(p){
     var k=_payKey(p);
+    if(_isReversed(p))return;   // deliberately un-recorded — never re-admit it
     if(!seen[k]){merged.push(p);seen[k]=true;paid+=(p.amt||0);}
   });
+  if(paid<0)paid=0;
   // FIX (2026-07-27): result=Object.assign({},b||a) takes every field it
   // doesn't explicitly overwrite from b - fine for fields that don't change
   // after creation, but amount is NOT one of those. cancelO()'s write-off
@@ -4266,6 +4404,7 @@ function _recordStockDelta(stockId,delta,orderId){
     if(!_stockDeltasByOrder[orderId])_stockDeltasByOrder[orderId]={};
     _stockDeltasByOrder[orderId][stockId]=(_stockDeltasByOrder[orderId][stockId]||0)+delta;
   }
+  _persistStockDeltas();   // round-3 finding I: the delta must survive an eviction
   // REMOVED (2026-07-21): a Layer 2 reconciliation attempt (untrimmed
   // lifetime counters + baseline, compared in runIntegrityCheck) was built
   // and shipped here, but an independent review correctly found it cannot
@@ -5096,6 +5235,11 @@ function processWriteQueue(){
       });
       if(!Object.keys(_stockDeltasByOrder[oid]).length)delete _stockDeltasByOrder[oid];
     });
+    /* Persist the CLEAR as well as the set. Without this a confirmed write would leave
+       the already-applied delta in storage, and the next boot would restore it and
+       deduct the same sale twice — turning a fix for lost stock into lost stock the
+       other way. The clear is the more important of the two writes. */
+    _persistStockDeltas();
     // A write queued while this one was in flight means genuinely new critical
     // work exists — keep the flag so that write still takes the immediate path.
     if(!FB_WRITE_QUEUE.length)_hasPendingCriticalEdit=false;
@@ -6316,6 +6460,7 @@ function startCloudListener(isWarmRefresh){
                 if(st&&pendingDelta){
                   st.qty=st.qty-pendingDelta; // reverse: undo exactly what the discarded edit did (negative-stock policy: no floor, so the reversal stays exact)
                   _stockQtyDeltas[stockId]=(_stockQtyDeltas[stockId]||0)-pendingDelta; // keep the aggregate consistent too
+                  _persistStockDeltas();   // round-3 finding I
                   console.log("[NDSYNC] reversed discarded-edit stock delta for order #"+lo.id+" on stock id="+stockId+" (was "+pendingDelta+")");
                 }
               });
@@ -8113,6 +8258,80 @@ var BOOK_INDEX_STATE="idle";    // idle | loading | ready | unavailable
 var _booksVersion=0;
 /* A period is a calendar month keyed off the record's OWN date, so a record can
    never be filed into the wrong book. */
+/* ============================================================================
+   POSTING-DATE CONTROL (2026-08-12)
+
+   Two gaps this closes, both measured against the shipped build:
+
+   1. NO DATE BOUNDS. A payment dated 2099-12-31 was accepted in silence. One mistyped
+      year puts a real receipt seventy years into the future, where it is invisible to
+      every month, quarter and year report — the cash looks lost, and the only way to
+      find it is to already suspect it. A date far in the PAST is different: backdating
+      a receipt to when it was actually collected is legitimate and routine in this
+      business, so that is confirmed, not refused.
+
+   2. NO PERIOD LOCK. Posting into a month whose book is already closed was silent.
+      _closePeriod does merge late records on a re-close, so nothing is lost — but
+      between the backdated posting and the next re-close, the closed book and the live
+      data disagree and nothing says so. Every real ERP either refuses this or routes it
+      through an explicit prior-period adjustment.
+
+   WHY WARN RATHER THAN REFUSE, for the closed period. Refusing would block a genuine
+   correction the director is entitled to make, and this business reconciles by hand
+   daily. The control that matters is that the decision is CONSCIOUS and leaves a trail.
+   A hard refusal on a far-future date is different — there is no legitimate reason to
+   post cash into 2099, so that one is refused outright.
+
+   Zero Firestore reads: the closed-period list comes from archivedPeriodsLocal(), the
+   localStorage record written at archive time.
+   ============================================================================ */
+var POST_FUTURE_DAYS=3;      // a receipt may legitimately be dated a couple of days ahead
+var POST_BACKDATE_DAYS=400;  // beyond this, confirm — it is more likely a typo than intent
+/* Returns null when the date is fine, or {hard:bool, msg:string}. hard===true means the
+   caller must abort; hard===false is a warning the caller surfaces and then proceeds. */
+function _postingDateIssue(dateStr){
+  try{
+    var raw=String(dateStr||"").trim();
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(raw))return null;   // other validation owns malformed input
+    var d=new Date(raw+"T00:00:00Z"),now=new Date(tday()+"T00:00:00Z");
+    if(!isFinite(d.getTime())||!isFinite(now.getTime()))return null;
+    var days=Math.round((d.getTime()-now.getTime())/86400000);
+    if(days>POST_FUTURE_DAYS){
+      return {hard:true,msg:"That date is "+days.toLocaleString()+" days in the future ("+raw+"). "+
+        "Cash cannot be recorded ahead of time — check the year."};
+    }
+    if(days< -POST_BACKDATE_DAYS){
+      return {hard:false,msg:"That date is "+Math.abs(days).toLocaleString()+" days ago ("+raw+"). "+
+        "If that is deliberate, continue; if it is a typo, fix the year."};
+    }
+    var per=bookPeriodOf(raw);
+    if(per&&archivedPeriodsLocal().indexOf(per)>=0){
+      return {hard:false,msg:"The books for "+per+" are already closed. This entry will make the "+
+        "closed book and the live figures disagree until you re-close that month."};
+    }
+    return null;
+  }catch(_){return null;}
+}
+/* Closed months that have gained records since they were closed. Drives the "re-close?"
+   prompt in Books. Local data only — no reads. */
+function closedPeriodsWithDrift(){
+  var out=[];
+  try{
+    var closed=archivedPeriodsLocal();
+    if(!closed.length)return out;
+    var seen={};
+    (D.invoices||[]).forEach(function(i){
+      var p=bookPeriodOf(i&&i.date);
+      if(p&&closed.indexOf(p)>=0)seen[p]=(seen[p]||0)+1;
+    });
+    (D.orders||[]).forEach(function(o){
+      var p=bookPeriodOf(o&&o.date);
+      if(p&&closed.indexOf(p)>=0)seen[p]=(seen[p]||0)+1;
+    });
+    Object.keys(seen).sort().forEach(function(p){out.push({period:p,records:seen[p]});});
+  }catch(_){}
+  return out;
+}
 function bookPeriodOf(dateStr){
   var s=String(dateStr||"");
   return /^[0-9]{4}-[0-9]{2}/.test(s)?s.slice(0,7):"";
@@ -8211,6 +8430,103 @@ function invoicesWithBooks(){ return _mergeById(D.invoices,_loadedBookArrays("in
 /* How many real books are loaded - lets a screen state honestly what it is showing. */
 function booksLoadedCount(){
   return Object.keys(BOOK_CACHE).filter(function(p){return !BOOK_CACHE[p].missing;}).length;
+}
+/* ---------------------------------------------------------------------------
+   ARCHIVE VISIBILITY AND REACHABILITY (2026-08-12, round-3 finding H)
+   booksLoadedCount() above was written so "a screen state honestly what it is
+   showing" — the intent was right and nothing ever called it. These three functions
+   finish that job.
+   --------------------------------------------------------------------------- */
+/* Which periods this device knows have been archived. Written at archive time and read
+   from localStorage, so asking the question costs ZERO Firestore reads — the whole point.
+   It is a local hint, not an authority: a period archived on another device is not here
+   until the index is loaded, which is why loadArchivedBooks() below re-reads the index
+   and merges. Under-reporting the hint is safe (you get the old behaviour); over-
+   reporting it is not, so only real archive completions write to it. */
+/* UNION OF TWO SOURCES (2026-08-12, round 6). D.closedPeriods is the authority because it
+   SYNCS — a month closed on the director's phone must be known to the staff handsets that
+   actually take the payments, and localStorage never leaves the device it was written on.
+   The localStorage copy is kept and unioned so a device that closed a period under ND47-11
+   does not forget it, and so the knowledge survives a D reload before the next sync.
+   Neither source can lose what the other holds. */
+function archivedPeriodsLocal(){
+  var out=[];
+  function add(p){ if(typeof p==="string"&&p&&out.indexOf(p)===-1)out.push(p); }
+  try{
+    var raw=localStorage.getItem("nd_book_periods");
+    if(raw){
+      var a=JSON.parse(raw);
+      if(Array.isArray(a))a.forEach(add);
+    }
+  }catch(_){}
+  try{
+    // D.closedPeriods is an id-keyed map (period -> closedAt), the same shape as every
+    // tombstone map in this file, so it merges and survives arbitration identically.
+    if(typeof D!=="undefined"&&D&&D.closedPeriods&&typeof D.closedPeriods==="object"){
+      Object.keys(D.closedPeriods).forEach(add);
+    }
+  }catch(_){}
+  out.sort();
+  return out;
+}
+function _noteArchivedPeriod(period){
+  if(!period)return;
+  /* WRITES LOCALSTORAGE ONLY — deliberately. (2026-08-12, round 6)
+     The first cut of this also wrote D.closedPeriods[period]=Date.now(). That looked
+     symmetrical and was wrong: D.closedPeriods is not a display hint, it is the signal
+     _hybridPeriodClosed()/_hybridDropArchived() use to DROP settled records out of the
+     live arrays. _noteArchivedPeriod is called from loadArchivedBooks() as well as from
+     archiving, so a director merely LOADING archives would have started marking periods
+     closed and dropping live records — a display fix reaching into data retention.
+     _closePeriod already writes that map with the real archive timestamp (see the
+     D.closedPeriods[period]=_archTs site); it owns it. This function only records what
+     THIS device knows for banner and warning purposes, and archivedPeriodsLocal() READS
+     both sources. Read the synced map, never write it from here. */
+  try{
+    var a=[];
+    var raw=localStorage.getItem("nd_book_periods");
+    if(raw){var p=JSON.parse(raw);if(Array.isArray(p))a=p.filter(function(x){return typeof x==="string"&&x;});}
+    if(a.indexOf(period)===-1){a.push(period);a.sort();}
+    localStorage.setItem("nd_book_periods",JSON.stringify(a));
+  }catch(_){}
+}
+/* The gap between what is archived and what is loaded, as a sentence, or "" when there
+   is nothing to say. Any report reading through ordersWithBooks()/invoicesWithBooks()
+   should show this; a total that silently omits a closed month is the actual defect. */
+function booksGapNote(){
+  var known=archivedPeriodsLocal();
+  if(!known.length)return "";
+  var missing=known.filter(function(p){return !(BOOK_CACHE[p]&&!BOOK_CACHE[p].missing);});
+  if(!missing.length)return "";
+  return missing.length+" archived "+(missing.length===1?"month":"months")+
+    " ("+missing.join(", ")+") "+(missing.length===1?"is":"are")+" NOT included in these figures.";
+}
+/* THE MISSING WIRE. loadBooks() was written, correct, and never invoked from any read
+   path. This is that invocation, made explicit and director-triggered so the Firestore
+   reads are spent deliberately rather than on every dashboard render. */
+function loadArchivedBooks(cb){
+  var _cb=(typeof cb==="function")?cb:function(){};
+  if(!FB_READY||!FB_BOOKS_COL){toast("Not connected — archived months cannot be loaded right now","err");_cb(new Error("offline"));return;}
+  toast("Loading archived months…","ok");
+  loadBookIndex(function(idx){
+    /* Union of what the shared index knows and what this device recorded locally, so a
+       period archived here is never missed if the index read fails, and a period
+       archived on ANOTHER device is picked up even though this device never saw it. */
+    var periods=(idx&&Array.isArray(idx.periods))?idx.periods.slice():[];
+    archivedPeriodsLocal().forEach(function(p){if(periods.indexOf(p)===-1)periods.push(p);});
+    periods.sort();
+    periods.forEach(_noteArchivedPeriod);   // keep the local hint in step with the index
+    if(!periods.length){toast("No archived months exist yet","ok");_cb(null,0);return;}
+    loadBooks(periods,function(){
+      var n=booksLoadedCount();
+      auditLog("DATA_EXPORTED","Archived books loaded into this session by "+CU.name+" ("+CU.role+"): "+
+        n+" of "+periods.length+" month(s) — "+periods.join(", ")+". Reports now include them until reload.");
+      toast(n+" archived month(s) loaded — reports now include them","ok");
+      try{rDash();}catch(_){}
+      try{rReports();}catch(_){}
+      _cb(null,n);
+    });
+  });
 }
 /* ============================================================================
    B5 GUARD — "can I see the WHOLE order history right now?"          (2026-07-30)
@@ -8343,6 +8659,7 @@ function _updateBookIndex(period,archivedRecords,cb){
     if(!idx.periods)idx.periods=[];
     if(!idx.customers)idx.customers={};
     if(idx.periods.indexOf(period)===-1){idx.periods.push(period);idx.periods.sort();}
+    _noteArchivedPeriod(period);   // round-3 finding H: so every later session KNOWS, for free
     _hrArr(archivedRecords).forEach(function(r){
       if(!r||r.cId==null)return;
       var k=String(r.cId);
@@ -10559,6 +10876,7 @@ function rDash(){
   // D.orders/D.invoices with zero books loaded).
   var _dashOrdAll=ordersWithBooks();
   var _dashInvAll=invoicesWithBooks();
+  var _dashGap=booksGapNote();   // round-3 finding H: never show a total that hides a closed month
   var del=_dashOrdAll.filter(function(o){return o.status==="Delivered";});
   // ── Period filter for financial stats ──────────────────────────────
   // Staff locked to today — no financial period access
@@ -10810,6 +11128,15 @@ function rDash(){
   }
   var _urgency={nr:0,nw:1,ni:2,nok:3};alerts.sort(function(a,b){return(_urgency[a.t]||2)-(_urgency[b.t]||2);});
   pg.innerHTML=
+    /* ROUND-3 FINDING H — same banner as Reports. The dashboard reads through
+       invoicesWithBooks(), so once a period is closed its figures are incomplete in
+       exactly the same silent way. Placed immediately after the page header so it is
+       seen before any number is read. */
+    (_dashGap?("<div class=\"notif nw\" style=\"margin:8px 0\">"+
+      "<i class=\"ti ti-archive\"></i><div><strong>Figures exclude archived data.</strong> "+
+      sanitizeInput(_dashGap)+
+      ((CU&&CU.role==="director")?" <button class=\"btn bs\" style=\"margin-left:6px\" onclick=\"loadArchivedBooks()\">Load archived months</button>":"")+
+      "</div></div>"):"")+
     "<div class=\"ph\"><h1>Dashboard</h1><p>Welcome back, "+CU.name+" &middot; "+new Date().toLocaleDateString("en-GB",{weekday:"long",day:"numeric",month:"long",year:"numeric"})+"</p></div>"+
     (can("vRev")?
     "<div style=\"display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px\">"
@@ -10978,6 +11305,8 @@ function rCusts(q,pg,sort,type){
   // Sort
   var del=_custOrdAll.filter(function(o){return o.status==="Delivered";});
   var revMap={};var delCusts=del;delCusts.forEach(function(o){revMap[o.cId]=(revMap[o.cId]||0)+o.qty*o.price;});
+  /* same single definition — this map drives the "highest revenue" customer sort */
+  _applyWriteOffsByGroup(revMap,del,function(o){return o.cId;},_custInvAll);
   var debtMap={};(D.customers||[]).forEach(function(cu){debtMap[cu.id]=custDebt(cu.id);});
   /* GROUPED ONCE PER RENDER (2026-08-11, ND47-6a). The three lookups inside the row map
      below each scanned an ARCHIVE-MERGED array in full, once per visible row. Page size is
@@ -11183,6 +11512,19 @@ function editCust(id){
   om("m-c");
 }
 async function delC(id){
+  /* CREDIT GUARD (2026-08-12). delC already blocks deleting a customer who OWES money —
+     protecting the business from losing a receivable — but happily deleted one holding a
+     prepayment. Executed: KSh 1,000 debt -> BLOCKED; KSh 750 credit -> "Customer removed".
+     Asymmetric in the direction that costs the customer: a prepaid customer deleted during
+     a cleanup has no record the business owes them anything. Mirrors the debt guard. */
+  try{
+    var _cuDel=(D.customers||[]).find(function(x){return x.id===id;});
+    if(_cuDel&&Number(_cuDel.credit)>0){
+      toast("This customer holds KSh "+_round2(_cuDel.credit).toLocaleString()+
+        " of store credit. Refund or use it before deleting them.","err");
+      return;
+    }
+  }catch(_){}
   if(!can("dCust"))return;
   var c=(D.customers||[]).find(function(x){return x.id===id;});if(!c)return;
   // ENTERPRISE RULE 1: never let a customer disappear while they still owe
@@ -11616,6 +11958,45 @@ function reversePayment(invId,pid,payIdx){
   if(_t<0&&(pid==null||pid<=0)&&payIdx>=0&&payIdx<pays.length&&pays[payIdx].pid==null)_t=payIdx;
   if(_t<0||_t>=pays.length){toast("Payment not found — it may have already been reversed","err");return;}
   var pay=pays[_t];
+  /* SPENT-CREDIT REFUSAL — MUST RUN BEFORE ANY MUTATION (2026-08-12, round-4 finding L).
+     This block was originally placed ~100 lines further down, after the payment had been
+     spliced out, the invoice rewritten, the permanent reversal tombstone written and the
+     outbox entry dropped — and it then told the director "Nothing was changed". Reversing
+     a payment whose overpayment credit has already been spent on another invoice cannot be
+     completed honestly, so it must be refused HERE, while the record is genuinely intact.
+     Everything this needs (pay.pid, inv.cId, the credit ledger) is already in scope. */
+  var _revShort=0,_revCredit=0,_revAvail=0,_revCu=null,_revEntries=[];
+  if(pay&&pay.pid!=null){
+    _revCu=(D.customers||[]).find(function(x){return x.id===inv.cId;});
+    if(_revCu&&_revCu.creditLog){
+      /* Match srcPid (one payment) OR srcPids (a payment SET, round-4 finding M): the
+         customer-level, unapplied-balance and cancel-to-credit paths spread their cash
+         across several payments, so the credit they create is owned by a set. Reversing
+         any member reverses the credit — the conservative direction, because leaving
+         credit standing against reversed cash is a direct loss. */
+      _revEntries=_revCu.creditLog.filter(function(l){
+        if(!l||l.type!=="overpayment"||(l.amt||0)<=0)return false;
+        if(l.srcPid===pay.pid)return true;
+        return !!(l.srcPids&&l.srcPids.indexOf&&l.srcPids.indexOf(pay.pid)>=0);
+      });
+      _revEntries.forEach(function(l){_revCredit=_round2(_revCredit+(l.amt||0));});
+      _revAvail=_round2(Math.min(_revCredit,Math.max(0,_revCu.credit||0)));
+      _revShort=_round2(_revCredit-_revAvail);
+      if(_revShort>0.005){
+        auditLog("PAYMENT_RECORDED","REVERSAL REFUSED: Invoice #"+invId+" payment of KSh "+_round2(pay.amt||0).toLocaleString()+
+          " created KSh "+_revCredit.toLocaleString()+" of customer credit, of which only KSh "+_revAvail.toLocaleString()+
+          " is still on the balance. KSh "+_revShort.toLocaleString()+" has already been spent against other invoices. "+
+          "Reversing now would leave that amount recorded against cash that no longer exists and would understate the "+
+          "customer's debt by exactly KSh "+_revShort.toLocaleString()+". Attempted by "+CU.name+" ("+CU.role+"). "+
+          "Refused before any change was made: the payment, the invoice, the reversal tombstone and the outbox entry "+
+          "are all exactly as they were.");
+        toast("Cannot reverse: KSh "+_revShort.toLocaleString()+" of the credit this payment created has already been "+
+          "spent on other invoices. Restore the customer's credit to at least KSh "+_revCredit.toLocaleString()+
+          " (or reverse the payments that used it) first.","err");
+        return;
+      }
+    }
+  }
   // Remove the payment entry
   pays.splice(_t,1);
   // Recalculate paid total from remaining payments — source of truth.
@@ -11684,7 +12065,7 @@ function reversePayment(invId,pid,payIdx){
   // two permanently disagreeing about the same sale. Canonical helper.
   var o=_orderForInvoice(inv);
   if(o){
-    if(inv.paid>=inv.amount){o.paid="Paid";}else if(inv.paid>0){o.paid="Partial";}else{o.paid="Unpaid";}
+    _ordPaidStatus(o,inv.paid,inv.amount);   // round-3 finding J: one definition
     o.amtPaid=inv.paid;
   }
   // FIX (2026-07-29): an overpayment records TWO things from ONE cash event — the
@@ -11697,13 +12078,16 @@ function reversePayment(invId,pid,payIdx){
   // undone. Clamped ≥0 (if the customer already spent the credit we can't claw back
   // more than remains). A second reverse of the same payment is a no-op — the
   // payment is already gone, so this never double-reverses.
-  var _revCredit=0;
-  if(pay&&pay.pid!=null){
-    var _revCu=(D.customers||[]).find(function(x){return x.id===inv.cId;});
-    if(_revCu&&_revCu.creditLog){
-      _revCu.creditLog.filter(function(l){return l.srcPid===pay.pid&&l.type==="overpayment"&&(l.amt||0)>0;}).forEach(function(l){
-        _revCredit=_round2(_revCredit+(l.amt||0));
-        _revCu.creditLog.push({cid:uid(),date:tday(),amt:-_round2(l.amt||0),type:"reversal",invId:invId,by:CU.name,role:CU.role,note:"Overpayment credit reversed together with its payment on Invoice #"+invId});
+  /* The refusal ran near the top of this function (round-4 finding L). Reaching here means
+     the clawback is fully satisfiable: _revAvail === _revCredit. The ledger entry is still
+     written from the ACTUAL recovered amount rather than the notional total, so credit and
+     sum(creditLog) cannot diverge even if the guard above is ever relaxed. */
+  if(_revCu&&_revCu.creditLog&&_revEntries.length){
+    {
+      _revEntries.forEach(function(l){
+        var _each=_round2(Math.min((l.amt||0),_revAvail));
+        _revAvail=_round2(_revAvail-_each);
+        if(_each>0)_revCu.creditLog.push({cid:uid(),date:tday(),amt:-_each,type:"reversal",invId:invId,by:CU.name,role:CU.role,note:"Overpayment credit reversed together with its payment on Invoice #"+invId});
       });
       if(_revCredit>0)_revCu.credit=_round2(Math.max(0,(_revCu.credit||0)-_revCredit));
     }
@@ -11804,6 +12188,21 @@ function recPay(){
   // itself is fully synchronous (no async ID reservation like orders need),
   // a simple timed lock is the proportional fix - it only needs to survive
   // the brief window between two rapid taps, not a multi-second async wait.
+  /* IDEMPOTENCY GUARD (2026-08-12). The flag below was released SYNCHRONOUSLY at the end
+     of this call, so a second tap's handler — which cannot start until the first returns —
+     always found it false. It blocked only re-entrant calls, which click events cannot
+     produce; the comment claiming it 'survives the window between two rapid taps' was
+     wrong. Executed: 3 sequential taps gave paid=1200 across 3 payments where 400/1 was
+     correct. A longer timer would also block a DIFFERENT legitimate payment typed seconds
+     later, so this refuses only a byte-identical resubmission inside 4 seconds. */
+  var _paySig="";
+  try{_paySig=[el("pay-cid")&&el("pay-cid").value,el("pay-amt")&&el("pay-amt").value,
+    el("pay-inv-id")&&el("pay-inv-id").value,el("pay-method")&&el("pay-method").value,
+    el("pay-ref")&&el("pay-ref").value,el("pay-date")&&el("pay-date").value].join("|");}catch(_){_paySig="";}
+  if(_paySig&&window._lastPaySig&&window._lastPaySig.sig===_paySig&&
+     (Date.now()-window._lastPaySig.at)<4000){
+    toast("That payment was just recorded — not recording it twice","err");return;
+  }
   if(window._recordingPayment)return;
   window._recordingPayment=true;
   var _payBtn=el("m-pay-save");
@@ -11823,6 +12222,20 @@ function recPay(){
   _hasPendingCriticalEdit=true;
   var invId=el("pay-inv-id")&&el("pay-inv-id").value?parseInt(el("pay-inv-id").value):0;
   var payDate=el("pay-date")&&el("pay-date").value?el("pay-date").value:tday();
+  /* POSTING-DATE CONTROL (2026-08-12). Placed here, immediately after the date is read
+     and BEFORE any mutation — the round-4 finding-L lesson: a guard that measures early
+     but acts late is not a guard. A hard issue returns; a soft one warns and proceeds,
+     and is written to the audit log so the decision is recoverable later. */
+  var _dateIssue=_postingDateIssue(payDate);
+  if(_dateIssue&&_dateIssue.hard){
+    toast(_dateIssue.msg,"err");
+    auditLog("PAYMENT_RECORDED","PAYMENT REFUSED: "+CU.name+" ("+CU.role+") tried to record KSh "+
+      _round2(amt||0).toLocaleString()+" dated "+payDate+". "+_dateIssue.msg+" Nothing was changed.");
+    window._recordingPayment=false;
+    var _pdBtn=el("m-pay-save");
+    if(_pdBtn){_pdBtn.disabled=false;_pdBtn.innerHTML="<i class=\"ti ti-check\"></i> Record";}
+    return;
+  }
   var method=el("pay-method")?el("pay-method").value:"Cash";
   var ref=el("pay-ref")?el("pay-ref").value:"";
   // ── INVOICE-SPECIFIC PAYMENT ──────────────────────────────────────────
@@ -11872,7 +12285,7 @@ function recPay(){
     // payment reference could hijack — see _orderForInvoice for the full mechanism.
     var o=_orderForInvoice(inv);
     if(o){
-      if(inv.paid>=inv.amount){o.paid="Paid";}else if(inv.paid>0){o.paid="Partial";}else{o.paid="Unpaid";}
+      _ordPaidStatus(o,inv.paid,inv.amount);   // round-3 finding J: one definition
       o.amtPaid=inv.paid;
     }
     // DURABILITY (2026-07-29): same reasoning as DELIVERY_COMPLETE — ride the
@@ -11907,6 +12320,21 @@ function recPay(){
        trail, and any partial overpayment was under-reported by the credited portion.
        _amtEntered captures the figure as submitted, before either mutation. */
     var _amtEntered=amt;
+    /* Every payment pid minted by THIS call (round-4 finding M). The customer-level and
+       unapplied-balance credit branches below attach this list to their creditLog entry so
+       reversePayment can find the credit from any one of them. */
+    var _payPidsThisCall=[];
+    /* ORDER-INDEPENDENT CREDIT LINKING (2026-08-12, round-5 finding P).
+       _payPidsThisCall is filled by the distribution loop further down. Any creditLog
+       entry created BEFORE that loop therefore snapshotted an empty array and was linked
+       to nothing — which is exactly what happened. Entries are registered here by
+       reference and their srcPids are written by _linkCreditToPids() just before this
+       function returns, so the position of any individual push stops mattering. */
+    var _creditEntriesThisCall=[];
+    function _linkCreditToPids(){
+      var _pids=(_payPidsThisCall||[]).slice();
+      _creditEntriesThisCall.forEach(function(e){ if(e) e.srcPids=_pids.slice(); });
+    }
     var existingCredit=(cu2&&cu2.credit>0)?cu2.credit:0;
     var totalDebt=(D.invoices||[]).filter(function(i){return i.cId===cId&&i.paid<i.amount&&!i.voided&&_invoiceOrderActive(i);}).reduce(function(s,i){return s+(i.amount-i.paid);},0);
     // Apply any existing credit balance first
@@ -11938,7 +12366,17 @@ function recPay(){
       if(cu2){
         cu2.credit=_round2((cu2.credit||0)+credit2);
         if(!cu2.creditLog)cu2.creditLog=[];
-        cu2.creditLog.push({cid:uid(),date:payDate,amt:credit2,type:"overpayment",method:method,ref:ref,by:CU.name,role:CU.role,note:"Overpayment on customer account"});
+        /* srcPids (2026-08-12, round-4 finding M). A customer-level payment is spread
+           oldest-first across several invoices, so no ONE pid owns this credit — but the
+           set of pids minted by this call does. Recording them lets reversePayment claw
+           this credit back when ANY of them is reversed, which is exactly the behaviour
+           the invoice-level path already had via srcPid. Without it, reversing the payment
+           left the credit standing and the customer spent cash that no longer existed. */
+        /* Registered, not snapshotted — this push runs BEFORE the distribution loop that
+           mints the pids, so a .slice() here captured [] (round-5 finding P). */
+        var _ovEntryCust={cid:uid(),srcPids:[],date:payDate,amt:credit2,type:"overpayment",method:method,ref:ref,by:CU.name,role:CU.role,note:"Overpayment on customer account"};
+        cu2.creditLog.push(_ovEntryCust);
+        _creditEntriesThisCall.push(_ovEntryCust);
         toast("KSh "+credit2.toLocaleString()+" overpayment stored as credit","ok");
       }
       amt=totalDebt;
@@ -11955,6 +12393,7 @@ function recPay(){
         if(!inv.payments)inv.payments=[];
         _touchedInvoiceIds.push(inv.id);
         var _distPid=uid();
+        _payPidsThisCall.push(_distPid);   // round-4 finding M: this cash event owns the credit it creates
         inv.payments.push({pid:_distPid,date:payDate,amt:tap,method:method,ref:ref});
         _outboxPutPayment(inv.id,_distPid); // B2: customer-level payment distributed across invoices — each slice durably queued
         inv.paid=_round2(inv.payments.reduce(function(s,p){return s+(p.amt||0);},0));
@@ -11977,9 +12416,20 @@ function recPay(){
     if(rem>0&&cu2){
       cu2.credit=_round2((cu2.credit||0)+rem);
       if(!cu2.creditLog)cu2.creditLog=[];
-      cu2.creditLog.push({cid:uid(),date:payDate,amt:rem,type:"overpayment",method:method,ref:ref,by:CU.name,role:CU.role,note:"Unapplied balance stored as credit"});
+      // srcPids — same reasoning as the customer-level branch above (round-4 finding M).
+      /* This site is correctly placed AFTER the loop today, so a snapshot would work —
+         routed through the same register anyway, because fixing only the site that failed
+         leaves this one a single refactor away from the identical bug. */
+      var _ovEntryRem={cid:uid(),srcPids:[],date:payDate,amt:rem,type:"overpayment",method:method,ref:ref,by:CU.name,role:CU.role,note:"Unapplied balance stored as credit"};
+      cu2.creditLog.push(_ovEntryRem);
+      _creditEntriesThisCall.push(_ovEntryRem);
       rem=0;
     }
+    /* Back-fill here: every pid has been minted and every credit entry registered, so the
+       links are complete from this point on. Called again before dirty() below — it is
+       idempotent, and two cheap calls are worth more than one assumption about which
+       return path a future edit might add. */
+    _linkCreditToPids();
     /* DOUBLE-POSTING FIX (2026-08-03) — this branch never resolved pending staff cash.
 
        The invoice-specific branch above has called _resolvePendingCashFor() since
@@ -12010,8 +12460,20 @@ function recPay(){
   if(el("pg-orders")&&el("pg-orders").classList.contains("act"))rOrds(undefined,ORD_PAGE);
   if(el("pg-debts")&&el("pg-debts").classList.contains("act"))rDebts();
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
+  /* Final back-fill before dirty() persists anything (round-5 finding P). If any edit
+     ever adds a pid after the block above, the link still lands. */
+  try{if(typeof _linkCreditToPids==="function")_linkCreditToPids();}catch(_){}
   dirty();
+  /* The soft half of the posting-date control: the entry went through, but the director
+     must SEE why it was unusual and it must be findable in the log afterwards. A warning
+     nobody records is a warning nobody can act on a week later. */
+  if(_dateIssue&&!_dateIssue.hard){
+    toast(_dateIssue.msg,"warn");
+    auditLog("PAYMENT_RECORDED","BACKDATED/CLOSED-PERIOD POSTING: KSh "+_round2(_amtEntered||amt||0).toLocaleString()+
+      " recorded by "+CU.name+" ("+CU.role+") dated "+payDate+" (today is "+tday()+"). "+_dateIssue.msg);
+  }
   toast("Payment recorded — KSh "+amt.toLocaleString());
+  try{window._lastPaySig={sig:_paySig,at:Date.now()};}catch(_){}
   window._recordingPayment=false;
   if(window._recordingPaymentTimer)clearTimeout(window._recordingPaymentTimer);
   var _payBtnDone=el("m-pay-save");
@@ -13188,7 +13650,13 @@ async function saveOrd(){
     if(!(D.stock||[]).length){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}toast("Add a product first","err");return;}
     var opEl=el("op");pn=opEl?opEl.value:"";
     if(!pn){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}toast("Please select a product","err");if(el("op-search"))el("op-search").focus();return;}
-    price=parseInt((opEl?opEl.getAttribute("data-p"):0)||0);
+    /* NEGATIVE PRICE (2026-08-12) — quantity is floored at 1 a few lines below ("a negative
+       value here would invert stock deduction"), but price took whatever data-p carried. A
+       product priced below zero produced o.price=-500 and a negative invoice, i.e. a
+       receivable that reduces what the customer owes. The offer branch below already
+       clamps with Math.max(0,...) for exactly this reason — the raw read did not. Clamped
+       at source so both paths agree. */
+    price=Math.max(0,parseInt((opEl?opEl.getAttribute("data-p"):0)||0));
     if(price<=0&&!isCat){if(!(await uiConfirm({title:"Zero-value order",message:"This product has no sale price set (KSh 0).\n\nContinue with a zero-value order?",variant:"warn",confirmText:"Place anyway"}))){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}return;}}
   }
 
@@ -13324,7 +13792,15 @@ async function saveOrd(){
     // and invoice id are both unique, so dropping the cId gate is safe; then migrate
     // the invoice's cId so the invoice FOLLOWS the order (and its payments) to the
     // new customer. For the common no-reassignment edit this is a no-op (same cId).
-    var linkedInv=(D.invoices||[]).find(function(i){return (o.invoiceId&&i.id===o.invoiceId)||(!o.invoiceId&&i.notes&&i.notes.match(new RegExp("#"+o.id+"(\\D|$)")));});
+    /* STALE POINTER (2026-08-12) — this tried o.invoiceId first and fell back to the notes
+       scrape ONLY when the pointer was falsy. A pointer that is present but DEAD (the
+       #1476/#1477 case this codebase documents, where invoiceId survived a renumber and
+       pointed at a deleted invoice) skipped the fallback and resolved to null. Executed:
+       stale pointer + perfectly valid notes -> NULL, while the canonical helper found
+       #2001; in syncPaymentStatuses that left a fully-paid order reading Unpaid.
+       Now: try the pointer, and if it does not RESOLVE, fall through to the canonical
+       helper instead of giving up. */
+      var linkedInv=(o.invoiceId?(D.invoices||[]).find(function(i){return i.id===o.invoiceId;}):null)||_linkedInvoicesOf(o.id,D.invoices)[0]||null;
     if(linkedInv)linkedInv.cId=cId;
     if(payStatus!=="Paid"){
       if(linkedInv){
@@ -13351,9 +13827,43 @@ async function saveOrd(){
           // payments as the genuine source of truth, so any future
           // recompute-from-payments naturally preserves this correction
           // instead of erasing it.
+          /* CASH PRESERVATION (2026-08-12) — the negative correction entry below kept the
+             ledger internally consistent (paid === sum(payments) still held, which is why no
+             existing check caught it) and externally WRONG: the customer's money simply
+             ceased to exist. Executed: an order of 5 x KSh 500 paid in full, shrunk to 1,
+             left invoice paid=500, credit=0 and KSh 2,000 accounted for nowhere.
+             The codebase already solves this correctly one function away — cancelling the
+             same order forces a credit-or-refund disposition and preserves all 2,500. The
+             comment above says "any overpayment handling is unchanged/out of scope here";
+             that scope decision WAS the defect (CLAUDE.md rule 14 — the structural twin).
+             The negative entry is still written, because the reasoning above it is sound:
+             payments must stay the source of truth so a later recompute cannot resurrect
+             the old total. What is added is that the money it removes now LANDS somewhere —
+             as customer credit, logged, exactly as the cancel path does. */
           var diffDown=_round2(amtPaid-linkedInv.paid);
           if(!linkedInv.payments)linkedInv.payments=[];
-          linkedInv.payments.push({pid:uid(),date:tday(),amt:diffDown,method:"Cash",ref:"Order edit correction by "+CU.name});
+          var _corrPid=uid();
+          linkedInv.payments.push({pid:_corrPid,date:tday(),amt:diffDown,method:"Cash",ref:"Order edit correction by "+CU.name});
+          var _freed=_round2(-diffDown);   // diffDown is negative; this is the cash released
+          if(_freed>0){
+            var _cuEd=(D.customers||[]).find(function(x){return x.id===o.cId;});
+            if(_cuEd){
+              _cuEd.credit=_round2((_cuEd.credit||0)+_freed);
+              if(!_cuEd.creditLog)_cuEd.creditLog=[];
+              _cuEd.creditLog.push({cid:uid(),srcPid:_corrPid,date:tday(),amt:_freed,type:"order-reduced",
+                ordId:o.id,invId:linkedInv.id,by:CU.name,role:CU.role,
+                note:"Order #"+o.id+" reduced after payment — cash held as credit"});
+              _stampRecordEdit(_cuEd);
+              auditLog("CREDIT_ADJUSTED","Order #"+o.id+" was reduced after KSh "+_round2(linkedInv.paid).toLocaleString()+
+                " had already been paid. KSh "+_freed.toLocaleString()+" of that cash is no longer owed against this order "+
+                "and has been held as CUSTOMER CREDIT by "+CU.name+" ("+CU.role+"). It was previously destroyed by this path.");
+              toast("KSh "+_freed.toLocaleString()+" held as credit for this customer","ok");
+            }else{
+              auditLog("CREDIT_ADJUSTED","Order #"+o.id+" reduced by KSh "+_freed.toLocaleString()+
+                " but customer #"+o.cId+" was not found — the cash could NOT be credited. Investigate.");
+              toast("KSh "+_freed.toLocaleString()+" freed but the customer record is missing — see the audit log","err");
+            }
+          }
         }
         linkedInv.paid=_round2(amtPaid);
         if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
@@ -13730,6 +14240,21 @@ function openDlv(oid){
 async function completeDlv(){
   var oid=parseInt(el("dlv-oid").value);
   var o=(D.orders||[]).find(function(x){return x.id===oid;});if(!o)return;
+  /* STATUS GUARD (2026-08-12) — completeDlv never checked for Cancelled. Reproduced as a
+     two-device race: A cancels #1001 (invoice deleted, 2 units returned to the shelf); B,
+     on a stale list, taps Complete Delivery. The order flipped back to Delivered with a NEW
+     paid invoice, the cancellation vanished with no warning, and — because prodConfirmed
+     ===true means 'stock was already taken', which stopped being true the moment the cancel
+     restored it — the 2 units were handed over and never deducted. Stock reads permanently
+     high and surfaces later as an unexplained stocktake shortfall.
+     Same shape and same placement as the guard added to _finishCancelO: at the MUTATION
+     site, not the button. */
+  if(o.status==="Cancelled"){
+    toast("Order #"+oid+" was cancelled — it cannot be delivered","err");
+    auditLog("SECURITY_VIOLATION","Delivery attempted on CANCELLED order #"+oid+" by "+CU.name+
+      " ("+CU.role+") — refused. Another device most likely cancelled it while this one held a stale list.");
+    return;
+  }
   // Triple-enforced ownership check — cannot be bypassed
   if(!can("eOrd")&&o.driver&&o.driver!==CU.name){
     toast("Security: you are not assigned to Order #"+oid,"err");
@@ -13804,7 +14329,20 @@ async function completeDlv(){
   // stays gated by mPaid — staff still route cash through the
   // pendingPayments/director-acknowledgement flow exactly as before.
   var total=_round2(o.qty*o.price);
-  var inv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.match(new RegExp("#"+oid+"(\\D|$)"));});
+  /* CANONICAL INVOICE LOOKUP (2026-08-12) — this was a free-text notes scrape that
+     ignored the structured i.orderId entirely. Found by an independent audit; the comment
+     block above _orderForInvoice claimed all six sites had been migrated to
+     _linkedInvoicesOf, and these had not — ackPendingPay was even named in it as fixed.
+     TWO WAYS IT FAILS, both reproduced in _proofB_invoice_lookup.js: an invoice correctly
+     linked by orderId whose notes were edited or imported (restoreXL / mergeXL) is NOT
+     found; and an unrelated invoice whose notes happen to contain the same #digits IS.
+     THREE DECISIONS, made deliberately rather than by omission:
+       - the cId check is KEPT. _linkedInvoicesOf does not filter by customer, and a cId
+         mismatch means corrupt data that must never silently match another customer.
+       - [0] preserves the previous first-match behaviour when an order somehow has more
+         than one linked invoice. Changing that is not this fix's job.
+       - each site keeps whatever extra guards it already had. */
+  var inv=_linkedInvoicesOf(oid,D.invoices).filter(function(i){return i.cId===o.cId;})[0]||null;
   // FIX (2026-07-21): the invoice ID here now goes through the same atomic
   // reservation as order/edit invoice creation, closing the same collision
   // class. Only the branch that actually creates a NEW invoice needs to
@@ -13848,20 +14386,16 @@ async function completeDlv(){
       }
     }
     if(inv){
-      if(inv.paid>=inv.amount){o.paid="Paid";o.amtPaid=inv.paid;}
-      else if(inv.paid>0){o.paid="Partial";o.amtPaid=inv.paid;}
-      else{o.paid="Unpaid";}
+      _ordPaidStatus(o,inv.paid,inv.amount);o.amtPaid=_round2(inv.paid||0);   // round-3 finding J: one definition (was an unguarded Paid assignment)
     }else if(amt>0){
-      if(amt>=total){o.paid="Paid";o.amtPaid=_round2(amt);}
-      else{o.paid="Partial";o.amtPaid=_round2(amt);}
+      _ordPaidStatus(o,amt,total);o.amtPaid=_round2(amt);   // round-3 finding J: one definition (was an unguarded Paid assignment)
     }
   }else{
     // Staff/driver: reflect whatever the invoice already shows (e.g. a prior
     // director-recorded payment) — but never apply a NEW payment here; that
     // still only ever happens via the pendingPayments/ack flow below.
     if(inv){
-      if(inv.paid>=inv.amount){o.paid="Paid";o.amtPaid=inv.paid;}
-      else if(inv.paid>0){o.paid="Partial";o.amtPaid=inv.paid;}
+      if(inv.paid>0||o.status==="Cancelled"){_ordPaidStatus(o,inv.paid,inv.amount);o.amtPaid=_round2(inv.paid||0);}   // round-3 finding J: one definition (was an unguarded Paid assignment)
       else{o.paid=o.paid||"Unpaid";}
     }else{
       o.paid=o.paid||"Unpaid";
@@ -14090,7 +14624,20 @@ function cancelO(id){
   var o=(D.orders||[]).find(function(x){return x.id===id;});if(!o)return;
   if(o.status==="Cancelled"){toast("Already cancelled");return;}
   if(o.status==="Delivered"){toast("Cannot cancel a delivered order — delete it if needed","err");return;}
-  var inv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.match(new RegExp("#"+id+"(\\D|$)"));});
+  /* CANONICAL INVOICE LOOKUP (2026-08-12) — this was a free-text notes scrape that
+     ignored the structured i.orderId entirely. Found by an independent audit; the comment
+     block above _orderForInvoice claimed all six sites had been migrated to
+     _linkedInvoicesOf, and these had not — ackPendingPay was even named in it as fixed.
+     TWO WAYS IT FAILS, both reproduced in _proofB_invoice_lookup.js: an invoice correctly
+     linked by orderId whose notes were edited or imported (restoreXL / mergeXL) is NOT
+     found; and an unrelated invoice whose notes happen to contain the same #digits IS.
+     THREE DECISIONS, made deliberately rather than by omission:
+       - the cId check is KEPT. _linkedInvoicesOf does not filter by customer, and a cId
+         mismatch means corrupt data that must never silently match another customer.
+       - [0] preserves the previous first-match behaviour when an order somehow has more
+         than one linked invoice. Changing that is not this fix's job.
+       - each site keeps whatever extra guards it already had. */
+  var inv=_linkedInvoicesOf(id,D.invoices).filter(function(i){return i.cId===o.cId;})[0]||null;
   var hasPaid=inv&&inv.paid>0;
   // ENTERPRISE RULE: cancelling an order that already has money paid against
   // it must not leave the fate of that money ambiguous. It used to just zero
@@ -14105,7 +14652,20 @@ function cancelO(id){
 }
 function _openCancelDisposition(id){
   var o=(D.orders||[]).find(function(x){return x.id===id;});if(!o)return;
-  var inv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.match(new RegExp("#"+id+"(\\D|$)"));});
+  /* CANONICAL INVOICE LOOKUP (2026-08-12) — this was a free-text notes scrape that
+     ignored the structured i.orderId entirely. Found by an independent audit; the comment
+     block above _orderForInvoice claimed all six sites had been migrated to
+     _linkedInvoicesOf, and these had not — ackPendingPay was even named in it as fixed.
+     TWO WAYS IT FAILS, both reproduced in _proofB_invoice_lookup.js: an invoice correctly
+     linked by orderId whose notes were edited or imported (restoreXL / mergeXL) is NOT
+     found; and an unrelated invoice whose notes happen to contain the same #digits IS.
+     THREE DECISIONS, made deliberately rather than by omission:
+       - the cId check is KEPT. _linkedInvoicesOf does not filter by customer, and a cId
+         mismatch means corrupt data that must never silently match another customer.
+       - [0] preserves the previous first-match behaviour when an order somehow has more
+         than one linked invoice. Changing that is not this fix's job.
+       - each site keeps whatever extra guards it already had. */
+  var inv=_linkedInvoicesOf(id,D.invoices).filter(function(i){return i.cId===o.cId;})[0]||null;
   if(!inv)return;
   var cu=(D.customers||[]).find(function(x){return x.id===o.cId;});
   var isCatOrder=(o.prodConfirmed===false);
@@ -14149,7 +14709,31 @@ function _finishCancelO(id,disposition){
   // re-verified it itself.
   if(!can("eOrd"))return;
   var o=(D.orders||[]).find(function(x){return x.id===id;});if(!o)return;
-  var inv=(D.invoices||[]).find(function(i){return i.cId===o.cId&&i.notes&&i.notes.match(new RegExp("#"+id+"(\\D|$)"));});
+  /* RE-ENTRY GUARD AT THE MUTATION SITE (2026-08-12). cancelO() checks status before
+     opening the flow, but the disposition modal's button calls _confirmCancelDisposition
+     directly and NEITHER it nor this function re-checked. Executed reproduction: two taps
+     on an order of qty 5 with KSh 400 paid gave stock +10 (DOUBLE RESTORE) and KSh 800 of
+     store credit for KSh 400 of cash (MONEY FABRICATED), with two plausible creditLog
+     entries and two ORDER_CANCELLED audit entries.
+     Placed HERE, not on the button: an entry-point lock is exactly the pattern this
+     codebase has already been burnt by, and voidInvoice._confirm re-checks permission at
+     its own mutation site for the same reason. Idempotent by state — a second call finds
+     the order already Cancelled and does nothing. */
+  if(o.status==="Cancelled"){toast("Order #"+id+" is already cancelled");return;}
+  /* CANONICAL INVOICE LOOKUP (2026-08-12) — this was a free-text notes scrape that
+     ignored the structured i.orderId entirely. Found by an independent audit; the comment
+     block above _orderForInvoice claimed all six sites had been migrated to
+     _linkedInvoicesOf, and these had not — ackPendingPay was even named in it as fixed.
+     TWO WAYS IT FAILS, both reproduced in _proofB_invoice_lookup.js: an invoice correctly
+     linked by orderId whose notes were edited or imported (restoreXL / mergeXL) is NOT
+     found; and an unrelated invoice whose notes happen to contain the same #digits IS.
+     THREE DECISIONS, made deliberately rather than by omission:
+       - the cId check is KEPT. _linkedInvoicesOf does not filter by customer, and a cId
+         mismatch means corrupt data that must never silently match another customer.
+       - [0] preserves the previous first-match behaviour when an order somehow has more
+         than one linked invoice. Changing that is not this fix's job.
+       - each site keeps whatever extra guards it already had. */
+  var inv=_linkedInvoicesOf(id,D.invoices).filter(function(i){return i.cId===o.cId;})[0]||null;
   var hasPaid=inv&&inv.paid>0;
   var isCatOrder=(o.prodConfirmed===false);
   // FIX (2026-07-29): a restored record (_stockNotDeducted) never took stock either,
@@ -14176,6 +14760,23 @@ function _finishCancelO(id,disposition){
          server amount kept coming back, so outstandingBal never reached zero and Delete
          kept refusing). That fix made LOCAL win; this stamp is what makes the write-off
          win on every OTHER device too, instead of only on the one that performed it. */
+      /* MONEY RE-CHECK AT THE MUTATION SITE (2026-08-12, round-4 finding O). cancelO()
+         decides whether to open the disposition modal from ITS view of the invoice. If a
+         merge landed since, or if _confirmCancelDisposition was reached directly, we can
+         arrive here with real cash on the invoice and no disposition chosen. Cancelling
+         then strands the money: not credited, not refunded, and excluded from debt because
+         the order is cancelled. Refuse and send the director back through the flow — the
+         same shape as the re-entry guard at the top of this function. */
+      if(_round2(inv.paid||0)>0.005&&!disposition){
+        auditLog("ORDER_CANCELLED","CANCEL REFUSED: Order #"+id+" carries KSh "+_round2(inv.paid).toLocaleString()+
+          " on Invoice #"+inv.id+" but no disposition (credit or refund) was chosen. This device saw the order as "+
+          "unpaid when Cancel was tapped, so the money arrived from another device in between. Attempted by "+
+          CU.name+" ("+CU.role+"). Nothing was changed — the order is still active.");
+        toast("This order now has KSh "+_round2(inv.paid).toLocaleString()+" paid against it (recorded on another "+
+          "device). Cancel it again and choose whether that money becomes credit or a refund.","err");
+        try{if(typeof _openCancelDisposition==="function")_openCancelDisposition(id);}catch(_){}
+        return;
+      }
       _stampRecordEdit(inv);
       o.cancelDisposition=disposition; // internal record only — doesn't affect any badge/status logic elsewhere
       if(disposition==="credit"){
@@ -14183,13 +14784,25 @@ function _finishCancelO(id,disposition){
         if(cu){
           cu.credit=_round2((cu.credit||0)+inv.paid);
           if(!cu.creditLog)cu.creditLog=[];
-          cu.creditLog.push({cid:uid(),date:tday(),amt:inv.paid,type:"overpayment",ordId:id,by:CU.name,role:CU.role,note:"Order #"+id+" cancelled — KSh "+inv.paid+" converted to store credit"});
+          /* srcPids (2026-08-12, round-4 finding M). This credit is funded by exactly the
+             payments currently on the invoice, so name them. Executed failure without it:
+             pay 500 -> cancel to credit -> reverse the payment; invoice went to 0 and the
+             KSh 500 of credit survived, funded by cash that had just been reversed. */
+          cu.creditLog.push({cid:uid(),srcPids:((inv.payments||[]).map(function(p){return p.pid;}).filter(function(x){return x!=null;})),date:tday(),amt:inv.paid,type:"overpayment",ordId:id,by:CU.name,role:CU.role,note:"Order #"+id+" cancelled — KSh "+inv.paid+" converted to store credit"});
         }
         dispNote=" \u2014 KSh "+inv.paid+" converted to customer credit";
       }else if(disposition==="refund"){
         dispNote=" \u2014 KSh "+inv.paid+" recorded as refunded in cash (paid outside the system)";
       }
     }else{
+      /* TOMBSTONE (2026-08-12, round-4 finding N). Removing the invoice without recording
+         the deletion is exactly the bug delO fixed on 2026-07-27: every merge path decides
+         whether to re-add a remote invoice by consulting deletedInvoiceIds, so a bare
+         filter lets a stale second device resurrect it on its next sync. Safe here because
+         this branch only runs when the invoice carries NO payments — the paid branch above
+         keeps its invoice for the books, exactly as delO does. */
+      if(!D.deletedInvoiceIds)D.deletedInvoiceIds={};
+      D.deletedInvoiceIds[inv.id]=Date.now();
       D.invoices=(D.invoices||[]).filter(function(i){return i.id!==inv.id;});
     }
   }
@@ -14604,7 +15217,13 @@ function _computeMissingOrders(){
     if(rec.auditCId){
       cust=(D.customers||[]).find(function(c){return c.id===rec.auditCId;});
     }
-    var inv=(D.invoices||[]).find(function(i){return i.notes&&i.notes.match(new RegExp("#"+id+"(\\D|$)"));});
+    /* CANONICAL LOOKUP (2026-08-12) — the sixth and last raw notes scrape, found by the
+       same audit sweep as the five money-path sites. This one recovers a MISSING order
+       from the audit log and uses its invoice to infer the customer and price, so failing
+       to find the invoice makes an otherwise recoverable order unrecoverable.
+       NO cId FILTER HERE, deliberately and unlike the other five: the customer is exactly
+       what this code is trying to infer, so filtering by it would be circular. */
+    var inv=_linkedInvoicesOf(id,D.invoices)[0]||null;
     if(!cust&&inv){
       cust=(D.customers||[]).find(function(c){return c.id===inv.cId;});
     }
@@ -14842,6 +15461,53 @@ function _writtenOffFor(orders,invArr){
       var _mo=_linkedOrderIdOf(i);
       return _mo!=null&&!!ids[_mo];
     }).reduce(function(a,i){return a+((Number(i.amount)||0)-(Number(i.paid)||0));},0);
+}
+/* NET REVENUE BY GROUP — ONE DEFINITION (2026-08-12).
+   The dashboard computed revenue as gross minus _writtenOffFor(...); the Reports
+   per-driver / per-customer / per-product breakdowns, BOTH Excel export sheets, and the
+   Customers-tab revenue sort all accumulated raw qty*price with no subtraction. Six
+   divergent definitions of one metric — an independent audit found three of them, a full
+   sweep of every qty*price accumulator found the other three.
+
+   ATTRIBUTION POLICY, chosen and stated rather than left implicit: a write-off belongs to
+   the ORDER its invoice is linked to, and therefore to that order's driver, customer and
+   product. That is not a new rule — it is exactly what _writtenOffFor already does for the
+   dashboard, so this reuses the proven function instead of inventing an attribution
+   scheme. It is also the only choice under which the breakdowns sum to the dashboard
+   total; any other rule leaves a silent residue.
+
+   IT MEANS A DRIVER'S REVENUE FALLS WHEN A CUSTOMER HE DELIVERED TO NEVER PAYS. That is
+   the honest number, and it is the director's call to change: to keep driver figures gross
+   while customers and products stay net, delete the drvMap line in rReports and nothing
+   else. Measured on live data 2026-08-12 the choice changes NOTHING today — both voided
+   invoices (KSh 1,500 total) belong to deleted orders #1180/#1181, which no breakdown
+   counts, so attributable write-offs are currently KSh 0.
+
+   Mutates map[key][field] in place so each caller keeps its own extra columns
+   (deliveries, qty, ords). Plain-number maps are supported for the Customers-tab sort. */
+function _applyWriteOffsByGroup(map,orders,keyFn,invArr,field){
+  try{
+    if(!map||typeof map!=="object")return map;
+    var f=field||"rev";
+    var byKey={};
+    (Array.isArray(orders)?orders:[]).forEach(function(o){
+      /* EMPTY KEY (2026-08-12) — the gross accumulators bucket an order with an empty
+         prod under "", but this skipped null/empty keys, so its write-off was never
+         subtracted and the reconciliation invariant this function exists to guarantee
+         broke (measured residue: 900). Normalise instead of skipping: the two sides must
+         agree on the key, whatever it is. */
+      if(!o)return;var k=keyFn(o);if(k==null)k="";
+      if(!byKey[k])byKey[k]=[];byKey[k].push(o);
+    });
+    Object.keys(byKey).forEach(function(k){
+      if(!Object.prototype.hasOwnProperty.call(map,k))return;
+      var wo=0;try{wo=_writtenOffFor(byKey[k],invArr);}catch(_){wo=0;}
+      if(!wo)return;
+      if(typeof map[k]==="number")map[k]=_round2(map[k]-wo);
+      else if(map[k]&&typeof map[k][f]==="number")map[k][f]=_round2(map[k][f]-wo);
+    });
+  }catch(_){}
+  return map;
 }
 function _revenueCompare(del,now){
   /* Type-check BOTH arguments, not truthiness. `now||new Date()` accepted any truthy value
@@ -15857,7 +16523,7 @@ function _ackDistributeToOpenInvoices(pp,remaining,skipInv){
       i.paid=_round2(i.payments.reduce(function(s,p){return s+(p.amt||0);},0));
       var _o=_orderForInvoice(i);
       if(_o){
-        if(i.paid>=i.amount){_o.paid="Paid";}else if(i.paid>0){_o.paid="Partial";}
+        _ordPaidStatus(_o,i.paid,i.amount);   // round-3 finding J: one definition
         _o.amtPaid=i.paid;
       }
       remaining=_round2(remaining-take);
@@ -16400,7 +17066,23 @@ function ackPendingPay(id){
   // contradiction recPay's own voided-guard exists to prevent. When the
   // order-specific invoice isn't collectable, fall through to the customer's
   // oldest ACTIVE invoice, or to credit below — never onto a written-off one.
-  var inv=(D.invoices||[]).find(function(i){return i.cId===pp.cId&&i.notes&&i.notes.match(new RegExp("#"+pp.ordId+"(\\D|$)"))&&!i.voided&&_invoiceOrderActive(i);});
+  /* CANONICAL INVOICE LOOKUP (2026-08-12) — this was a free-text notes scrape that
+     ignored the structured i.orderId entirely. Found by an independent audit; the comment
+     block above _orderForInvoice claimed all six sites had been migrated to
+     _linkedInvoicesOf, and these had not — ackPendingPay was even named in it as fixed.
+     TWO WAYS IT FAILS, both reproduced in _proofB_invoice_lookup.js: an invoice correctly
+     linked by orderId whose notes were edited or imported (restoreXL / mergeXL) is NOT
+     found; and an unrelated invoice whose notes happen to contain the same #digits IS.
+     THREE DECISIONS, made deliberately rather than by omission:
+       - the cId check is KEPT. _linkedInvoicesOf does not filter by customer, and a cId
+         mismatch means corrupt data that must never silently match another customer.
+       - [0] preserves the previous first-match behaviour when an order somehow has more
+         than one linked invoice. Changing that is not this fix's job.
+       - each site keeps whatever extra guards it already had. */
+  /* ackPendingPay ALSO keeps !i.voided and _invoiceOrderActive(i). Those are a separate,
+     already-shipped fix stopping cash landing on a written-off or dead-order invoice.
+     Dropping them while fixing the lookup would be a straight regression. */
+  var inv=_linkedInvoicesOf(pp.ordId,D.invoices).filter(function(i){return i.cId===pp.cId&&!i.voided&&_invoiceOrderActive(i);})[0]||null;
   if(!inv){
     inv=(D.invoices||[]).filter(function(i){return i.cId===pp.cId&&i.paid<i.amount&&!i.voided&&_invoiceOrderActive(i);})
       .sort(function(a,b){return a.date>b.date?1:-1;})[0];
@@ -16417,7 +17099,7 @@ function ackPendingPay(id){
       remaining-=apply;
       var o=(D.orders||[]).find(function(x){return x.id===pp.ordId;});
       if(o){
-        if(inv.paid>=inv.amount){o.paid="Paid";}else if(inv.paid>0){o.paid="Partial";}
+        _ordPaidStatus(o,inv.paid,inv.amount);   // round-3 finding J: one definition
         o.amtPaid=inv.paid;
       }
     }
@@ -16457,6 +17139,57 @@ function ackPendingPay(id){
      amount above the balance and can see exactly what they are approving. That is
      the only place an overpayment can be a deliberate act rather than an artefact. */
   if(remaining>0)remaining=_ackDistributeToOpenInvoices(pp,remaining,inv);
+  /* CANCELLED-ORDER CASH (2026-08-12). The custody path is correct and deliberate — it
+     exists to stop the phantom-credit double-count fixed on 2026-08-03, and its premise is
+     written into the audit entry: 'this is a handover of money already on the books'.
+     For a CANCELLED order that premise is false. There is no live invoice for the money to
+     be on, so nothing was applied and nothing was credited: executed, a KSh 600 collection
+     on a later-cancelled order left inv.paid=0 and credit=0 while the toast said 'applied'.
+     The business held the cash with no recorded liability and the audit log stated
+     something untrue. ackCustodyAmt was written but is read nowhere, so it appeared in no
+     report either.
+     When the linked order is cancelled (or gone) the cash is NOT already on the books, so
+     it becomes customer credit — a real, visible liability — instead of vanishing. */
+  /* FAIL CLOSED (2026-08-12, same day, second pass). The first cut of this fix wrote
+     `catch(_){_ppOrd=null;}` and then treated a null order as dead. That conflates two
+     completely different states:
+       (a) the index resolved and the order genuinely is not there -> dead, credit it;
+       (b) the lookup THREW and we do not know -> not a licence to mint credit.
+     Under (b) any transient failure of _getOrdByIdIndex() — a hydration gap, a partial
+     boot, an exception anywhere inside it — would have crediting EVERY acknowledged
+     collection, which is precisely the phantom-credit double-count closed on 2026-08-03.
+     Found because _proofB_phantom_credit.js §3 does not stub _getOrdByIdIndex: the lookup
+     threw and four assertions that guard "acknowledgement must never mint credit" went red
+     on a Delivered order. That was a real signal, not a sandbox artefact.
+     The safe default when we cannot tell is CUSTODY: it creates no liability, changes no
+     balance, and is reversible by a human who can see the order. Credit is only minted on
+     positive knowledge that the order is cancelled or absent. */
+  var _ppOrd=null,_ppOrdKnown=false;
+  try{
+    if(pp.ordId!=null){_ppOrd=_getOrdByIdIndex()[pp.ordId];}
+    _ppOrdKnown=true;   // reached only if the index resolved without throwing
+  }catch(_){_ppOrd=null;_ppOrdKnown=false;}
+  var _orderDead=(pp.ordId!=null&&_ppOrdKnown&&(!_ppOrd||_ppOrd.status==="Cancelled"));
+  if(remaining>0&&_orderDead){
+    var _cuPP=(D.customers||[]).find(function(x){return x.id===pp.cId;});
+    if(_cuPP){
+      _cuPP.credit=_round2((_cuPP.credit||0)+_round2(remaining));
+      if(!_cuPP.creditLog)_cuPP.creditLog=[];
+      _cuPP.creditLog.push({cid:uid(),srcPp:pp.id,date:tday(),amt:_round2(remaining),
+        type:"cancelled-order-cash",ordId:pp.ordId,by:CU.name,role:CU.role,
+        note:"Cash collected for Order #"+pp.ordId+", which was cancelled — held as credit"});
+      _stampRecordEdit(_cuPP);
+      pp.ack=true;pp.ackedBy=CU.name;pp.ackedDate=tday();
+      pp.ackVia="cancelled-order-credit";pp.ackCreditAmt=_round2(remaining);
+      auditLog("CASH_ACKNOWLEDGED","Director "+CU.name+" acknowledged KSh "+_round2(remaining).toLocaleString()+
+        " collected by "+pp.collectedBy+" for Order #"+pp.ordId+", which was CANCELLED. There is no live invoice "+
+        "for this money, so it is NOT a handover of cash already on the books — it has been held as CUSTOMER "+
+        "CREDIT so the business's liability to the customer is recorded. (Before 2026-08-12 this path marked the "+
+        "cash acknowledged and applied it nowhere.)");
+      toast("KSh "+_round2(remaining).toLocaleString()+" held as credit — Order #"+pp.ordId+" was cancelled","ok");
+      dirty();rDash();return;
+    }
+  }
   var _custodyOnly=(remaining>0);
   pp.ack=true;pp.ackedBy=CU.name;pp.ackedDate=tday();
   if(_custodyOnly){
@@ -17106,16 +17839,23 @@ function exportReportXL(){
   var byProd={};delivered.forEach(function(o){
     if(!byProd[o.prod])byProd[o.prod]={Product:unescapeForEdit(o.prod),Units:0,Revenue:0};
     byProd[o.prod].Units+=o.qty;byProd[o.prod].Revenue+=o.qty*o.price;});
+  _applyWriteOffsByGroup(byProd,delivered,function(o){return o.prod;},invoicesWithBooks(),"Revenue");
   var byCust={};delivered.forEach(function(o){
     var cu=custById(o.cId);var n=cu?cu.name:"Unknown";
     if(!byCust[n])byCust[n]={Customer:cu?unescapeForEdit(cu.name):"Unknown",Orders:0,Revenue:0};
     byCust[n].Orders++;byCust[n].Revenue+=o.qty*o.price;});
+  _applyWriteOffsByGroup(byCust,delivered,function(o){var c=custById(o.cId);return c?unescapeForEdit(c.name):"Unknown";},invoicesWithBooks(),"Revenue");
   var wb=XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(Object.values(byProd)),"By Product");
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(Object.values(byCust).sort(function(a,b){return b.Revenue-a.Revenue;})),"By Customer");
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(delivered.map(function(o){var cu=custById(o.cId);return{Date:o.deliveredAt||o.date,Order:o.id,Customer:cu?unescapeForEdit(cu.name):"",Product:unescapeForEdit(o.prod),Qty:o.qty,Price:o.price,Revenue:o.qty*o.price,Driver:unescapeForEdit(o.driver||""),Payment:o.paid};})),"Orders Detail");
   // Driver performance sheet
   var drvMap2={};delivered.forEach(function(o){var d=o.completedBy||o.driver||"Unassigned";var asgn=o.driver||"Unassigned";if(!drvMap2[d])drvMap2[d]={"Completed By":unescapeForEdit(d),"Assigned Driver":asgn===d?"(same)":unescapeForEdit(asgn),Deliveries:0,Units:0,Revenue:0};drvMap2[d].Deliveries++;drvMap2[d].Units+=o.qty;drvMap2[d].Revenue+=o.qty*o.price;});
+  /* THE SEVENTH accumulator (2026-08-12). The audit found three divergent revenue
+     definitions; a sweep found three more; this one was found only because
+     _proofB_revenue_onedef.js counts them and refused to accept six. exportReportXL has
+     TWO driver maps - drvMap2 here for the Excel sheet, separate from rReports drvMap. */
+  _applyWriteOffsByGroup(drvMap2,delivered,function(o){return o.completedBy||o.driver||"Unassigned";},invoicesWithBooks(),"Revenue");
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(Object.values(drvMap2).sort(function(a,b){return b.Deliveries-a.Deliveries;})),"Driver Performance");
   // Audit log sheet (last 100 events)
   if(D.auditLog&&(D.auditLog||[]).length){
@@ -17134,6 +17874,13 @@ function rReports(){
   // these locals everywhere below instead of the raw D arrays.
   var _rptOrdAll=ordersWithBooks();
   var _rptInvAll=invoicesWithBooks();
+  /* round-3 finding H: an all-time or multi-month view is exactly where archived data
+     goes missing, so this screen must never present a total without saying so. */
+  var _rptGap=booksGapNote();
+  /* CLOSED-PERIOD DRIFT (2026-08-12). _closePeriod merges late records on a re-close, so
+     a backdated posting is never LOST — but until that re-close happens the closed book
+     and the live figures disagree, and nothing said so. Local data only; zero reads. */
+  var _rptDrift=[];try{_rptDrift=closedPeriodsWithDrift();}catch(_){_rptDrift=[];}
   var del=_rptOrdAll.filter(function(o){
     if(o.status!=="Delivered")return false;
     if(RPT_FROM||RPT_TO){
@@ -17187,6 +17934,8 @@ function rReports(){
     drvMap[completed].qty+=o.qty;
     drvMap[completed].rev+=o.qty*o.price;
   });
+  /* net of write-offs — see _applyWriteOffsByGroup for the attribution policy */
+  _applyWriteOffsByGroup(drvMap,del,function(o){return o.completedBy||o.driver||"Unassigned";},_rptInvAll);
   var drvPerf=Object.values(drvMap).sort(function(a,b){return b.deliveries-a.deliveries;});
   // Payment aging
   var today=tday();
@@ -17216,12 +17965,30 @@ function rReports(){
     else aging.d60p+=(inv.amount-inv.paid);
   });
   var cRevMap={};del.forEach(function(o){if(!cRevMap[o.cId])cRevMap[o.cId]={rev:0,ords:0};cRevMap[o.cId].rev+=o.qty*o.price;cRevMap[o.cId].ords++;});
+  _applyWriteOffsByGroup(cRevMap,del,function(o){return o.cId;},_rptInvAll);
   var cRevs=(D.customers||[]).map(function(c){var cm=cRevMap[c.id]||{rev:0,ords:0};return{c:c,rev:cm.rev,ords:cm.ords,debt:custDebt(c.id)};}).sort(function(a,b){return b.rev-a.rev;});
   var pRevs={};del.forEach(function(o){if(!pRevs[o.prod])pRevs[o.prod]={qty:0,rev:0};pRevs[o.prod].qty+=o.qty;pRevs[o.prod].rev+=o.qty*o.price;});
+  _applyWriteOffsByGroup(pRevs,del,function(o){return o.prod;},_rptInvAll);
   var zones=[].concat([],(D.customers||[]).map(function(c){return c.estate||c.zone||"";})).filter(function(z,i,a){return z&&a.indexOf(z)===i;});
   var _rptLabel="";if(RPT_FROM&&RPT_TO)_rptLabel=RPT_FROM+" to "+RPT_TO;else if(RPT_FROM)_rptLabel="From "+RPT_FROM;else if(RPT_TO)_rptLabel="Up to "+RPT_TO;
   pg.innerHTML=
     "<div class=\"ph\"><h1>Business Reports</h1>"+
+    /* ROUND-3 FINDING H — the banner is the fix. Before this, closing a period silently
+       removed that month from every total on this screen with no indication at all. The
+       figures were wrong and looked exactly like correct figures. Now the screen states
+       what it is excluding and offers the load; the reads are spent only if asked. */
+    (_rptDrift.length?("<div class=\"notif nw\" style=\"margin:8px 0\">"+
+      "<i class=\"ti ti-alert-triangle\"></i><div><strong>Closed months have new records.</strong> "+
+      sanitizeInput(_rptDrift.map(function(x){return x.period+" ("+x.records+")";}).join(", "))+
+      " — these were posted after the book was closed, so the closed book and these figures "+
+      "disagree until you close those months again."+
+      "</div></div>"):"")+
+    (_rptGap?("<div class=\"notif nw\" style=\"margin:8px 0\">"+
+      "<i class=\"ti ti-archive\"></i><div><strong>Figures exclude archived data.</strong> "+
+      sanitizeInput(_rptGap)+" Totals below are for the months still held live."+
+      (CU&&CU.role==="director"
+        ?" <button class=\"btn bs\" style=\"margin-left:6px\" onclick=\"loadArchivedBooks()\">Load archived months</button>":"")+
+      "</div></div>"):"")+
     "<div style=\"display:flex;flex-wrap:wrap;gap:5px;margin:8px 0 4px\">"+
     (function(){
       var n2=new Date(),y2=n2.getFullYear(),m2=n2.getMonth(),t2=tday();
@@ -18419,6 +19186,20 @@ function printStatement(cId){
     "<div><div style='font-size:20px;font-weight:800;color:#1a1560'>NEW DAWN PURE DRINKING WATER</div>"+
     "<div style='color:#666;font-size:12px'>Nyayo Estate, Gate D, Court 290 &bull; Tel: 0710805099 / 0733930568</div></div></div>"+
     "<h1>CUSTOMER STATEMENT</h1>"+
+    /* ARCHIVE HONESTY ON A CUSTOMER-FACING DOCUMENT (2026-08-12). This statement is
+       explicitly "Period: All time" and is read through invoicesWithBooks(), which
+       returns hot data only when no book is loaded. Handing a customer a document
+       headed "All time" that silently omits a closed month is worse than any internal
+       report being short: it is the artefact they dispute against. If archives exist
+       and are not loaded, the document says so in its own words. */
+    (function(){
+      var g="";try{g=booksGapNote();}catch(_){g="";}
+      return g?("<div style='border:1px solid #c0392b;background:#fdecea;color:#7b241c;"+
+        "padding:8px 10px;border-radius:6px;margin:10px 0;font-size:12px'>"+
+        "<strong>Incomplete history.</strong> "+sanitizeInput(g)+
+        " Ask for an updated statement with the archived months loaded before treating "+
+        "this as a full record.</div>"):"";
+    })()+
     "<div><strong>"+cu.name+"</strong> &bull; "+cAddr(cu)+"<br>"+
     "Statement date: "+new Date().toLocaleDateString()+"<br>"+
     "Period: All time</div>"+
@@ -19609,7 +20390,16 @@ function syncPaymentStatuses(){
     // cancelled order as "Paid", masking the fact that it was cancelled.
     if(o.status==="Cancelled")return;
     var inv=(D.invoices||[]).find(function(i){
-      return i.cId===o.cId&&((o.invoiceId&&i.id===o.invoiceId)||(!o.invoiceId&&i.notes&&i.notes.match(new RegExp("#"+o.id+"(\\D|$)"))));
+      /* STALE POINTER (2026-08-12) — this tried o.invoiceId first and fell back to the notes
+       scrape ONLY when the pointer was falsy. A pointer that is present but DEAD (the
+       #1476/#1477 case this codebase documents, where invoiceId survived a renumber and
+       pointed at a deleted invoice) skipped the fallback and resolved to null. Executed:
+       stale pointer + perfectly valid notes -> NULL, while the canonical helper found
+       #2001; in syncPaymentStatuses that left a fully-paid order reading Unpaid.
+       Now: try the pointer, and if it does not RESOLVE, fall through to the canonical
+       helper instead of giving up. */
+      return i.cId===o.cId&&(i.id===o.invoiceId||String(i.orderId)===String(o.id)||
+        (i.orderId==null&&i.notes&&_linkedInvoicesOf(o.id,[i]).length>0));
     });
     // Same principle applies to a voided invoice — voidInvoice._confirm()
     // deliberately sets o.paid="Voided" so the write-off is visible on the
@@ -19620,9 +20410,7 @@ function syncPaymentStatuses(){
     // 2026-07-20 Voided-order-visibility fix look like it never worked.
     if(inv&&inv.voided){if(o.paid!=="Voided")o.paid="Voided";return;}
     if(inv){
-      if(inv.paid>=inv.amount){o.paid="Paid";o.amtPaid=inv.paid;}
-      else if(inv.paid>0){o.paid="Partial";o.amtPaid=inv.paid;}
-      else{o.paid="Unpaid";}
+      _ordPaidStatus(o,inv.paid,inv.amount);o.amtPaid=_round2(inv.paid||0);   // round-3 finding J: one definition (was an unguarded Paid assignment)
     }else{
       // No invoice: if order was explicitly set Paid at creation, keep it
       // FIX (2026-07-25): this used to default a corrupted/unrecognized
