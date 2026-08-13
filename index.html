@@ -379,7 +379,7 @@ var APP_VERSION="47";
    (~line 2764, `stamp:BUILD_STAMP`) but NEVER read back or compared — grep for `.stamp`
    comparisons returns nothing — so renaming the build costs ZERO extra Firestore reads
    and cannot force a full re-load on any device. */
-var BUILD_STAMP="ND47-12c";
+var BUILD_STAMP="ND47-12d";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -2847,7 +2847,7 @@ var _HYDRATE_ORDER_FIELDS=["cId","driver","notes","deliver","prod","stockId","qt
                                 would make it last-writer-wins and could lose a payment
    See the block comment at the end of _mergeCustomerCredit for the full reasoning. */
 var _CUSTOMER_PROFILE_FIELDS=["name","phone","phone2","idno","estate","court","house","htype","road","zone","ctype","creditLimit","notes"];
-function _hydrateById(arr,docs,label,arrName,fromCache){
+function _hydrateById(arr,docs,label,arrName,fromCache,changed){
   // Defensive: hydration runs inside an onSnapshot callback, where a throw would break the
   // listener for the rest of the session. Bad input is a no-op, never an exception.
   if(!arr||typeof arr.forEach!=="function")return 0;
@@ -2940,7 +2940,9 @@ function _hydrateById(arr,docs,label,arrName,fromCache){
   });
   if(added||updated||_tombSkipped)
     console.log("[NDHYBRID] "+label+": +"+added+" new, "+updated+" updated from listener"+
-      ((typeof fromCache==="undefined")?"":(fromCache?" [CACHE — no reads billed]":" [SERVER — "+docs.length+" reads billed]"))+
+      ((typeof fromCache==="undefined")?""
+        :(fromCache?" [CACHE — no reads billed]"
+                   :" [SERVER — "+((changed==null)?"?":changed)+" changed doc(s) billed of "+docs.length+" in the result]"))+
       (_tombSkipped?" ("+_tombSkipped+" deleted/archived record(s) refused re-entry — the collection still holds them; the delete cap or a failed delete is why)":""));
   return added+updated;
 }
@@ -3451,9 +3453,20 @@ function _hybridStartListeners(){
            free cache hits. Firestore offline persistence is enabled, so they may well be
            free — and the read-cost figures quoted to the director were guesses either way.
            s.metadata.fromCache is already on the snapshot; it just was not being read. */
-        var _fromCache=true;
+        /* CORRECTED 2026-08-13, same day, from a live log. The first cut reported
+           docs.length as "reads billed". That is wrong and it overstated the cost by
+           three orders of magnitude: onSnapshot ALWAYS hands back the complete query
+           result, so docs.length is just the collection size (579) on every single
+           delivery, changed or not. It is not a read count and can never be one.
+           Saving ONE order printed "[SERVER — 579 reads billed]" twice — 1,158 reads for
+           a single write, which would have been alarming and was pure measurement error.
+           s.docChanges() is the documents that actually moved in this snapshot, which is
+           what Firestore bills for. fromCache is still reported because a cache-served
+           snapshot costs nothing regardless of how many documents changed. */
+        var _fromCache=true,_changed=null;
         try{_fromCache=!!(s.metadata&&s.metadata.fromCache);}catch(_){_fromCache=true;}
-        var n=_hydrateById(D[arrName],docs,label,arrName,_fromCache);
+        try{_changed=(typeof s.docChanges==="function")?s.docChanges().length:null;}catch(_){_changed=null;}
+        var n=_hydrateById(D[arrName],docs,label,arrName,_fromCache,_changed);
         // Keep the shadow in step with what the server told us, so hydration never
         // looks like a local edit and never triggers a write-back storm.
         docs.forEach(function(d){
