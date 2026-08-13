@@ -379,7 +379,7 @@ var APP_VERSION="47";
    (~line 2764, `stamp:BUILD_STAMP`) but NEVER read back or compared — grep for `.stamp`
    comparisons returns nothing — so renaming the build costs ZERO extra Firestore reads
    and cannot force a full re-load on any device. */
-var BUILD_STAMP="ND47-12b";
+var BUILD_STAMP="ND47-12c";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -2847,7 +2847,7 @@ var _HYDRATE_ORDER_FIELDS=["cId","driver","notes","deliver","prod","stockId","qt
                                 would make it last-writer-wins and could lose a payment
    See the block comment at the end of _mergeCustomerCredit for the full reasoning. */
 var _CUSTOMER_PROFILE_FIELDS=["name","phone","phone2","idno","estate","court","house","htype","road","zone","ctype","creditLimit","notes"];
-function _hydrateById(arr,docs,label,arrName){
+function _hydrateById(arr,docs,label,arrName,fromCache){
   // Defensive: hydration runs inside an onSnapshot callback, where a throw would break the
   // listener for the rest of the session. Bad input is a no-op, never an exception.
   if(!arr||typeof arr.forEach!=="function")return 0;
@@ -2940,6 +2940,7 @@ function _hydrateById(arr,docs,label,arrName){
   });
   if(added||updated||_tombSkipped)
     console.log("[NDHYBRID] "+label+": +"+added+" new, "+updated+" updated from listener"+
+      ((typeof fromCache==="undefined")?"":(fromCache?" [CACHE — no reads billed]":" [SERVER — "+docs.length+" reads billed]"))+
       (_tombSkipped?" ("+_tombSkipped+" deleted/archived record(s) refused re-entry — the collection still holds them; the delete cap or a failed delete is why)":""));
   return added+updated;
 }
@@ -3202,7 +3203,24 @@ function _maybeRecordFullLoadBaseline(){
     _deltaRecordBaseline(at,true);
     if(!_baselineLoggedThisLoad){
       _baselineLoggedThisLoad=true;
-      console.log("[NDDELTA] full load DELIVERED and clean (0 documents missing _updatedAt) — baseline recorded. The next cold load on this device runs in delta mode: tens of reads, not ~1,294.");
+      /* MESSAGE CORRECTED (2026-08-13). This used to promise "the next cold load on this
+         device runs in delta mode: tens of reads, not ~1,294". It cannot. The delta gate a
+         few lines above refuses whenever D.orders / D.invoices / D.customers are EMPTY —
+         and a cold load is empty by definition, which is what makes it cold. The promise
+         was printed on two consecutive mornings and a full load was taken both times.
+         The refusal itself is CORRECT and must not be relaxed: a delta against an empty D
+         would leave the device holding ~20 records instead of 577. What was wrong was the
+         claim. The baseline is still recorded and still used — by a warm re-subscribe,
+         not by a cold boot.
+         Whether those documents are actually BILLED is a separate question this build now
+         answers rather than assumes: the per-collection log line reports CACHE or SERVER,
+         because Firestore offline persistence is enabled and a cache-served snapshot costs
+         nothing. Until that has been read from a real log, no read-cost figure for a cold
+         boot should be quoted as fact. */
+      console.log("[NDDELTA] full load DELIVERED and clean (0 documents missing _updatedAt) — baseline recorded. "+
+        "NOTE: a cold load ALWAYS takes the full path (the delta gate refuses an empty D, by design). "+
+        "The baseline serves warm re-subscribes. See the CACHE/SERVER tag on each collection line above "+
+        "for whether these documents were billed at all.");
     }
   }catch(_){}
 }
@@ -3427,7 +3445,15 @@ function _hybridStartListeners(){
           _updatedAtMissing[label]=_miss;
         }
         if(!D[arrName])D[arrName]=[];
-        var n=_hydrateById(D[arrName],docs,label,arrName);
+        /* CACHE-OR-SERVER (2026-08-13). The main-document listener has always reported
+           doc.metadata.fromCache; the COLLECTION listeners never did, so nothing in any log
+           said whether the ~1,600 documents delivered on a cold boot were BILLED reads or
+           free cache hits. Firestore offline persistence is enabled, so they may well be
+           free — and the read-cost figures quoted to the director were guesses either way.
+           s.metadata.fromCache is already on the snapshot; it just was not being read. */
+        var _fromCache=true;
+        try{_fromCache=!!(s.metadata&&s.metadata.fromCache);}catch(_){_fromCache=true;}
+        var n=_hydrateById(D[arrName],docs,label,arrName,_fromCache);
         // Keep the shadow in step with what the server told us, so hydration never
         // looks like a local edit and never triggers a write-back storm.
         docs.forEach(function(d){
