@@ -379,7 +379,7 @@ var APP_VERSION="47";
    (~line 2764, `stamp:BUILD_STAMP`) but NEVER read back or compared — grep for `.stamp`
    comparisons returns nothing — so renaming the build costs ZERO extra Firestore reads
    and cannot force a full re-load on any device. */
-var BUILD_STAMP="ND47-12";
+var BUILD_STAMP="ND47-12b";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -8972,7 +8972,15 @@ function _checkDocSize(sizeKB,payload){
         " days of headroom · composition: "+shown
         .map(function(p){return p.k+" "+Math.round(p.kb)+"KB("+p.n+")";}).join(" · ")+
         (restKB>=0.5?" · everything else "+Math.round(restKB)+"KB":"")+
-        " · TOMBSTONES "+tombKB.toFixed(1)+"KB("+tombN+" entries — grows forever, never shrinks; see HANDOVER 12.4E)");
+        /* CORRECTED 2026-08-12 from a live production log. This line told the director
+   "grows forever, never shrinks", which stopped being true when pruneOldTombstones()
+   was added — it removes order, customer, invoice and payment-compaction markers older
+   than 90 days, on the once-daily EOD cycle (any device open after 21:00 runs it for the
+   whole fleet, since _lastEodBackupDate is synced). Measured in production 2026-08-12:
+   41 entries, 0.8 KB, in a 36 KB document. A warning that is FALSE is worse than none —
+   the director is meant to be able to trust what this app tells them on screen, and a
+   standing false alarm about unbounded growth trains them to ignore the real one. */
+" · tombstones "+tombKB.toFixed(1)+"KB("+tombN+" entries, pruned at 90 days)");
       /* UNBOUNDED-GROWTH EARLY WARNING (2026-08-09, ND47-1).
          D.pendingPayments is NEVER removed from — verified mechanically: zero reassignments,
          zero splices, zero filter-reassigns anywhere in the file. Entries are pushed at
@@ -14747,6 +14755,14 @@ function _finishCancelO(id,disposition){
     if(st.history.length>STOCK_HISTORY_MAX)st.history=st.history.slice(-STOCK_HISTORY_MAX);
     updateStockBadge();
   }
+  /* CAPTURED BEFORE THE ASSIGNMENT (2026-08-13, round-9 finding U). The retraction guard
+     ~66 lines below used to read o.status directly, copied verbatim from delO. delO never
+     rewrites o.status, so there it is still "Delivered" when the guard runs; here the very
+     next statement makes it "Cancelled", so the guard could never be true and the whole
+     fix was inert. The QUESTION to ask of any guard is not "is the condition right" but
+     "can it be true where it sits". */
+  var _wasDeliveredWater=false;
+  try{_wasDeliveredWater=(o.status==="Delivered"&&is20ltr(o.prod));}catch(_){_wasDeliveredWater=false;}
   o.status="Cancelled";
   o.paid=hasPaid?"Partial":"Cancelled";
   var dispNote="";
@@ -14806,6 +14822,14 @@ function _finishCancelO(id,disposition){
       D.invoices=(D.invoices||[]).filter(function(i){return i.id!==inv.id;});
     }
   }
+  /* WATER-CYCLE RETRACTION (2026-08-13, round-8 finding R). Mirrors the call at the end
+     of delO, with its identical guard and for the identical reason: completeDlv credited
+     this order's bottles toward the customer's free-bottle milestone at delivery, and a
+     cancellation retracts that delivery. Without this the customer keeps entitlement for
+     water they never received. syncWaterCycles() is a full recalculation from real order
+     history and it already refuses to run when a closed period is not loaded, so it cannot
+     guess from a truncated list. No water-cycle logic is changed by this line. */
+  if(_wasDeliveredWater){try{syncWaterCycles();}catch(_){}}
   auditLog("ORDER_CANCELLED","Order #"+id+" cancelled by "+CU.name+" ("+CU.role+"). Product: "+o.prod+", Qty: "+o.qty+dispNote);
   rOrds(undefined,ORD_PAGE);rDel();
   if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
@@ -16256,7 +16280,29 @@ async function recreateOrder(idx){
 }
 
 
-function doRS(){if(!can("aSt")){toast("Permission denied","err");return;}var id=parseInt(el("rp").value);var q=parseInt(el("rq").value)||0;if(q<=0){toast("Enter quantity to add","err");return;}var p=(D.stock||[]).find(function(s){return s.id===id;});if(p){p.qty+=q;_recordStockDelta(p.id,q);
+function doRS(){if(!can("aSt")){toast("Permission denied","err");return;}var id=parseInt(el("rp").value);var q=parseInt(el("rq").value)||0;if(q<=0){toast("Enter quantity to add","err");return;}var p=(D.stock||[]).find(function(s){return s.id===id;});if(p){
+  /* BOUND EVALUATED BEFORE THE MUTATION (2026-08-13, round-9 finding V). This block used
+     to sit AFTER p.qty+=q and _recordStockDelta, which broke it twice over: the ratio test
+     became q > 100*(old+q), algebraically impossible, and declining left the quantity and
+     the queued sync delta already applied. Nothing may change until the answer is in. */
+  var _before=p.qty||0;
+  var _rsBig=(q>100000)||(_before>0&&q>_before*100);
+  if(_rsBig){
+    var _rsMsg="Restock "+p.name+" by "+q.toLocaleString()+" units?\n\nThat is very large next to the "+
+      _before.toLocaleString()+" currently in stock. Check for an extra zero — a mistyped restock "+
+      "cannot be undone without creating and deleting a fake order.";
+    if(!window.confirm(_rsMsg)){
+      auditLog("STOCK_UPDATED","RESTOCK CANCELLED at the confirmation: "+CU.name+" ("+CU.role+") was asked to "+
+        "confirm +"+q.toLocaleString()+" units of "+p.name+" against "+_before.toLocaleString()+" in stock, "+
+        "and declined. Nothing was changed — the quantity was never added and no sync delta was queued.");
+      toast("Restock cancelled — nothing was changed","ok");
+      return;
+    }
+    auditLog("STOCK_UPDATED","LARGE RESTOCK CONFIRMED: "+CU.name+" ("+CU.role+") added "+q.toLocaleString()+
+      " units of "+p.name+". Stock before: "+_before.toLocaleString()+". This was flagged as unusually "+
+      "large and confirmed deliberately.");
+  }
+  p.qty+=q;_recordStockDelta(p.id,q);
   if(!p.history)p.history=[];p.history.push({ts:tday(),type:"restock",qty:q,by:CU.name,bal:p.qty});if(p.history.length>STOCK_HISTORY_MAX)p.history=p.history.slice(-STOCK_HISTORY_MAX);
   // FIX (2026-07-27): the "auto-fulfil pending orders" loop that used to live
   // here deducted each still-Pending order's FULL quantity from stock AGAIN on
@@ -20090,7 +20136,26 @@ function syncWaterCycles(){
         if(prev<4&&cum>=4&&cum<8)newH.push({ts:ord.deliveredAt||ord.date||tday(),bottles:cum,event:"milestone_4",ordId:ord.id,qty:ord.qty,by:"System (sync)"});
         while(cum>=8){cyc++;newH.push({ts:ord.deliveredAt||ord.date||tday(),bottles:8,event:"cycle_complete",cycleNum:cyc,ordId:ord.id,qty:ord.qty,by:"System (sync)"});cum-=8;}
       }
-      var manual=(cu.cycleHistory||[]).filter(function(h){return h.by&&h.by!=="System (bootstrap)"&&h.by!=="System (sync)";});
+      /* (ordId,event) DEDUPE (2026-08-13, round-9 finding S). This used to keep every
+         entry whose `by` was not a System string. completeDlv writes its entries with
+         by:CU.name, so every organically-earned cycle looked hand-entered and was kept
+         FOREVER — and the rebuild then added its own entry for the same delivery, showing
+         the customer twice the entitlement they earned and over-issuing a free bottle.
+         The `by` field records WHO did something; it was being read to infer WHETHER the
+         entry was derived. Those are different questions and it only accidentally answered
+         the second one for entries the system itself wrote.
+         An old entry is now dropped ONLY when the rebuild has already produced one for the
+         same (ordId, event). An entry with no ordId is a genuine hand grant and is always
+         kept. Nothing is removed that the rebuild did not replace, so no ordId can leave
+         the order-recovery index that ~15252 and ~18224 scan. */
+      var _rebuilt={};
+      newH.forEach(function(x){if(x&&x.ordId!=null)_rebuilt[x.ordId+"|"+x.event]=true;});
+      var manual=(cu.cycleHistory||[]).filter(function(h){
+        if(!h||!h.by)return false;
+        if(h.by==="System (bootstrap)"||h.by==="System (sync)")return false;
+        if(h.ordId==null)return true;                       // hand-entered grant — always keep
+        return !_rebuilt[h.ordId+"|"+h.event];              // orphan (order gone) — keep for recovery
+      });
       cu.cycleHistory=newH.concat(manual);
       changed++;
     }
