@@ -379,7 +379,7 @@ var APP_VERSION="47";
    (~line 2764, `stamp:BUILD_STAMP`) but NEVER read back or compared — grep for `.stamp`
    comparisons returns nothing — so renaming the build costs ZERO extra Firestore reads
    and cannot force a full re-load on any device. */
-var BUILD_STAMP="ND47-12d";
+var BUILD_STAMP="ND47-12i";
 /* ── GLOBAL ERROR SAFETY NET (2026-07-26) ──────────────────────────────
    This single-file app has no framework error boundary. Before this, ANY
    uncaught exception during a render or during the onSnapshot merge (which
@@ -2362,6 +2362,77 @@ function _hybridPeriodClosed(rec){
     return !!(p&&D.closedPeriods[p]);
   }catch(_){return false;}
 }
+/* FINDING Q — THE DROP RULE AND THE WRITE RULE DISAGREED. (2026-08-13)
+
+   _isArchivableOrder (the WRITE side, what goes INTO a book) requires that EVERY invoice
+   linked to the order is itself settled. That clause was added 2026-07-30 after a real
+   incident: an edited order issues a REPLACEMENT invoice, so one order legitimately
+   carries more than one. With the first settled and the second still owing, the old code
+   archived both — a live receivable left the live document and custDebt read it as zero.
+
+   _hybridDerive("o") (the DROP side, what is REMOVED from the live arrays) asked a
+   different question entirely: settled = (o.paid === "Paid"). It never looked at the
+   invoices. So the drop side could remove an order the book had refused to take.
+
+   MEASURED over seven cases in _proofB_findingQ.js: the two rules disagreed on FOUR, and
+   THREE of those were the dangerous direction — drop says yes, write says no:
+     order 4  edited order, first invoice settled, replacement still owing
+     order 6  cancelled order still carrying an unpaid invoice
+     order 7  still Pending but marked Paid in advance
+   Each would have been dropped from D.orders on a closed period without any book ever
+   receiving it.
+
+   WHY THE FIX IS HERE AND NOT IN _hybridDerive. _hybridDerive runs on EVERY record during
+   hydration; giving it an invoice scan would make cold load O(n squared) — this project
+   has already had six quadratic scans removed. _hybridDropArchived runs only when a
+   period is actually closed, and already walks the arrays, so the cost is bounded and
+   paid only on the path that can do the damage.
+
+   FAILS CLOSED. Every uncertainty — no id, lookup unavailable, a malformed invoice, an
+   exception — returns false, which KEEPS the record. Dropping on doubt is the one
+   outcome that cannot be undone from the client. */
+function _hybridOrderFullySettled(o){
+  try{
+    if(!o||o.id==null)return false;                       // cannot identify it -> keep
+    if(typeof _linkedInvoicesOf!=="function")return false; // no canonical lookup -> keep
+    var invs=_linkedInvoicesOf(o.id,D.invoices);
+    if(!invs)return false;                                 // lookup gave nothing usable -> keep
+    for(var k=0;k<invs.length;k++){
+      var i=invs[k];
+      if(!i)return false;                                  // malformed row -> keep
+      if(i.voided===true)continue;                         // voided counts settled, as the write side does
+      if(!((Number(i.paid)||0)>=Number(i.amount)))return false;  // one owing invoice keeps the whole order
+    }
+    return true;   // no invoices, or every one settled — matches _isArchivableOrder
+  }catch(_){return false;}
+}
+/* A4-R (2026-08-13) — THE MIRROR OF _hybridOrderFullySettled.
+   That one stops an ORDER leaving while an invoice still owes. This one stops an INVOICE
+   leaving while its ORDER is still live, which is the direction finding Q did not cover.
+   It matters because a written-off invoice is `settled` (voided ⇒ settled) while its order
+   reads "Voided" and is therefore NOT settled: the pair splits, and revenue — computed as
+   gross(orders) minus the voided invoices linked to them — loses the subtraction and reports
+   deliberately written-off money as real. Measured at KSh 1,000 in
+   _proofB_a4r_dropsymmetry.js.
+   `liveIds` is the index of orders that are STAYING, built once per pass by the caller. It is
+   passed in rather than derived here so this cannot become an O(n squared) scan — six of those
+   have been removed from this file already.
+   FAILS CLOSED everywhere except one branch: an invoice with no linked order at all returns
+   true, because there is no order that could disagree with it. That is not an uncertainty, and
+   without it a standalone manual invoice could never be archived again. */
+function _hybridInvoiceOrderGone(i,liveIds){
+  try{
+    if(!i||i.id==null)return false;                 // cannot identify it -> keep
+    if(!liveIds||typeof liveIds!=="object")return false;   // no index -> keep
+    var oid=(i.orderId!=null)?i.orderId:null;
+    if(oid==null){
+      if(typeof _linkedOrderIdOf!=="function")return false; // canonical lookup gone -> keep
+      oid=_linkedOrderIdOf(i);
+    }
+    if(oid==null)return true;   // genuinely no linked order — nothing can disagree with it
+    return !liveIds[String(oid)];   // order still live -> KEEP the invoice with it
+  }catch(_){return false;}
+}
 function _hybridDropArchived(){
   if(!HYBRID_COLLECTIONS_LIVE)return 0;
   try{
@@ -2370,11 +2441,31 @@ function _hybridDropArchived(){
     ["orders","invoices"].forEach(function(key){
       var kind=(key==="orders")?"o":"i";
       var keep=[];
+      /* A4-R: index the orders that are STAYING, once, for the invoices pass only. Built
+         HERE rather than above the loop because "orders" is processed first and has already
+         written its survivors back to D.orders by the time this runs — so an order dropped in
+         this very pass correctly counts as gone, and its invoice is free to follow it. */
+      var _liveOrd=null;
+      if(kind==="i"){
+        _liveOrd={};
+        (D.orders||[]).forEach(function(o){if(o&&o.id!=null)_liveOrd[String(o.id)]=true;});
+      }
       (D[key]||[]).forEach(function(r){
         if(!r){return;}
         _hybridDerive(kind,r);
+        /* FINDING Q (2026-08-13): for an ORDER, r.settled comes from the order's own
+           `paid` string and says nothing about its invoices. The write side refuses to
+           archive an order whose replacement invoice is still owing; without this the
+           drop side removed it anyway. Invoices are unaffected — _hybridDerive("i")
+           already computes paid>=amount, which is the same question the write side asks. */
+        var _qOk=(kind!=="o")||_hybridOrderFullySettled(r);
+        /* A4-R (2026-08-13): the mirror of _qOk. An INVOICE may not leave while the order it
+           belongs to is still live, or the pair splits and a write-off reverts — a voided
+           invoice is settled, but its order reads "Voided" and is not, so only one of them
+           was eligible to go. Order and invoices leave together, or not at all. */
+        var _iOk=(kind!=="i")||_hybridInvoiceOrderGone(r,_liveOrd);
         // UNSETTLED records are never archived — keep them no matter how old the period.
-        if(r.settled===true&&_hybridPeriodClosed(r)){
+        if(r.settled===true&&_qOk&&_iOk&&_hybridPeriodClosed(r)){
           dropped++;
           // Forget the shadow entry too, so the tracker does not read the absence as a
           // deletion and issue a delete against a document the archive legitimately owns.
@@ -2393,7 +2484,16 @@ function _hybridSeedShadow(){
   // Called after a successful Phase 1 backfill, and after listener hydration, so the
   // first flush does not re-write all 730 documents for no reason.
   try{
-    _hybridShadow={orders:{},invoices:{}};
+    /* customers WAS MISSING (2026-08-13, A1). The shadow is declared as
+       {orders,invoices,customers} and six sites read _hybridShadow.customers — RAIL 1 in
+       _hybridFlushDocs and the customer write loop among them. Rebuilding it without that key
+       left it undefined, so the next flush threw a TypeError inside _hybridFlushDocs' own
+       try/catch: swallowed, logged as a "flush error", and every customer write after it
+       skipped — and customer records carry credit balances, which is money. It never fired
+       because this function had NO CALLERS at all. The A1 restore path below is its first, so
+       the trap is closed in the same build that arms it. */
+    _hybridShadow={orders:{},invoices:{},customers:{}};
+    (D.customers||[]).forEach(function(c){if(c&&c.id!=null)_hybridShadow.customers[String(c.id)]=JSON.stringify(c);});
     (D.orders||[]).forEach(function(o){if(o&&o.id!=null)_hybridShadow.orders[String(o.id)]=JSON.stringify(o);});
     (D.invoices||[]).forEach(function(i){if(i&&i.id!=null)_hybridShadow.invoices[String(i.id)]=JSON.stringify(i);});
   }catch(_){}
@@ -5677,19 +5777,105 @@ function _hideCloudOfflineBanner(){
    - Auto-restores if main doc is wiped
    - Zero manual steps, zero cost, forever free
    ══════════════════════════════════════════════════════════ */
+/* BACKUP BUDGET (2026-08-13, A1). Firestore rejects a document over 1 MiB = 1,048,576 bytes
+   outright. 750 KB leaves ~27% headroom, which is deliberate: JSON.stringify length is a close
+   proxy for what Firestore counts but not the same number (it counts field names, the document
+   path and index entries too), and a backup that fails is worth far less than one that carries
+   slightly less history. */
+var BACKUP_BUDGET_BYTES=750*1024;
+/* Is this record settled? Answered by _hybridDerive, the CANONICAL rule used by the archive
+   drop path, rather than restated here — two definitions of "settled" would drift, and this
+   file has been bitten by exactly that (finding Q: the write side and the drop side disagreed).
+   _hybridDerive WRITES rec.settled, so it is handed a shallow probe: a backup builder must not
+   mutate live records. On any doubt this returns false = UNSETTLED = always included, so an
+   unreadable record is kept rather than dropped. */
+function _bkSettled(kind,rec){
+  try{
+    if(!rec)return false;
+    var probe=(kind==="i")?{voided:rec.voided,amount:rec.amount,paid:rec.paid}:{paid:rec.paid};
+    _hybridDerive(kind,probe);
+    return probe.settled===true;
+  }catch(_){return false;}
+}
+function _bkLen(o){try{return JSON.stringify(o).length+1;}catch(_){return 0;}}
+/* THE PAYLOAD IS BOUNDED BY BYTES, NOT BY A TIME WINDOW OR BY PERIOD-CLOSING (2026-08-13, A1).
+   Measured before this change: 1,121 KB at 1,200 orders — about two months of trading — after
+   which Firestore refused the document and the daily backup simply stopped.
+   Order of priority, and it is a money order:
+     1. everything that is not orders/invoices   (measured flat at 210-526 KB, 600 -> 36,500 orders)
+     2. EVERY unsettled order and invoice, any age — these are live receivables
+     3. recent settled records, newest first, until the budget runs out
+   An order and its invoices are added TOGETHER (the A4-R pairing rule): a split pair is what
+   makes a write-off revert into real revenue.
+   The manifest records exactly what was left out, so a restore can never mistake a partial
+   backup for a complete one. See _restoreSpecificBackupConfirmed, which MERGES when it sees
+   manifest.partial rather than replacing — without that, this payload would look like a mass
+   deletion to _hybridReapDeletes. The two halves are one fix. */
 function getBackupPayload(){
-  return {
-    D:D,USERS:USERS,nOId:nOId,nIId:nIId,nCId:nCId,
+  var ordAll=(D.orders||[]),invAll=(D.invoices||[]);
+  var base={};
+  try{for(var k in D){if(Object.prototype.hasOwnProperty.call(D,k))base[k]=D[k];}}catch(_){base=D;}
+  base.orders=[];base.invoices=[];
+  var payload={
+    D:base,USERS:USERS,nOId:nOId,nIId:nIId,nCId:nCId,
     setupDone:FB_SETUP_DONE,
     backedUpAt:Date.now(),
-    stats:{
-      customers:(D.customers||[]).length,
-      orders:(D.orders||[]).length,
-      stock:(D.stock||[]).length,
-      invoices:(D.invoices||[]).length,
-      users:(USERS||[]).length
-    }
+    stats:{customers:(D.customers||[]).length,orders:0,stock:(D.stock||[]).length,invoices:0,users:(USERS||[]).length}
   };
+  var used=_bkLen(payload);
+  /* index invoices by their order once — a per-order scan of D.invoices here would be the
+     O(n squared) shape this file has had removed six times */
+  var invByOrd={},invTaken={},ordTaken={};
+  invAll.forEach(function(i){
+    if(!i)return;
+    var oid=(i.orderId!=null)?String(i.orderId):null;
+    if(oid==null&&typeof _linkedOrderIdOf==="function"){try{var m=_linkedOrderIdOf(i);if(m!=null)oid=String(m);}catch(_){}}
+    if(oid!=null){if(!invByOrd[oid])invByOrd[oid]=[];invByOrd[oid].push(i);}
+  });
+  var unsettledOmitted=0,oldest=null;
+  function noteDate(r){try{var d=r&&(r.date||r.deliveredAt);if(d&&(!oldest||String(d)<oldest))oldest=String(d);}catch(_){}}
+  /* an order and every invoice linked to it move as one unit, or not at all */
+  function tryAddOrder(o,mustKeep){
+    if(!o||o.id==null||ordTaken[String(o.id)])return false;
+    var group=[o],cost=_bkLen(o);
+    var linked=invByOrd[String(o.id)]||[];
+    for(var x=0;x<linked.length;x++){
+      if(linked[x]&&linked[x].id!=null&&!invTaken[String(linked[x].id)]){group.push(linked[x]);cost+=_bkLen(linked[x]);}
+    }
+    if(!mustKeep&&(used+cost)>BACKUP_BUDGET_BYTES)return false;
+    if(mustKeep&&(used+cost)>BACKUP_BUDGET_BYTES){unsettledOmitted++;return false;}
+    ordTaken[String(o.id)]=true;base.orders.push(o);noteDate(o);
+    for(var y=1;y<group.length;y++){invTaken[String(group[y].id)]=true;base.invoices.push(group[y]);noteDate(group[y]);}
+    used+=cost;return true;
+  }
+  function tryAddInvoice(i,mustKeep){
+    if(!i||i.id==null||invTaken[String(i.id)])return false;
+    var cost=_bkLen(i);
+    if((used+cost)>BACKUP_BUDGET_BYTES){if(mustKeep)unsettledOmitted++;return false;}
+    invTaken[String(i.id)]=true;base.invoices.push(i);noteDate(i);used+=cost;return true;
+  }
+  /* TIER 1 — every unsettled record, any age. Money first. */
+  ordAll.forEach(function(o){if(!_bkSettled("o",o))tryAddOrder(o,true);});
+  invAll.forEach(function(i){if(!_bkSettled("i",i))tryAddInvoice(i,true);});
+  /* TIER 2 — settled history, newest first, until the budget is spent. */
+  var rest=[];
+  ordAll.forEach(function(o){if(o&&o.id!=null&&!ordTaken[String(o.id)])rest.push(o);});
+  try{rest.sort(function(a,b){var da=String((a&&(a.deliveredAt||a.date))||""),db=String((b&&(b.deliveredAt||b.date))||"");return da>db?-1:(da<db?1:0);});}catch(_){}
+  rest.forEach(function(o){tryAddOrder(o,false);});
+  invAll.forEach(function(i){if(i&&i.id!=null&&!invTaken[String(i.id)])tryAddInvoice(i,false);});
+  payload.stats.orders=base.orders.length;payload.stats.invoices=base.invoices.length;
+  payload.manifest={
+    partial:(base.orders.length<ordAll.length)||(base.invoices.length<invAll.length),
+    budgetBytes:BACKUP_BUDGET_BYTES,
+    ordersTotal:ordAll.length,ordersIncluded:base.orders.length,ordersOmitted:Math.max(0,ordAll.length-base.orders.length),
+    invoicesTotal:invAll.length,invoicesIncluded:base.invoices.length,invoicesOmitted:Math.max(0,invAll.length-base.invoices.length),
+    unsettledOmitted:unsettledOmitted,
+    oldestIncluded:oldest,
+    note:"Omitted records are SETTLED history. They live in the orders/invoices Firestore "+
+      "collections and in the closed-period books. Restoring this backup MERGES: anything it "+
+      "does not mention is left alone, never deleted."
+  };
+  return payload;
 }
 function writeBackup(docId){
   if(!FB_BACKUP_COL)return;
@@ -5697,6 +5883,44 @@ function writeBackup(docId){
   if(isEmpty&&FB_SETUP_DONE)return; // never backup empty data
   try{
     var payload=JSON.parse(JSON.stringify(getBackupPayload()));
+    /* SIZE CHECK BEFORE THE WRITE (2026-08-13, A1). Firestore rejects a document over
+       1 MiB outright, so a backup that has grown past it does not degrade — it stops, and
+       until now it stopped silently. Measured at 200 customers / 2,400 orders the payload
+       is 1,223 KB, already 119% of the limit.
+       Warning at 80% leaves real headroom to act. The write is STILL ATTEMPTED whatever
+       the size: a backup that might succeed must never be skipped because of an estimate,
+       and JSON.stringify length is a close but not exact proxy for what Firestore counts. */
+    /* An omitted unsettled record means a live receivable did not fit in the backup. That is
+       the one omission that is never routine, so it is said out loud rather than left in the
+       manifest for someone to find later. */
+    try{
+      var _bkUn=(payload.manifest&&payload.manifest.unsettledOmitted)||0;
+      if(_bkUn>0){
+        toast(_bkUn+" UNPAID record(s) did not fit in today's backup — close a period to archive "+
+          "settled history, or call this in","err");
+        auditLog("DATA_EXPORTED","BACKUP COULD NOT HOLD ALL OUTSTANDING MONEY: "+_bkUn+" unsettled "+
+          "record(s) were left out of the backup because the payload budget was already full. "+
+          "Every unsettled record is meant to be included regardless of age. Closing a period "+
+          "archives settled history and frees room. Investigate before relying on this backup.");
+      }
+    }catch(_){}
+    var _bkKB=0;
+    try{_bkKB=Math.round(JSON.stringify(payload).length/1024);}catch(_){_bkKB=0;}
+    if(_bkKB>=1024){
+      try{
+        toast("BACKUP TOO LARGE ("+_bkKB.toLocaleString()+" KB). Firestore rejects anything over "+
+          "1,024 KB — this backup will FAIL. Close a period to archive settled records, or call this in.","err");
+        auditLog("DATA_EXPORTED","BACKUP OVER THE LIMIT: the payload is "+_bkKB.toLocaleString()+" KB and Firestore "+
+          "rejects any document over 1,024 KB, so this backup is expected to FAIL. Closing a period archives settled "+
+          "records out of the live data and shrinks it. Until then the daily backup is not running.");
+      }catch(_){}
+    }else if(_bkKB>=820){
+      try{
+        auditLog("DATA_EXPORTED","BACKUP APPROACHING THE LIMIT: the payload is "+_bkKB.toLocaleString()+" KB of the "+
+          "1,024 KB Firestore document maximum ("+Math.round(_bkKB/1024*100)+"%). Past that the daily backup stops "+
+          "working entirely. Closing a period archives settled records and shrinks it.");
+      }catch(_){}
+    }
     FB_BACKUP_COL.doc(docId).set(payload).then(function(){
       // Stamp completion in main doc so all devices know a backup happened
       // today — triggers for the new sod-/eod- prefixes (either one counts
@@ -5708,9 +5932,29 @@ function writeBackup(docId){
         FB_DOC_REF.set({_lastDailyBackup:tday()},{merge:true}).catch(function(){});
       }
     }).catch(function(e){
-      /* backup write failed silently */
+      /* WAS SILENT (2026-08-13, A1). The comment here used to read "backup write failed
+         silently" — and it did. This is the single most important place in the file for a
+         failure to be heard: the daily backup IS the disaster-recovery plan, and the day it
+         stops is the day nobody finds out until they need it. Both the toast and the audit
+         entry are wrapped so that reporting a failure can never itself throw. */
+      var _msg="";try{_msg=String((e&&(e.message||e.code))||e||"unknown");}catch(_){_msg="unknown";}
+      try{
+        auditLog("DATA_EXPORTED","BACKUP FAILED: the backup \""+docId+"\" was NOT written. Size "+_bkKB.toLocaleString()+
+          " KB. Reason: "+_msg+(_bkKB>=1024?" — the payload exceeds the 1,024 KB Firestore document limit, which is "+
+          "almost certainly the cause.":"")+" There is no backup for this run. Investigate before relying on it.");
+      }catch(_){}
+      try{toast("Backup FAILED — no copy was saved. See the audit log.","err");}catch(_){}
     });
-  }catch(e){/* backup error silently */}
+  }catch(e){
+    /* Also previously silent. A throw before the write reaches Firestore at all — a
+       malformed payload, a null collection reference — left no trace whatsoever. */
+    try{
+      var _m2="";try{_m2=String((e&&(e.message||e.code))||e||"unknown");}catch(_){_m2="unknown";}
+      auditLog("DATA_EXPORTED","BACKUP ABORTED before it was sent: \""+docId+"\" — "+_m2+
+        ". No backup exists for this run.");
+      toast("Backup could not be prepared — see the audit log","err");
+    }catch(_){}
+  }
 }
 function pruneOldBackups(prefix,keepCount){
   if(!FB_BACKUP_COL)return;
@@ -12263,6 +12507,62 @@ function recPay(){
   var cId=parseInt(el("pay-cid").value),amt=_round2(parseFloat(el("pay-amt").value)||0);
   if(!cId||isNaN(cId)){toast("Invalid customer","err");window._recordingPayment=false;if(_payBtn){_payBtn.disabled=false;_payBtn.innerHTML="<i class=\"ti ti-check\"></i> Record";}return;}
   if(!amt||amt<=0){toast("Enter a valid amount greater than zero","err");window._recordingPayment=false;if(_payBtn){_payBtn.disabled=false;_payBtn.innerHTML="<i class=\"ti ti-check\"></i> Record";}return;}
+  /* PAYMENT SANITY BOUND (2026-08-13, A3). Measured before this: typing 10000 against a
+     KSh 1,000 invoice created KSh 9,000 of store credit with nothing asked, and
+     999999999999 was accepted just as quietly. The restock path has asked at 100x since
+     ND47-12b; the cash path asked at nothing.
+     The trigger is deliberately NOT "more than the balance" — settling several invoices at
+     once, or leaving deliberate credit, is normal, and a guard that fires daily gets clicked
+     through, which is worse than no guard. It needs BOTH: more than 5x what this customer
+     actually owes, AND at least KSh 2,000 in absolute terms. Full settlements and modest
+     overpayments pass untouched; an extra zero trips at every scale this business uses.
+     The balance comes from custDebt — the canonical collectable figure, which already
+     excludes paid, voided and cancelled-order invoices. Never re-derive "owed" locally.
+     Computed here, before any write: the first mutation (inv.paid) is ~50 lines below, so a
+     refusal leaves every record exactly as it was. */
+  var _pbTok=cId+"|"+amt;
+  var _pbOK=(window._payBoundOK===_pbTok);
+  window._payBoundOK=null;   /* one-shot: consumed on read, so confirming one large payment
+                                can never silently authorise a different one later */
+  if(!_pbOK){
+    var _pbOwed=0,_pbBig=false;
+    try{
+      _pbOwed=_round2(Number(custDebt(cId))||0);
+      _pbBig=(amt>=2000)&&(amt>Math.max(_pbOwed,0)*5);
+    }catch(_){_pbOwed=0;_pbBig=false;}   /* cannot measure -> never obstruct a real payment */
+    if(_pbBig){
+      var _pbNm="This customer";
+      try{var _pbCu=(D.customers||[]).find(function(x){return x.id===cId;});
+          if(_pbCu)_pbNm=can("vPhone")?_pbCu.name:maskName(_pbCu.name);}catch(_){}
+      var _pbMsg=_pbNm+(_pbOwed>0?" owes KSh "+_pbOwed.toLocaleString()+" in total."
+                                 :" has nothing outstanding.")+"\n\n"+
+        "You are recording KSh "+amt.toLocaleString()+" — far more than that.\n\n"+
+        "Check for an extra zero. Anything above the balance becomes store credit the "+
+        "customer can spend on future water.";
+      /* Release the lock and its auto-timer BEFORE the dialog opens: otherwise the 2,500 ms
+         timer would re-enable the button underneath an open modal, and a slow answer would
+         leave the Record button disabled for good. */
+      if(window._recordingPaymentTimer)clearTimeout(window._recordingPaymentTimer);
+      window._recordingPayment=false;
+      if(_payBtn){_payBtn.disabled=false;_payBtn.innerHTML="<i class=\"ti ti-check\"></i> Record";}
+      uiConfirm({title:"Record KSh "+amt.toLocaleString()+"?",message:_pbMsg,
+        variant:"warn",confirmText:"Yes, that is correct",cancelText:"Go back"}).then(function(_okPay){
+          if(!_okPay){
+            try{auditLog("PAYMENT_RECORDED","PAYMENT STOPPED AT THE CHECK: "+CU.name+" ("+CU.role+") was asked to "+
+              "confirm KSh "+amt.toLocaleString()+" for "+_pbNm+", who owes KSh "+_pbOwed.toLocaleString()+
+              ", and declined. Nothing was recorded.");}catch(_){}
+            toast("Payment cancelled — nothing was recorded","ok");
+            return;
+          }
+          try{auditLog("PAYMENT_RECORDED","LARGE PAYMENT CONFIRMED: KSh "+amt.toLocaleString()+" for "+_pbNm+
+            ", who owes KSh "+_pbOwed.toLocaleString()+". Flagged as unusually large and confirmed deliberately "+
+            "by "+CU.name+" ("+CU.role+").");}catch(_){}
+          window._payBoundOK=_pbTok;
+          recPay();   /* re-enter: the form is untouched, and _lastPaySig was never stamped */
+        });
+      return;
+    }
+  }
   // ITEM 3 (2026-07-21): flag set here, after all three validation checks
   // above, not before - avoids forcing an unnecessary server read on the
   // next unrelated write if this payment fails validation and returns early.
@@ -12799,6 +13099,24 @@ function setOrderMode(mode){
     var totRow=el("otot")&&el("otot").closest?el("otot").closest(".ftot"):null;
     if(payRow)payRow.style.display="none";
     if(amtRow)amtRow.style.display="none";
+    /* CLEAR THE HIDDEN MONEY FIELDS (2026-08-13). Hiding a row does not empty it: an amount
+       typed in Exact mode survives the switch to Category, where the order total is 0 by
+       definition because the price is confirmed at delivery.
+       WHAT THAT DID, CHECKED PER PATH RATHER THAN ASSUMED:
+         category CREATE — harmless. That branch never reads oamt; it hard-codes amtPaid:0 and
+                           payStatus:"Unpaid". An earlier draft of this comment claimed it
+                           wrote an invoice with amount 0 and paid 500. It does not, and the
+                           claim was removed rather than left to mislead someone.
+         category EDIT   — real. saveOrd's edit path DOES read oamt unconditionally, so a stale
+                           500 against a total of 0 set o.amtPaid=500 and marked the order Paid.
+         12g onwards     — the A3 twin-3 refusal reads oamt BEFORE the mode branch, so the stale
+                           value now BLOCKS a legitimate category order, with a message about a
+                           field the form is not showing. That part is a regression the guard
+                           introduced, and it is why this is fixed at the cause rather than by
+                           exempting category orders from the guard.
+       A money input the operator cannot see must not be able to speak. */
+    if(el("oamt"))el("oamt").value=0;
+    if(el("opay"))el("opay").value="Unpaid";
     if(totRow)totRow.style.display="none";
     // Reset product search
     if(el("op-search"))el("op-search").value="";
@@ -13611,6 +13929,42 @@ function reserveNextComplaintId(){
     return _provisionalSingleId();
   });
 }
+/* PARK AN OVERPAYMENT AS CUSTOMER CREDIT (2026-08-13). Extracted so saveOrd's edit and
+   create paths share ONE implementation instead of two copies of the credit-writing code —
+   the repeated-at-N-sites shape is what produced findings Q, M and the A3 twins.
+   Shape copied from completeDlv's dlvOver block and cancelO's CASH PRESERVATION block: add
+   to customer.credit, append a creditLog entry with a unique cid so the cross-device union
+   cannot double-count it, stamp the record, and audit it. Returns the amount actually parked
+   so the caller can report the truth rather than an assumption.
+   If the customer cannot be found the money is NOT silently dropped: it is audited as an
+   investigation item and the caller is told, which is what the cancel path does. */
+function _creditOverpayment(cId,amt,ordId,invId,why,srcPid){
+  var _v=_round2(Number(amt)||0);
+  if(!(_v>0))return 0;
+  try{
+    var _cu=(D.customers||[]).find(function(x){return x.id===cId;});
+    if(!_cu){
+      auditLog("CREDIT_ADJUSTED","OVERPAYMENT COULD NOT BE CREDITED: KSh "+_v.toLocaleString()+
+        " was collected above what was owed on "+(ordId!=null?"Order #"+ordId:"an order")+
+        " but customer #"+cId+" was not found. The cash is recorded nowhere. Investigate.");
+      toast("KSh "+_v.toLocaleString()+" over-collected but the customer record is missing — see the audit log","err");
+      return 0;
+    }
+    _cu.credit=_round2((_cu.credit||0)+_v);
+    if(!_cu.creditLog)_cu.creditLog=[];
+    /* srcPid links this credit to the payment that funded it, so reversePayment reverses
+       both together (round-4 finding M). null is legitimate and means there is no payment to
+       reverse — the same null completeDlv stores for a standalone delivery overpayment. */
+    _cu.creditLog.push({cid:uid(),srcPid:(srcPid==null?null:srcPid),date:tday(),amt:_v,type:"overpayment",ordId:ordId,invId:invId,
+      by:CU.name,role:CU.role,note:why||("Overpayment on Order #"+ordId)});
+    _stampRecordEdit(_cu);
+    auditLog("CREDIT_ADJUSTED","OVERPAYMENT HELD AS CREDIT: KSh "+_v.toLocaleString()+" was collected above "+
+      "what was owed on "+(ordId!=null?"Order #"+ordId:"an order")+" and is held as store credit for "+
+      (can("vPhone")?_cu.name:maskName(_cu.name))+" by "+CU.name+" ("+CU.role+").");
+    toast("KSh "+_v.toLocaleString()+" over-payment held as credit for this customer","ok");
+    return _v;
+  }catch(_){return 0;}
+}
 async function saveOrd(){
   // UI/UX (2026-07-28): converted to async so the 7 native confirm() gates below
   // become in-app uiConfirm() dialogs (no more "localhost says"). SAFE against the
@@ -13728,6 +14082,77 @@ async function saveOrd(){
   var delivDate=el("od")?el("od").value:"";
   if(!delivDate){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}toast("Please set a delivery date","err");if(el("od"))el("od").focus();return;}
   var editId=el("o-edit-id").value;
+  /* AMOUNT PAID MAY NOT EXCEED THE ORDER TOTAL (2026-08-13, A3 twin 3).
+     Nothing checked `oamt` against the order value, at either of the two places it is read.
+     Typing 10,000 on a KSh 1,000 order did this:
+       EDIT   -> o.amtPaid=10,000 while linkedInv.paid was CAPPED at 1,000 (line ~14111).
+                 KSh 9,000 existed nowhere: no credit entry, no payment row, no audit line.
+                 The mirror case — an order reduced AFTER payment — was fixed on 2026-08-12
+                 by crediting the customer ("CASH PRESERVATION", ~60 lines below). The
+                 over-payment direction was missed. Structural twin, again.
+       CREATE -> the new invoice was written with paid(10,000) > amount(1,000): a record that
+                 is neither debt nor credit, and every "collected" figure reads 9,000 high.
+     A REFUSAL, not a confirm dialog, and deliberately so. The other three typed-money sites
+     got a "check for an extra zero" confirm because at those sites a large amount can be
+     genuine and there is a proven home for the excess (invoice takes what fits, remainder to
+     customer credit). `oamt` is not a payment-taking field and has no such home — money
+     beyond this order belongs in Record Payment, which credits it correctly. saveInv has
+     enforced this identical rule on this identical pair of fields for weeks (~line 16833:
+     "Amount paid cannot exceed invoice total"), so this is an existing pattern extended to
+     its twin form rather than a new mechanism.
+     DO NOT "complete the set" by adding a 5x/KSh 2,000 confirm here. With paid <= total
+     enforced, the reference for such a confirm is the order total itself, so typed > total*5
+     is unreachable: the dialog could never fire, and a guard that cannot be true is dead code
+     that only looks like protection.
+     THE SECOND CLAUSE (typed > previous) exists because prepO pre-fills this field from the
+     record (~line 13039). Without it, any order already holding amtPaid > total — from this
+     defect, or from a reduction after payment — could never be saved again at all, not even
+     to change its delivery date. With it, such an order can be left alone or REDUCED (which
+     flows into the CASH PRESERVATION branch and credits the customer the difference), but
+     never pushed further out of balance. */
+  var _obTotal=_round2((Number(price)||0)*(Number(qty)||0));
+  var _obTyped=0;
+  try{_obTyped=_round2(parseFloat(el("oamt")&&el("oamt").value)||0);}catch(_){_obTyped=0;}
+  /* Mirrors the two reads exactly: the create path ignores oamt without mPaid (line ~14273),
+     the edit path honours it for anyone who can edit an order at all. */
+  var _obUsed=editId?true:can("mPaid");
+  /* ALWAYS ACCEPT THE CASH (2026-08-13, superseding 12h). This refused to save when the
+     amount paid exceeded the order total. The business takes the money, so refusing does not
+     prevent the overpayment — it only prevents the system recording it, which is worse. The
+     excess now becomes customer credit via _creditOverpayment, exactly as recPay,
+     completeDlv and the cancel path already do.
+     What remains here is the same CONFIRM the other three typed-money sites carry. 12h argued
+     such a dialog would be dead code — true only while paid<=total was enforced. It is not
+     enforced any more, so an extra zero is reachable again and the question is live. */
+  if(_obUsed&&_obTyped>=2000&&_obTyped>Math.max(_obTotal,0)*5){
+    {
+      /* Both long strings are built BEFORE the guard release, so that the release and the
+         `return;` end up adjacent. That is not cosmetic: _sweep_b26.js SWEEP 5 checks every
+         `return;` after window._savingOrder is armed for a release within a 700-character
+         lookback, and it flagged the first draft of this block — the release was genuinely
+         there and genuinely ran first, but these two messages pushed it out of the window.
+         The sweep's window was already widened once, in 2026-08-07, for exactly this reason.
+         Widening it a second time would weaken a real dead-button check to accommodate my
+         formatting, so the code moved instead. The release still precedes toast(), so an
+         exception thrown in rendering cannot strand the Place-order button disabled. */
+      var _obMsg="This order is worth KSh "+_obTotal.toLocaleString()+".\n\n"+
+        "You are recording KSh "+_obTyped.toLocaleString()+" as paid — far more than that.\n\n"+
+        "Check for an extra zero. Anything above the order total is held as store credit for "+
+        "the customer.";
+      if(!(await uiConfirm({title:"Paid KSh "+_obTyped.toLocaleString()+"?",message:_obMsg,
+          variant:"warn",confirmText:"Yes, that is correct",cancelText:"Go back"}))){
+        window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}
+        try{auditLog("ORDER_UPDATED","AMOUNT PAID STOPPED AT THE CHECK: "+CU.name+" ("+CU.role+") was asked to "+
+          "confirm KSh "+_obTyped.toLocaleString()+" as paid on "+(editId?"Order #"+editId:"a new order")+
+          " worth KSh "+_obTotal.toLocaleString()+", and declined. Nothing was written.");}catch(_){}
+        toast("Cancelled — nothing was recorded","ok");
+        return;
+      }
+      try{auditLog("ORDER_UPDATED","LARGE AMOUNT PAID CONFIRMED: KSh "+_obTyped.toLocaleString()+" on "+
+        (editId?"Order #"+editId:"a new order")+" worth KSh "+_obTotal.toLocaleString()+
+        ". Flagged as unusually large and confirmed deliberately by "+CU.name+" ("+CU.role+").");}catch(_){}
+    }
+  }
   // CRITICAL FIX (2026-07-25): verified root cause of orders vanishing -
   // order creation was the ONE record type that never forced a pre-write
   // freshness check, unlike customer creation and payment recording, which
@@ -13954,11 +14379,25 @@ async function saveOrd(){
         linkedInv.amount=paidTarget;
         _stampRecordEdit(linkedInv); // F6 (2026-07-30): same reasoning as the sibling branch above — this is the downward-correction path, so an un-stamped amount would be reverted by other devices exactly like the upward one
         var diffPaid=_round2(paidTarget-(linkedInv.paid||0));
+        var _opPid=null;   /* the payment this edit actually wrote; funds the credit below */
         if(diffPaid!==0){
           if(!linkedInv.payments)linkedInv.payments=[];
-          linkedInv.payments.push({pid:uid(),date:tday(),amt:diffPaid,method:"Cash",ref:"Order edit "+(diffPaid>0?"adjustment":"correction")+" by "+CU.name});
+          _opPid=uid();
+          linkedInv.payments.push({pid:_opPid,date:tday(),amt:diffPaid,method:"Cash",ref:"Order edit "+(diffPaid>0?"adjustment":"correction")+" by "+CU.name});
         }
         linkedInv.paid=paidTarget;
+        /* ALWAYS ACCEPT THE CASH (2026-08-13). paidTarget caps the invoice at the order total,
+           which is right — an invoice must never read paid>amount. But the difference used to
+           simply cease to exist: the order said KSh 10,000 paid, the invoice said 1,000, and
+           KSh 9,000 was in no record at all. It is now held as customer credit, the same
+           disposition recPay, completeDlv and the cancel path already use.
+           o.amtPaid is corrected to what actually landed on the invoice so the order and its
+           invoice agree — every other site in this file keeps o.amtPaid === inv.paid. */
+        var _opEx=_round2(amtPaid-paidTarget);
+        if(_opEx>0){
+          _creditOverpayment(o.cId,_opEx,o.id,linkedInv.id,"Overpayment recorded on Order #"+o.id,_opPid);
+          o.amtPaid=paidTarget;
+        }
         if(el("pg-dashboard")&&el("pg-dashboard").classList.contains("act"))rDash();
         auditLog("ORDER_UPDATED","Order #"+o.id+" edited by "+CU.name+" ("+CU.role+")");
         dirty();cm("m-o");rOrds(undefined,ORD_PAGE);toast("Order #"+o.id+" updated");
@@ -14179,12 +14618,24 @@ async function saveOrd(){
     // Always create invoice for exact orders — provides full financial trail
     // FIX (2026-07-21): both IDs now reserved together in ONE transaction -
     // see reserveNextOrderAndInvoiceIds - instead of two sequential ones.
-    var _newInv={id:newInvId,orderId:newOrdId,cId:cId,amount:total,paid:amtPaid,due:(function(){var dd=new Date((el("od").value||tday())+"T12:00:00");dd.setDate(dd.getDate()+7);return dd.toISOString().split("T")[0];})(),notes:"Order #"+newOrdId,date:tday(),payments:amtPaid>0?[{pid:uid(),date:tday(),amt:amtPaid,method:"Cash",ref:"Order #"+newOrdId}]:[]};
+    /* ALWAYS ACCEPT THE CASH (2026-08-13). This wrote paid:amtPaid unclamped, so an overpayment
+         produced an invoice paid MORE than it is worth — neither debt nor credit, and every
+         "collected" figure read high. The invoice now takes what fits and the excess is parked
+         as customer credit immediately after the push (below), so the cash is never lost. */
+      var _opTake=_round2(Math.min(amtPaid,total)),_opOver=_round2(amtPaid-_opTake);
+      /* Minted here, before the literal, so the payment row and the credit entry that
+         follows can name the SAME id. Without the link, reversing this payment would leave
+         the overpayment credit standing (round-4 finding M). */
+      var _opPid=(_opTake>0?uid():null);
+      var _newInv={id:newInvId,orderId:newOrdId,cId:cId,amount:total,paid:_opTake,due:(function(){var dd=new Date((el("od").value||tday())+"T12:00:00");dd.setDate(dd.getDate()+7);return dd.toISOString().split("T")[0];})(),notes:"Order #"+newOrdId,date:tday(),payments:_opTake>0?[{pid:_opPid,date:tday(),amt:_opTake,method:"Cash",ref:"Order #"+newOrdId}]:[]};
     /* The invoice is held back with its order, not independently. An invoice whose
        orderId refers to a number no other device has ever seen would be an orphan on
        arrival, so the pair travels together or not at all. */
     if(_prov)_newInv._numPending=true;
     (D.invoices||[]).push(_newInv);
+    /* Parked AFTER the push so the credit entry can name a real invoice id, and so a failure
+       to create the invoice cannot leave a credit standing on its own. */
+    if(_opOver>0)_creditOverpayment(cId,_opOver,newOrdId,newInvId,"Overpayment at order placement — Order #"+newOrdId,_opPid);
     /* OUTBOX BEFORE AUDIT (2026-08-07, b26) — closes the handover's open item 3.
        _outboxPut used to run AFTER auditLog. auditLog is not trivial: it trims, it
        builds an ordSnapshot, it touches D.auditLog and the document-size logic. If it
@@ -14314,6 +14765,87 @@ async function completeDlv(){
     return;
   }
   var isCat=o.prodConfirmed===false;
+
+  /* DELIVERY CASH SANITY BOUND (2026-08-13, A3 twin 1). recPay gained this bound in the
+     same build; this is its twin and it carries MORE risk, not less — it is the
+     driver-facing path, used around twenty times a day, on a phone, at a customer's door.
+     Either role's typed number becomes money: with mPaid it goes straight to inv.paid and
+     customer credit below, and without mPaid it becomes a pendingPayments row that
+     ackPendingPay later applies to the same places. So both roles are checked.
+     PLACED HERE, above every mutation in this function, and not at the invoice branch
+     further down: by that point o.status is already "Delivered" and a category order has
+     already had its stock deducted, so a decline there would leave a half-applied delivery
+     for the next dirty() to persist. Here, a decline is a true no-op.
+     The price peek below is read-only; the authoritative parse of the same dropdown, ~20
+     lines down, is untouched and still decides what gets stored.
+     Reference figure is max(custDebt, this delivery) — custDebt is the canonical collectable
+     figure but cannot see an invoice that does not exist yet; max() cannot double-count and
+     errs strict, never loose. Thresholds are deliberately IDENTICAL to recPay (>= KSh 2,000
+     and more than 5x the reference): one class of mistake must not have two rules, and a
+     driver must not face a different test from the office. */
+  var _dbAmt=0;
+  try{_dbAmt=_round2(parseFloat(el("dlv-amt")&&el("dlv-amt").value)||0);}catch(_){_dbAmt=0;}
+  if(_dbAmt>0){
+    var _dbRef=0,_dbVal=0,_dbBig=false,_dbSkip=false;
+    try{
+      var _dbPrice=Number(o.price)||0;
+      if(isCat){
+        _dbPrice=0;   /* unknown until confirmed; "Other / not listed" is genuinely 0 */
+        var _dbSel=el("dlv-prod-select"),_dbV=_dbSel?String(_dbSel.value||""):"";
+        /* DO NOT ASK BEFORE THE DELIVERY IS EVEN VALID (2026-08-13). This bound sits above
+           every mutation, which is right — a decline must write nothing. But that also puts
+           it above the "Please select the exact brand being delivered" refusal ~1,300
+           characters below. With no product chosen the price is unknown, the reference is 0,
+           and any amount >= KSh 2,000 tripped the dialog: the driver was asked to confirm an
+           unusually large collection, confirmed it, and was only then told to pick the brand.
+           That trains click-through on the one dialog that must never be clicked through, on
+           the driver path this guard exists for. Skipping is safe because that submission is
+           refused a few lines below whatever happens here; the check runs in full on the
+           re-submission, when the price is known and the delivery would really proceed.
+           "__other__" is deliberately NOT skipped — it carries a real price of 0 and the
+           delivery DOES go through, so cash against it still deserves the question. */
+        if(!_dbV){_dbSkip=true;}
+        else if(_dbV!=="__other__")_dbPrice=parseInt(_dbV.split("|")[1])||0;
+      }
+      _dbVal=_round2((Number(o.qty)||0)*_dbPrice);
+      _dbRef=_round2(Math.max(Number(custDebt(o.cId))||0,_dbVal));
+      _dbBig=(!_dbSkip)&&(_dbAmt>=2000)&&(_dbAmt>Math.max(_dbRef,0)*5);
+    }catch(_){_dbRef=0;_dbVal=0;_dbBig=false;}   /* cannot measure -> never block a real delivery */
+    if(_dbBig){
+      var _dbNm="This customer";
+      try{var _dbCu=(D.customers||[]).find(function(x){return x.id===o.cId;});
+          if(_dbCu)_dbNm=can("vPhone")?_dbCu.name:maskName(_dbCu.name);}catch(_){}
+      /* Same guard, same numbers, different sentence per role: withholding customer detail
+         from staff/drivers is deliberate policy here, so their dialog names this delivery's
+         value and never the customer's whole outstanding balance. */
+      var _dbMsg=can("mPaid")
+        ? (_dbNm+(_dbRef>0?" owes KSh "+_dbRef.toLocaleString()+" in total, including this delivery."
+                          :" has nothing outstanding.")+"\n\n"+
+           "You are recording KSh "+_dbAmt.toLocaleString()+" collected — far more than that.\n\n"+
+           "Check for an extra zero. Anything above the balance becomes store credit the "+
+           "customer can spend on future water.")
+        : ((_dbVal>0?"This delivery is worth KSh "+_dbVal.toLocaleString()+"."
+                    :"This delivery has no price set on it yet.")+"\n\n"+
+           "You are recording KSh "+_dbAmt.toLocaleString()+" collected — far more than that.\n\n"+
+           "Check for an extra zero. The director has to confirm this cash, and anything "+
+           "above what is owed becomes store credit for the customer.");
+      if(!(await uiConfirm({title:"Collected KSh "+_dbAmt.toLocaleString()+"?",message:_dbMsg,
+          variant:"warn",confirmText:"Yes, that is correct",cancelText:"Go back"}))){
+        try{auditLog(can("mPaid")?"PAYMENT_RECORDED":"CASH_PENDING",
+          "DELIVERY CASH STOPPED AT THE CHECK: "+CU.name+" ("+CU.role+") was asked to confirm KSh "+
+          _dbAmt.toLocaleString()+" collected on delivery of Order #"+oid+" for "+_dbNm+
+          " (delivery worth KSh "+_dbVal.toLocaleString()+", reference balance KSh "+_dbRef.toLocaleString()+
+          "), and declined. The delivery was NOT completed and no money was recorded.");}catch(_){}
+        toast("Delivery not completed — nothing was recorded","ok");
+        return;
+      }
+      try{auditLog(can("mPaid")?"PAYMENT_RECORDED":"CASH_PENDING",
+        "LARGE DELIVERY CASH CONFIRMED: KSh "+_dbAmt.toLocaleString()+" collected on delivery of Order #"+
+        oid+" for "+_dbNm+" (delivery worth KSh "+_dbVal.toLocaleString()+", reference balance KSh "+
+        _dbRef.toLocaleString()+"). Flagged as unusually large and confirmed deliberately by "+
+        CU.name+" ("+CU.role+").");}catch(_){}
+    }
+  }
 
   // ── CATEGORY ORDER: confirm exact product first ──
   if(isCat){
@@ -14863,7 +15395,7 @@ function _finishCancelO(id,disposition){
   }
   /* WATER-CYCLE RETRACTION (2026-08-13, round-8 finding R). Mirrors the call at the end
      of delO, with its identical guard and for the identical reason: completeDlv credited
-     this order's bottles toward the customer's free-bottle milestone at delivery, and a
+     this order's bottles toward the customer's cycle milestone at delivery, and a
      cancellation retracts that delivery. Without this the customer keeps entitlement for
      water they never received. syncWaterCycles() is a full recalculation from real order
      history and it already refuses to run when a closed period is not loaded, so it cannot
@@ -15035,6 +15567,78 @@ function rDel(q){
     "</tbody></table></div>";
 }
 
+/* STOCK ADJUSTMENT (2026-08-13, round-8 finding T). Deliberately modelled line-for-line
+   on adjustCredit, which is this codebase's proven shape for "a human deliberately moves
+   a number that money depends on": director-only, mandatory reason, in-app confirmation
+   showing before and after, the state re-read AFTER the dialog closes, and the whole thing
+   audited under the actor's name.
+
+   WHY A SIGNED DELTA AND NOT A NEW TOTAL. _recordStockDelta is the mechanism that makes
+   concurrent stock correct across devices — both the read and the write side compute
+   serverQty + pendingDelta. A "set the total to N" control would fight that: two devices
+   each setting a total would clobber, where two devices each recording -3 and -2 converge
+   to -5 correctly. So the input is a CHANGE, exactly like every other stock movement.
+
+   NEGATIVE RESULTS ARE ALLOWED, NOT CLAMPED. This project deliberately preserves negative
+   stock (a backorder of -5 stays -5 through a snapshot merge). Clamping here would hide a
+   mistyped adjustment AND desynchronise the delta from the quantity. The confirmation
+   states the resulting figure plainly, including when it is below zero, so the director
+   decides with the number in front of them. */
+function adjustStock(sid){
+  if(!can("rest")){toast("Director only","err");return;}
+  var p=(D.stock||[]).find(function(x){return x.id===sid;});
+  if(!p){toast("Product not found","err");return;}
+  var qEl=el("stadj-qty"),rEl=el("stadj-reason");
+  var delta=qEl?parseInt(qEl.value,10):NaN;
+  var reason=rEl?sanitizeInput(String(rEl.value||"").trim()):"";
+  if(!isFinite(delta)||delta===0){toast("Enter the change — a negative number reduces stock","err");return;}
+  if(reason.length<4){toast("A reason is required — it goes on the permanent record","err");return;}
+  var before=Number(p.qty)||0;
+  /* Sanity bound, computed from the PRE-change quantity (round-9 finding V: the restock
+     bound was evaluated after the mutation and was therefore algebraically dead). */
+  var mag=Math.abs(delta);
+  if(mag>100000||(before>0&&mag>before*100)){
+    toast("That is very large next to the "+before.toLocaleString()+" in stock — check for an extra zero","err");
+    return;
+  }
+  var after=before+delta;
+  uiConfirm({title:(delta<0?"Reduce ":"Increase ")+p.name+" by "+mag.toLocaleString()+"?",
+    message:p.name+" will go from "+before.toLocaleString()+" to "+after.toLocaleString()+" in stock."+
+      (after<0?"\n\nWARNING: that leaves a NEGATIVE quantity ("+after.toLocaleString()+"). That is allowed — it means "+
+        "you owe more than you hold — but check it is what you meant.":"")+
+      "\n\nReason recorded: "+reason+
+      "\n\nThis is logged against your name in the audit trail and in this product's movement history. "+
+      "It does not create an order and does not touch revenue.",
+    variant:"warn",confirmText:(delta<0?"Reduce stock":"Increase stock")}).then(function(ok){
+      if(!ok)return;
+      /* RE-READ AFTER THE DIALOG. Another device may have sold or restocked this product
+         while the confirmation was open. adjustCredit does exactly this and it is why it
+         can be trusted; a delta is still correct against a moved quantity, but the figures
+         the director just agreed to are not, so say so rather than silently applying. */
+      var p2=(D.stock||[]).find(function(x){return x.id===sid;});
+      if(!p2){toast("Product no longer exists","err");return;}
+      var nowQty=Number(p2.qty)||0;
+      if(nowQty!==before){
+        toast("Stock changed to "+nowQty.toLocaleString()+" while this was open — reopen and check","warn");
+        showStockHistory(sid);return;
+      }
+      p2.qty=nowQty+delta;
+      _recordStockDelta(p2.id,delta);   // durable + syncs, same as every other movement
+      if(!p2.history)p2.history=[];
+      p2.history.push({ts:tday(),type:"adjust",qty:delta,by:CU.name,bal:p2.qty,note:reason});
+      try{_trimStockHistories();}catch(_){}
+      _stampRecordEdit(p2);
+      _hasPendingCriticalEdit=true;
+      auditLog("STOCK_UPDATED","STOCK ADJUSTMENT: "+p2.name+" changed by "+(delta>0?"+":"")+delta.toLocaleString()+
+        " units by "+CU.name+" ("+CU.role+"). Before: "+before.toLocaleString()+", after: "+p2.qty.toLocaleString()+
+        ". Reason: "+reason+". This was a deliberate manual adjustment — no order was created and revenue is untouched.");
+      dirty();
+      toast(p2.name+": "+(delta>0?"+":"")+delta.toLocaleString()+" — now "+p2.qty.toLocaleString()+" in stock","ok");
+      showStockHistory(sid);
+      try{if(el("pg-stock")&&el("pg-stock").classList.contains("act"))rStock();}catch(_){}
+      try{updateStockBadge();}catch(_){}
+    });
+}
 function showStockHistory(sid){
   var s=(D.stock||[]).find(function(x){return x.id===sid;});if(!s)return;
   var hist=(s.history||[]).slice().reverse(); // newest first
@@ -15051,17 +15655,37 @@ function showStockHistory(sid){
       +"<th style=\"padding:7px 10px;color:#fff;text-align:right\">Balance</th>"
       +"<th style=\"padding:7px 10px;color:#fff;text-align:left\">By</th></tr></thead><tbody>";
     html+=hist.map(function(h){
-      var typeCol=h.type==="restock"?"#27ae60":h.type==="restore"?"#3498db":"#e74c3c";
-      var typeLabel=h.type==="restock"?"Restock":h.type==="restore"?"Restore (cancel)":"Sale";
+      /* "adjust" added 2026-08-13. Without it a manual adjustment rendered as "Sale",
+         which would have been the movement history stating something untrue. */
+      var typeCol=h.type==="restock"?"#27ae60":h.type==="restore"?"#3498db":h.type==="adjust"?"#8e44ad":"#e74c3c";
+      var typeLabel=h.type==="restock"?"Restock":h.type==="restore"?"Restore (cancel)":h.type==="adjust"?"Adjustment":"Sale";
+      var _reasonRow=(h.type==="adjust"&&h.note)?("<div style=\"font-size:10px;color:var(--tx2);margin-top:2px\">"+sanitizeInput(h.note)+"</div>"):"";
       var qtyStr=(h.qty>0?"+":"")+h.qty;
       return "<tr style=\"border-bottom:1px solid var(--bd)\">"
         +"<td style=\"padding:7px 10px\">"+h.ts+"</td>"
-        +"<td style=\"padding:7px 10px\"><span style=\"color:"+typeCol+";font-weight:700\">"+typeLabel+"</span></td>"
+        +"<td style=\"padding:7px 10px\"><span style=\"color:"+typeCol+";font-weight:700\">"+typeLabel+"</span>"+_reasonRow+"</td>"
         +"<td style=\"padding:7px 10px;text-align:right;font-weight:700;color:"+typeCol+"\">" +qtyStr+"</td>"
         +"<td style=\"padding:7px 10px;text-align:right\">"+h.bal+"</td>"
         +"<td style=\"padding:7px 10px;color:var(--tx2)\">"+h.by+"</td></tr>";
     }).join("");
     html+="</tbody></table>";
+  }
+  /* ADJUSTMENT FORM (2026-08-13). Director-only, and rendered inside the modal that is
+     already open — the same relationship showCreditLog has with adjustCredit. Placed
+     BELOW the history so the director sees what actually happened before changing it. */
+  if(can("rest")){
+    html+="<div style=\"border-top:2px solid var(--bd);margin-top:16px;padding-top:14px\">"
+      +"<div style=\"font-size:13px;font-weight:800;color:var(--nv);margin-bottom:4px\">Adjust stock</div>"
+      +"<div style=\"font-size:11px;color:var(--tx2);margin-bottom:10px\">For breakage, spillage, theft or a stocktake "
+      +"difference. Use a NEGATIVE number to reduce stock. Currently <strong>"+(s.qty||0).toLocaleString()+"</strong> in stock.</div>"
+      +"<div style=\"display:flex;gap:8px;flex-wrap:wrap;align-items:flex-start\">"
+      +"<input id=\"stadj-qty\" type=\"number\" step=\"1\" placeholder=\"e.g. -3\" "
+      +"style=\"width:110px;padding:8px;border:1px solid var(--bd);border-radius:6px;font-size:13px\">"
+      +"<input id=\"stadj-reason\" type=\"text\" maxlength=\"120\" placeholder=\"Reason (required) — e.g. 3 bottles broken in the yard\" "
+      +"style=\"flex:1;min-width:200px;padding:8px;border:1px solid var(--bd);border-radius:6px;font-size:13px\">"
+      +"<button class=\"btn\" style=\"background:#8e44ad;color:#fff\" onclick=\"adjustStock("+s.id+")\">"
+      +"<i class=\"ti ti-adjustments\"></i> Record adjustment</button>"
+      +"</div></div>";
   }
   html+="</div>";
   var tt=el("m-generic-title");
@@ -16513,7 +17137,8 @@ function editInv(id){
   el("m-iv-save").innerHTML="<i class=\"ti ti-check\"></i> Update";
   om("m-iv");
 }
-function saveInv(){
+async function saveInv(){   /* async 2026-08-13: needed to await the amount bound below.
+     Safe — the only caller is onclick="saveInv()" and it discards the return value. */
   if(!can("aInv")&&!can("eInv"))return;
   var cId=parseInt(el("ivc")&&el("ivc").value)||0;var a=_round2(parseFloat(el("iva").value)||0);var p=_round2(parseFloat(el("ivp").value)||0);
   if(!a||a<=0){toast("Amount must be greater than 0","err");return;}
@@ -16521,6 +17146,62 @@ function saveInv(){
   if(el("ivd")&&!el("ivd").value){var d30=new Date();d30.setDate(d30.getDate()+30);el("ivd").value=d30.toISOString().split("T")[0];}
   if(p>a){toast("Amount paid cannot exceed invoice total","err");return;}
   var editId=el("iv-edit-id").value;
+  /* INVOICE AMOUNT SANITY BOUND (2026-08-13, A3 twin 2). saveInv refuses a<=0 and refuses
+     p>a, so the PAID figure is safe — and never checks the AMOUNT at all. Typing 10000 for
+     1000 bills a real customer KSh 9,000 they do not owe, and overstates custDebt, the
+     overdue lists, the statement and revenue by the same figure until somebody notices.
+     Same defect class as recPay, one step earlier: that one mis-records money RECEIVED,
+     this one mis-records money OWED.
+     Reference = the largest amount this customer's own history already justifies: the
+     invoice's current amount when editing, and their largest non-voided invoice otherwise.
+     Voided invoices are excluded on purpose — a written-off figure must not become the
+     precedent for the next one. A new customer has reference 0, so a first manual invoice of
+     KSh 2,000+ is confirmed once; manual invoices are rare here because orders create their
+     own, so that is one click on an unusual action.
+     Thresholds identical to recPay and completeDlv (>= KSh 2,000 and more than 5x): three
+     sites, one rule, the same two numbers.
+     Placed here, above the first mutation on BOTH paths (i.amount on the edit path, the
+     D.invoices.push on the create path), so a decline writes nothing. */
+  var _ibRef=0,_ibBig=false;
+  try{
+    var _ibPrev=0;
+    if(editId){
+      var _ibCur=(D.invoices||[]).find(function(x){return String(x.id)===String(editId);});
+      if(_ibCur)_ibPrev=Number(_ibCur.amount)||0;
+    }
+    var _ibMax=0;
+    (D.invoices||[]).forEach(function(x){
+      if(!x||x.cId!==cId)return;
+      if(editId&&String(x.id)===String(editId))return;
+      if(x.voided)return;
+      var _v=Number(x.amount)||0;if(_v>_ibMax)_ibMax=_v;
+    });
+    _ibRef=_round2(Math.max(_ibPrev,_ibMax));
+    _ibBig=(a>=2000)&&(a>Math.max(_ibRef,0)*5);
+  }catch(_){_ibRef=0;_ibBig=false;}   /* cannot measure -> never obstruct real invoicing */
+  if(_ibBig){
+    var _ibNm="this customer";
+    try{var _ibCu=(D.customers||[]).find(function(x){return x.id===cId;});
+        if(_ibCu)_ibNm=can("vPhone")?_ibCu.name:maskName(_ibCu.name);}catch(_){}
+    var _ibMsg=(editId?"You are changing Invoice #"+editId+" to KSh "+a.toLocaleString()+"."
+                     :"You are creating an invoice for KSh "+a.toLocaleString()+".")+"\n\n"+
+      (_ibRef>0?"The largest invoice "+_ibNm+" has had is KSh "+_ibRef.toLocaleString()+"."
+               :"There is no earlier invoice for "+_ibNm+" to compare this against.")+"\n\n"+
+      "Check for an extra zero. This is what the customer will be asked to pay, and it "+
+      "counts as revenue until somebody corrects it.";
+    if(!(await uiConfirm({title:"Invoice KSh "+a.toLocaleString()+"?",message:_ibMsg,
+        variant:"warn",confirmText:"Yes, that is correct",cancelText:"Go back"}))){
+      try{auditLog("PAYMENT_RECORDED","INVOICE AMOUNT STOPPED AT THE CHECK: "+CU.name+" ("+CU.role+") was asked "+
+        "to confirm KSh "+a.toLocaleString()+(editId?" on Invoice #"+editId:" on a new invoice")+" for "+_ibNm+
+        " (largest previous KSh "+_ibRef.toLocaleString()+"), and declined. Nothing was written.");}catch(_){}
+      toast("Cancelled — nothing was changed","ok");
+      return;
+    }
+    try{auditLog("PAYMENT_RECORDED","LARGE INVOICE AMOUNT CONFIRMED: KSh "+a.toLocaleString()+
+      (editId?" on Invoice #"+editId:" on a new invoice")+" for "+_ibNm+" (largest previous KSh "+
+      _ibRef.toLocaleString()+"). Flagged as unusually large and confirmed deliberately by "+
+      CU.name+" ("+CU.role+").");}catch(_){}
+  }
   if(editId){
     var i=(D.invoices||[]).find(function(x){return String(x.id)===String(editId);});
     if(i){
@@ -19388,6 +20069,19 @@ function restoreSpecificBackup(docId){
 }
 /* Split out so the confirmation above stays a thin gate and the restore body
    below is unchanged from what it was when it ran inline. */
+/* A1 (2026-08-13) — used only by a PARTIAL restore. Records the backup carries win; records it
+   never mentions are kept as they are. It cannot delete: the result is a superset of the
+   backup's own list, so the worst case is that a stale live record survives a restore — which
+   is recoverable, while a deleted collection is not. On any exception it returns whichever
+   list is non-empty, preferring the restored one. */
+function _restoreKeepUnmentioned(live,restored){
+  try{
+    var have={},out=[];
+    (restored||[]).forEach(function(r){if(r&&r.id!=null){have[String(r.id)]=true;out.push(r);}});
+    (live||[]).forEach(function(r){if(r&&r.id!=null&&!have[String(r.id)])out.push(r);});
+    return out;
+  }catch(_){return (restored&&restored.length)?restored:(live||[]);}
+}
 function _restoreSpecificBackupConfirmed(docId){
   if(!can("rest")){toast("Only directors can restore backups","err");return;}
   if(!FB_BACKUP_COL)return;
@@ -19395,7 +20089,31 @@ function _restoreSpecificBackupConfirmed(docId){
     if(!doc.exists){toast("Backup not found","err");return;}
     var data=doc.data();
     if(!data||!data.D){toast("Backup data invalid","err");return;}
+    /* PARTIAL-BACKUP MERGE (2026-08-13, A1). getBackupPayload now bounds the payload by bytes,
+       so a backup can legitimately omit settled orders/invoices — they live in their own
+       Firestore collections and in the closed-period books. Replacing D with a partial payload
+       would make every omitted record look DELETED to _hybridReapDeletes ("in shadow, absent
+       from D"), which is precisely the mechanism of the 2026-07-31 incident that issued 1,188
+       deletes. RAIL 1 does not catch it — that only fires when orders AND invoices AND
+       customers are ALL empty, and a partial payload is not empty.
+       So: records the backup CARRIES are restored (that is the restore); records it never
+       mentions are KEPT exactly as they are. A backup with no manifest is a legacy/complete
+       one and takes the original path untouched. */
+    var _bkMan=data.manifest||null,_bkPartial=!!(_bkMan&&_bkMan.partial);
+    var _bkLiveO=(D.orders||[]).slice(),_bkLiveI=(D.invoices||[]).slice();
     D=data.D;
+    if(_bkPartial){
+      D.orders=_restoreKeepUnmentioned(_bkLiveO,D.orders);
+      D.invoices=_restoreKeepUnmentioned(_bkLiveI,D.invoices);
+      /* Make the reap a no-op by construction: after this the shadow holds exactly what D
+         holds, so "in shadow, absent from D" is the empty set. */
+      try{_hybridSeedShadow();}catch(_){}
+      try{auditLog("DATA_EXPORTED","PARTIAL BACKUP RESTORED: "+docId+" carried "+
+        (_bkMan.ordersIncluded||0)+" of "+(_bkMan.ordersTotal||0)+" orders and "+
+        (_bkMan.invoicesIncluded||0)+" of "+(_bkMan.invoicesTotal||0)+" invoices; the rest are "+
+        "settled history held in the collections and books and were LEFT UNTOUCHED, not deleted. "+
+        "Restored by "+CU.name+" ("+CU.role+").");}catch(_){}
+    }
     if(!D.routes)D.routes=[];if(!D.complaints)D.complaints=[];if(!D.offers)D.offers=[];if(!D.auditLog)D.auditLog=[];
     if(data.USERS&&data.USERS.length>=USERS.length)USERS=data.USERS;
     // ROOT-CAUSE FIX (2026-07-21): confirmed live — restoring an older backup
