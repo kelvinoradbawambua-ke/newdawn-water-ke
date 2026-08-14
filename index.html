@@ -2688,6 +2688,71 @@ function _hybridTombstoned(arrName,k){
   return false;
 }
 
+/* ROOT-CAUSE FIX (2026-08-14, ND47-12i) — THE PHANTOM DRIFT.
+   FOUND IN LIVE PRODUCTION, director's laptop, 2026-08-13 18:30 -> 2026-08-14 06:32.
+
+   THE SYMPTOM. The counts guard fired repeatedly:
+     counts NOT published — mine {"orders":591,"invoices":592,...}
+                            vs published {"orders":591,...,"invoices":594}
+   Read literally that says this device is missing two invoices. It was not. The
+   06:32 cold boot proved it: a FULL load delivered 592 invoices and reported
+     invoices/hot: +592 new ... (2 deleted/archived record(s) refused re-entry
+                   — the collection still holds them)
+   592 held + 2 refused = 594. Nothing was lost. The published count was inflated.
+
+   THE MECHANISM. The tombstone rule — "a record this business has deleted or
+   archived is not part of the live set" — was enforced at TWO sites and not a third:
+     ENTRY      _hydrateById (~line 2966)      refuses a tombstoned id into D.        OK
+     RESIDENCY  _hybridPruneTombstoned         removes DELETED ids already in D.      OK
+     COUNTING   _mk() in the publish block,    counted D[name].length raw.            MISSING
+                and the delta gate's `have`
+   _hybridPruneTombstoned deliberately excludes archived* (see its choice 1: archiving
+   is a Books movement with its own handler and must not be duplicated through a second,
+   less careful route). That choice is correct and is NOT changed here. But it means an
+   ARCHIVED record that was already resident when the tombstone arrived stays in a
+   long-running device's D — and that device then published it as part of its count.
+
+   WHY THE COUNT IS THE RIGHT PLACE TO FIX IT, AND NOT D. Every consumer of the published
+   count — the delta gate — is asking one question: "does this device hold a COMPLETE set?"
+   Completeness is defined by what a device is allowed to HOLD, and by the entry rule a
+   complete device holds no tombstoned records at all. So a count that includes them is
+   simply not the number the gate thinks it is reading. Correcting the count needs no
+   deletion, issues no write, costs no reads, and cannot move a money figure. Removing the
+   records from D instead would mean a THIRD removal path over archived records, which the
+   file already warns against, and would risk _hybridReapDeletes destroying archived
+   history that ordersWithBooks() still merges back for statements.
+
+   NO MONEY IMPACT, AND THAT IS PROVEN NOT ASSUMED. An archived record is settled by
+   construction — the write side refuses to archive an order whose invoice is still owing
+   (_hybridOrderFullySettled, and _hybridDerive("i") computes paid>=amount). A settled
+   record contributes zero to every collectable-money predicate. So the stale device's
+   debt figures were never wrong; only its count, and the delta decisions taken from it.
+
+   WHAT IT COST. Per the ND47-6a analysis at the orphan tool, the inflated count makes
+   every OTHER device read published(594) > local(592), call it drift, refuse delta and
+   take a FULL load of ~1,294 documents. This fix removes that recurring cost at its
+   source, on every device, without deleting anything.
+
+   Proof: _proofB_phantom_drift.js. */
+/* DEFINED AS SUBTRACTION, DELIBERATELY: this is `length` MINUS the tombstoned entries,
+   not a re-count of what looks valid. The first draft counted up instead — skipping any
+   entry that was falsy or had no id — and _proofB_delta_gate.js caught it immediately:
+   its fixtures build `new Array(429)`, every slot empty, so counting up returned 0, the
+   gate read "EMPTY in memory" and refused delta on a complete device. Subtracting keeps
+   every entry the old `.length` counted counted, including holes and id-less records
+   (neither of which can carry a tombstone anyway), so the ONLY behavioural difference
+   between this and the code it replaces is the one this fix exists to make. */
+function _liveCount(name){
+  try{
+    var a=(D&&D[name])||[],n=a.length;
+    for(var i=0;i<a.length;i++){
+      var r=a[i];
+      if(r&&r.id!=null&&_hybridTombstoned(name,String(r.id)))n--;
+    }
+    return n;
+  }catch(_){return ((D&&D[name])||[]).length;}   // never let counting break a read path
+}
+
 /* FIELD FIX (2026-08-03) — A RECORD DELETED ON ANOTHER DEVICE LINGERED UNTIL REFRESH.
 
    Reported by the owner: a customer was deleted on one phone; a second phone, already
@@ -3119,7 +3184,7 @@ function _deltaBaselineOrZero(){
     var names=["orders","invoices","customers"];
     var i,n,have;
     for(i=0;i<names.length;i++){
-      n=names[i];have=((D&&D[n])||[]).length;
+      n=names[i];have=_liveCount(n);   // tombstoned records are not part of the live set — see _liveCount
       if(have===0){
         console.log("[NDDELTA] REFUSED — "+n+" is EMPTY in memory. This is a cold load: D is rebuilt by the listeners, so a delta query would return only what changed and this device would silently hold ~20 records instead of the full set. Taking the FULL load.");
         return 0;
@@ -3131,7 +3196,9 @@ function _deltaBaselineOrZero(){
       return 0;
     }
     for(i=0;i<names.length;i++){
-      n=names[i];have=((D&&D[n])||[]).length;
+      /* Counting tombstoned records here inflates `have`, which makes this gate MORE
+         permissive — the unsafe direction. Same rule, same primitive as the publish side. */
+      n=names[i];have=_liveCount(n);
       var want=Number(pub[n]);
       if(!(typeof pub[n]==="number")||isNaN(want)||want<0){
         console.log("[NDDELTA] REFUSED — published count for "+n+" is missing or not a number ("+JSON.stringify(pub[n])+"); an unusable count proves nothing. Taking the FULL load.");
@@ -5218,7 +5285,11 @@ function processWriteQueue(){
 
          So: publish what this device actually holds. Deletions and repairs now
          reflect correctly, and the stuck-high state is unreachable. */
-      var _mk=function(name){return ((D&&D[name])||[]).length;};
+      /* _liveCount, not D[name].length — a tombstoned record still resident in a
+         long-running device's D is not part of the live set and must not be published
+         as though it were. That inflation is what produced the phantom drift of
+         2026-08-13/14 and the recurring full loads. See _liveCount. */
+      var _mk=function(name){return _liveCount(name);};
       var _counts={orders:_mk("orders"),invoices:_mk("invoices"),customers:_mk("customers")};
       /* ROOT-CAUSE FIX (2026-08-09, ND47-1) — A BEHIND DEVICE WAS DESTROYING THE DRIFT
          DETECTOR, INCLUDING ITS OWN. Found in live production, and it was showing the
@@ -5870,6 +5941,22 @@ function getBackupPayload(){
     ordersTotal:ordAll.length,ordersIncluded:base.orders.length,ordersOmitted:Math.max(0,ordAll.length-base.orders.length),
     invoicesTotal:invAll.length,invoicesIncluded:base.invoices.length,invoicesOmitted:Math.max(0,invAll.length-base.invoices.length),
     unsettledOmitted:unsettledOmitted,
+    /* COMPOSITION (2026-08-13). The 735 KB measurement that set this budget had to be taken by
+       asking the director to run JSON.stringify in a browser console. That is not a 100-year
+       answer. The payload now states what is consuming it, so budget pressure is visible in
+       the app and inside every backup document, and the next person never has to ask.
+       Measured with _bkLen (JSON length), the same ruler the budget itself uses. */
+    bytes:(function(){try{return {
+      total:_bkLen(payload),
+      orders:_bkLen(base.orders),
+      invoices:_bkLen(base.invoices),
+      customers:_bkLen(base.customers),
+      auditLog:_bkLen(base.auditLog),
+      stock:_bkLen(base.stock),
+      pendingPayments:_bkLen(base.pendingPayments),
+      cycleHistory:(function(){var t=0;try{(base.customers||[]).forEach(function(c){t+=_bkLen(c&&c.cycleHistory);});}catch(_){}return t;})(),
+      creditLog:(function(){var t=0;try{(base.customers||[]).forEach(function(c){t+=_bkLen(c&&c.creditLog);});}catch(_){}return t;})()
+    };}catch(_){return null;}})(),
     oldestIncluded:oldest,
     note:"Omitted records are SETTLED history. They live in the orders/invoices Firestore "+
       "collections and in the closed-period books. Restoring this backup MERGES: anything it "+
@@ -8468,6 +8555,21 @@ var LEGACY_BEFORE="2026-07-29";
    cycleHistory into the books archive IN STEP with their settled orders/invoices
    (so the recovery lookups can fall back to a loaded book), not cap it in place. */
 var STOCK_HISTORY_MAX=10;
+/* cycleHistory IS NOT CAPPED, and that is a decision the director holds (DECISION-3,
+   2026-08-13). It is the last unbounded array inside a synced record: syncWaterCycles and
+   runIntegrityCheck REBUILD it from ordersWithBooks(), so it carries one entry per 4-bottle
+   milestone and per 8-bottle cycle for a customer's entire life — proven in
+   _proofB_100yr_12j.js: 2,400 entries (~258 KB) for ONE customer over a century.
+   A cap was written, proven 44/44, and REMOVED again, because all three water-cycle guards
+   refused it: the byte-identity gate on runIntegrityCheck, the "WATER CYCLE — absolute rule,
+   must not be touched" domain, and _proofB_watercycle_guard.js. That lock exists because
+   touching this function once wrote bad business data in production (2026-08-01,
+   bootstrapped=195 on an empty order list). Opening it is the director's call, not a
+   maintainer's.
+   It cannot break the backup: 12i's byte budget already bounds the payload and drops the
+   oldest SETTLED records first, never an unsettled one. The manifest now reports
+   cycleHistory's exact byte cost in every backup, so the decision can be taken on a real
+   number rather than an estimate. */
 /* ── ARCHIVE ELIGIBILITY — the safety predicate, defined and PROVEN before the
    machinery that will use it (2026-07-29). Nothing calls these yet; they exist so the
    rule is settled and tested first, because the archive is the one change in this
@@ -20170,9 +20272,19 @@ function updateBackupBadge(){
   var lastManual=localStorage.getItem("nd_last_backup")||"";
   var lastAny=lastCloud>lastManual?lastCloud:lastManual;
   var daysSince=lastAny?Math.floor((new Date(tday())-new Date(lastAny))/(1000*60*60*24)):999;
-  if(cloudBackupToday||manualToday){
-    badge.innerHTML="<i class=\"ti ti-shield-check\"></i> Backed up today";
+  /* TRUTHFULNESS FIX (2026-08-13). This showed one green "Backed up today" for either
+     condition, so downloading an Excel file turned the badge green with NO cloud backup at
+     all. The badge is the only place the director can see whether disaster recovery is
+     actually running, which makes a false green the worst possible defect in it — and it was
+     found precisely because the director was asked to read it and the answer could not be
+     trusted. The two states are now named separately. Nothing else about the badge changes. */
+  if(cloudBackupToday){
+    badge.innerHTML="<i class=\"ti ti-shield-check\"></i> Backed up to cloud today"+
+      (manualToday?" + local copy":"");
     badge.style.background="#27ae60";badge.style.color="#fff";
+  }else if(manualToday){
+    badge.innerHTML="<i class=\"ti ti-shield-half\"></i> Local copy only — no cloud backup today";
+    badge.style.background="#f39c12";badge.style.color="#fff";
   }else if(daysSince<=2){
     badge.innerHTML="<i class=\"ti ti-shield\"></i> Last backup: "+lastAny;
     badge.style.background="#f39c12";badge.style.color="#fff";
