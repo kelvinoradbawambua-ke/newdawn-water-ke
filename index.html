@@ -6009,6 +6009,38 @@ function writeBackup(docId){
       }catch(_){}
     }
     FB_BACKUP_COL.doc(docId).set(payload).then(function(){
+      /* SUCCESS WAS INVISIBLE (2026-08-18). Every FAILURE path in this function is loud —
+         audit entry plus toast (see the A1 work below, and the size warnings above). Success
+         said nothing at all. That asymmetry actively misleads: on 18 Aug 2026 a production
+         console log covering 4½ days showed a dozen "[NDBACKUP] deferred" lines and not one
+         completion, and the only honest reading of it was "this log cannot tell you whether
+         the backup ran" — the deferrals are the offline guard doing its job, and a landed
+         backup left no trace to weigh against them. The daily backup IS the disaster-recovery
+         plan; whether it ran must be answerable from the same log that reports it failing.
+         Console-only and inside the existing .then() — no behaviour change, no extra write.
+         Size is included because it is the number that decides how long backups keep working
+         at all (1,024 KB Firestore hard limit; measured 753 KB at 590 orders on 2026-08-13). */
+      /* IT REPORTS THE RECOVERY POSITION, NOT JUST THE SIZE (2026-08-18). The payload is
+         BYTE-BOUNDED at BACKUP_BUDGET_BYTES (750 KB), so it never dies at Firestore's 1 MiB
+         cap — it TRUNCATES, dropping settled history newest-first-kept once the budget is
+         spent. That degradation is deliberate and correct, but it was entirely silent: only
+         unsettledOmitted>0 (a dropped RECEIVABLE) ever spoke. A backup that has quietly gone
+         from "all history" to "recent history plus all receivables" is a different recovery
+         position, and the director was never told it changed. The manifest already recorded
+         every number needed; nothing read it out. Reads manifest only — computes nothing. */
+      try{
+        var _mf=payload.manifest||{};
+        console.log("[NDBACKUP] WROTE \""+docId+"\" — "+_bkKB.toLocaleString()+" KB, "+
+          Math.round(_bkKB/(BACKUP_BUDGET_BYTES/1024)*100)+"% of the "+Math.round(BACKUP_BUDGET_BYTES/1024)+
+          " KB budget. "+(_mf.partial
+            ? "PARTIAL: "+(_mf.ordersIncluded||0)+"/"+(_mf.ordersTotal||0)+" orders, "+
+              (_mf.invoicesIncluded||0)+"/"+(_mf.invoicesTotal||0)+" invoices; "+
+              ((_mf.ordersOmitted||0)+(_mf.invoicesOmitted||0))+" SETTLED record(s) dropped, oldest kept "+
+              (_mf.oldestIncluded||"?")+
+              ((_mf.unsettledOmitted||0)>0 ? " — "+_mf.unsettledOmitted+" UNSETTLED RECORD(S) ALSO DROPPED, SEE AUDIT LOG." : " (no receivable dropped).")
+            : "COMPLETE: all "+(_mf.ordersTotal||0)+" orders and "+(_mf.invoicesTotal||0)+" invoices included.")+
+          " Confirmed write, not an offline-queued one.");
+      }catch(_){}
       // Stamp completion in main doc so all devices know a backup happened
       // today — triggers for the new sod-/eod- prefixes (either one counts
       // as "backed up today" for the recovery-check logic below), plus the
@@ -6074,8 +6106,27 @@ function runAutoBackup(){
      flag (line ~289) — the same signal the logout final-push and the self-heal already gate
      on, so this reuses a proven predicate rather than inventing a connectivity test.
      NOT a behaviour change when online: the flag is set by the first server snapshot, which
-     arrives within seconds, and runAutoBackup is already re-fired on a 10s timer (~line 5484)
-     and on reconnect — so a backup deferred here is taken moments later, not skipped. */
+     arrives within seconds, and runAutoBackup is re-fired by startAutoBackup's timers AND by the
+     server-confirmed snapshot handler — so a backup deferred here is taken moments later.
+     RETRY CADENCE, CORRECTED (2026-08-18) — this comment used to read "re-fired on a 10s timer
+     (~line 5484) and on reconnect". Every part of that was wrong, and they were the wrong parts
+     to be wrong about, because they are the entire justification for deferring at all:
+       - startAutoBackup (below) arms a 10-SECOND ONE-SHOT and then a 10-MINUTE interval, so a
+         deferral inside a live session is retried in up to ten minutes, not ten seconds.
+       - line 5484 has nothing to do with backups.
+       - THE RECONNECT RE-FIRE DID NOT EXIST AT ALL. runAutoBackup had four callers: those two
+         timers, the logout path, and the manual "Snapshot now" button. Nothing watched for the
+         moment _cloudServerConfirmed flipped true, so a session that deferred here and ended
+         before the 10-minute interval wrote no backup for that day — silently.
+       It exists now: the fromCache===false branch of the snapshot handler calls runAutoBackup(),
+       alongside the provisional-number drain that already used that trigger. A future session
+       must not remove it believing a timer covers it — a timer only covers a session that lives
+       long enough, and the whole failure mode was sessions that do not.
+     WHAT MAKES THE DEFERRAL SAFE is not the timer — it is that this early return happens BEFORE
+     D._lastSodBackupDate is stamped (see START OF DAY below). The day's backup slot is therefore
+     never consumed by a deferral, so the next attempt that finds a server-confirmed snapshot
+     still writes it. Verified by reading both sites on 2026-08-18; do not reorder the stamp
+     above the guard. */
   if(typeof _cloudServerConfirmed!=="undefined"&&!_cloudServerConfirmed){
     console.log("[NDBACKUP] deferred — no server-confirmed snapshot yet (offline or still connecting). "+
       "Avoids queueing a full dataset copy into IndexedDB on every idle logout.");
@@ -6614,6 +6665,31 @@ function startCloudListener(isWarmRefresh){
          pending, which is the overwhelmingly common case. The fromCache guard itself is
          only READ here; nothing about it is changed. */
       try{if(_pendingNumberCount())_drainPendingNumbers();}catch(_){}
+      /* RETRY THE DEFERRED BACKUP (2026-08-18) — THE MISSING HALF OF THE 2026-08-09 OFFLINE
+         GUARD. runAutoBackup() refuses to run while !_cloudServerConfirmed, to stop every idle
+         logout on a disconnected device parking a full dataset copy in IndexedDB. That guard is
+         right and stays. But it justified itself with "runAutoBackup is already re-fired on a
+         10s timer and ON RECONNECT" — and the reconnect half DID NOT EXIST. The only callers
+         were a 10-second one-shot and a 10-minute interval (both armed by startAutoBackup at
+         login) plus the logout path and the manual button. So the guard could defer a backup
+         and nothing was listening for the moment its blocker cleared.
+         THE WINDOW THAT LEAVES OPEN: a director session that begins on a cold reconnect, takes
+         its 10-second attempt before the server snapshot lands, and ends before the 10-minute
+         interval fires, writes NO backup for that day at all — silently, because success was
+         never logged either (see writeBackup). The 18 Aug 2026 log shows exactly this shape
+         repeatedly: cold reconnect, "NDBACKUP deferred", logout, and the server-confirmed
+         snapshot arriving only AFTERWARDS.
+         WHY HERE: fromCache===false is the same "the server is genuinely talking to us" signal
+         the line above already uses to drain provisional order numbers, for the same reason —
+         it is the precise instant the blocker clears, so it needs no timer of its own. This
+         extends a proven trigger instead of adding a new mechanism.
+         WHY IT CANNOT RUN AWAY: runAutoBackup re-checks everything itself — director role,
+         FB_READY, non-empty data, 8am-10pm business hours, and the SHARED per-day stamps
+         (D._lastSodBackupDate / _lastEodBackupDate / _lastPeriodicBackupAt, all read from the
+         cloud document). On a reconnect where today's backup already exists it returns at a
+         date comparison having done ZERO Firestore operations. The per-day write cap is
+         unchanged; this only closes the case where that cap was never reached. */
+      try{if(typeof runAutoBackup==="function")runAutoBackup();}catch(_){}
     }
     console.log("[NDSYNC] snapshot arrived — _cloudDataConfirmed=true, doc.exists="+doc.exists+", doc.metadata.fromCache="+(doc.metadata&&doc.metadata.fromCache));
     /* PERF FIX (2026-08-01) — FOUND IN LIVE PRODUCTION: login took ~20 s after a
@@ -13852,6 +13928,27 @@ function _drainPendingNumbers(force){
     });
     (D.customers||[]).forEach(function(cu){
       (cu&&cu.creditLog||[]).forEach(function(e){if(e&&String(e.ordId)===String(provOid))e.ordId=r.orderId;});
+      /* CYCLE HISTORY (2026-08-18) — PREVIOUSLY MISSED, and it reached production.
+         completeDlv() writes a cycleHistory row {event:"milestone_4"|"cycle_complete",
+         ordId:o.id} at delivery. If a delivery is completed while the order still
+         holds a PROVISIONAL number — which is exactly what happened on 16 Aug 2026,
+         20:17 delivery, 20:18 renumber #1786900663699406 -> #1722 — that row is left
+         pointing at an id this function then TOMBSTONES one screen above.
+         Why that is not merely cosmetic: the water-cycle reconciliation dedupes the
+         old rows against the rebuilt ones on the composite key (ordId|event) — see
+         "(ordId,event) DEDUPE (2026-08-13, round-9 finding S)". A stale ordId misses
+         that key, so the orphan is classed as "order gone, keep for recovery" and
+         SURVIVES ALONGSIDE the rebuilt row: one physical delivery, counted twice in
+         the customer's cycle history. That is round-9 finding S re-entering through
+         the provisional-numbering door.
+         The water cycle is informational only — no free bottle, no entitlement — so
+         this is an ACCURACY defect, not a money one.
+         Found because _drainPendingNumbers repointed three reference collections and
+         this fourth one keys off the order id in exactly the same way; the twin tool
+         _renumberTimestampIds had the identical gap and is fixed in the same pass.
+         Proven by _proofB_renumber_cyclehistory.js (§3 reproduces the duplicate
+         against the shipped dedupe, §4 shows this line collapsing it to one). */
+      (cu&&cu.cycleHistory||[]).forEach(function(h){if(h&&String(h.ordId)===String(provOid))h.ordId=r.orderId;});
     });
     (D.pendingPayments||[]).forEach(function(p){if(p&&String(p.ordId)===String(provOid))p.ordId=r.orderId;});
     /* Move the durable outbox entry onto the real id. The provisional entry may
@@ -17742,6 +17839,15 @@ function _renumberTimestampIds(apply,includeUnsettled){
       var refs=0;
       (D.customers||[]).forEach(function(cu){
         (cu&&cu.creditLog||[]).forEach(function(e){if(e&&String(e.ordId)===oldOid){e.ordId=newOid;refs++;}});
+        /* CYCLE HISTORY (2026-08-18) — the same gap _drainPendingNumbers had, in the
+           structurally identical place. A delivery recorded before the renumber left
+           a cycleHistory row keyed on the OLD order id; the water-cycle reconciliation
+           dedupes on (ordId|event), so a stale id survives alongside the rebuilt row
+           and the delivery is counted twice. Informational-only counter, so this is an
+           accuracy defect. Restored in the rollback below — a forward-only repoint here
+           would be WORSE than none, because a failed renumber would then leave
+           cycleHistory on the new id while everything else went back. */
+        (cu&&cu.cycleHistory||[]).forEach(function(h){if(h&&String(h.ordId)===oldOid){h.ordId=newOid;refs++;}});
       });
       (D.pendingPayments||[]).forEach(function(p){if(p&&String(p.ordId)===oldOid){p.ordId=newOid;refs++;}});
       /* STOCK LEDGER (2026-08-07, b26) — PREVIOUSLY MISSED, and this tool has already been
@@ -17801,6 +17907,12 @@ function _renumberTimestampIds(apply,includeUnsettled){
            Stock history is restored too, because the forward pass now repoints it. */
         (D.customers||[]).forEach(function(cu){
           (cu&&cu.creditLog||[]).forEach(function(en){if(en&&String(en.ordId)===String(newOid))en.ordId=oldOidNum;});
+          /* cycleHistory is restored too, because the forward pass now repoints it
+             (2026-08-18). oldOidNum, not oldOid — completeDlv writes ordId:o.id as a
+             NUMBER, so restoring the string form would leave a type mismatch that the
+             String()-on-both-sides comparisons above would silently tolerate. Same
+             class as the w.o.id and stock-history type bugs already fixed here. */
+          (cu&&cu.cycleHistory||[]).forEach(function(h){if(h&&String(h.ordId)===String(newOid))h.ordId=oldOidNum;});
         });
         (D.pendingPayments||[]).forEach(function(p){if(p&&String(p.ordId)===String(newOid))p.ordId=oldOidNum;});
         (D.stock||[]).forEach(function(st){
