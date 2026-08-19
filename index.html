@@ -1117,6 +1117,116 @@ function _linkedInvoiceOf(ordId,invArr){
   var a=_linkedInvoicesOf(ordId,invArr);
   return a.length?a[0]:null;
 }
+/* ============================================================================
+   ORDER -> ITS INVOICE, IN ONE PASS INSTEAD OF ONE SCAN PER ORDER  (2026-08-19)
+
+   WHY THIS EXISTS. syncPaymentStatuses() ran
+       (D.orders||[]).forEach(function(o){ var inv=(D.invoices||[]).find(...); ... })
+   i.e. a FULL scan of D.invoices for every order — O(orders x invoices), and the
+   .find predicate itself sometimes built a RegExp per pair. Measured against the
+   live data on 2026-08-19: 669 orders x 672 invoices = 449,568 predicate
+   evaluations, and syncPaymentStatuses runs from runIntegrityCheck, which
+   setTimeout()s 15 seconds after EVERY director login (see ~10477), plus after
+   every restore (~6392) and in a merge path (~7842).
+
+   WHY IT IS URGENT RATHER THAN COSMETIC. Nothing bounds D.orders in memory except
+   archiving (the only bulk shrink is inside _closePeriod), and as of 2026-08-19
+   D.closedPeriods is EMPTY — no period has ever been closed. So both arrays grow
+   with the business and the work grows as their PRODUCT: at the measured 14
+   orders/day that is ~689 million predicate evaluations five years out, ~2.7 billion
+   at ten years, and ~262 billion at the 100-YEAR design target — all on the
+   director's login path. This is the same class of defect the header comment above
+   _getOrdByIdIndex records fixing for the customer/debt loops.
+
+   EQUIVALENCE IS THE WHOLE DIFFICULTY — READ THIS BEFORE CHANGING ANYTHING.
+   The original predicate resolves an order's invoice through THREE routes at once:
+
+     i.cId===o.cId && (  i.id===o.invoiceId                                  (R1)
+                      || String(i.orderId)===String(o.id)                    (R2)
+                      || (i.orderId==null && i.notes
+                          && _linkedInvoicesOf(o.id,[i]).length>0)  )        (R3)
+
+   Array.prototype.find returns the FIRST invoice IN ARRAY ORDER satisfying ANY of
+   them. A "natural" index that tries R1, then R2, then R3 can therefore return a
+   DIFFERENT invoice than find did — whenever an earlier invoice matches R2 while a
+   later one matches R1. That would change an order's payment badge and its
+   amtPaid, i.e. a money figure on screen. So this index stores, per key, the
+   LOWEST invoice ARRAY INDEX, and the lookup takes the minimum across routes.
+   That reproduces find() exactly rather than approximately.
+
+   Type strictness is preserved too. R1 and the cId test use === , so those keys
+   are type-tagged (_pmTag) — otherwise numeric 137 would start matching string
+   "137" and the index would find pairs the original never did. R2 was already a
+   String() comparison, so it is keyed as a plain string, including the "null"
+   that String(null) yields, so even that edge case behaves as before.
+
+   R3's key set is exactly the maximal digit-runs after each "#" in notes. That is
+   what _linkedInvoicesOf's own /#<id>(\D|$)/ boundary accepts: on notes "#1370",
+   "#137" fails the boundary (next char is a digit) and only "1370" matches, which
+   is precisely what /#(\d+)/g yields since \d+ is greedy. Leading zeros are kept
+   verbatim ("#0137" does not match order 137) exactly as the RegExp did.
+
+   Cached on the same cheap signals as _getOrdByIdIndex: array identity and
+   length. Deliberately NOT book-aware — every caller of this index works on the
+   LIVE D.invoices array (it returns array positions into the array it was given),
+   and an archived invoice's order is archived with it (pair rule), so there is
+   nothing for a book to contribute here. Callers needing archived history keep
+   using _linkedInvoicesOf / ordersWithBooks().
+
+   Proven by _proofB_hotpath_index_equivalence.js, which drives BOTH the original
+   .find and this index over adversarial data — stale-but-present invoiceId, notes
+   links, orderId==null, several invoices per order, cId mismatch, voided, leading
+   zeros, payment-reference collisions — and asserts the SAME invoice object comes
+   back for every order, not merely an equally-plausible one.                     */
+function _pmTag(v){return (typeof v)+":"+String(v);}
+var _invForOrdCache=null,_invForOrdCacheArr=null,_invForOrdCacheLen=-1;
+function _getInvForOrderIndex(){
+  var invs=D.invoices||[];
+  if(_invForOrdCache&&_invForOrdCacheArr===invs&&_invForOrdCacheLen===invs.length)return _invForOrdCache;
+  var byInvId={},byOrdRef={};
+  for(var ix=0;ix<invs.length;ix++){
+    var i=invs[ix];
+    if(!i)continue;
+    var c=_pmTag(i.cId)+"|";
+    var k1=c+_pmTag(i.id);                                  // R1 — matched against o.invoiceId
+    if(byInvId[k1]===undefined)byInvId[k1]=ix;              // lowest array index wins == find()
+    var k2=c+String(i.orderId);                             // R2 — matched against String(o.id)
+    if(byOrdRef[k2]===undefined)byOrdRef[k2]=ix;
+    if(i.orderId==null&&i.notes){                           // R3 — notes link, same gate as the original
+      var toks=String(i.notes).match(/#(\d+)/g);
+      if(toks)for(var t=0;t<toks.length;t++){
+        var k3=c+toks[t].slice(1);
+        if(byOrdRef[k3]===undefined)byOrdRef[k3]=ix;
+      }
+    }
+  }
+  _invForOrdCache={byInvId:byInvId,byOrdRef:byOrdRef,arr:invs};
+  _invForOrdCacheArr=invs;
+  _invForOrdCacheLen=invs.length;
+  return _invForOrdCache;
+}
+/* The lookup. Returns the SAME value the original .find returned, undefined
+   included, so callers need no null-handling change. */
+function _invForOrder(o,idx){
+  if(!o)return undefined;
+  /* VALIDATE the caller-supplied index rather than trusting it (2026-08-19). Found by the
+     function-level harness, which calls every function with fabricated arguments: a truthy
+     second argument that is not actually an index made this throw
+     "Cannot read properties of undefined" on _x.byInvId. No production caller does that —
+     syncPaymentStatuses passes a real _getInvForOrderIndex() result and every other path
+     omits the argument — so this was a harness artifact, not a live defect. It is fixed
+     anyway because `idx||...` silently trusting its input is exactly the shape that turns a
+     future caller's mistake into a thrown exception mid-loop over money records, and
+     rebuilding is cheap and always correct. Keeps the harness baseline at 85 TypeError /
+     0 ReferenceError instead of moving it to 89 — a baseline that drifts for benign reasons
+     stops being able to reveal a real regression. */
+  var _x=(idx&&idx.byInvId&&idx.byOrdRef&&idx.arr)?idx:_getInvForOrderIndex();
+  var c=_pmTag(o.cId)+"|";
+  var a=_x.byInvId[c+_pmTag(o.invoiceId)];
+  var b=_x.byOrdRef[c+String(o.id)];
+  var best=(a===undefined)?b:((b===undefined)?a:(a<b?a:b));
+  return (best===undefined)?undefined:_x.arr[best];
+}
 /* The inverse lookup: which ORDER does this invoice belong to? Six sites (voidInvoice,
    recPay's invoice branch, recPay's customer-level distribution, ackPendingPay, payI, and
    the archive-eligibility scan) each carried a byte-identical copy of
@@ -2084,6 +2194,18 @@ function _outboxReconcile(){
       _outboxDoneThisSession=true;
       if(!snap||snap.empty)return;
       var liveOrd={};(D.orders||[]).forEach(function(o){if(o&&o.id!=null)liveOrd[o.id]=true;});
+      /* SYMMETRY FIX (2026-08-19, CLAUDE.md rule 14 — same bug pattern, second site).
+         An index was already built for ORDERS here, but the invoice presence test below
+         stayed a full (D.invoices||[]).some(...) scan per healed record — O(queue x
+         invoices). The outer loop is bounded (the outbox, and the 50-event window), so this
+         is the mildest of the six nested scans; it is converted because leaving one site of
+         a pattern unfixed is how this codebase has repeatedly grown the next defect.
+         MUST be updated on push, exactly as liveOrd is: the .some it replaces re-scanned
+         D.invoices every iteration and so DID see an invoice added earlier in the same
+         batch. A map that is not maintained would let two records carrying the same invoice
+         id both push, duplicating a receivable. Keyed with _pmTag to preserve the strict
+         x.id===si.id comparison. */
+      var liveInv={};(D.invoices||[]).forEach(function(i){if(i&&i.id!=null)liveInv[_pmTag(i.id)]=true;});
       var dismissed={};(D.dismissedMissingOrders||[]).forEach(function(id){dismissed[id]=true;});
       var restoredO=[],restoredI=[],dropped=0,skipped=[];
       var payAcc={restored:[],skipped:skipped,dropped:0};   // B2 — payment entries
@@ -2108,12 +2230,13 @@ function _outboxReconcile(){
         restoredO.push(oid);
         var si=d.invoice;
         if(si&&si.id!=null&&
-           !(D.invoices||[]).some(function(x){return x.id===si.id;})&&
+           !liveInv[_pmTag(si.id)]&&
            !(D.deletedInvoiceIds&&D.deletedInvoiceIds[si.id])&&
            !(typeof _recentlyVoidedInvoiceIds!=="undefined"&&_recentlyVoidedInvoiceIds&&_recentlyVoidedInvoiceIds[si.id])){
           var _ci=JSON.parse(JSON.stringify(si));
           _ci._healedFrom="outbox";_ci._healedAt=Date.now();
           (D.invoices||[]).push(_ci);
+          liveInv[_pmTag(si.id)]=true;   // keep the index true to D.invoices — see the note above
           restoredI.push(si.id);
         }
       });
@@ -3984,8 +4107,17 @@ function _verifyCollectionMigration(cb){
           problems.push("invoice #"+i.id+" settled flag WRONG: doc="+d.settled+" derived="+_expSettled+" (amount="+d.amount+" paid="+d.paid+" voided="+!!d.voided+") — unsettled debt could be invisible");
       });
       // counts both directions — a document with no live counterpart is just as wrong
-      Object.keys(docO).forEach(function(k){if(!(D.orders||[]).some(function(o){return String(o.id)===k;}))problems.push("/orders has orphan document #"+k);});
-      Object.keys(docI).forEach(function(k){if(!(D.invoices||[]).some(function(i){return String(i.id)===k;}))problems.push("/invoices has orphan document #"+k);});
+      /* EFFICIENCY FIX (2026-08-19): these two lines were the worst nested scan in the file —
+         a full D.orders / D.invoices scan per DOCUMENT, i.e. O(documents x live records):
+         ~448,000 comparisons on the live data and ~2.6e11 at the 100-year design target.
+         This gates _hybridStripMainDoc, so it is the last thing that should ever time out.
+         One forward pass builds the id sets; the String(x.id)===k comparison is preserved
+         exactly because the sets are keyed with the same String(x.id) the original computed,
+         and Object.keys(docO) already yields strings. Same answers, both directions. */
+      var _liveOrdIds={};(D.orders||[]).forEach(function(o){if(o)_liveOrdIds[String(o.id)]=true;});
+      var _liveInvIds={};(D.invoices||[]).forEach(function(i){if(i)_liveInvIds[String(i.id)]=true;});
+      Object.keys(docO).forEach(function(k){if(!_liveOrdIds[k])problems.push("/orders has orphan document #"+k);});
+      Object.keys(docI).forEach(function(k){if(!_liveInvIds[k])problems.push("/invoices has orphan document #"+k);});
 
       /* CUSTOMERS (2026-07-31). Verified on the same money-first basis as invoices: credit is
          real liability the business honours as goods, and creditLimit gates future sales. The
@@ -5964,10 +6096,33 @@ function getBackupPayload(){
   };
   return payload;
 }
+/* IN-FLIGHT MARKER (2026-08-19) — ADDED AFTER A PRODUCTION WRITE STORM.
+   On 2026-08-19 a reconnect retry was added to the fromCache===false snapshot branch. It
+   ran away: a backup write PRODUCES a server-confirmed snapshot, that snapshot re-fired the
+   retry, and nothing anywhere in this file recorded that a backup was already being written.
+   Dozens of ~700 KB writes went out inside nine minutes until Firestore answered
+   "resource-exhausted: Write stream exhausted maximum allowed queued writes" and started
+   rejecting with 400s — which also jams ORDINARY order and payment writes, so this was a
+   money risk, not just noise. Rolled back the same morning.
+   This is a TIMESTAMP, not a boolean, deliberately: with offline persistence a .set()
+   promise does not settle until the server acks, which offline can be hours. A boolean would
+   wedge backups shut for that whole period. A timestamp self-heals after BK_INFLIGHT_MS.
+   Cleared on EVERY exit path — .then(), .catch(), and the synchronous catch below. */
+var BK_INFLIGHT_MS=120000;
+var _bkWritingSince=0;
+function _bkWriteInFlight(){return _bkWritingSince>0&&(Date.now()-_bkWritingSince)<BK_INFLIGHT_MS;}
+/* The reconnect retry fires AT MOST ONCE per page load. Even if every other guard here
+   failed, one extra runAutoBackup() per session is the worst case — a bound, not a hope. */
+var _bkRetriedThisSession=false;
 function writeBackup(docId){
   if(!FB_BACKUP_COL)return;
   var isEmpty=(!D.customers||(D.customers||[]).length===0)&&(!D.orders||(D.orders||[]).length===0);
   if(isEmpty&&FB_SETUP_DONE)return; // never backup empty data
+  /* NOT an early return — deliberately. runAutoBackup stamps the day BEFORE it calls here,
+     so bailing out at this point would mark the day backed-up with no backup written. The
+     concurrency decision belongs to runAutoBackup, which checks _bkWriteInFlight() before
+     it stamps anything. This function only PUBLISHES that a write is outstanding. */
+  _bkWritingSince=Date.now();
   try{
     var payload=JSON.parse(JSON.stringify(getBackupPayload()));
     /* SIZE CHECK BEFORE THE WRITE (2026-08-13, A1). Firestore rejects a document over
@@ -6009,6 +6164,38 @@ function writeBackup(docId){
       }catch(_){}
     }
     FB_BACKUP_COL.doc(docId).set(payload).then(function(){
+      /* SUCCESS WAS INVISIBLE (2026-08-18). Every FAILURE path in this function is loud —
+         audit entry plus toast (see the A1 work below, and the size warnings above). Success
+         said nothing at all. That asymmetry actively misleads: on 18 Aug 2026 a production
+         console log covering 4½ days showed a dozen "[NDBACKUP] deferred" lines and not one
+         completion, and the only honest reading of it was "this log cannot tell you whether
+         the backup ran" — the deferrals are the offline guard doing its job, and a landed
+         backup left no trace to weigh against them. The daily backup IS the disaster-recovery
+         plan; whether it ran must be answerable from the same log that reports it failing.
+         Console-only and inside the existing .then() — no behaviour change, no extra write.
+         Size is included because it is the number that decides how long backups keep working
+         at all (1,024 KB Firestore hard limit; measured 753 KB at 590 orders on 2026-08-13). */
+      /* IT REPORTS THE RECOVERY POSITION, NOT JUST THE SIZE (2026-08-18). The payload is
+         BYTE-BOUNDED at BACKUP_BUDGET_BYTES (750 KB), so it never dies at Firestore's 1 MiB
+         cap — it TRUNCATES, dropping settled history newest-first-kept once the budget is
+         spent. That degradation is deliberate and correct, but it was entirely silent: only
+         unsettledOmitted>0 (a dropped RECEIVABLE) ever spoke. A backup that has quietly gone
+         from "all history" to "recent history plus all receivables" is a different recovery
+         position, and the director was never told it changed. The manifest already recorded
+         every number needed; nothing read it out. Reads manifest only — computes nothing. */
+      try{
+        var _mf=payload.manifest||{};
+        console.log("[NDBACKUP] WROTE \""+docId+"\" — "+_bkKB.toLocaleString()+" KB, "+
+          Math.round(_bkKB/(BACKUP_BUDGET_BYTES/1024)*100)+"% of the "+Math.round(BACKUP_BUDGET_BYTES/1024)+
+          " KB budget. "+(_mf.partial
+            ? "PARTIAL: "+(_mf.ordersIncluded||0)+"/"+(_mf.ordersTotal||0)+" orders, "+
+              (_mf.invoicesIncluded||0)+"/"+(_mf.invoicesTotal||0)+" invoices; "+
+              ((_mf.ordersOmitted||0)+(_mf.invoicesOmitted||0))+" SETTLED record(s) dropped, oldest kept "+
+              (_mf.oldestIncluded||"?")+
+              ((_mf.unsettledOmitted||0)>0 ? " — "+_mf.unsettledOmitted+" UNSETTLED RECORD(S) ALSO DROPPED, SEE AUDIT LOG." : " (no receivable dropped).")
+            : "COMPLETE: all "+(_mf.ordersTotal||0)+" orders and "+(_mf.invoicesTotal||0)+" invoices included.")+
+          " Confirmed write, not an offline-queued one.");
+      }catch(_){}
       // Stamp completion in main doc so all devices know a backup happened
       // today — triggers for the new sod-/eod- prefixes (either one counts
       // as "backed up today" for the recovery-check logic below), plus the
@@ -6018,7 +6205,9 @@ function writeBackup(docId){
         D._lastDailyBackup=tday();
         FB_DOC_REF.set({_lastDailyBackup:tday()},{merge:true}).catch(function(){});
       }
+      _bkWritingSince=0; // write settled — release the in-flight marker
     }).catch(function(e){
+      _bkWritingSince=0; // release on failure too, or one error wedges backups for BK_INFLIGHT_MS
       /* WAS SILENT (2026-08-13, A1). The comment here used to read "backup write failed
          silently" — and it did. This is the single most important place in the file for a
          failure to be heard: the daily backup IS the disaster-recovery plan, and the day it
@@ -6035,6 +6224,7 @@ function writeBackup(docId){
   }catch(e){
     /* Also previously silent. A throw before the write reaches Firestore at all — a
        malformed payload, a null collection reference — left no trace whatsoever. */
+    _bkWritingSince=0; // threw before/while sending — nothing is outstanding, release
     try{
       var _m2="";try{_m2=String((e&&(e.message||e.code))||e||"unknown");}catch(_){_m2="unknown";}
       auditLog("DATA_EXPORTED","BACKUP ABORTED before it was sent: \""+docId+"\" — "+_m2+
@@ -6074,8 +6264,27 @@ function runAutoBackup(){
      flag (line ~289) — the same signal the logout final-push and the self-heal already gate
      on, so this reuses a proven predicate rather than inventing a connectivity test.
      NOT a behaviour change when online: the flag is set by the first server snapshot, which
-     arrives within seconds, and runAutoBackup is already re-fired on a 10s timer (~line 5484)
-     and on reconnect — so a backup deferred here is taken moments later, not skipped. */
+     arrives within seconds, and runAutoBackup is re-fired by startAutoBackup's timers AND by the
+     server-confirmed snapshot handler — so a backup deferred here is taken moments later.
+     RETRY CADENCE, CORRECTED (2026-08-18) — this comment used to read "re-fired on a 10s timer
+     (~line 5484) and on reconnect". Every part of that was wrong, and they were the wrong parts
+     to be wrong about, because they are the entire justification for deferring at all:
+       - startAutoBackup (below) arms a 10-SECOND ONE-SHOT and then a 10-MINUTE interval, so a
+         deferral inside a live session is retried in up to ten minutes, not ten seconds.
+       - line 5484 has nothing to do with backups.
+       - THE RECONNECT RE-FIRE DID NOT EXIST AT ALL. runAutoBackup had four callers: those two
+         timers, the logout path, and the manual "Snapshot now" button. Nothing watched for the
+         moment _cloudServerConfirmed flipped true, so a session that deferred here and ended
+         before the 10-minute interval wrote no backup for that day — silently.
+       It exists now: the fromCache===false branch of the snapshot handler calls runAutoBackup(),
+       alongside the provisional-number drain that already used that trigger. A future session
+       must not remove it believing a timer covers it — a timer only covers a session that lives
+       long enough, and the whole failure mode was sessions that do not.
+     WHAT MAKES THE DEFERRAL SAFE is not the timer — it is that this early return happens BEFORE
+     D._lastSodBackupDate is stamped (see START OF DAY below). The day's backup slot is therefore
+     never consumed by a deferral, so the next attempt that finds a server-confirmed snapshot
+     still writes it. Verified by reading both sites on 2026-08-18; do not reorder the stamp
+     above the guard. */
   if(typeof _cloudServerConfirmed!=="undefined"&&!_cloudServerConfirmed){
     console.log("[NDBACKUP] deferred — no server-confirmed snapshot yet (offline or still connecting). "+
       "Avoids queueing a full dataset copy into IndexedDB on every idle logout.");
@@ -6089,6 +6298,20 @@ function runAutoBackup(){
   var dateStr=now.getFullYear()+"-"+String(now.getMonth()+1).padStart(2,"0")+"-"+String(now.getDate()).padStart(2,"0");
   var hourStr=dateStr+"-"+String(hr).padStart(2,"0");
   var nowMs=Date.now();
+
+  /* ONE BACKUP AT A TIME (2026-08-19) — THE GUARD THE WRITE STORM NEEDED.
+     Checked HERE, before any stamp is set, and not inside writeBackup: every branch below
+     stamps the day and THEN calls writeBackup, so bailing out further down would record the
+     day as backed-up while no backup was written — trading a write storm for silent data
+     loss. Returning here leaves the stamps untouched, so the next legitimate trigger (the
+     10-minute interval, or a later snapshot) tries again cleanly.
+     Self-healing by design: _bkWriteInFlight() expires after BK_INFLIGHT_MS, so a promise
+     that never settles (offline .set()) cannot disable backups permanently. */
+  if(_bkWriteInFlight()){
+    console.log("[NDBACKUP] skipped — a backup write is already in flight ("+
+      Math.round((Date.now()-_bkWritingSince)/1000)+"s). Not stamping the day; the next trigger retries.");
+    return;
+  }
 
   // ROOT-CAUSE FIX (2026-07-21): all three tracking timestamps below are now
   // read from D — which is populated from the SHARED cloud document (see the
@@ -6147,6 +6370,7 @@ function runAutoBackup(){
     writeBackup("eod-"+dateStr);
     pruneOldBackups("eod-",14);
     pruneOldTombstones(); // piggyback the existing daily tombstone-prune cycle onto EOD instead of a separate "daily" type
+    pruneOldEvents();     // 2026-08-19: the ONLY Firestore limit a century crossed — see pruneOldEvents
     FB_DOC_REF.set({_lastEodBackupDate:dateStr},{merge:true}).catch(function(){});
     return;
   }
@@ -6159,6 +6383,78 @@ function runAutoBackup(){
     pruneOldBackups("periodic-",24); // ~3 days of coverage at this cadence
     FB_DOC_REF.set({_lastPeriodicBackupAt:nowMs},{merge:true}).catch(function(){});
   }
+}
+/* ===========================================================================
+   EVENT RETENTION — the last Firestore limit a century crossed   (2026-08-19)
+
+   THE DEFECT. newdawn_events had NO prune. Only the outbox (~2050, ~2126) and backups
+   (~6247) were ever deleted; books are never deleted, correctly, because they ARE the
+   archive. Events therefore grew forever and were the single largest consumer of the
+   1 GiB free-tier storage allowance — the only one of the six free-tier limits that a
+   100-year run actually crossed. Reads, writes, egress and the 1 MiB document cap are all
+   structurally safe (bounded listeners, the zero-read boot, and the archive-map prune above).
+
+   SIZED TO THIS BUSINESS, on the director's own figures (2026-08-19): 10 staff, at most 500
+   customers, at most 20 orders/day. At ~109 audit call sites an order lifecycle writes several
+   events, so ~150/day is a fair ceiling. Unpruned that is ~1.6 GB over a century — a breach on
+   its own. At the 730-day retention below it is ~33 MB, PERMANENTLY FLAT, about 3% of the
+   allowance. The order and invoice documents (~657 MB at 20/day for a century) then become the
+   dominant term and the whole database lands near 64% of the free allowance.
+
+   WHAT THIS DOES NOT TOUCH — the point that makes short retention safe. Events are a forensic
+   record of ACTIONS. The MONEY lives in the /orders and /invoices documents, which this never
+   deletes and which nothing prunes. Pruning a two-year-old event cannot remove a receivable,
+   a payment, an invoice or an order. The director's requirement was "short, just enough to
+   follow up money"; 730 days is deliberately generous against that.
+
+   WHY IT CANNOT AFFECT RECOVERY. Both event read paths are capped at the newest 50 documents
+   (~6806 orderBy ts desc limit 50, ~6810 the same with a ts> watermark), and self-heal only
+   ever considers events inside HEAL_RECENT_MS = 5 minutes with a 2-minute grace. A 730-day
+   cutoff is four orders of magnitude away from either. The 50-event recovery window the
+   director asked to keep is untouched.
+
+   WHY THIS IS NOT ANOTHER WRITE STORM. The 2026-08-19 incident was an unbounded feedback loop:
+   an action triggered on a signal that same action produced. This has neither property.
+     * It is triggered by a DATE (the once-daily EOD slot), not by any signal it emits.
+     * Deleting an event does NOT create an event — this function deliberately writes NO audit
+       entry, only a console line, so there is no path from its effect back to its trigger.
+     * It is hard-capped at EVENT_PRUNE_MAX_PER_RUN documents per run, so the worst case is
+       bounded regardless of backlog, and it is idempotent — a deleted document cannot return.
+   The cap is set ABOVE the accrual rate on purpose: at ~150 events/day, a cap of 150 would
+   only hold level and never drain an existing backlog, so 400/day drains at ~250/day net while
+   costing 400 of the 20,000 daily writes (2%) and 400 of the 50,000 daily reads (0.8%). Once
+   drained the query matches nothing and the steady cost is a single empty-result read per day.
+   400 is also inside Firestore's 500-operation batch limit.
+
+   Director-only and server-confirmed, matching the backup path: a cache-only snapshot must
+   never drive a deletion decision. Proven by _proofB_event_retention.js. */
+var EVENT_RETENTION_DAYS=730;      // 2 years — "short, enough to follow up money"
+var EVENT_PRUNE_MAX_PER_RUN=400;   // hard cap: above the ~150/day accrual so a backlog drains
+function pruneOldEvents(){
+  if(!FB_EVENTS_COL||!FB_READY||!fbDb)return;
+  if(!CU||CU.role!=="director")return;              // one device decides, as with backups
+  if(typeof _cloudServerConfirmed!=="undefined"&&!_cloudServerConfirmed)return; // never act on cache-only state
+  var cutoffIso;
+  try{cutoffIso=new Date(Date.now()-EVENT_RETENTION_DAYS*86400000).toISOString();}catch(_){return;}
+  /* Single-field range + order on the SAME field (ts), so no composite index is required.
+     ts is an ISO-8601 string throughout (see the watermark query at ~6810), and ISO-8601
+     sorts correctly as text, which is why a string comparison is the right one here. */
+  FB_EVENTS_COL.where("ts","<",cutoffIso).orderBy("ts","asc").limit(EVENT_PRUNE_MAX_PER_RUN).get()
+    .then(function(snap){
+      if(!snap||snap.empty)return null;             // drained — nothing to do, nothing logged
+      var batch=fbDb.batch(),n=0;
+      snap.forEach(function(d){batch.delete(d.ref);n++;});
+      return batch.commit().then(function(){
+        console.log("[NDEVENTS] retention prune — deleted "+n+" event(s) older than "+
+          EVENT_RETENTION_DAYS+" days (before "+cutoffIso.slice(0,10)+"). Cap is "+
+          EVENT_PRUNE_MAX_PER_RUN+"/run"+(n===EVENT_PRUNE_MAX_PER_RUN?"; the cap was reached, so more remain and the next EOD continues":"; the backlog is now clear")+
+          ". Orders, invoices and payments are NEVER touched by this.");
+      });
+    })
+    .catch(function(e){
+      console.log("[NDEVENTS] retention prune skipped — "+((e&&e.code)||"unknown")+
+        ". Nothing was deleted; the next EOD retries.");
+    });
 }
 function pruneOldTombstones(){
   // STRUCTURAL/COST AUDIT FIX (2026-07-20): D.deletedOrderIds and
@@ -6205,13 +6501,142 @@ function pruneOldTombstones(){
      Safe on identical reasoning to the order map directly above: syncIdCounters() makes id
      reuse structurally impossible, so an aged-out deletion tombstone is merely wasteful,
      not a correctness risk, and 90 days far exceeds any realistic stale-device window.
-     NOTE the deliberate asymmetry — archivedOrderIds/archivedInvoiceIds are NOT pruned here
-     and must not be, because the books still read them to resolve archived records. */
+
+     CORRECTION (2026-08-19): this comment used to end with a deliberate asymmetry —
+     "archivedOrderIds/archivedInvoiceIds are NOT pruned here and must not be, because the
+     books still read them to resolve archived records." THE STATED REASON IS FALSE. The
+     books read BOOK_CACHE (see _loadedBookArrays / ordersWithBooks), never these maps. The
+     caution was still the right instinct — it stopped an earlier session age-pruning them
+     blind — but the justification was wrong, and a wrong justification in a comment is how
+     a real ceiling went unnoticed. See the ARCHIVE MAP block immediately below. */
   var prunedI=0;
   if(D.deletedInvoiceIds){
     Object.keys(D.deletedInvoiceIds).forEach(function(k){
       if(D.deletedInvoiceIds[k]<cutoff){delete D.deletedInvoiceIds[k];prunedI++;}
     });
+  }
+  /* =========================================================================
+     ARCHIVE MAPS — THE 1 MiB DOCUMENT CEILING              (2026-08-19)
+
+     THE DEFECT. _closePeriod writes, for every archived record:
+         D.closedPeriods[period]=_archTs;                         <- bounded, ~20 B/month
+         D.archivedOrderIds[o.id]=_archTs;                        <- UNBOUNDED, ~30 B/record
+         D.archivedInvoiceIds[i.id]=_archTs;                      <- UNBOUNDED, ~30 B/record
+     The per-record maps live inside the main document, are append-only, and were never
+     pruned. At the measured 14 orders/day that is ~60 bytes per order forever:
+         today (0 periods closed) .....        0 bytes   main doc 37 KB / 1024 KB
+         ~16,800 orders (~3.2 years) ...   ~1.0 MB   -> BLOWS the 1,048,576 B hard cap
+         511,000 orders (100 years) ....  ~29 MiB   -> 29x the cap
+     Firestore rejects the write outright at the cap: total sync failure, not degradation.
+     As of 2026-08-19 D.closedPeriods is EMPTY (measured in production) — no period has ever
+     been closed — so the clock has not started and there is NOTHING TO MIGRATE. This is a
+     preventive fix, which is why it can be this conservative.
+
+     WHY A PERIOD MARKER IS A COMPLETE REPLACEMENT. The maps have exactly two consumers:
+       (a) the six read/write guards, which ask "is this id archived?" — an O(1) membership
+           test used inside per-snapshot loops (~3031, ~2750). Those stay UNTOUCHED and stay
+           O(1); nothing here changes _hybridTombstoned or any predicate.
+       (b) _archivedHistoryFullyLoaded's "has anything ever been archived?" test — moved to
+           D.closedPeriods in the same change (see the note there; moving it is MANDATORY,
+           not optional, or pruning re-opens the B5 cycleHistory defect).
+     The books never read these maps at all — they read BOOK_CACHE.
+
+     WHY THE GUARDS CANNOT BE ASKED ABOUT A PRUNED ENTRY — the load-bearing argument, and it
+     is a property of the QUERY, not a heuristic. Those guards only ever answer about records
+     a listener actually delivers, and the listener delivers exactly two sets (see ~3573):
+     records inside the hot window, and ALL UNSETTLED records of any age. An archived record
+     is settled by definition — _hybridDropArchived requires r.settled===true AND _qOk AND
+     _iOk AND _hybridPeriodClosed(r), all four — so it can only ever arrive through the date
+     window. Condition 2 below guarantees every pruned entry is outside that window.
+
+     WHY 365 DAYS AND NOT THE 60-DAY ARCHIVE AGE. ARCHIVE_MIN_AGE_DAYS=60 but
+     HOT_WINDOW_DAYS=90, so a freshly archived record can be 60-90 days old and STILL be
+     inside the listener's reach — its entry is genuinely needed. The threshold must therefore
+     exceed 90, and it CANNOT be the archive age.
+
+     SET TO 365 ON THE DIRECTOR'S INSTRUCTION (2026-08-19), raised from the 180 this shipped
+     with. The trade, in absolute numbers rather than ratios:
+         120 days -> 1.33x the hot window, device must be offline > 4 months
+         180 days -> 2x    the hot window, device must be offline > 6 months
+         365 days -> 4x    the hot window, device must be offline > 1 YEAR
+     All three are PERMANENTLY FLAT — the growth per archived order is zero in every case, so
+     none of them re-opens the 29 MiB ceiling. What the extra bytes buy is offline margin
+     against the write-side counter-argument documented below.
+
+     MEASURED, not estimated, by _proofB_archive_map_prune.js §6 at 365 days: it simulates
+     1,200 monthly closes at 426 records/month and reports the per-record maps holding
+     265,837 bytes after ten years and 265,837 after a hundred — flat, and only 11,076 entries
+     ever resident. With the 25,291 bytes of period markers and today's 37 KB of live document
+     that is 31.4% OF THE 1,048,576-BYTE CAP, FOREVER, against 23,637,613 bytes (22.5x the cap)
+     unpruned. An earlier draft of this comment estimated ~307 KB from arithmetic; the executed
+     projection says 266 KB, and the measured figure is the one that belongs here.
+     Do not lower this below 91 without re-reading the hot-window argument above.
+
+     THE COUNTER-ARGUMENT, FOUND IN _closePeriod AND NOT DISMISSED. _closePeriod carries a
+     SECOND justification for never pruning these maps, different from the false "the books
+     read them" one corrected above, and this one is REAL:
+        "a device that stays offline past a prune window and then resurrects a plain DELETED
+         record is a minor, obvious nuisance ... Resurrecting an ARCHIVED record is worse: it
+         would silently reintroduce a STALE copy (whatever payment/status state that
+         far-behind device last saw) sitting alongside the correct, already-archived copy."
+     That threat is the WRITE side (a returning device re-publishing its own stale copy), not
+     the read side my hot-window argument covers. It is partially — not wholly — mitigated:
+       * _hybridDropArchived keys on D.closedPeriods, which is NEVER pruned, so a returning
+         device still drops any stale copy whose derived settled===true. That is the common
+         case and it stays fully protected at any age, forever.
+       * The residual hole: a stale copy whose derived settled is FALSE (the far-behind device
+         last saw it unpaid) is not dropped by that path, and with its per-id entry pruned the
+         id-only guard no longer catches it either. It would appear as ONE phantom unpaid row.
+     It cannot be closed by making _hybridDropArchived trust bare period-closure, because an
+     unsettled record dated in a closed period is exactly what a live receivable looks like —
+     that primitive was designed, then REJECTED, for losing money. See the rejection note.
+     So this is an accuracy risk (a visible phantom row a director can delete), traded against
+     the alternative, which is a hard 1 MiB write failure at ~3.2 years of closes. The
+     threshold is therefore a DIRECTOR-OWNED lifespan-vs-safety trade, not an engineering
+     default, and it was put to them as such and DECIDED: 365 days, on the instruction "do
+     recommended so long as its safe doesnt mess up functioning and guarantees future".
+     For scale, that is FOUR TIMES the 90-day window this file already accepts for deletion
+     tombstones on the identical reasoning ("far beyond any realistic phone-left-in-a-drawer
+     scenario"), so a device would have to be offline for a full year, then reconnect rather
+     than be re-logged-in fresh, and hold a stale copy whose derived settled flag is false,
+     before the residual hole is even reachable.
+
+     CONDITION 1 IS WHAT MAKES IT SAFE FOR EXISTING DATA. An entry is prunable only if a
+     closedPeriods marker carrying the SAME _archTs still exists — i.e. the bounded
+     replacement is demonstrably present for that entry. An entry with no matching marker is
+     Build-A-era, has no period equivalent, and is KEPT FOREVER. Today that set is empty
+     (measured: 0 entries, 0 markers) so this branch is dead code on arrival — it exists so
+     that a device holding legacy data can never lose a guard.
+     Proven by _proofB_archive_map_prune.js. Never weaken either condition. */
+  var prunedAO=0,prunedAI=0,keptNoMarker=0;
+  /* Named, not inlined, so the threshold is greppable and so the proof can READ it instead of
+     hardcoding a copy that could silently drift from the code. Deliberately NOT reusing the
+     90-day `cutoff` above: these two retentions answer different questions and must be able to
+     move independently. NOTE for anyone auditing "180" in this file — the two other 180-day
+     figures belong to compactedPaymentIds (90 days to compact + 90 days of tombstone) and are
+     an unrelated mechanism; changing this constant must not touch them. */
+  var ARCHIVE_TOMB_RETENTION_DAYS=365;
+  var _archCutoff=Date.now()-ARCHIVE_TOMB_RETENTION_DAYS*24*60*60*1000;
+  var _markerTs={};
+  if(D.closedPeriods)Object.keys(D.closedPeriods).forEach(function(p){_markerTs[D.closedPeriods[p]]=true;});
+  function _pruneArchMap(map){
+    var n=0;
+    if(!map)return 0;
+    Object.keys(map).forEach(function(k){
+      var ts=map[k];
+      if(!_markerTs[ts]){keptNoMarker++;return;}   // COND 1 — no bounded replacement: keep forever
+      if(!(ts<_archCutoff))return;                 // COND 2 — still within hot window + margin
+      delete map[k];n++;
+    });
+    return n;
+  }
+  prunedAO=_pruneArchMap(D.archivedOrderIds);
+  prunedAI=_pruneArchMap(D.archivedInvoiceIds);
+  if(prunedAO||prunedAI||keptNoMarker){
+    console.log("[NDPRUNE] archive maps — pruned "+prunedAO+" order + "+prunedAI+
+      " invoice id(s) whose period marker is present and older than "+ARCHIVE_TOMB_RETENTION_DAYS+" days"+
+      (keptNoMarker?("; KEPT "+keptNoMarker+" entr(y/ies) with NO matching closedPeriods marker (legacy — never pruned)"):"")+
+      ". closedPeriods="+((D.closedPeriods&&Object.keys(D.closedPeriods).length)||0)+" marker(s) retained.");
   }
   /* Compaction markers age out on the SAME 90-day cycle (2026-08-11, ND47-6a), which is
      what keeps the map itself from becoming a new forever-growing field — the exact problem
@@ -6228,8 +6653,25 @@ function pruneOldTombstones(){
   /* prunedI is in this condition deliberately: dirty() is what persists the pruned map, so
      omitting it would delete invoice tombstones in memory only and let them come straight
      back on the next snapshot — a prune that silently does nothing. */
-  if(prunedO>0||prunedC>0||prunedI>0||prunedP>0){
-    console.log("[NDSYNC] pruneOldTombstones — removed "+prunedO+" order tombstone(s), "+prunedC+" customer tombstone(s), "+prunedI+" invoice tombstone(s), "+prunedP+" payment-compaction marker(s) older than 90 days");
+  /* prunedAO/prunedAI ADDED to this condition (2026-08-19) — and their omission was a REAL
+     DEFECT in the archive-map prune above, caught by reading the comment directly overhead
+     rather than by any test. Without them, a run that pruned ONLY archive-map entries (the
+     common case: the other four maps are on a 90-day cycle, the archive maps on 180 days, so
+     they will routinely fall due on different runs) would delete those entries IN MEMORY
+     ONLY. dirty() would never fire, the pruned map would never be persisted, and the very
+     next snapshot would restore it from the server — "a prune that silently does nothing",
+     exactly as the note above describes for prunedI, and the 1 MiB ceiling would never
+     actually be relieved while every log line claimed it had been.
+     WHY THE PROOF DID NOT CATCH IT: _proofB_archive_map_prune.js drove _pruneArchMap in
+     isolation with an injected clock and asserted the map shrank. It never asked whether the
+     shrink was PERSISTED. That is the same shape as the write-storm miss — a correct branch,
+     tested in isolation, inside a path that did not do what the branch implied. There is now
+     an explicit assertion for this condition in §7 of that suite.
+     keptNoMarker is deliberately NOT in this condition: it counts entries deliberately left
+     alone, so nothing changed and a write would be pure cost. */
+  if(prunedO>0||prunedC>0||prunedI>0||prunedP>0||prunedAO>0||prunedAI>0){
+    console.log("[NDSYNC] pruneOldTombstones — removed "+prunedO+" order tombstone(s), "+prunedC+" customer tombstone(s), "+prunedI+" invoice tombstone(s), "+prunedP+" payment-compaction marker(s) older than 90 days"+
+      ((prunedAO||prunedAI)?(", plus "+prunedAO+" archived-order and "+prunedAI+" archived-invoice id(s) older than "+ARCHIVE_TOMB_RETENTION_DAYS+" days"):""));
     dirty(); // goes through the normal, already-safe debounced write path
   }
 }
@@ -6614,6 +7056,56 @@ function startCloudListener(isWarmRefresh){
          pending, which is the overwhelmingly common case. The fromCache guard itself is
          only READ here; nothing about it is changed. */
       try{if(_pendingNumberCount())_drainPendingNumbers();}catch(_){}
+      /* RETRY THE DEFERRED BACKUP (2026-08-18) — THE MISSING HALF OF THE 2026-08-09 OFFLINE
+         GUARD. runAutoBackup() refuses to run while !_cloudServerConfirmed, to stop every idle
+         logout on a disconnected device parking a full dataset copy in IndexedDB. That guard is
+         right and stays. But it justified itself with "runAutoBackup is already re-fired on a
+         10s timer and ON RECONNECT" — and the reconnect half DID NOT EXIST. The only callers
+         were a 10-second one-shot and a 10-minute interval (both armed by startAutoBackup at
+         login) plus the logout path and the manual button. So the guard could defer a backup
+         and nothing was listening for the moment its blocker cleared.
+         THE WINDOW THAT LEAVES OPEN: a director session that begins on a cold reconnect, takes
+         its 10-second attempt before the server snapshot lands, and ends before the 10-minute
+         interval fires, writes NO backup for that day at all — silently, because success was
+         never logged either (see writeBackup). The 18 Aug 2026 log shows exactly this shape
+         repeatedly: cold reconnect, "NDBACKUP deferred", logout, and the server-confirmed
+         snapshot arriving only AFTERWARDS.
+         WHY HERE: fromCache===false is the same "the server is genuinely talking to us" signal
+         the line above already uses to drain provisional order numbers, for the same reason —
+         it is the precise instant the blocker clears, so it needs no timer of its own. This
+         extends a proven trigger instead of adding a new mechanism.
+         THE "IT CANNOT RUN AWAY" CLAIM THAT USED TO SIT HERE WAS FALSE, AND IT REACHED
+         PRODUCTION (2026-08-19). It read: "runAutoBackup re-checks everything itself ... the
+         per-day stamps ... On a reconnect where today's backup already exists it returns at a
+         date comparison having done ZERO Firestore operations." Every clause was true in
+         isolation and the conclusion was still wrong, because of a function 1,700 lines away:
+         the snapshot merge handler assigns D._lastSodBackupDate FROM THE INCOMING DOCUMENT.
+         A snapshot captured before our stamp-write landed therefore REWOUND the stamp, the
+         date comparison passed a second time, and — because a backup write itself produces a
+         server-confirmed snapshot — this trigger re-armed itself. Dozens of ~700 KB writes in
+         nine minutes, ending in "resource-exhausted: Write stream exhausted maximum allowed
+         queued writes" and 400s that jam ordinary order/payment writes too.
+         LESSON FOR THE NEXT SESSION: a trigger must never fire on a signal that the action it
+         triggers is itself capable of producing, unless something outside both of them bounds
+         the count. Verifying "the guard is present and correct" is not verifying "the value
+         the guard reads cannot be rewritten by someone else mid-flight".
+         FOUR INDEPENDENT BOUNDS NOW, so no single mistake re-opens it:
+           1. _bkRetriedThisSession — this trigger fires at most ONCE per page load. Absolute.
+           2. the own-write skip below — a snapshot caused by our own write never re-arms it.
+           3. runAutoBackup returns early while _bkWriteInFlight() (checked before stamping).
+           4. the merge handler is now MONOTONIC on all three stamps — it can move them
+              forward, never backward, so a stale snapshot cannot rewind today's stamp.
+         Bound 1 alone caps the damage at one extra call per session; 4 removes the cause. */
+      if(!_bkRetriedThisSession){
+        /* Same predicate the snapshot-received handler uses for isOwnWrite. A backup, or the
+           stamp write that follows it, echoes back as a server-confirmed snapshot within
+           milliseconds — that echo must not be read as "the connection just came back". */
+        var _bkOwnEcho=(Date.now()-FB_LAST_LOCAL_WRITE)<5000;
+        if(!_bkOwnEcho){
+          _bkRetriedThisSession=true;
+          try{if(typeof runAutoBackup==="function")runAutoBackup();}catch(_){}
+        }
+      }
     }
     console.log("[NDSYNC] snapshot arrived — _cloudDataConfirmed=true, doc.exists="+doc.exists+", doc.metadata.fromCache="+(doc.metadata&&doc.metadata.fromCache));
     /* PERF FIX (2026-08-01) — FOUND IN LIVE PRODUCTION: login took ~20 s after a
@@ -7666,14 +8158,37 @@ function startCloudListener(isWarmRefresh){
     // record of a recent backup" in its own local memory and would trigger
     // its own redundant one — multiplied across every director login,
     // reconnect, or session-timeout re-entry throughout the day.
-    if(data.D._lastDailyBackup)D._lastDailyBackup=data.D._lastDailyBackup;
-    else if(data._lastDailyBackup)D._lastDailyBackup=data._lastDailyBackup;
-    if(data.D._lastSodBackupDate)D._lastSodBackupDate=data.D._lastSodBackupDate;
-    else if(data._lastSodBackupDate)D._lastSodBackupDate=data._lastSodBackupDate;
-    if(data.D._lastEodBackupDate)D._lastEodBackupDate=data.D._lastEodBackupDate;
-    else if(data._lastEodBackupDate)D._lastEodBackupDate=data._lastEodBackupDate;
-    if(data.D._lastPeriodicBackupAt)D._lastPeriodicBackupAt=data.D._lastPeriodicBackupAt;
-    else if(data._lastPeriodicBackupAt)D._lastPeriodicBackupAt=data._lastPeriodicBackupAt;
+    /* MONOTONIC, NOT LAST-WRITER-WINS (2026-08-19) — THE ROOT CAUSE OF THE WRITE STORM.
+       These four lines used to assign the remote value unconditionally. That is what made a
+       reconnect-triggered backup run away on 2026-08-19: runAutoBackup stamps
+       D._lastSodBackupDate locally and pushes it as a separate small write; a snapshot that
+       was captured BEFORE that write landed then arrived here and REWOUND the stamp to
+       yesterday's value; the "have we backed up today?" comparison passed a second time; and
+       because a backup write itself produces a server-confirmed snapshot, the cycle repeated
+       until Firestore refused with resource-exhausted. See the identical echo-loop lesson
+       recorded ~10 lines below about FB_READY, and the four bounds at the retry trigger.
+       These stamps are pure high-water marks — "the latest point at which a backup is known
+       to have been taken, anywhere in the fleet". For that meaning, moving BACKWARD is always
+       wrong, whoever asks. Cross-device sharing is untouched: a LATER stamp from another
+       device still wins, which is the entire reason they are synced. Date strings are
+       YYYY-MM-DD so a plain string compare orders them correctly; _lastPeriodicBackupAt is
+       epoch ms and compares numerically. Never restore the unconditional form. */
+    function _bkFwdDate(cur,inc){
+      if(!inc)return cur;
+      return (!cur||String(inc)>String(cur))?inc:cur;
+    }
+    function _bkFwdNum(cur,inc){
+      var i=Number(inc)||0,c=Number(cur)||0;
+      return i>c?i:cur;
+    }
+    var _rDaily=(data.D&&data.D._lastDailyBackup)||data._lastDailyBackup;
+    var _rSod  =(data.D&&data.D._lastSodBackupDate)||data._lastSodBackupDate;
+    var _rEod  =(data.D&&data.D._lastEodBackupDate)||data._lastEodBackupDate;
+    var _rPer  =(data.D&&data.D._lastPeriodicBackupAt)||data._lastPeriodicBackupAt;
+    D._lastDailyBackup   =_bkFwdDate(D._lastDailyBackup,_rDaily);
+    D._lastSodBackupDate =_bkFwdDate(D._lastSodBackupDate,_rSod);
+    D._lastEodBackupDate =_bkFwdDate(D._lastEodBackupDate,_rEod);
+    D._lastPeriodicBackupAt=_bkFwdNum(D._lastPeriodicBackupAt,_rPer);
     syncIdCounters();
     syncPaymentStatuses();
     // CRITICAL FIX: this used to unconditionally call scheduleCloudSync() here,
@@ -8933,7 +9448,26 @@ function loadArchivedBooks(cb){
    history — the situation today, before any period has been closed). */
 function _archivedHistoryFullyLoaded(){
   try{
-    var anyArchived=D.archivedOrderIds&&Object.keys(D.archivedOrderIds).length>0;
+    /* 1 MiB CEILING FIX (2026-08-19) — THIS HALF IS MANDATORY, NOT COSMETIC.
+       This test used to ask "has anything ever been archived?" by counting
+       D.archivedOrderIds. The companion change in pruneOldTombstones now ages those
+       per-record entries out, so once a pruned period's entries are gone this test would
+       have answered "nothing was ever archived" -> return true -> "history is fully
+       loaded". syncWaterCycles would then have proceeded on a TRUNCATED order list,
+       recomputed totalBottles from it and rebuilt cu.cycleHistory — destroying the record
+       of completed cycles. That is precisely the B5 defect documented at the top of
+       syncWaterCycles, which this very guard exists to prevent. Pruning without moving this
+       test first would have re-opened it.
+       D.closedPeriods is the correct source and always was: it is written by the SAME
+       _closePeriod transaction that writes the per-record entries (one marker per closed
+       month, ~20 bytes, ~1,200 entries in a century), it is NEVER pruned, and it is what
+       the books themselves are keyed by. Identical answer, permanently bounded.
+       Kept deliberately tolerant of a legacy shape: if a pre-2026-07-31 (Build-A) archive
+       ever left per-record entries with no matching marker, those entries are never pruned
+       (see the marker gate in pruneOldTombstones), so OR-ing the old test in keeps this
+       guard armed for them too. It costs one Object.keys on a bounded map. */
+    var anyArchived=(D.closedPeriods&&Object.keys(D.closedPeriods).length>0)||
+                    (D.archivedOrderIds&&Object.keys(D.archivedOrderIds).length>0);
     if(!anyArchived)return true;
     if(!BOOK_INDEX||!Array.isArray(BOOK_INDEX.periods))return false;   // cannot prove -> refuse
     for(var k=0;k<BOOK_INDEX.periods.length;k++){
@@ -9927,6 +10461,12 @@ function _selfHealFromEventSnapshots(){
     var _healCutoff=Math.max(now-HEAL_RECENT_MS,HEAL_EPOCH_MS);
     var _dismissed={};(D.dismissedMissingOrders||[]).forEach(function(id){_dismissed[id]=true;});
     var _liveOrd={};(D.orders||[]).forEach(function(o){_liveOrd[o.id]=true;});
+    /* SYMMETRY FIX (2026-08-19) — the twin of the outbox-heal site (see the fuller note
+       there). Orders were indexed; the invoice presence test was still a full scan per
+       healed record. Maintained on push for the same reason: the .some it replaces saw
+       invoices added earlier in the same batch, and a stale map would duplicate a
+       receivable. _pmTag preserves the strict x.id===si.id comparison. */
+    var _liveInv={};(D.invoices||[]).forEach(function(i){if(i&&i.id!=null)_liveInv[_pmTag(i.id)]=true;});
     var _healedOrds=[],_healedInvs=[];
     // PASS 1 — pick the LATEST snapshot per order id.
     // FIX (2026-07-29, second look): this originally only read ORDER_PLACED, which
@@ -9998,12 +10538,13 @@ function _selfHealFromEventSnapshots(){
       _healedOrds.push(oid);
       var si=rec.snap.invoice;
       if(si&&si.id!=null&&
-         !(D.invoices||[]).some(function(x){return x.id===si.id;})&&
+         !_liveInv[_pmTag(si.id)]&&
          !(D.deletedInvoiceIds&&D.deletedInvoiceIds[si.id])&&
          !(_recentlyVoidedInvoiceIds&&_recentlyVoidedInvoiceIds[si.id])){
         var _ci=JSON.parse(JSON.stringify(si));
         _ci._healedFrom="event-snapshot";_ci._healedAt=Date.now();
         (D.invoices||[]).push(_ci);
+        _liveInv[_pmTag(si.id)]=true;   // keep the index true to D.invoices — see the note above
         _healedInvs.push(si.id);
       }
     });
@@ -13852,6 +14393,27 @@ function _drainPendingNumbers(force){
     });
     (D.customers||[]).forEach(function(cu){
       (cu&&cu.creditLog||[]).forEach(function(e){if(e&&String(e.ordId)===String(provOid))e.ordId=r.orderId;});
+      /* CYCLE HISTORY (2026-08-18) — PREVIOUSLY MISSED, and it reached production.
+         completeDlv() writes a cycleHistory row {event:"milestone_4"|"cycle_complete",
+         ordId:o.id} at delivery. If a delivery is completed while the order still
+         holds a PROVISIONAL number — which is exactly what happened on 16 Aug 2026,
+         20:17 delivery, 20:18 renumber #1786900663699406 -> #1722 — that row is left
+         pointing at an id this function then TOMBSTONES one screen above.
+         Why that is not merely cosmetic: the water-cycle reconciliation dedupes the
+         old rows against the rebuilt ones on the composite key (ordId|event) — see
+         "(ordId,event) DEDUPE (2026-08-13, round-9 finding S)". A stale ordId misses
+         that key, so the orphan is classed as "order gone, keep for recovery" and
+         SURVIVES ALONGSIDE the rebuilt row: one physical delivery, counted twice in
+         the customer's cycle history. That is round-9 finding S re-entering through
+         the provisional-numbering door.
+         The water cycle is informational only — no free bottle, no entitlement — so
+         this is an ACCURACY defect, not a money one.
+         Found because _drainPendingNumbers repointed three reference collections and
+         this fourth one keys off the order id in exactly the same way; the twin tool
+         _renumberTimestampIds had the identical gap and is fixed in the same pass.
+         Proven by _proofB_renumber_cyclehistory.js (§3 reproduces the duplicate
+         against the shipped dedupe, §4 shows this line collapsing it to one). */
+      (cu&&cu.cycleHistory||[]).forEach(function(h){if(h&&String(h.ordId)===String(provOid))h.ordId=r.orderId;});
     });
     (D.pendingPayments||[]).forEach(function(p){if(p&&String(p.ordId)===String(provOid))p.ordId=r.orderId;});
     /* Move the durable outbox entry onto the real id. The provisional entry may
@@ -17742,6 +18304,15 @@ function _renumberTimestampIds(apply,includeUnsettled){
       var refs=0;
       (D.customers||[]).forEach(function(cu){
         (cu&&cu.creditLog||[]).forEach(function(e){if(e&&String(e.ordId)===oldOid){e.ordId=newOid;refs++;}});
+        /* CYCLE HISTORY (2026-08-18) — the same gap _drainPendingNumbers had, in the
+           structurally identical place. A delivery recorded before the renumber left
+           a cycleHistory row keyed on the OLD order id; the water-cycle reconciliation
+           dedupes on (ordId|event), so a stale id survives alongside the rebuilt row
+           and the delivery is counted twice. Informational-only counter, so this is an
+           accuracy defect. Restored in the rollback below — a forward-only repoint here
+           would be WORSE than none, because a failed renumber would then leave
+           cycleHistory on the new id while everything else went back. */
+        (cu&&cu.cycleHistory||[]).forEach(function(h){if(h&&String(h.ordId)===oldOid){h.ordId=newOid;refs++;}});
       });
       (D.pendingPayments||[]).forEach(function(p){if(p&&String(p.ordId)===oldOid){p.ordId=newOid;refs++;}});
       /* STOCK LEDGER (2026-08-07, b26) — PREVIOUSLY MISSED, and this tool has already been
@@ -17801,6 +18372,12 @@ function _renumberTimestampIds(apply,includeUnsettled){
            Stock history is restored too, because the forward pass now repoints it. */
         (D.customers||[]).forEach(function(cu){
           (cu&&cu.creditLog||[]).forEach(function(en){if(en&&String(en.ordId)===String(newOid))en.ordId=oldOidNum;});
+          /* cycleHistory is restored too, because the forward pass now repoints it
+             (2026-08-18). oldOidNum, not oldOid — completeDlv writes ordId:o.id as a
+             NUMBER, so restoring the string form would leave a type mismatch that the
+             String()-on-both-sides comparisons above would silently tolerate. Same
+             class as the w.o.id and stock-history type bugs already fixed here. */
+          (cu&&cu.cycleHistory||[]).forEach(function(h){if(h&&String(h.ordId)===String(newOid))h.ordId=oldOidNum;});
         });
         (D.pendingPayments||[]).forEach(function(p){if(p&&String(p.ordId)===String(newOid))p.ordId=oldOidNum;});
         (D.stock||[]).forEach(function(st){
@@ -17862,9 +18439,28 @@ function _renumberTimestampIds(apply,includeUnsettled){
 function _repairStaleInvoicePointers(apply){
   if(typeof CU==="undefined"||!CU||CU.role!=="director"){try{toast("Director only","err");}catch(_){}return 0;}
   var fixable=[],ambiguous=[],orphaned=[],healthy=0;
+  /* EFFICIENCY FIX (2026-08-19): the `pointed` lookup below was a full D.invoices scan for
+     EVERY order — O(orders x invoices), 449,568 comparisons on the live data and ~262
+     billion at the 100-year design target. This tool is director-only and manual, so it was
+     never going to be noticed at today's volume; at scale it would simply hang the browser.
+     _byId is keyed with _pmTag so the strict i.id===o.invoiceId comparison is preserved —
+     a plain String() key would start matching numeric 137 to string "137", which the
+     original never did. Lowest array index wins, matching .find's first-match semantics.
+     _linkedInvoicesOf(o.id) is left exactly as it was: it runs only on the miss path (a
+     genuinely stale pointer), which is rare by definition, and it is the canonical linking
+     helper — replacing it would change WHICH invoice this tool re-points to, and that is a
+     money-visible decision this fix has no business touching. */
+  var _rspById={};
+  (D.invoices||[]).forEach(function(i,ix){
+    if(!i)return;
+    var k=_pmTag(i.id);
+    if(_rspById[k]===undefined)_rspById[k]=ix;
+  });
+  var _rspArr=D.invoices||[];
   (D.orders||[]).forEach(function(o){
     if(!o||o.id==null||o.invoiceId==null||o.invoiceId==="")return;
-    var pointed=(D.invoices||[]).find(function(i){return i&&i.id===o.invoiceId;});
+    var _pix=_rspById[_pmTag(o.invoiceId)];
+    var pointed=(_pix===undefined)?undefined:_rspArr[_pix];
     if(pointed){healthy++;return;}
     var linked=[];
     try{linked=_linkedInvoicesOf(o.id);}catch(_){linked=[];}
@@ -20985,11 +21581,50 @@ function syncWaterCycles(){
     return;
   }
   var _wcOrders=ordersWithBooks();
+  /* EFFICIENCY FIX (2026-08-19). This used to run _wcOrders.filter(...) INSIDE the
+     per-customer loop — O(customers x merged orders), and it re-ran is20ltr(o.prod) once
+     per (customer, order) pair rather than once per order. Measured on the live data:
+     450 customers x 669 orders = 300,750 predicate evaluations per call, and this runs from
+     runIntegrityCheck on EVERY director login (~10477).
+
+     THIS ONE IS THE WORST OF THE SET AND ARCHIVING CANNOT HELP IT. Every other scan here
+     shrinks once periods are closed, because closing trims D.orders. This one reads
+     ordersWithBooks() — the merged live+archive history — which is unbounded BY DESIGN
+     (that is the whole point of the books). So it grows forever regardless: ~155 million
+     evaluations at 10 years, and ~1.5 BILLION at the 100-year design target (roughly 3,000
+     customers x 511,000 orders). That is a multi-minute frozen browser on a director login.
+
+     THE FIX, and why it is exactly equivalent. One forward pass over _wcOrders groups the
+     qualifying orders by cId. .filter preserves array order, so a group built by a single
+     forward pass holds the same elements in the same order the filter produced — and the
+     .sort below is then applied to that identical array. Array.prototype.sort has been
+     required to be STABLE since ES2019, so equal keys (same deliveredAt/date) keep the same
+     relative order they had, which is what makes the rebuilt cycleHistory byte-identical
+     rather than merely equivalent. A customer with no water orders must still be processed
+     (totalBottles 0 -> correct 0 -> a stale non-zero waterCycle is reset), so a missing
+     group yields [] exactly as the old filter did — NOT a skipped customer.
+
+     ONE DELIBERATE DIFFERENCE, stated rather than hidden: a null/undefined element in
+     _wcOrders would have made the old filter THROW on o.cId; here it is skipped. _mergeById
+     does not produce holes, so this is unreachable today — it is hardening, not a fix, and
+     it is the only respect in which behaviour differs.
+
+     WATER CYCLE — the director has confirmed the cycle is INFORMATIONAL ONLY: there is no
+     free bottle and no entitlement, so a wrong count is an accuracy bug, never a money bug.
+     (Comments elsewhere in this file call it an entitlement; those are wrong and this note
+     is deliberately not repeating them.) That lowers the blast radius but not the bar —
+     cu.cycleHistory is a customer-visible record, so "equivalent" was not good enough here;
+     it had to be identical. Proven by _proofB_hotpath_index_equivalence.js. */
+  var _wcByCust={};
+  for(var _wi=0;_wi<_wcOrders.length;_wi++){
+    var _wo=_wcOrders[_wi];
+    if(!_wo||_wo.status!=="Delivered"||!is20ltr(_wo.prod))continue;
+    var _wk=_pmTag(_wo.cId);
+    (_wcByCust[_wk]||(_wcByCust[_wk]=[])).push(_wo);
+  }
   var changed=0;
   (D.customers||[]).forEach(function(cu){
-    var waterOrds=_wcOrders.filter(function(o){
-      return o.cId===cu.id&&o.status==="Delivered"&&is20ltr(o.prod);
-    }).sort(function(a,b){
+    var waterOrds=(_wcByCust[_pmTag(cu.id)]||[]).slice().sort(function(a,b){
       var da=a.deliveredAt||a.date||"";var db=b.deliveredAt||b.date||"";
       return da>db?1:da<db?-1:0;
     });
@@ -21221,6 +21856,19 @@ function runIntegrityCheck(){
   // burning the bounded event window the missing-order detector depends on. Counted
   // separately and silently from here.
   var _legacyOrphans=0;
+  /* EFFICIENCY FIX (2026-08-19) — built once here, used inside the loop below.
+     THE ONE THING THAT MAKES THIS SAFE, because it is NOT a pure refactor:
+     _getOrdByIdIndex() is BOOK-AWARE (it merges ordersWithBooks() when a book is loaded),
+     whereas the (D.orders||[]).find it replaces searched LIVE orders only. So in general the
+     two can disagree — an archived order is absent from D.orders but present in the index.
+     They cannot disagree HERE, and the reason is the line immediately below: this loop skips
+     every invoice that is paid or voided, so only UNSETTLED invoices ever reach the lookup,
+     and an unsettled invoice's order can never have been archived (archive RULE 1 requires
+     the invoice settled first, RULE 2 moves the pair together). That is the identical
+     argument the header comment on _getOrdByIdIndex makes for custDebt. If a future change
+     ever lets a settled invoice reach that lookup, this substitution stops being equivalent
+     and must be revisited — hence this note rather than a silent swap. */
+  var _icOrdIdx=(typeof _getOrdByIdIndex==="function")?_getOrdByIdIndex():{};
   (D.invoices||[]).forEach(function(inv){
     if(inv.paid>=inv.amount||inv.voided)return; // paid or voided — ignore
     if(_isLegacyRecord(inv.date)){_legacyOrphans++;return;} // history — do not re-alert
@@ -21230,7 +21878,17 @@ function runIntegrityCheck(){
        naming a number that was never an order id — while the real link went unchecked. */
     var _oidIC=_linkedOrderIdOf(inv);
     if(_oidIC!=null){
-      var _oIC=(D.orders||[]).find(function(x){return String(x.id)===String(_oidIC);});
+      /* EFFICIENCY FIX (2026-08-19): was (D.orders||[]).find(...) — a full order scan per
+         open invoice, i.e. O(open invoices x orders) on a function that runs from
+         runIntegrityCheck on every director login. _icOrdIdx below is the SAME
+         _getOrdByIdIndex() that custDebt and _invoiceOrderActive already resolve orders
+         through, so this site now agrees with them by construction instead of by
+         coincidence. The lookup is keyed String(id) to preserve the original
+         String(x.id)===String(_oidIC) comparison exactly — the index is keyed by raw id,
+         and JS object keys are strings, so idx[_oidIC] performs that same coercion. Check 2
+         directly above already used a one-pass index (custIds); this site was simply never
+         converted. */
+      var _oIC=_icOrdIdx[_oidIC];
       if(!_oIC)issues.push("Invoice #"+inv.id+" references deleted order #"+_oidIC+" — KSh "+((Number(inv.amount)||0)-(Number(inv.paid)||0))+" outstanding");
     }
   });
@@ -21315,6 +21973,17 @@ function syncIdCounters(){
 }
 function syncPaymentStatuses(){
   // Fix any order whose payment badge doesn't match its invoice reality
+  /* EFFICIENCY FIX (2026-08-19) — the inner (D.invoices||[]).find below is now resolved
+     through _getInvForOrderIndex(), built ONCE per call instead of scanned once per order.
+     Same answer, including which invoice wins when several match: see the long equivalence
+     note above _getInvForOrderIndex, and _proofB_hotpath_index_equivalence.js, which drives
+     the ORIGINAL predicate and this index over the same adversarial rows and asserts an
+     identical invoice object per order. Was O(orders x invoices) — 449,568 evaluations on
+     the live data (669 x 672, measured 2026-08-19); at the measured 14 orders/day that is
+     ~2.7 BILLION at 10 years and ~262 BILLION at the 100-YEAR design target (511,000
+     orders x 512,000 invoices) — on a function that runs from runIntegrityCheck on every
+     director login. Now O(orders + invoices): ~1.02 million at century volume, once. */
+  var _pmIdx=_getInvForOrderIndex();
   (D.orders||[]).forEach(function(o){
     // A Cancelled order's label ("Partial" if something was paid, "Cancelled"
     // if not) is set deliberately by _finishCancelO() and must not be
@@ -21323,18 +21992,23 @@ function syncPaymentStatuses(){
     // otherwise make this function see "fully paid" and silently relabel a
     // cancelled order as "Paid", masking the fact that it was cancelled.
     if(o.status==="Cancelled")return;
-    var inv=(D.invoices||[]).find(function(i){
-      /* STALE POINTER (2026-08-12) — this tried o.invoiceId first and fell back to the notes
+    /* STALE POINTER (2026-08-12) — this tried o.invoiceId first and fell back to the notes
        scrape ONLY when the pointer was falsy. A pointer that is present but DEAD (the
        #1476/#1477 case this codebase documents, where invoiceId survived a renumber and
        pointed at a deleted invoice) skipped the fallback and resolved to null. Executed:
        stale pointer + perfectly valid notes -> NULL, while the canonical helper found
        #2001; in syncPaymentStatuses that left a fully-paid order reading Unpaid.
        Now: try the pointer, and if it does not RESOLVE, fall through to the canonical
-       helper instead of giving up. */
-      return i.cId===o.cId&&(i.id===o.invoiceId||String(i.orderId)===String(o.id)||
-        (i.orderId==null&&i.notes&&_linkedInvoicesOf(o.id,[i]).length>0));
-    });
+       helper instead of giving up.
+       2026-08-19: that rule is UNCHANGED — all three routes are still ORed and the same
+       invoice still wins. What changed is that they are pre-indexed rather than re-scanned
+       per order. The predicate it replaces was, verbatim:
+         i.cId===o.cId && ( i.id===o.invoiceId
+                         || String(i.orderId)===String(o.id)
+                         || (i.orderId==null && i.notes
+                             && _linkedInvoicesOf(o.id,[i]).length>0) )
+       kept here in full because the index is only correct so long as it keeps matching it. */
+    var inv=_invForOrder(o,_pmIdx);
     // Same principle applies to a voided invoice — voidInvoice._confirm()
     // deliberately sets o.paid="Voided" so the write-off is visible on the
     // Orders page, not just buried in the Invoices list. This function used
@@ -21506,7 +22180,129 @@ function loadFirebase(cb){
   }
   trySet();
 }
+/* ===========================================================================
+   STALE-BUILD SELF-REFRESH                                     (2026-08-19)
+
+   THE PROBLEM. Deployment is a manual upload; a device only picks up a new build
+   when it reloads. The director's laptop reloads on every upload, but a staff phone
+   that is left open for weeks keeps running old code indefinitely. A mixed fleet is
+   a real risk: it is how a device ends up not seeing another device's new orders.
+   Measured habit (director, 2026-08-19): most devices reload every 2-3 days anyway,
+   so this only ever fires for a genuinely dormant one.
+
+   WHERE IT RUNS, AND WHY HERE. First statement of the window "load" handler —
+   BEFORE renderConnecting(), BEFORE loadFirebase(), BEFORE any Firestore work and
+   before anyone has logged in. That placement is the whole safety argument:
+     * nothing is logged in, so no session is lost and no PIN re-entry is forced;
+     * no listener has been attached, so a reload throws away no subscription;
+     * nothing is dirty in memory, so no unsaved edit can be lost;
+     * queued offline writes live in IndexedDB, which SURVIVES a reload by design
+       (that is what enableMultiTabIndexedDbPersistence buys) — so a phone holding
+       an unsynced order does not lose it.
+   Cost: two localStorage reads and one write per boot. ZERO Firestore reads, zero
+   writes, no effect on the zero-read boot.
+
+   THE ONE THING THAT WOULD BE WORSE THAN A STALE BUILD, and why navigator.onLine
+   is a hard gate: if this reloads a phone that is offline and the browser has not
+   cached the HTML, the app is simply GONE until connectivity returns — a driver
+   mid-round with no system at all. A stale build still takes orders. So an offline
+   device is NEVER reloaded, at any age. It will refresh on its next online boot.
+
+   WHY IT CANNOT LOOP — and this is the write-storm lesson in a new costume: never
+   trigger an action on a signal the action itself reproduces unless something
+   outside bounds it. Two independent bounds, either sufficient alone:
+     1. nd_last_boot is stamped BEFORE the reload is issued, so the very next boot
+        reads a fresh timestamp and the age test fails. Note the ordering in the
+        code: `last` is captured into a local FIRST, then the key is overwritten, so
+        the comparison still uses the OLD value on this pass.
+     2. nd_reload_at is an independent cooldown — at most one attempt per hour no
+        matter what else happens, including a reload that never completes.
+   If localStorage is unavailable the function does nothing at all.
+
+   WHY THE fetch() BEFORE THE RELOAD. location.reload() revalidates, and whether it
+   returns new bytes depends on the host's cache headers, which cannot be verified
+   from here. `fetch(href,{cache:"reload"})` bypasses the HTTP cache, so the fresh
+   HTML is in cache before the reload consumes it — no "?v=" cache-buster, so
+   nothing is left in the address bar to confuse staff and the origin is unchanged
+   (localStorage and IndexedDB are keyed by origin and are preserved). It costs one
+   extra HTML fetch, once per 7 days per dormant device — egress, not Firestore
+   reads. On any fetch failure it falls through to a plain reload rather than
+   stranding the device.
+
+   TWO TRIGGERS ARE NEEDED, and the second is the one that actually matters.
+   A page-load check alone MISSES the very device it is aimed at: a phone whose tab is
+   left open for weeks resumes from the background pause WITHOUT a page load (see
+   KEEP_COLLECTIONS_ON_BACKGROUND), so a load-time check would never once fire on it.
+     TRIGGER A — page load, device was CLOSED longer than the limit. Runs pre-login,
+       so it is unconditionally safe and reloads silently.
+     TRIGGER B — the tab has been OPEN longer than the limit and the user has just
+       come back to it. This one can find a logged-in session, so it is gated on
+       `!CU` — logged out only. That is not a rare state: this app idle-logs-out (see
+       the idle-logout backup path), so a long-lived tab returns to logged-out
+       regularly and the refresh lands on the next visibility change after that.
+       NEVER reload a logged-in user here: a half-typed order or payment would be
+       destroyed to fix a problem that is not urgent. A stale build still takes orders.  */
+var BUILD_REFRESH_MAX_AGE_MS=7*24*60*60*1000;   // dormant/open longer than this -> refresh
+var BUILD_RELOAD_COOLDOWN_MS=60*60*1000;        // bound 2: one attempt per hour, absolute
+var _ndBootAt=Date.now();                        // for TRIGGER B: how long this tab has been open
+/* The single reload path both triggers share, so the loop guards and the offline gate
+   can only ever be written once. Returns true if a reload is under way. */
+function _ndTryStaleReload(ageMs,why){
+  try{
+    if(typeof localStorage==="undefined"||!localStorage)return false;
+    var now=Date.now();
+    var tried=parseInt(localStorage.getItem("nd_reload_at")||"0",10)||0;
+    if(now-tried<BUILD_RELOAD_COOLDOWN_MS){             // BOUND 2
+      console.log("[NDBUILD] "+why+" "+Math.round(ageMs/86400000)+" days, but a refresh was already attempted "+
+        Math.round((now-tried)/60000)+" min ago — standing down (loop guard).");
+      return false;
+    }
+    if(!navigator.onLine){                             // HARD GATE — never strand a device
+      console.log("[NDBUILD] "+why+" "+Math.round(ageMs/86400000)+" days, but this device is OFFLINE. "+
+        "NOT reloading — a stale build still takes orders; a device with no cached HTML would have nothing. "+
+        "It will refresh on its next online start.");
+      return false;
+    }
+    localStorage.setItem("nd_reload_at",String(now));
+    console.log("[NDBUILD] "+why+" "+Math.round(ageMs/86400000)+" days (limit "+
+      Math.round(BUILD_REFRESH_MAX_AGE_MS/86400000)+"). Fetching the current build and reloading once, "+
+      "while logged out, so no session or unsaved work is affected. Offline writes survive in IndexedDB.");
+    try{
+      fetch(location.href,{cache:"reload"}).then(function(){location.reload();})
+        .catch(function(){location.reload();});
+    }catch(_){location.reload();}
+    return true;
+  }catch(_){return false;}
+}
+/* TRIGGER A — at page load. */
+function _staleBuildSelfRefresh(){
+  try{
+    if(typeof localStorage==="undefined"||!localStorage)return false;
+    var now=Date.now();
+    var last=parseInt(localStorage.getItem("nd_last_boot")||"0",10)||0;
+    localStorage.setItem("nd_last_boot",String(now));   // BOUND 1 — stamp before deciding
+    if(!last)return false;                              // first boot ever on this device
+    var ageMs=now-last;
+    if(ageMs<BUILD_REFRESH_MAX_AGE_MS)return false;     // started recently — the normal case
+    return _ndTryStaleReload(ageMs,"this device was last started");
+  }catch(_){return false;}
+}
+/* TRIGGER B — a long-lived tab coming back into view. Logged out ONLY. Costs one
+   subtraction per visibility change; no storage read unless it actually fires. */
+document.addEventListener("visibilitychange",function(){
+  try{
+    if(document.visibilityState!=="visible")return;
+    var upMs=Date.now()-_ndBootAt;
+    if(upMs<BUILD_REFRESH_MAX_AGE_MS)return;            // open, but not long enough
+    if(typeof CU!=="undefined"&&CU)return;              // logged in — never interrupt real work
+    _ndTryStaleReload(upMs,"this tab has been open");
+  }catch(_){}
+});
 window.addEventListener("load",function(){
+  /* FIRST statement — see the block above. Returns true only when a reload is under
+     way, in which case there is no point starting Firebase for a page about to be
+     replaced (that would attach listeners and then discard them). */
+  if(_staleBuildSelfRefresh())return;
   renderConnecting();
   loadFirebase(function(err){
     if(err){
