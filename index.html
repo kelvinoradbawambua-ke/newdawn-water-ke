@@ -6102,6 +6102,50 @@ function _hideCloudOfflineBanner(){
    path and index entries too), and a backup that fails is worth far less than one that carries
    slightly less history. */
 var BACKUP_BUDGET_BYTES=750*1024;
+/* BACKUP_AUDIT_MAX (2026-08-20) — MEASURED IN PRODUCTION, NOT ESTIMATED.
+   THE DEFECT. The backup carried the audit log at its LIVE ceiling, AUDIT_HOT_MAX=200
+   entries, and at ~800 bytes an entry that is ~19% of the entire backup budget spent on a
+   diagnostic log. The director's backup went PARTIAL on 2026-08-20 and dropped 255 settled
+   records because of it. The packer's own manifest, read out of the written document:
+       total 767,985 of a 768,000 budget   <- 15 bytes spare; it genuinely ran out
+       orders    274,910 (563 of 687 kept)
+       customers 183,913
+       auditLog  143,838                   <- THIS. 19% of the budget.
+       invoices  139,679 (557 of 688 kept)
+       stock      14,958 · pendingPayments 7,694
+   The 255 dropped records total 74,883 bytes (44,578 orders + 30,305 invoices — older
+   records are smaller than the ones kept). Trimming the log to 20 entries frees ~130 KB,
+   which covers that 75 KB and leaves ~57 KB spare, so the backup returns to COMPLETE.
+
+   WHY THIS WAS INVISIBLE UNTIL NOW. The main-document composition line printed
+   "auditLog 13KB(20)" at 05:51 while the backup two minutes later measured 143,838 bytes.
+   Both were correct: the main doc is written early in boot, and the events listener then
+   refills D.auditLog from newdawn_events toward AUDIT_HOT_MAX. So the size that mattered
+   was never the one on screen. Anyone diagnosing this from the composition log alone will
+   conclude the audit log is 13 KB and be wrong by a factor of ten.
+
+   WHY 20 IS SAFE, i.e. why this is not throwing away the audit trail. newdawn_events IS
+   the durable audit trail, on a 730-day retention (see EVENT_RETENTION_DAYS), and both
+   event read paths are capped at the newest 50 documents anyway. D.auditLog is a local
+   display cache refilled from that collection on every boot. What the backup needs to
+   carry is the money — orders, invoices, customers — not a re-derivable log.
+   AUDIT_HOT_MAX is deliberately NOT changed: it governs the live doc and the audit screen,
+   which is a different question from what a disaster-recovery copy has to hold.
+
+   WHY THE base!==D GUARD. The base copy above falls back to `base=D` if the property loop
+   throws. On that path `base` and `D` are the SAME OBJECT, so assigning base.auditLog would
+   replace the live in-memory audit log with a 20-entry slice and the next write would
+   persist that loss. `.slice()` itself is safe — it returns a new array and never mutates —
+   but the ASSIGNMENT is not, so it is gated. Backup size is an optimisation; live data is
+   not. If that path is ever taken the backup is simply larger, which is the correct way to
+   lose this trade.
+   NOTE FOR A FUTURE SESSION: the pre-existing `base.orders=[]` / `base.invoices=[]` lines
+   below have this same hazard on that same fallback path and are NOT guarded. That is a
+   real latent bug, not a style point — it would empty the live orders array. It is left
+   alone here deliberately: the loop is a for-in over a plain object and cannot throw, so
+   the path is unreachable, and widening this change into the shared money-write path to fix
+   an unreachable case is the wrong trade in a build about backup size. Fix it on its own. */
+var BACKUP_AUDIT_MAX=20;
 /* Is this record settled? Answered by _hybridDerive, the CANONICAL rule used by the archive
    drop path, rather than restated here — two definitions of "settled" would drift, and this
    file has been bitten by exactly that (finding Q: the write side and the drop side disagreed).
@@ -6135,6 +6179,10 @@ function getBackupPayload(){
   var base={};
   try{for(var k in D){if(Object.prototype.hasOwnProperty.call(D,k))base[k]=D[k];}}catch(_){base=D;}
   base.orders=[];base.invoices=[];
+  /* Trim the audit log OUT OF THE BACKUP COPY ONLY — see BACKUP_AUDIT_MAX. slice() returns
+     a new array, so D.auditLog is never touched; the base!==D guard covers the fallback
+     path above where the two would be the same object. */
+  if(base!==D)base.auditLog=(D.auditLog||[]).slice(-BACKUP_AUDIT_MAX);
   var payload={
     D:base,USERS:USERS,nOId:nOId,nIId:nIId,nCId:nCId,
     setupDone:FB_SETUP_DONE,
