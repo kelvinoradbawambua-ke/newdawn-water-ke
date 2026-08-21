@@ -1812,6 +1812,49 @@ var HYBRID_CUSTOMERS_LIVE=true;
    path and nothing below runs. Turning it on is a deliberate, audited act.
    ============================================================================ */
 var HYBRID_DELTA_SYNC_LIVE=true;
+/* PERSISTENCE_MODERN_CACHE_LIVE (2026-08-21) — BUILT, SHIPPED OFF, ON THE DIRECTOR'S
+   INSTRUCTION TO REMOVE ANY 100-YEAR RISK FROM THE DEPRECATION WARNING.
+
+   THE WARNING. Every boot logs:
+     "Firestore (10.12.2): enableMultiTabIndexedDbPersistence() will be deprecated in the
+      future, you can use FirestoreSettings.cache instead."
+   It is a notice, not a fault — the very next line is "offline persistence ENABLED
+   (multi-tab)". Nothing is broken today and, because the SDK is pinned (see the
+   firebasejs/10.12.2 URLs and the matching guard in _build_nd47.js), no date arrives when
+   it breaks by itself.
+
+   WHY THIS COULD NOT SIMPLY BE ADDED AS ANOTHER FALLBACK RUNG — the reason this flag
+   exists at all. `enablePersistence()` is called AFTER `firebase.firestore()` returns.
+   `FirestoreSettings.cache` is INITIALISATION-TIME ONLY: it must be supplied via
+   settings() before the instance is used for anything, and calling enablePersistence()
+   afterwards throws. So the replacement is not a fallback, it is a different boot path.
+   An earlier draft of this fix tried to add it as a fifth rung in the ladder below; that
+   code would have been unreachable-or-wrong, which is worse than no code. Written down
+   because the next session will have the same instinct.
+
+   WHY IT SHIPS OFF. What persistence buys is the durable IndexedDB write queue — the
+   difference between "the order survives a tunnel, a screen-lock and a reload" and "the
+   order existed only in RAM". That is the most money-critical mechanism in this file. The
+   new path cannot be verified from a code reading: whether this compat build even exposes
+   firebase.firestore.persistentLocalCache is an observation, not a deduction, and proving
+   the queue still survives needs a real device taken offline mid-write. Shipping it ON
+   untested would gamble the offline queue to silence a cosmetic log line. So it is built,
+   reviewed and inert — the same pattern HYBRID_COLLECTIONS_LIVE used through its cutover.
+
+   HOW TO TURN IT ON, when someone is willing to run the test:
+     1. Set this to true in a VALIDATE build (node _build_nd47.js --test).
+     2. Open it. The boot must log "offline persistence via FirestoreSettings.cache
+        (modern)" and NOT the deprecation warning. If it logs
+        "MODERN CACHE UNAVAILABLE", this SDK build does not expose the API and the answer
+        is no — leave the flag off, nothing is lost.
+     3. THE TEST THAT ACTUALLY MATTERS: log in, go offline (devtools Network → Offline, or
+        aeroplane mode on a phone), take an order, reload the page while still offline, then
+        come back online. The order must appear in Firestore. If it does not, the durable
+        queue is gone and this flag must go straight back to false.
+     4. Repeat with two tabs open, which is what the multi-tab manager is for.
+   Only after step 3 passes on a real device is this safe to ship on. Until then, false is
+   the correct value and the warning is the correct cost. */
+var PERSISTENCE_MODERN_CACHE_LIVE=false;
 /* How old an index/watermark may be before it is refused and a full load is taken
    instead. A device that has been off for longer than this cannot trust its baseline:
    too much may have changed, and — more importantly — a record DELETED while it was
@@ -6146,6 +6189,41 @@ var BACKUP_BUDGET_BYTES=750*1024;
    the path is unreachable, and widening this change into the shared money-write path to fix
    an unreachable case is the wrong trade in a build about backup size. Fix it on its own. */
 var BACKUP_AUDIT_MAX=20;
+/* BACKUP_MUSTKEEP_CEILING (2026-08-21) — MAKES "A RECEIVABLE IS NEVER DROPPED" TRUE.
+
+   THE DEFECT, measured. Tier 1 adds every unsettled order and invoice before any settled one,
+   and that is what the "no receivable is ever dropped" promise rests on. But tier 1 checked
+   the SAME 750 KB soft budget as tier 2:
+       if(mustKeep&&(used+cost)>BACKUP_BUDGET_BYTES){unsettledOmitted++;return false;}
+   `used` is seeded with the whole payload base — which includes the ENTIRE customer array,
+   untiered, untrimmed and never budget-checked. So the promise was conditional on the base
+   fitting, and nobody had checked what happens when it stops fitting.
+
+   THE NUMBERS (customer 407.8 B, order 488.3 B, invoice 250.8 B, all from the manifest of
+   sod-2026-08-20; non-customer base 23,483 B):
+       451 customers (today) -> base 207,396 B -> room for 758 order+invoice pairs
+     1,000 customers         -> base 431,272 B -> room for 455 pairs
+     1,500 customers         -> base 635,167 B -> room for 179 pairs
+     1,825 customers         -> base 767,699 B -> room for ZERO, AND EVERY RECEIVABLE REFUSED
+   D.customers is never archived, so this counts every customer ever recorded, not the active
+   ones. At 1,825 the daily backup would contain a customer list and no money at all, with
+   only `unsettledOmitted` quietly counting what was lost.
+
+   THE FIX. Tier 2 (settled history, discretionary) keeps the 750 KB soft budget — that
+   headroom is deliberate and protects against Firestore's 1,048,576 B hard limit, which this
+   project has hit before and which silently stopped backups. Tier 1 (money owed, not
+   discretionary) now gets its own, higher ceiling. A receivable is only ever dropped when it
+   genuinely cannot fit in a Firestore document, not because settled history and a customer
+   list got there first.
+   1,000,000 leaves ~48 KB under the hard cap for the manifest, the id counters and USERS,
+   all of which are written after the tiers run.
+
+   WHAT THIS DOES NOT FIX, stated plainly: an unbounded customer array inside a bounded
+   document. This buys headroom (the receivable guarantee now holds to ~2,395 customers
+   instead of 1,825) and makes the failure loud rather than silent. The structural answer is
+   still to bound the live set — closing periods into newdawn_books — or to split the backup
+   across documents. Neither is a one-line change and neither should be improvised. */
+var BACKUP_MUSTKEEP_CEILING=1000000;
 /* Is this record settled? Answered by _hybridDerive, the CANONICAL rule used by the archive
    drop path, rather than restated here — two definitions of "settled" would drift, and this
    file has been bitten by exactly that (finding Q: the write side and the drop side disagreed).
@@ -6177,7 +6255,25 @@ function _bkLen(o){try{return JSON.stringify(o).length+1;}catch(_){return 0;}}
 function getBackupPayload(){
   var ordAll=(D.orders||[]),invAll=(D.invoices||[]);
   var base={};
-  try{for(var k in D){if(Object.prototype.hasOwnProperty.call(D,k))base[k]=D[k];}}catch(_){base=D;}
+  /* THE FALLBACK NO LONGER ALIASES D (2026-08-21). It used to be `catch(_){base=D;}`, which
+     made `base` and `D` the SAME OBJECT — and the very next line does `base.orders=[]`, so on
+     that path the live in-memory orders and invoices arrays would have been EMPTIED, and the
+     next write would have persisted the loss. It was documented as unreachable (a for-in over
+     a plain object cannot throw) and left alone yesterday as out of scope. The director's
+     instruction on 2026-08-21 was to close anything that risks the 100-year goal, and a
+     landmine sitting one line from a fix for the same class of bug qualifies.
+     Now the fallback builds a SECOND independent copy instead. If even that fails, base stays
+     an empty object: the backup is then degraded (no customers/stock) but the tiers still add
+     the money records, and — the point — live data cannot be touched either way. A degraded
+     backup is recoverable; a wiped D.orders is not. */
+  try{for(var k in D){if(Object.prototype.hasOwnProperty.call(D,k))base[k]=D[k];}}
+  catch(_){
+    base={};
+    try{Object.keys(D||{}).forEach(function(k2){try{base[k2]=D[k2];}catch(_2){}});}catch(_3){}
+    console.log("[NDBACKUP] payload base copy fell back to the defensive path"+
+      (Object.keys(base).length?"":" AND CAME OUT EMPTY — this backup will carry the money records but not customers/stock")+
+      ". Live data was not touched.");
+  }
   base.orders=[];base.invoices=[];
   /* Trim the audit log OUT OF THE BACKUP COPY ONLY — see BACKUP_AUDIT_MAX. slice() returns
      a new array, so D.auditLog is never touched; the base!==D guard covers the fallback
@@ -6209,8 +6305,11 @@ function getBackupPayload(){
     for(var x=0;x<linked.length;x++){
       if(linked[x]&&linked[x].id!=null&&!invTaken[String(linked[x].id)]){group.push(linked[x]);cost+=_bkLen(linked[x]);}
     }
+    /* Tier 2 (settled history) keeps the soft budget; tier 1 (money owed) gets the higher
+       ceiling. See BACKUP_MUSTKEEP_CEILING — the promise that a receivable is never dropped
+       used to be conditional on the untiered customer array leaving room. */
     if(!mustKeep&&(used+cost)>BACKUP_BUDGET_BYTES)return false;
-    if(mustKeep&&(used+cost)>BACKUP_BUDGET_BYTES){unsettledOmitted++;return false;}
+    if(mustKeep&&(used+cost)>BACKUP_MUSTKEEP_CEILING){unsettledOmitted++;return false;}
     ordTaken[String(o.id)]=true;base.orders.push(o);noteDate(o);
     for(var y=1;y<group.length;y++){invTaken[String(group[y].id)]=true;base.invoices.push(group[y]);noteDate(group[y]);}
     used+=cost;return true;
@@ -6218,7 +6317,10 @@ function getBackupPayload(){
   function tryAddInvoice(i,mustKeep){
     if(!i||i.id==null||invTaken[String(i.id)])return false;
     var cost=_bkLen(i);
-    if((used+cost)>BACKUP_BUDGET_BYTES){if(mustKeep)unsettledOmitted++;return false;}
+    /* Same split as tryAddOrder. This one branch served both tiers, so an unsettled invoice
+       with no linked order — the shape a standalone receivable takes — was refused on the
+       soft budget too. */
+    if((used+cost)>(mustKeep?BACKUP_MUSTKEEP_CEILING:BACKUP_BUDGET_BYTES)){if(mustKeep)unsettledOmitted++;return false;}
     invTaken[String(i.id)]=true;base.invoices.push(i);noteDate(i);used+=cost;return true;
   }
   /* TIER 1 — every unsettled record, any age. Money first. */
@@ -6258,6 +6360,24 @@ function getBackupPayload(){
       "collections and in the closed-period books. Restoring this backup MERGES: anything it "+
       "does not mention is left alone, never deleted."
   };
+  /* EARLY WARNING (2026-08-21) — the customer array is the one part of this payload with no
+     tier, no trim and no budget check, and it is never archived. It is charged to `used`
+     before a single record is packed, so it silently sets the ceiling on how much money
+     history the backup can hold. At 1,825 customers it consumes the whole budget and even
+     tier 1 starts refusing (see BACKUP_MUSTKEEP_CEILING). This line makes that visible years
+     ahead instead of on the morning it happens. Logged only past 50% so it is a signal, not
+     noise, and it computes nothing the manifest did not already measure. */
+  try{
+    var _custB=_bkLen(base.customers),_share=_custB/BACKUP_BUDGET_BYTES;
+    if(_share>0.5){
+      console.log("[NDBACKUP] HEADS UP — the customer list is now "+Math.round(_custB/1024)+" KB, "+
+        Math.round(_share*100)+"% of the "+Math.round(BACKUP_BUDGET_BYTES/1024)+" KB backup budget, from "+
+        ((base.customers||[]).length)+" customers. Customers are never archived and are not budget-checked, "+
+        "so this directly reduces how much order/invoice history a backup can carry. Receivables are still "+
+        "protected to "+Math.round(BACKUP_MUSTKEEP_CEILING/1024)+" KB. The structural fix is to bound the live "+
+        "set (close periods into newdawn_books) or split the backup across documents.");
+    }
+  }catch(_){}
   return payload;
 }
 /* IN-FLIGHT MARKER (2026-08-19) — ADDED AFTER A PRODUCTION WRITE STORM.
@@ -6787,7 +6907,27 @@ function pruneOldTombstones(){
      move independently. NOTE for anyone auditing "180" in this file — the two other 180-day
      figures belong to compactedPaymentIds (90 days to compact + 90 days of tombstone) and are
      an unrelated mechanism; changing this constant must not touch them. */
-  var ARCHIVE_TOMB_RETENTION_DAYS=365;
+  /* 365 -> 180 ON 2026-08-21, AND THE REASON IS THAT MY EARLIER FIGURE WAS CALCULATED AT THE
+     WRONG VOLUME. When this moved 180 -> 365 earlier the same day, the projection said the maps
+     stay flat at ~266 KB. That was computed at the MEASURED 14 orders/day. The director then
+     stated the real operating ceiling: 20-30 orders/day. Re-projected on those numbers, with
+     ~30 bytes per archived id and two ids per order:
+         retention   20/day        25/day        30/day
+         365 days    464 KB (45%)  571 KB (56%)  678 KB (66%)   <- of the 1,048,576 B cap
+         180 days    247 KB (24%)  300 KB (29%)  352 KB (34%)
+     At 30 orders/day a 365-day window would spend two thirds of the main document on a lookup
+     table, and that document also carries stock, pendingPayments, the audit log and every
+     tombstone map. 180 days leaves real room.
+     NOTHING IS LOST BY SHORTENING IT. These maps only record WHICH records a closed period owns.
+     The records themselves stay in /orders and /invoices AND gain a second copy in
+     newdawn_books when the period closes — see _closePeriod, which writes to the books and
+     deliberately forgets the shadow entry so the reaper never deletes the document. Pruning an
+     entry here removes a pointer, not a record.
+     WHY 180 IS STILL SAFE AS A WINDOW: the entry only has to outlive the possibility of a stale
+     device re-offering an archived record to hydration. The hot listener window is 90 days, so
+     180 is double it, and the still-needed marks added on 2026-08-20 independently protect any
+     id a listener is actually still delivering. */
+  var ARCHIVE_TOMB_RETENTION_DAYS=180;
   var _archCutoff=Date.now()-ARCHIVE_TOMB_RETENTION_DAYS*24*60*60*1000;
   var _markerTs={};
   if(D.closedPeriods)Object.keys(D.closedPeriods).forEach(function(p){_markerTs[D.closedPeriods[p]]=true;});
@@ -9858,6 +9998,37 @@ function _closePeriod(period,cb){
       invoices:mergedInvoices
     };
     FB_BOOKS_COL.doc(bookDocId(period)).set(payload,{merge:true}).then(function(){
+      /* READ-BACK VERIFICATION (2026-08-21) — added before this mechanism is used for the
+         first time on live money. `closedPeriods` is still 0: nothing has ever been archived
+         in production, so the one thing that must not be assumed is that a resolved .set()
+         means the books actually hold the records.
+         WHY A RESOLVED WRITE IS NOT ENOUGH. With offline persistence enabled, a write resolves
+         against the LOCAL IndexedDB queue and is replayed later. That is exactly the property
+         that makes orders survive a tunnel — and it means .then() can fire on a device whose
+         book document has not reached Firestore at all. The code below then removes those
+         records from D. Everything downstream is careful and correct, but all of it rests on
+         the books being real.
+         So: force a SERVER read of the document just written and confirm it holds at least
+         what we expect, before anything is removed from the live arrays. If the read fails,
+         the document is missing, or the counts are short, this THROWS — which lands in the
+         existing .catch() below, and D is never touched. The period simply stays open and the
+         director can retry. One extra read, on a rare, deliberate, director-triggered action.
+         Note >= not ===: the books are merged with {merge:true} and may legitimately already
+         contain records from an earlier close of the same period. Short is a failure; extra
+         is normal. */
+      return FB_BOOKS_COL.doc(bookDocId(period)).get({source:"server"}).then(function(_vdoc){
+        if(!_vdoc||!_vdoc.exists)
+          throw new Error("read-back FAILED: the book document for "+period+" is not on the server after the write");
+        var _vd=_vdoc.data()||{};
+        var _vo=(_vd.orders||[]).length,_vi=(_vd.invoices||[]).length;
+        if(_vo<mergedOrders.length||_vi<mergedInvoices.length)
+          throw new Error("read-back MISMATCH for "+period+": the server holds "+_vo+" order(s) and "+_vi+
+            " invoice(s), expected at least "+mergedOrders.length+" and "+mergedInvoices.length+
+            ". Nothing was removed from the live data.");
+        console.log("[NDBOOKS] read-back VERIFIED from the server — "+period+" holds "+_vo+" order(s) and "+
+          _vi+" invoice(s). Safe to remove the archived records from the live arrays.");
+      });
+    }).then(function(){
       BOOK_CACHE[period]={orders:mergedOrders,invoices:mergedInvoices,closed:true};
       _booksVersion++;
       console.log("[NDBOOKS] closed "+period+" - "+ordsToArchive.length+" order(s), "+invsToArchive.length+" invoice(s) confirmed written");
@@ -18985,9 +19156,48 @@ function rDebts(q,pg){
      the archive-merged order array, then a scan, then a sort, for every row on the page.
      See _latestOrderByCustomer for the measurement and the deterministic tie-break. */
   var _debtLastOrd=_latestOrderByCustomer(_debtOrdAll,false);
+  /* UNPAID-INVOICE INDEX, BUILT ONCE (2026-08-21) — the last per-customer full scan on this
+     page. The line below used to be (D.invoices||[]).filter(...) INSIDE the per-customer map,
+     so it walked every invoice, and called _invoiceOrderActive() on every invoice, once for
+     EVERY customer. Extends the memoised-index idiom already used two lines up by
+     _latestOrderByCustomer and in ~24 other places in this file (_getOrdByIdIndex,
+     _getInvForOrderIndex) rather than inventing a new mechanism.
+       today   :    451 customers x ~45 hot invoices  =     ~20k comparisons — invisible
+       year 100: ~10,500 customers x ~3,000           = ~31.5M comparisons on one screen
+     D.invoices is bounded by the 90-day hot window plus unsettled, so the inner term does not
+     grow with history — but the customer term does, and this is the multiplication that made
+     the debtors page the one screen that degrades with customer count.
+     EXACT EQUIVALENCE IS PRESERVED, and that is why the lookup still filters on `i.cId===c.id`
+     rather than trusting the map key. Object keys are strings, so indexing by String(i.cId)
+     alone would make a numeric id 5 match a string id "5" — which the ORIGINAL `===` does not.
+     If any record ever carried a mismatched type, keying alone would silently CHANGE a debt
+     figure. So the map narrows the candidates from every invoice to the handful sharing that
+     key, and the strict comparison still decides. Same output, by construction.
+     The three customer-independent predicates (unpaid, not voided, order active) move into the
+     single build pass.
+     WHAT THIS DOES NOT SAVE, corrected after the proof measured it: _invoiceOrderActive() is
+     called the SAME number of times as before, not fewer. `&&` short-circuits and `i.cId===c.id`
+     was the FIRST term, so the old form already only reached active() for that customer's own
+     invoices; summed over all customers that equals one pass. The saving is entirely in the id
+     comparisons — 31.5M -> 4.8k at year-100 scale. An earlier draft of this comment claimed the
+     active() saving and was wrong; it is recorded here because an overstated comment is how the
+     next session inherits a wrong mental model. */
+  var _debtUnpaidByCust=(function(){
+    var m={};
+    (D.invoices||[]).forEach(function(i){
+      if(!i)return;
+      if(!(i.paid<i.amount))return;
+      if(i.voided)return;
+      if(!_invoiceOrderActive(i))return;
+      var k=String(i.cId);
+      if(!m[k])m[k]=[];
+      m[k].push(i);
+    });
+    return m;
+  })();
   var debtors=(D.customers||[]).map(function(c){
     // Period-scoped debt: find orders in this period and their unpaid invoices
-    var allInvs=(D.invoices||[]).filter(function(i){return i.cId===c.id&&i.paid<i.amount&&!i.voided&&_invoiceOrderActive(i);});
+    var allInvs=(_debtUnpaidByCust[String(c.id)]||[]).filter(function(i){return i.cId===c.id;});
     var periodInvs=(DEBT_PERIOD==="all")?allInvs:allInvs.filter(function(i){
       // Use the linked order's date — the actual date the debt was created
       var ordDate="";
@@ -22507,7 +22717,37 @@ window.addEventListener("load",function(){
     try{
       firebase.initializeApp(firebaseConfig);
       fbAuth=firebase.auth();
-      fbDb=firebase.firestore();
+      /* MODERN CACHE PATH — inert unless PERSISTENCE_MODERN_CACHE_LIVE is true; see that
+         flag for why it is off and exactly how to test it. It must run HERE, wrapped around
+         the instance's creation, because settings({localCache}) has to be applied before the
+         instance is used for anything at all. Every failure mode falls through to the
+         unchanged enablePersistence() ladder below, so the worst case is today's behaviour. */
+      fbDb=(function(){
+        if(!PERSISTENCE_MODERN_CACHE_LIVE)return firebase.firestore();
+        try{
+          var _F=firebase.firestore;
+          if(typeof _F.persistentLocalCache==="function"&&typeof _F.persistentMultipleTabManager==="function"){
+            var _d=firebase.firestore();
+            _d.settings({localCache:_F.persistentLocalCache({tabManager:_F.persistentMultipleTabManager()})});
+            window._ndPersistence="modern-cache";
+            console.log("[NDSYNC] offline persistence via FirestoreSettings.cache (modern, multi-tab) — "+
+              "enablePersistence() was never called, so no deprecation warning. The durable IndexedDB "+
+              "write queue is provided by persistentLocalCache instead.");
+            return _d;
+          }
+          console.log("[NDSYNC] MODERN CACHE UNAVAILABLE — this SDK build does not expose "+
+            "firebase.firestore.persistentLocalCache. Falling back to enablePersistence(); "+
+            "set PERSISTENCE_MODERN_CACHE_LIVE=false, nothing is lost.");
+        }catch(_mc){
+          console.log("[NDSYNC] MODERN CACHE FAILED ("+((_mc&&_mc.message)||"unknown")+
+            ") — falling back to enablePersistence(). The offline queue is NOT affected.");
+        }
+        /* Whatever happened above, hand back a plain instance. If settings() already ran on a
+           half-configured instance we deliberately make a fresh one is NOT possible (compat
+           caches one per app), so we return the same accessor and let the ladder decide —
+           window._ndPersistence was not set to "modern-cache", so the ladder will run. */
+        return firebase.firestore();
+      })();
       // FIX (2026-07-29): both failure paths used to be swallowed by empty
       // .catch(){} handlers. Offline persistence is what lets Firestore queue a
       // write durably in IndexedDB and replay it on reconnect — on a delivery
@@ -22585,7 +22825,14 @@ window.addEventListener("load",function(){
           var _safari=/Safari/i.test(_ua)&&!/Chrome|Chromium|CriOS|Edg|FxiOS|OPR/i.test(_ua);
           _isWebKit=!!(_iOS||_safari);
         }catch(_){}
-        if(typeof fbDb.enablePersistence==="function"&&_isWebKit){
+        /* MUST BE FIRST (2026-08-21). If the modern cache path above configured the instance,
+           persistence is ALREADY on and calling enablePersistence() now throws — settings()
+           has been applied and the instance is in use. This branch is therefore not an
+           optimisation, it is a correctness guard on the flag being flipped. It can only be
+           true when PERSISTENCE_MODERN_CACHE_LIVE is true AND the API was present. */
+        if(window._ndPersistence==="modern-cache"){
+          /* nothing to do — already durable, and the log line was written at init */
+        }else if(typeof fbDb.enablePersistence==="function"&&_isWebKit){
           console.log("[NDSYNC] WebKit/iOS detected — using single-tab persistence (avoids Safari's shared-lock multi-tab path)");
           fbDb.enablePersistence().then(function(){
             _persistOk("single-tab");
