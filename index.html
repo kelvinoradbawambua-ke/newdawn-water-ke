@@ -22235,9 +22235,48 @@ function runIntegrityCheck(){
     issues.push("Water cycle synced for "+bootstrapped+" customer(s) — quantities recomputed from delivered orders");
     if(el("pg-customers")&&el("pg-customers").classList.contains("act"))rCusts();
   }
-  // Check 1: negative stock
+  /* Check 1: negative stock — THE MUTATION IS REMOVED (2026-08-24). REPORTED BY THE
+     DIRECTOR FROM THE FIELD: staff can place an order when stock is low (correct), but the
+     count did not reconcile after restocking (not correct).
+
+     WHAT THIS USED TO DO:
+         if(s.qty<0){s.qty=0;issues.push("Stock: "+s.name+" had negative qty — reset to 0");}
+     ...and 60 lines below, `issues.length>0` called dirty(), so the reset was WRITTEN to
+     Firestore and pushed to every device, then audit-logged and toasted to the director as
+     "corrected".
+
+     WHY IT WAS WRONG. On 2026-07-28 this system adopted the NEGATIVE-STOCK POLICY
+     (Option A, a business decision): an order is never blocked by low stock, the deduction
+     is not floored at 0, and a shortfall is carried as a negative — "7 owed / backordered" —
+     precisely so a later restock reconciles by plain addition with no catch-up logic. Every
+     DEDUCTION site had its Math.max(0,...) floor removed for that. This check was left doing
+     exactly the same thing by another route, and it runs 15 SECONDS AFTER EVERY DIRECTOR
+     LOGIN, so in practice the shortfall was erased within a minute of being created.
+
+     THE ARITHMETIC, which is what the director actually asked to be verified:
+         stock 3, staff sells 10   -> qty = -7   (7 owed — correct)
+         director logs in          -> qty = 0    (shortfall silently erased, and SAVED)
+         restock +20               -> qty = 20
+         TRUE available is 20 - 7  =  13         -> the system OVERSTATED stock by 7
+     Which is word for word the failure the policy comment at the order-creation site warned
+     about: "The old Math.max(0,...) floor discarded the shortfall, leaving stock permanently
+     overstated after a restock."
+
+     WHY REPORTING IT WAS ALSO WRONG, not just the reset. A backorder is a normal operating
+     state under this policy, not a data-integrity issue. Pushing it into `issues` made every
+     login produce an audit entry, a toast claiming something had been "corrected", and a
+     cloud write — for a value that was right all along. Negative quantities are already
+     surfaced where they belong: the Stock page and the low-stock badges flag a negative as
+     critical (see the negative-stock policy note at the order-creation site).
+
+     WHAT IS DELIBERATELY NOT TOUCHED: the water-cycle block above and its _wcHeld/_wcOrdersIC
+     /_wcLoaded guards are unchanged — they are locked by _proofB_watercycle_guard.js after
+     runIntegrityCheck wrote bad business data in production on 2026-08-01. This edit is
+     confined to Check 1 and changes nothing that guard asserts. */
   (D.stock||[]).forEach(function(s){
-    if(s.qty<0){s.qty=0;issues.push("Stock: "+s.name+" had negative qty — reset to 0");}
+    if(s.qty<0)console.log("[NDSTOCK] "+s.name+" is at "+s.qty+" — "+Math.abs(s.qty)+
+      " unit(s) backordered. This is the negative-stock policy working, NOT an error: the next "+
+      "restock adds to it and the count reconciles on its own. It is deliberately NOT reset to 0.");
   });
   // Check 2: orders referencing missing customers
   var custIds=(D.customers||[]).reduce(function(m,c){m[c.id]=true;return m;},{});
@@ -22292,7 +22331,13 @@ function runIntegrityCheck(){
   // Check 5: payment status sync
   syncPaymentStatuses();
   if(issues.length>0){
-    if((D.stock||[]).some(function(s){return s.qty===0&&issues.some(function(i){return i.indexOf(s.name)>-1});}))dirty();
+    /* REMOVED 2026-08-24 with Check 1's mutation. This dirty() existed for exactly one
+       purpose: to PERSIST the negative-stock reset that has just been deleted. Its condition
+       was "a stock item now reads 0 AND an issue mentions its name" — which only ever matched
+       an item this function had itself just zeroed. With the reset gone it can no longer be
+       true, and leaving a write trigger whose only reachable cause has been removed is how a
+       future session re-derives a wrong reason for it. The other checks below (id counters,
+       payment statuses) call dirty() themselves where they genuinely change something. */
     auditLog("CUSTOMER_UPDATED","Data integrity check: "+issues.length+" issue(s) — "+issues.slice(0,3).join("; "));
     // Show director what was fixed
     toast("✓ Data check: "+issues.length+" item(s) corrected — see audit log","ok");
