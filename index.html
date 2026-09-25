@@ -180,6 +180,52 @@ td{padding:9px 12px;vertical-align:middle}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 .install-bar{display:none;position:fixed;bottom:0;left:0;right:0;background:var(--nv);border-top:3px solid var(--gd);padding:12px 16px;z-index:500;align-items:center;justify-content:space-between;gap:12px}
 .install-bar.show{display:flex}
+/* ══ APPLE-DEVICE FIXES (2026-09-17) ═══════════════════════════════════════════════════
+   The director's standing constraint: "fix for iphone without messing android" and "dont
+   fix for phone and mess for laptop". Everything below therefore either targets iOS ONLY,
+   or is a progressive declaration that browsers without the feature simply ignore. It is
+   placed LAST in the sheet so it wins on cascade order without needing !important, and it
+   adds NO new selectors of its own — it only adjusts properties on rules already above.
+
+   ── 1. THE iOS INPUT AUTO-ZOOM. This is the single biggest reason the iPad "is a mess"
+   while Chrome is fine. Mobile WebKit ZOOMS THE WHOLE PAGE IN whenever a focused input has
+   a font-size below 16px, and it does not zoom back out when the field blurs — so the user
+   is left on a magnified, horizontally-scrolling layout after every search or edit and has
+   to pinch out by hand. The app has ten such fields at 12px: the `.srch input` rule and
+   nine inline-styled search boxes (customers, orders, delivery, stock, invoices, debts,
+   complaints and two others). No other browser does this: Android Chrome and desktop
+   ignore font-size for zoom entirely, which is exactly why the bug looked platform-specific
+   and unreproducible on the laptop.
+   WHY @supports (-webkit-touch-callout:none). It is the standard iOS-only feature query:
+   mobile WebKit supports the property, Blink (Chrome, Edge, Android) dropped it, so this
+   block is invisible to Android and to the director's Windows laptop. The inline
+   `style="...font-size:12px..."` on those nine inputs beats a plain selector, so the rule
+   inside is scoped tightly and marked !important — the ONLY !important added here, and it
+   can affect nothing outside iOS because the whole block is unreachable elsewhere.
+   BOUNDED DOWNSIDE. If this query ever DID match a non-iOS browser, the single consequence
+   is that search-box text renders at 16px instead of 12px. Cosmetic, not functional — it
+   cannot break a layout, a calculation or a sync path.
+
+   ── 2. 100dvh. `min-height:100vh` is wrong on iOS: Safari measures vh against the LARGEST
+   viewport (toolbars hidden), so a 100vh box is taller than the visible area whenever the
+   toolbars are shown, which produces the phantom scroll and the cut-off login screen. These
+   two declarations are NOT inside the iOS block on purpose — `dvh` is the correct unit
+   everywhere, and a browser that does not understand it discards the declaration as invalid
+   and keeps the 100vh above it. On desktop and Android there is no dynamic toolbar, so dvh
+   resolves identically to vh and nothing moves.
+
+   ── 3. SAFE-AREA INSETS. env(safe-area-inset-*) evaluates to 0px on every device without a
+   notch or home indicator — every Android phone, every laptop, and the iPad itself — so
+   these are inert outside the handful of iPhones that need them. Applied only to the two
+   position:fixed elements that can actually collide with the home indicator. */
+@supports (-webkit-touch-callout:none){
+  .srch input,#cust-srch,#ords-srch,#del-srch,#stk-srch,#inv-srch,#debt-srch,#cmp-srch,#cmp-c-search,
+  input[type="text"],input[type="search"],input[type="number"],input[type="tel"],select,textarea{font-size:16px!important}
+}
+body{min-height:100dvh}
+.lscreen{min-height:100dvh}
+.install-bar{padding-bottom:calc(12px + env(safe-area-inset-bottom))}
+.ov{padding-left:calc(14px + env(safe-area-inset-left));padding-right:calc(14px + env(safe-area-inset-right))}
 </style>
 </head>
 <body>
@@ -1263,11 +1309,117 @@ function _orderForInvoice(inv){
   var _s=String(_oid);
   return (D.orders||[]).find(function(x){return String(x.id)===_s;})||null;
 }
-function custDebt(id){
-  var cu=(D.customers||[]).find(function(x){return x.id===id;});
+/* PER-CUSTOMER INVOICE POOL (2026-08-25) — a CANDIDATE NARROWER, nothing more.
+
+   WHY IT EXISTS. rDash and rCusts each call custDebt() once per customer, and custDebt()
+   filtered EVERY invoice on every call. At 454 customers x 782 invoices that is ~355,000
+   invoice evaluations per render — and the listener path re-renders up to five times per
+   snapshot burst (see attach(), ~3926), so ~1.78 million per order placed, each allocating.
+   That is the shape that dies on an iPhone, and it is the same O(customers x invoices) this
+   file has already removed from the debtors page (_debtUnpaidByCust) and from
+   _dormantCustomers.
+
+   WHAT IT DELIBERATELY DOES NOT DO — this is the whole safety argument. It groups ONLY on
+   String(i.cId) and applies NONE of custDebt's predicates. Every test — the amount/paid
+   coercion, voided, the linked-order resolution — still runs inside custDebt, unchanged, on
+   the narrowed pool.
+
+   WHY THE RESULT IS IDENTICAL BY CONSTRUCTION, not by inspection:
+     - any invoice for which the ORIGINAL first test `i.cId!==id` passes (i.e. strictly
+       equal) necessarily satisfies String(i.cId)===String(id), so it is ALWAYS in the pool;
+     - any pool member that is NOT a strict match is still rejected by that same unchanged
+       first test, which is left in place precisely for this.
+   So the surviving set, and therefore the sum, cannot differ. Object keys are strings, so
+   keying ALONE would make numeric id 5 match string id "5" — which `===` does not. The map
+   narrows; the strict comparison still decides. Same rule as _debtUnpaidByCust (~19205),
+   where trusting the key alone was measured pulling in 13 extra invoices on real data.
+
+   WHY IT IS NOT MEMOISED. It is built fresh by each caller, per render. A cached pool keyed
+   on array identity+length would not notice `inv.paid` changing in place — a payment would
+   land and the debt figure would not move. Grouping is cheap (one pass); staleness on money
+   is not survivable. This is also why the builder applies no predicates: predicate results
+   go stale, a cId grouping does not.
+
+   OPTIONAL AND BACKWARD-COMPATIBLE: custDebt(id) with no second argument behaves EXACTLY as
+   before, scanning D.invoices. The per-customer loops pass the pool (rDash, rCusts, and —
+   added 2026-09-23 — rReports, which the first pass MISSED; see the note on
+   _custStrictIndex). The other 13 call sites pass nothing and are untouched. (This comment
+   used to say 38; that figure came from a comment-inclusive grep and was wrong.)
+   Proven by _proofB_custdebt_pool.js and, end to end, by _proofB_render_equivalence.js. */
+function _custDebtInvIndex(){
+  /* Object.create(null), not {} (2026-09-23): a plain object inherits "constructor",
+     "toString", "__proto__"..., so a cId that ever stringified to one of those would make
+     `!m[k]` false and `m[k].push` throw. Identical for every real (numeric) key; it only
+     removes a latent crash. */
+  var m=Object.create(null);
+  (D.invoices||[]).forEach(function(i){
+    if(!i)return;
+    var k=String(i.cId);
+    if(!m[k])m[k]=[];
+    m[k].push(i);
+  });
+  return m;
+}
+/* ── STRICT CUSTOMER INDEX (2026-09-23) — THE SECOND O(n×m) THE FIRST FIX LEFT STANDING ──
+   FOUND BY MEASUREMENT, NOT READING. _profile_render_work.js renders every screen at 1x and
+   2x the director's real volumes and counts every array callback. After the invoice pool
+   shipped, Dashboard and Customers were STILL quadratic (exponents 1.81 and 1.98), and
+   _profile_hotspots.js attributed the remainder to the first line of custDebt itself:
+       var cu=(D.customers||[]).find(function(x){return x.id===id;});
+   — a linear scan of every customer, executed once per customer: 103,671 callbacks on the
+   Dashboard, 206,570 on Reports. The invoice pool fixed the invoice scan and left this one.
+   The same shape was on every Delivery row (~16,779) and Reports passed no pool at all
+   (460,356 callbacks in custDebt's invoice filter) — an omission the first pass's
+   "only two per-customer loops exist" check missed, because its regex stopped at the closing
+   brace of the inline default object (rev:0, ords:0) and never reached the custDebt call
+   behind it. (Deliberately written without a literal brace: several proofs extract functions
+   by naive brace counting, and a lone quoted closing brace in a comment truncates them —
+   which is exactly how _proofB_revenue_onedef.js 4.9 failed when this note first had one.)
+
+   WHY NOT custById(). It is O(1) but NOT equivalent: _getCustByIdIndex keys on c.id as a
+   plain property, so numeric 7 and string "7" collide, and it keeps the LAST record for a
+   duplicated id. .find(x=>x.id===id) is type-strict and returns the FIRST. On this project's
+   data mixed-type ids are real (the invoice pool's note measured 13), so swapping in
+   custById could hand a customer another record's credit — a money change. Not acceptable.
+
+   THIS INDEX IS AN EXACT STAND-IN FOR THAT .find:
+     - key = typeof + ":" + id, so "number:7" and "string:7" stay distinct, as === requires;
+     - FIRST occurrence wins, as .find returns the first match;
+     - only number/string ids are indexed; any other lookup (undefined, null, objects, NaN)
+       falls back to the original .find, so those exotic cases behave exactly as before;
+     - if ANY entry is null or not an object the builder returns null, and every lookup
+       falls back to the original .find — which would have thrown on reaching that entry.
+       Refusing to index is the only way to preserve "throws iff .find would have thrown".
+   Built once per render and never cached across calls, so it cannot go stale.
+   Proven end to end by _proofB_render_equivalence.js: the COMPLETE rendered HTML of every
+   affected screen is compared byte-for-byte between the outgoing live build and this one. */
+function _custStrictIndex(){
+  var arr=(D&&D.customers)||[],m=Object.create(null);
+  for(var k=0;k<arr.length;k++){
+    var c=arr[k];
+    if(!c||typeof c!=="object")return null;
+    var id=c.id,t=typeof id;
+    if(t!=="number"&&t!=="string")continue;
+    if(id!==id)continue;                       // NaN: .find can never return it
+    var key=t+":"+id;
+    if(!(key in m))m[key]=c;                   // first occurrence, exactly as .find
+  }
+  return m;
+}
+/* Exact replacement for (D.customers||[]).find(function(x){return x.id===id;}). */
+function _custStrictGet(ix,id){
+  var t=typeof id;
+  if(ix&&(t==="number"||t==="string")&&id===id)return ix[t+":"+id];
+  return (D.customers||[]).find(function(x){return x.id===id;});
+}
+function custDebt(id,_invPool,_custIx){
+  /* No _custIx passed => the original linear .find, byte-for-byte. */
+  var cu=_custIx!==undefined?_custStrictGet(_custIx,id):(D.customers||[]).find(function(x){return x.id===id;});
   var credit=(cu&&cu.credit>0)?cu.credit:0;
   var _ordIdx=_getOrdByIdIndex();
-  var gross=(D.invoices||[]).filter(function(i){
+  /* No pool passed => the original full scan, byte-for-byte. */
+  var _src=_invPool?(_invPool[String(id)]||[]):(D.invoices||[]);
+  var gross=_src.filter(function(i){
     if(i.cId!==id)return false;
     /* C2 FIX (2026-07-30): coerce before comparing. A legacy/imported invoice with an
        absent or non-numeric amount used to PASS this test (undefined>=undefined is
@@ -1729,6 +1881,11 @@ var FB_OUTBOX_COL=null;              // newdawn_outbox collection (null until Fi
 var FB_ORDERS_COL=null;              // /orders/{orderId}
 var FB_INVOICES_COL=null;            // /invoices/{invoiceId}
 var FB_CUSTOMERS_COL=null;           // /customers/{customerId}
+/* PERMANENT ARCHIVE (2026-09-24) — see _archiveThenDelete. WRITTEN ONLY: the app never reads,
+   lists or queries these, so they add no listener, no read cost and no index-keep-list field. */
+var FB_ORDERS_DEL_COL=null;          // /orders_deleted/{orderId}
+var FB_INVOICES_DEL_COL=null;        // /invoices_deleted/{invoiceId}
+var FB_CUSTOMERS_DEL_COL=null;       // /customers_deleted/{customerId}
 var HOT_WINDOW_DAYS=90;              // see the spec: hot window = recent OR unsettled
 var _hybridMigrating=false;
 /* THE KILL SWITCH. false = this build behaves EXACTLY like the frozen Build A: orders and
@@ -2458,6 +2615,95 @@ function _persistCustomerDoc(c){
     });
   }catch(_){}
 }
+/* ── PERMANENT ARCHIVE OF DELETED RECORDS (2026-09-24, director-approved "Option A") ─────────
+   Until today a user delete ended in FB_*_COL.doc(k).delete(): the order, invoice or customer
+   document was DESTROYED, and only its tombstone (id -> time) and an audit line survived. A
+   professional ERP never destroys a business record; it retains a before-image. This moves the
+   record into a parallel archive collection (orders_deleted / invoices_deleted /
+   customers_deleted) and removes it from the live collection ONLY AFTER the archive copy is
+   confirmed by the server.
+
+   WHY A SEPARATE COLLECTION, NOT A "deleted" FLAG ON THE LIVE DOCUMENT. A flag would leave the
+   record where every listener still delivers it: an unpaid deleted order would ride the
+   `settled==false` listener for ever (reads that grow every year), its tombstone could never be
+   pruned (the still-needed marks pin it while delivered), and an OLD phone that does not know
+   the flag would admit it once its tombstone aged out. Moving it keeps the live collections
+   exactly as every device — old or new — already expects them: the record simply leaves.
+
+   EACH STEP, AND WHY:
+     1. READ THE SERVER'S CURRENT DOCUMENT (source:"server"), not this device's shadow. If another
+        device edited the record after this one last wrote it, the archive gets the latest state.
+        Server-only, so a cached "does not exist" can never be mistaken for the truth.
+     2. Not on the server -> already gone (another device removed it): nothing to archive or
+        delete; the shadow entry is cleared.
+     3. WRITE THE ARCHIVE COPY: { rec: <the whole original document>, _archive: {from, id,
+        deletedAt (the tombstone time), archivedAt, by, build} }. The record sits under ONE map
+        field so a single index exemption on `rec` keeps its storage cost down.
+     4. ONLY WHEN THE SERVER CONFIRMS THE COPY, delete the live document; then clear the shadow.
+   Any failure before step 4 deletes NOTHING and leaves the shadow entry, so a later flush
+   retries from step 1 (re-archiving is an idempotent overwrite of the same id).
+
+   NO WRITE STORM (the 2026-08-19 incident). One archive attempt per record is in flight at a
+   time (_archInFlight), and step 1 fails fast while offline, so repeated flushes cannot pile up
+   queued writes. Each failure is logged once per record per session.
+
+   IF THE ARCHIVE IS NOT PERMITTED YET. Firestore rules are per collection here, so until the
+   director adds rules for the three archive collections, step 3 fails with permission-denied.
+   Then this does EXACTLY what the app did before — deletes the live document — and reports it
+   once per session to the Audit screen (SYNC_HEALTH), so the gap is visible, never silent.
+   Nothing is ever worse than before this change.
+
+   NOT CHANGED: WHICH records are deleted. That is decided upstream by _hybridReapDeletes (a
+   deletion tombstone is required — 2026-09-24) and by delO/delC/cancel, none of which is touched.
+   Records with money history are never deleted at all (delO/delC keep paid invoices and
+   delivered orders). Proven by _proofB_archive_delete.js. */
+var _archBlocked={};     // label -> true once an archive collection refused a write this session
+var _archInFlight={};    // "label:id" -> true while that record's archive-then-delete is pending
+var _archWarned={};      // "label:id" -> true once a failure for it has been logged this session
+function _archiveThenDelete(label,k){
+  var live=label==="orders"?FB_ORDERS_COL:label==="invoices"?FB_INVOICES_COL:label==="customers"?FB_CUSTOMERS_COL:null;
+  var arch=label==="orders"?FB_ORDERS_DEL_COL:label==="invoices"?FB_INVOICES_DEL_COL:label==="customers"?FB_CUSTOMERS_DEL_COL:null;
+  var shadow=(typeof _hybridShadow!=="undefined"&&_hybridShadow)?_hybridShadow[label]:null;
+  if(!live||!shadow||k==null)return;
+  var id=String(k),key=label+":"+id;
+  if(_archInFlight[key])return;                              // one attempt per record at a time
+  _archInFlight[key]=true;
+  function done(){delete _archInFlight[key];}
+  /* Exactly the pre-2026-09-24 behaviour: used only when the archive is not permitted. */
+  function hardDelete(){
+    live.doc(id).delete().then(function(){delete shadow[k];done();},function(){done();});
+  }
+  if(_archBlocked[label]||!arch){hardDelete();return;}
+  var step="read";
+  live.doc(id).get({source:"server"}).then(function(snap){
+    if(!snap||!snap.exists){delete shadow[k];return "gone";}
+    var tmap=label==="orders"?D.deletedOrderIds:label==="invoices"?D.deletedInvoiceIds:D.deletedCustomerIds;
+    var copy={rec:snap.data()||{},_archive:{from:label,id:id,deletedAt:(tmap&&tmap[k])||null,
+      archivedAt:Date.now(),by:(typeof CU!=="undefined"&&CU&&CU.name)||null,build:BUILD_STAMP}};
+    step="archive";
+    return arch.doc(id).set(copy).then(function(){
+      step="delete";
+      return live.doc(id).delete();                          // ONLY after the copy is confirmed
+    }).then(function(){delete shadow[k];return "archived";});
+  }).then(function(r){
+    if(r==="archived")console.log("[NDARCHIVE] "+label+" #"+id+" archived to "+label+"_deleted, then removed from "+label);
+    done();
+  },function(e){
+    var code=(e&&e.code)||(e&&e.message)||"unknown";
+    if(step==="archive"&&code==="permission-denied"){
+      _archBlocked[label]=true;
+      console.log("[NDARCHIVE] "+label+"_deleted is NOT PERMITTED by the Firestore rules — deleting as before (no archive copy). Add the archive rules to enable permanent retention.");
+      try{
+        if(typeof _reportDeviceSyncHealth==="function"&&CU)
+          _reportDeviceSyncHealth("ARCHIVE_NOT_PERMITTED_"+label,"the "+label+"_deleted collection is not allowed by the Firestore rules, so deleted "+label+" are being removed WITHOUT an archive copy (the old behaviour). Add the three archive rules in the Firebase console to turn permanent retention on.");
+      }catch(_){}
+      hardDelete();
+      return;
+    }
+    if(!_archWarned[key]){_archWarned[key]=true;console.log("[NDARCHIVE] "+label+" #"+id+" not archived yet ("+step+": "+code+") — NOTHING deleted; a later flush retries.");}
+    done();
+  });
+}
 function _deleteCustomerDoc(id){
   try{ if(FB_CUSTOMERS_COL&&id!=null)FB_CUSTOMERS_COL.doc(String(id)).delete().catch(function(){}); }catch(_){}
 }
@@ -2761,8 +3007,49 @@ function _hybridReapDeletes(shadow,live,del,label){
     }catch(_){}
     return 0;
   }
-  gone.forEach(function(k){try{del(k);}catch(_){}});
-  return gone.length;
+  /* TOMBSTONE REQUIRED (2026-09-24) — OPEN ITEM #2 IN NEXT_SESSION_PROMPT.md, CLOSED.
+     Until today this line deleted EVERY record in `gone`: "in the shadow, absent from D". The
+     count cap above is the only thing that separated a real deletion from a partial load, so a D
+     short by 1-5 real records at flush time sent those documents to Firestore's delete() — and
+     silently, because nothing here logged a deletion of 5 or fewer. That is a COUNT heuristic
+     standing in for a TOMBSTONE check, which CLAUDE.md lists as an absolute rule never to accept,
+     and it sits directly on goal 1 (zero missing orders). Reproduced by executing the live
+     build's reaper: _proofB_reaper_tombstone.js §1.
+     NOW: a document is deleted only when D carries its deletion tombstone
+     (_hybridDeletedTombstone — the same predicate hydration already uses to refuse re-entry).
+     Every legitimate delete path writes that tombstone in the same synchronous block as the
+     removal, before dirty() schedules this flush — verified line by line on 2026-09-24 and by
+     EXECUTING delO() and the delC() cascade end to end (§3, §4: identical Firestore deletes to
+     the live build). Period close does not rely on this function at all: _hybridDropArchived
+     forgets the shadow entry so an archived document is never reaped.
+     WHAT HAPPENS TO AN ABSENT RECORD WITH NO TOMBSTONE: its document is KEPT and its shadow
+     entry is forgotten. The old code forgot it too, after deleting — so the next flush starts
+     from the same shadow either way, and the only difference is that the record survives. If
+     it was a transient gap, the record re-hydrates into D and is simply rewritten once (the
+     write path is idempotent, merge:true). If something genuinely removed it without a
+     tombstone, it comes back as a stray row a director can dismiss — the direction this project
+     already chose ("a stray extra record a director can dismiss is far cheaper than a silently
+     lost one", see the main-document merge). Forgetting the entry is what stops such records
+     accumulating in the shadow and inflating the cap above until it blocks real deletes.
+     THE GUARANTEE: the set deleted here is always a SUBSET of what the previous code deleted
+     (it is exactly that set intersected with the tombstoned ids) and the refused branch above is
+     untouched. Fuzzed over 4,000 random states in §7. It can only ever delete LESS.
+     VISIBILITY: the director could not see these deletes before. Each kept record is logged, and
+     reported to the Audit screen through _reportDeviceSyncHealth — which is limited to ONCE per
+     session per condition, so this cannot become a write storm (§6; see the 2026-08-19 incident). */
+  var sure=[],kept=[];
+  gone.forEach(function(k){(_hybridDeletedTombstone(label,k)?sure:kept).push(k);});
+  if(kept.length){
+    kept.forEach(function(k){try{delete shadow[k];}catch(_){}});
+    console.log("[NDHYBRID] DELETE WITHHELD ("+label+"): "+kept.length+" record(s) absent from D with NO deletion tombstone — documents KEPT, not deleted: "+kept.slice(0,10).join(", ")+(kept.length>10?", ...":""));
+    try{
+      if(typeof _reportDeviceSyncHealth==="function"&&CU)
+        _reportDeviceSyncHealth("HYBRID_DELETE_WITHHELD_"+label,label+": kept "+kept.length+" document(s) that were absent from this device's data but carried no deletion tombstone (e.g. "+kept.slice(0,3).join(", ")+"). Nothing was deleted. If one of these is a record you deleted, delete it again.");
+    }catch(_){}
+  }
+  if(sure.length)console.log("[NDHYBRID] deleting "+sure.length+" tombstoned "+label+" document(s): "+sure.slice(0,10).join(", ")+(sure.length>10?", ...":""));
+  sure.forEach(function(k){try{del(k);}catch(_){}});
+  return sure.length;
 }
 
 /* ROOT-CAUSE FIX (2026-08-02) — THE MISSING ORDER. Captured live on the owner's
@@ -3184,8 +3471,10 @@ function _hybridFlushDocs(writesOnly){
     // ---- orders: deleted (in shadow, gone from the array) — RAIL 2, see _hybridReapDeletes
     // writesOnly skips this entirely — see the block comment on this function for why
     // deletion stays on the confirmed path at its original frequency.
+    /* 2026-09-24: a tombstoned order is ARCHIVED then removed, never destroyed — see
+       _archiveThenDelete (it clears the shadow entry itself, only on success). */
     if(!writesOnly)delO2=_hybridReapDeletes(_hybridShadow.orders,liveO,function(k){
-      FB_ORDERS_COL.doc(k).delete().then(function(){delete _hybridShadow.orders[k];}).catch(function(){});
+      _archiveThenDelete("orders",k);
     },"orders");
     // ---- invoices: new or changed
     var liveI={};
@@ -3211,7 +3500,7 @@ function _hybridFlushDocs(writesOnly){
     });
     // ---- invoices: deleted — RAIL 2, see _hybridReapDeletes  (writesOnly: see above)
     if(!writesOnly)delI2=_hybridReapDeletes(_hybridShadow.invoices,liveI,function(k){
-      FB_INVOICES_COL.doc(k).delete().then(function(){delete _hybridShadow.invoices[k];}).catch(function(){});
+      _archiveThenDelete("invoices",k);                      // 2026-09-24 — archived, never destroyed
     },"invoices");
     // ---- customers (own flag; transactional persister — see _persistCustomerDoc)
     var wroteC=0,delC2=0;
@@ -3234,8 +3523,10 @@ function _hybridFlushDocs(writesOnly){
         wroteC++;
       });
       // ---- customers: deleted — RAIL 2, see _hybridReapDeletes  (writesOnly: see above)
+      /* 2026-09-24 — archived, never destroyed. The shadow entry now clears only when the live
+         delete is confirmed (it used to clear immediately, so a failed delete was never retried). */
       if(!writesOnly)delC2=_hybridReapDeletes(_hybridShadow.customers,liveC,function(k){
-        _deleteCustomerDoc(k);delete _hybridShadow.customers[k];
+        _archiveThenDelete("customers",k);
       },"customers");
     }
     if(wroteO||wroteI||delO2||delI2||wroteC||delC2)
@@ -6644,6 +6935,36 @@ function runAutoBackup(){
     // frequency, matches the intent of periodic archival rather than
     // per-action overhead.
     archiveAuditLogs();
+    /* MOVED HERE FROM THE EOD BLOCK (2026-08-25) — THE CENTURY DEPENDED ON A ONE-HOUR WINDOW.
+       pruneOldEvents() is the single mechanism that keeps storage flat for 100 years: unpruned,
+       events reach ~1.6 GB against a 1 GiB allowance; at the 730-day retention they are ~33 MB,
+       permanently flat. pruneOldTombstones() likewise bounds the two tombstone maps that ride
+       inside every sync payload.
+
+       Both used to run ONLY from the EOD branch, which is gated `hr>=21` — a ONE-HOUR window
+       (21:00-22:00), director-only, server-confirmed. This whole function already returns early
+       outside 08:00-22:00, so SOD's effective window is FOURTEEN hours and fires on the first
+       director login of any day; EOD's is one hour at the end of it.
+
+       WHY THAT WAS A REAL RISK AND NOT A TIDY-UP. Events accrue ~150/day and the prune is
+       hard-capped at EVENT_PRUNE_MAX_PER_RUN=400, so it must run on at least 150/400 = 37.5%
+       of days simply to hold level. Below that rate the collection grows without bound and the
+       century breaks — silently, because nothing logs a prune that never ran. The director's
+       observed logins are mornings; relying on them being at a screen between 9pm and 10pm on
+       more than a third of days was an assumption nobody had stated, let alone measured.
+
+       NOT A WRITE-STORM RISK (the 2026-08-19 rule: never trigger an action on a signal that
+       action itself produces). Both are triggered by a DATE, not by anything they emit:
+       pruneOldEvents deliberately writes no audit entry, only a console line, and
+       pruneOldTombstones performs no write at all — it mutates D in memory and rides the next
+       ordinary flush. Neither has a path from its effect back to its trigger. Both keep their
+       existing caps, their director-only guard and their server-confirmed guard.
+
+       INVISIBLE UNTIL 2026/2028 either way: nothing is old enough to prune yet (90 days for
+       tombstones, 730 for events), so this changes no behaviour today. It changes whether the
+       mechanism is actually reachable when it finally matters. */
+    pruneOldTombstones();
+    pruneOldEvents();
     FB_DOC_REF.set({_lastSodBackupDate:dateStr,_lastPeriodicBackupAt:nowMs},{merge:true}).catch(function(){});
     return; // one backup action per check — keeps each write small and simple
   }
@@ -6653,8 +6974,13 @@ function runAutoBackup(){
     D._lastEodBackupDate=dateStr;
     writeBackup("eod-"+dateStr);
     pruneOldBackups("eod-",14);
-    pruneOldTombstones(); // piggyback the existing daily tombstone-prune cycle onto EOD instead of a separate "daily" type
-    pruneOldEvents();     // 2026-08-19: the ONLY Firestore limit a century crossed — see pruneOldEvents
+    /* pruneOldTombstones() and pruneOldEvents() MOVED TO THE SOD BLOCK (2026-08-25) — see the
+       long note there. They ran here because EOD was the natural "end of day housekeeping"
+       slot, but `hr>=21` made that a one-hour window for the two functions the 100-year
+       storage model depends on. SOD's window is fourteen hours and is proven to fire daily.
+       Deliberately NOT left duplicated here: running them twice a day buys nothing (both are
+       idempotent and capped, and one run per day already exceeds the accrual rate) while
+       doubling the exposure of an event-deleting operation. */
     FB_DOC_REF.set({_lastEodBackupDate:dateStr},{merge:true}).catch(function(){});
     return;
   }
@@ -8882,7 +9208,72 @@ function _startHeartbeat(){
     }
   },60000); // checked once a minute — the two heavier branches only fire rarely
 }
+/* ── RENDER COALESCER (2026-09-17) — THE APPLE-DEVICE ROOT CAUSE ──────────────────────
+   THE MEASURED PROBLEM. The hybrid cutover subscribes FIVE bounded listeners (orders hot,
+   orders open, invoices hot, invoices open, customers all — see _hybridStartListeners).
+   Each one ends its handler with `if(n){refreshCurrentPage();}` at ~line 3972. A single
+   order placed touches orders AND invoices, so ONE user action delivers a burst of
+   snapshots and this function used to run a FULL synchronous page render for every one
+   of them — up to five complete repaints of the same screen, painting identical pixels
+   four extra times.
+
+   WHY IT KILLED iPHONES AND iPADS AND NOT CHROME. Nothing here is logically wrong, so the
+   desktop just does the work and looks fine. WebKit does not have that luxury: each repaint
+   is a full innerHTML teardown and re-parse of the page subtree, and iOS kills a tab that
+   spikes memory (Jetsam) rather than letting it swap. The kill arrives as SIGKILL, so there
+   is NO JavaScript error to catch and nothing in the console — which is exactly why this
+   was invisible for so long and why the global error banner never reported it. Combined
+   with the per-render invoice scan that custDebt used to do, one order placed cost
+   5 x 355,028 = ~1.78 MILLION allocating invoice evaluations. With the custDebt candidate
+   pool (2026-08-25) that per-render figure is already down to ~1,564; this change removes
+   the remaining 5x multiplier on top of it.
+
+   LEADING + TRAILING, DELIBERATELY — NOT A PLAIN TRAILING DEBOUNCE. A plain debounce would
+   have been a bigger saving (5 renders -> 1 instead of 5 -> 2) and was rejected anyway. All
+   fourteen call sites were read first: every one is fire-and-forget, wrapped in
+   try{}catch(_){} and followed by a return or an unrelated statement, so none READS the DOM
+   afterwards. But two of them are the first paint after login (~8641) and the restore paths
+   (~7574, ~3809), and making the very first paint of a session arrive late is a visible
+   behaviour change for a benefit that is already almost entirely captured by collapsing the
+   burst. So the FIRST call after a quiet period still renders SYNCHRONOUSLY, byte-for-byte
+   as before, and only the duplicate calls behind it are collapsed into one trailing render.
+   Nothing that worked before can start working differently; only the redundant repaints go.
+
+   THE WINDOW. 120ms. The five snapshots land within a few milliseconds of each other on a
+   laptop but can spread out on a loaded phone, so the window has to be wider than the burst
+   or stragglers escape and cost a render each. 120ms is still well under the ~200ms at which
+   a delay stops feeling instant, and it only ever delays the REDUNDANT repaint — never the
+   first one.
+
+   THIS CANNOT DROP AN UPDATE. The trailing render reads D at the moment it runs, not at the
+   moment it was scheduled, so it always paints the newest state — later snapshots that
+   arrive inside the window are included in it, not lost. That is the property
+   _proofB_render_coalesce.js §3 executes. */
+var _rcpTimer=null,_rcpLastRender=0,_rcpCoalesced=0,_rcpRenders=0;
+var RCP_WINDOW_MS=120;
 function refreshCurrentPage(){
+  var now=Date.now();
+  /* Leading edge — a call arriving after a quiet period paints immediately, exactly as
+     this function always did. This is what keeps the login paint and the recovery toasts
+     synchronous. */
+  if(!_rcpTimer&&(now-_rcpLastRender)>=RCP_WINDOW_MS){
+    _rcpLastRender=now;_rcpRenders++;
+    _refreshCurrentPageNow();
+    return;
+  }
+  /* Trailing edge — everything else in this burst collapses into ONE later render. */
+  _rcpCoalesced++;
+  if(_rcpTimer)return;
+  _rcpTimer=setTimeout(function(){
+    _rcpTimer=null;_rcpLastRender=Date.now();_rcpRenders++;
+    _refreshCurrentPageNow();
+  },RCP_WINDOW_MS);
+}
+/* Diagnostics only — lets the Audit/console confirm the coalescing is actually happening on
+   a real device, which is the one thing a simulation cannot prove. Reads nothing, writes
+   nothing, costs nothing. */
+function _rcpStats(){return{renders:_rcpRenders,coalesced:_rcpCoalesced,windowMs:RCP_WINDOW_MS};}
+function _refreshCurrentPageNow(){
   var activePg=document.querySelector(".pg.act");
   if(!activePg)return;
   var pid=activePg.id.replace("pg-","");
@@ -9255,9 +9646,34 @@ function pk(k){
           if(SU)auditLog("SECURITY_VIOLATION","PIN lockout: "+SU.name+" ("+SU.role+") exceeded "+PIN_MAX+" attempts — locked "+PIN_LOCKOUT+"s");
           // Start countdown display
           var countdown=setInterval(function(){
+            /* FIX (2026-09-16) — DIAGNOSED FROM A DIRECTOR PHOTO OF THE LIVE ERROR BANNER
+               READING "A display error occurred (34)" on an Android phone at the login screen.
+               el() is document.getElementById (line ~663) and RETURNS NULL when the node is
+               gone, so `el("perr").textContent=` below was an UNGUARDED write on a 1-second
+               timer. #perr lives inside #pinsec, which exists only on the login screen. A
+               successful login replaces el("root").innerHTML with the app UI, which has no
+               #perr — and NOTHING cleared this interval on login, on logout, or on re-render.
+               So after any PIN lockout followed by a login, it kept firing into a destroyed
+               node once a second for the rest of the 30-second lockout, throwing TypeError
+               every time. Each throw is caught by the global error boundary (~line 394), which
+               increments window._ndErrCount and repaints the banner count — measured at 29
+               throws from one lockout by _proofB_pin_countdown.js, against the 34 photographed.
+               WHY THE BANNER SHOWED ON THE LOGIN SCREEN THOUGH THE ERRORS FIRED INSIDE THE APP:
+               logout() ends with renderLogin() and NO page reload (~line 11791), so the count
+               survives logout. It means "errors since the last full page load", not "errors on
+               this screen" — worth remembering before chasing a login-screen bug that isn't one.
+               THIS IS THE IDLE-WARNING PATTERN (~line 14461), NOT A NEW MECHANISM: that tick
+               already clears itself the moment its node goes, and was the only timer in the file
+               doing it correctly. This was the only one re-looking-up a node with no null test.
+               IT CANNOT WEAKEN THE LOCKOUT. pinLockRemaining() reads sessionStorage via
+               getPinState(), and pk() re-checks it on every keypress — the lockout is enforced
+               entirely by that state. This interval only paints a message, so stopping it early
+               cannot let anyone in one second sooner. Proved by execution in §4 of the proof. */
+            var pe=el("perr");
+            if(!pe){clearInterval(countdown);return;}
             var r=pinLockRemaining();
-            if(r>0){el("perr").textContent="Too many wrong attempts. Locked for "+r+"s.";}
-            else{clearInterval(countdown);el("perr").textContent="Enter your PIN.";}
+            if(r>0){pe.textContent="Too many wrong attempts. Locked for "+r+"s.";}
+            else{clearInterval(countdown);pe.textContent="Enter your PIN.";}
           },1000);
         }else{
           setPinState(s);
@@ -12224,7 +12640,11 @@ function rDash(){
   var cost=periodDel.reduce(function(a,o){return a+o.qty*(o.cost||0);},0);
   var pend=(D.orders||[]).filter(function(o){return o.status==="Pending"||o.status==="Processing";}).length;
   var low=(D.stock||[]).filter(function(s){return s.qty<=s.min;}).length;
-  var dashDebtMap={};(D.customers||[]).forEach(function(cu){dashDebtMap[cu.id]=custDebt(cu.id);});
+  /* PERF (2026-08-25): build the per-customer invoice pool ONCE for this render instead of
+     letting custDebt re-scan all invoices per customer. Same figures — the pool only narrows
+     candidates and custDebt's own `i.cId!==id` still decides. See _custDebtInvIndex. */
+  var _dashInvPool=_custDebtInvIndex(),_dashCustIx=_custStrictIndex();   // both per render — see _custStrictIndex
+  var dashDebtMap={};(D.customers||[]).forEach(function(cu){dashDebtMap[cu.id]=custDebt(cu.id,_dashInvPool,_dashCustIx);});
   var debts=(D.customers||[]).filter(function(c){return dashDebtMap[c.id]>0;});
   var totD=debts.reduce(function(a,c){return a+dashDebtMap[c.id];},0);
   var oCmp=(D.complaints||[]).filter(function(c){return c.status!=="Resolved";}).length;
@@ -12597,7 +13017,10 @@ function rCusts(q,pg,sort,type){
   var revMap={};var delCusts=del;delCusts.forEach(function(o){revMap[o.cId]=(revMap[o.cId]||0)+o.qty*o.price;});
   /* same single definition — this map drives the "highest revenue" customer sort */
   _applyWriteOffsByGroup(revMap,del,function(o){return o.cId;},_custInvAll);
-  var debtMap={};(D.customers||[]).forEach(function(cu){debtMap[cu.id]=custDebt(cu.id);});
+  /* PERF (2026-08-25): same one-pass pool as rDash — see _custDebtInvIndex for why this
+     cannot change a debt figure. */
+  var _custInvPool=_custDebtInvIndex(),_custCustIx=_custStrictIndex();   // both per render — see _custStrictIndex
+  var debtMap={};(D.customers||[]).forEach(function(cu){debtMap[cu.id]=custDebt(cu.id,_custInvPool,_custCustIx);});
   /* GROUPED ONCE PER RENDER (2026-08-11, ND47-6a). The three lookups inside the row map
      below each scanned an ARCHIVE-MERGED array in full, once per visible row. Page size is
      50, so the cost was 50 x (all orders + all invoices) every time the Customers tab drew.
@@ -16546,13 +16969,17 @@ function rDel(q){
     "<div class=\"stat sb\"><div class=\"sl\">This month</div><div class=\"sv\">"+monthDel+"</div><div class=\"ss\">delivered</div></div>"+
     "<div class=\"stat sn\" style=\"cursor:pointer\" onclick=\"nav('orders',null);setTimeout(function(){filterOrds('Delivered');},80)\"><div class=\"sl\">Total delivered</div><div class=\"sv\">"+totalDel+"</div><div class=\"ss\">view all &rarr;</div></div>"+
     "<div class=\"stat sb\"><div class=\"sl\">Routes</div><div class=\"sv\">"+(D.routes||[]).length+"</div></div>")
-  var _dr=el("del-results");
+  var _dr=el("del-results"),_dlvCustIx=_custStrictIndex();   // once per render, for the row map below
   if(_dr)_dr.innerHTML=
     "<div class=\"tw\"><table>"+
     "<thead><tr><th>#</th><th>Customer</th><th>Full address</th><th>Product</th><th>Qty</th><th>Bottle before</th><th>Assigned</th><th>Payment</th><th>Status</th><th style=\"width:30px\" title=\"Notes/Instructions\">&#128196;</th><th></th></tr></thead>"+
     "<tbody>"+
       (pendFil.length?pendFil.map(function(o){
-        var c=(D.customers||[]).find(function(x){return x.id===o.cId;});
+        /* 2026-09-23: was a linear customer scan per delivery row — measured quadratic
+           (exponent 2.00). Exact stand-in, see _custStrictIndex. The index is built once
+           per render on the `var _dr=` line above, because this map sits inside a string
+           expression where no statement can go. */
+        var c=_custStrictGet(_dlvCustIx,o.cId);
         return "<tr><td style=\"font-weight:700\">#"+o.id+"</td>"+
           "<td><div style=\"font-weight:700\">"+(c?(can("vPhone")?c.name:maskName(c.name)):"&mdash;")+"</div><div class=\"ca\">"+(c&&can("vPhone")?c.phone:"")+"</div></td>"+
           "<td style=\"font-size:11px\">"+(c?[c.estate,c.court,c.house?"No."+c.house:"",c.htype].filter(Boolean).join(", "):(sanitizeInput(unescapeForEdit(o.deliver))||"&mdash;"))+"</td>"+
@@ -17206,9 +17633,23 @@ function _applyWriteOffsByGroup(map,orders,keyFn,invArr,field){
       if(!o)return;var k=keyFn(o);if(k==null)k="";
       if(!byKey[k])byKey[k]=[];byKey[k].push(o);
     });
+    /* VOIDED PRE-FILTER (2026-09-23) — the third O(n×m) the profiler found. This helper
+       calls _writtenOffFor once PER GROUP (per customer, per product, per driver), and each
+       call filtered EVERY invoice: 134,862 callbacks on the Customers tab, 137,397 on Reports.
+       _writtenOffFor's predicate rejects any invoice that is not voided on its very first
+       line — `if(!i||!i.voided)return false;` — so filtering those out once, up front, hands
+       it exactly the elements it could ever keep, in the same order. The same elements summed
+       in the same order give the same floating-point total, so every write-off figure is
+       unchanged. Voided invoices are rare, so each per-group call now scans a handful instead
+       of all of them.
+       Only applied when invArr is an array: if a caller ever passes nothing, _writtenOffFor
+       still computes its own base per call, exactly as before. The filter cannot throw
+       (`i&&i.voided` is null-safe), so it cannot change which groups the try/catch below
+       zeroes. */
+    var _woInv=Array.isArray(invArr)?invArr.filter(function(i){return !!(i&&i.voided);}):invArr;
     Object.keys(byKey).forEach(function(k){
       if(!Object.prototype.hasOwnProperty.call(map,k))return;
-      var wo=0;try{wo=_writtenOffFor(byKey[k],invArr);}catch(_){wo=0;}
+      var wo=0;try{wo=_writtenOffFor(byKey[k],_woInv);}catch(_){wo=0;}
       if(!wo)return;
       if(typeof map[k]==="number")map[k]=_round2(map[k]-wo);
       else if(map[k]&&typeof map[k][f]==="number")map[k][f]=_round2(map[k][f]-wo);
@@ -19380,8 +19821,12 @@ function rCmps(q,pg){
 function cmpRows(fil){
   var sm={"Open":"br","In progress":"ba","Resolved":"bg"};
   if(!fil.length)return "<tr><td colspan=\"8\"><div class=\"te\"><i class=\"ti ti-message-report\"></i><p>No complaints</p></div></td></tr>";
+  /* 2026-09-23: was a linear customer scan per complaint row — the last screen the profiler
+     measured as quadratic (exponent 1.75). Small today, but it grows with complaints x
+     customers. Exact stand-in, see _custStrictIndex; built once per call, not per row. */
+  var _cmpCustIx=_custStrictIndex();
   return fil.map(function(c){
-    var cu=(D.customers||[]).find(function(x){return x.id===c.cId;});
+    var cu=_custStrictGet(_cmpCustIx,c.cId);
     return "<tr><td>#"+c.id+"</td>"+
       "<td>"+
       (can("vPhone")?"<div style=\"font-weight:700\">"+(cu?cu.name:"&mdash;")+"</div><div class=\"ca\">"+(cu?(cu.phone||""):"")+"</div>":"<div style=\"font-weight:700\">"+(cu?[cu.estate,cu.court,cu.house?"No."+cu.house:""].filter(Boolean).join(", "):"&mdash;")+"</div>")+
@@ -19721,7 +20166,11 @@ function exportReportXL(){
     var auditRows=(D.auditLog||[]).slice().reverse().map(function(e){return{Timestamp:e.ts,User:unescapeForEdit(e.user||""),Role:e.role,Action:e.action,Details:unescapeForEdit(e.details||"")};});
     XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(auditRows),"Audit Log");
   }
-  XLSX.writeFile(wb,"NewDawn_Report_"+new Date().toISOString().slice(0,10)+".xlsx");
+  /* 2026-09-24: was the first ten characters of an ISO timestamp — a UTC calendar date. Kenya is
+     UTC+3, so any report exported between 00:00 and 03:00 was named with YESTERDAY's date.
+     Flagged by _system_audit.js [date/utc-shift]. tday() is _ymd(new Date()), the local date
+     every other filename and record in this file already uses. Filename only; no data. */
+  XLSX.writeFile(wb,"NewDawn_Report_"+tday()+".xlsx");
   toast("Report exported — "+delivered.length+" deliveries");
 }
 function rReports(){
@@ -19752,7 +20201,14 @@ function rReports(){
     }
     return true;
   });
-  var totD=(D.customers||[]).reduce(function(a,c){return a+custDebt(c.id);},0);
+  /* 2026-09-23: the Reports TOTAL-debt figure — a per-customer reduce with no pool, the loop
+     the profiler still charged ~334,000 callbacks to after the cRevs loop below was fixed.
+     Missed twice by pattern checks: the 2026-08-25 check looked only for forEach/map, not
+     reduce. Found this time by listing EVERY custDebt call and classifying each one. Same
+     pools and exactness as cRevs; the reduce still sums in customer order, so the float total
+     is unchanged. Built here rather than shared with cRevs so neither depends on the other. */
+  var _rptTotInvPool=_custDebtInvIndex(),_rptTotCustIx=_custStrictIndex();
+  var totD=(D.customers||[]).reduce(function(a,c){return a+custDebt(c.id,_rptTotInvPool,_rptTotCustIx);},0);
   var totCredit=(D.customers||[]).reduce(function(a,cu){return a+(cu.credit||0);},0);
   // BUSINESS-LOGIC FIX (2026-07-20): owner's explicit decision — a written-off
   // (voided) amount should NOT inflate the headline Revenue figure, even
@@ -19825,7 +20281,13 @@ function rReports(){
   });
   var cRevMap={};del.forEach(function(o){if(!cRevMap[o.cId])cRevMap[o.cId]={rev:0,ords:0};cRevMap[o.cId].rev+=o.qty*o.price;cRevMap[o.cId].ords++;});
   _applyWriteOffsByGroup(cRevMap,del,function(o){return o.cId;},_rptInvAll);
-  var cRevs=(D.customers||[]).map(function(c){var cm=cRevMap[c.id]||{rev:0,ords:0};return{c:c,rev:cm.rev,ords:cm.ords,debt:custDebt(c.id)};}).sort(function(a,b){return b.rev-a.rev;});
+  /* 2026-09-23: this per-customer loop passed NO pool — measured 460,356 invoice-filter
+     callbacks plus 206,570 customer-scan callbacks per Reports render, the heaviest screen in
+     the app. The 2026-08-25 "only two per-customer loops exist" check missed it: its regex
+     stopped at the closing brace of the inline default object (rev:0, ords:0) below. Same
+     pools, same exactness, as rDash. No literal brace in this note — see _custStrictIndex. */
+  var _rptDebtInvPool=_custDebtInvIndex(),_rptDebtCustIx=_custStrictIndex();
+  var cRevs=(D.customers||[]).map(function(c){var cm=cRevMap[c.id]||{rev:0,ords:0};return{c:c,rev:cm.rev,ords:cm.ords,debt:custDebt(c.id,_rptDebtInvPool,_rptDebtCustIx)};}).sort(function(a,b){return b.rev-a.rev;});
   var pRevs={};del.forEach(function(o){if(!pRevs[o.prod])pRevs[o.prod]={qty:0,rev:0};pRevs[o.prod].qty+=o.qty;pRevs[o.prod].rev+=o.qty*o.price;});
   _applyWriteOffsByGroup(pRevs,del,function(o){return o.prod;},_rptInvAll);
   var zones=[].concat([],(D.customers||[]).map(function(c){return c.estate||c.zone||"";})).filter(function(z,i,a){return z&&a.indexOf(z)===i;});
@@ -20348,7 +20810,7 @@ function exportAuditCSV(){
   var blob=new Blob([csv],{type:"text/csv"});
   var a=document.createElement("a");
   a.href=URL.createObjectURL(blob);
-  a.download="newdawn_audit_"+new Date().toISOString().slice(0,10)+".csv";
+  a.download="newdawn_audit_"+tday()+".csv";   // 2026-09-24: local date, not UTC — see exportReportXL
   a.click();
   toast("Exported "+logs.length+" entries to CSV");
 }
@@ -21355,7 +21817,10 @@ function sendEmailBackup(manual){
     // invoices but never subtracted cu.credit, overstating the emailed figure for
     // any customer holding credit — contradicting this KPI's own "agrees with the
     // debtors page" intent.
-    debt:"KSh "+((D.customers||[]).reduce(function(s,c){return s+custDebt(c.id);},0)).toLocaleString(),
+    /* 2026-09-23: pooled, same exactness as the screens (see _custStrictIndex). An IIFE because
+       this sits inside an object literal where no statement can go. Proven identical by
+       _proofB_render_equivalence.js §6, which captures the emailjs payload in both builds. */
+    debt:"KSh "+((function(){var p=_custDebtInvIndex(),x=_custStrictIndex();return (D.customers||[]).reduce(function(s,c){return s+custDebt(c.id,p,x);},0);})()).toLocaleString(),
     stock:(D.stock||[]).length,
     complaints:(D.complaints||[]).filter(function(c){return c.status!=="Resolved";}).length
   };
@@ -21822,8 +22287,13 @@ function stopAutoSaveLoop(){if(AS_TIMER){clearInterval(AS_TIMER);AS_TIMER=null;}
 function xSheet(name){
   var wb=XLSX.utils.book_new();
   var td=tday();
+  /* 2026-09-23: the Customers sheet below calls custDebt once per customer, and this object
+     literal builds EVERY sheet eagerly — so even exporting "Orders" paid the full O(n×m).
+     Pooled, same exactness as the screens (see _custStrictIndex). Proven identical by
+     _proofB_render_equivalence.js §6, which captures the rows handed to json_to_sheet. */
+  var _xsInvPool=_custDebtInvIndex(),_xsCustIx=_custStrictIndex();
   var sheets={
-    "Customers":(D.customers||[]).map(function(c){return{Name:unescapeForEdit(c.name),Phone:unescapeForEdit(c.phone),Estate:unescapeForEdit(c.estate||""),Court:unescapeForEdit(c.court||""),HouseNo:unescapeForEdit(c.house||""),Type:c.ctype,Debt:"KSh "+(custDebt(c.id)||0).toLocaleString()};}),
+    "Customers":(D.customers||[]).map(function(c){return{Name:unescapeForEdit(c.name),Phone:unescapeForEdit(c.phone),Estate:unescapeForEdit(c.estate||""),Court:unescapeForEdit(c.court||""),HouseNo:unescapeForEdit(c.house||""),Type:c.ctype,Debt:"KSh "+(custDebt(c.id,_xsInvPool,_xsCustIx)||0).toLocaleString()};}),
     // BOOKS (2026-07-30): this is a director-triggered export of the same data
     // the full backup covers — read through the merged accessors for the same
     // reason (identical to the raw D arrays with zero books loaded).
@@ -22922,6 +23392,9 @@ window.addEventListener("load",function(){
       FB_ORDERS_COL=fbDb.collection("orders");         // HYBRID MIGRATION (2026-07-31)
       FB_INVOICES_COL=fbDb.collection("invoices");     // HYBRID MIGRATION (2026-07-31)
       FB_CUSTOMERS_COL=fbDb.collection("customers");   // HYBRID MIGRATION (2026-07-31)
+      FB_ORDERS_DEL_COL=fbDb.collection("orders_deleted");       // PERMANENT ARCHIVE (2026-09-24) — _archiveThenDelete
+      FB_INVOICES_DEL_COL=fbDb.collection("invoices_deleted");   //   written only; never read or queried by the app
+      FB_CUSTOMERS_DEL_COL=fbDb.collection("customers_deleted");
       FB_COUNTERS_REF=fbDb.collection("newdawn_counters").doc("main");
     }catch(e){
       var r=document.getElementById("root");
