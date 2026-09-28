@@ -11957,10 +11957,29 @@ async function checkAutoSaveRecovery(){
   var hasCurrentData=(D.customers||[]).length||(D.orders||[]).length||(D.invoices||[]).length;
   if(snap&&snap.D){
     var snapHasData=(snap.D.customers&&(snap.D.customers||[]).length)||(snap.D.orders&&(snap.D.orders||[]).length);
-    var snapCusts=(snap.D.customers||[]).length;
-    var snapOrds=(snap.D.orders||[]).length;
-    var currCusts=D.customers?(D.customers||[]).length:0;
-    var currOrds=D.orders?(D.orders||[]).length:0;
+    /* COUNT ONLY LIVE RECORDS, ON BOTH SIDES (2026-09-29) — FOUND IN PRODUCTION the morning
+       after the first close. The director closed July (371 orders, 378 invoices archived,
+       read-back verified) and at the next login was offered "Restore auto-saved session?
+       1348 orders ... Live cloud data currently has 977 orders" — 1,348 - 371 = 977 exactly.
+       The snapshot was taken at 00:09:37, one minute BEFORE the close finished, and the log
+       shows a logout in the middle of the close, after which CU is null and lsKey() names the
+       shared slot, so the director's own slot kept the pre-close copy. The raw .length test
+       read 371 legitimately archived orders as 371 missing ones. "Restore & replace" would
+       have put them back as live records and pushed that to the cloud. The director pressed
+       Cancel. The same false alarm follows any bulk delete made after the last autosave.
+       NOW: a record that the LIVE data has tombstoned (deleted, or archived into a closed
+       month) is not counted in the snapshot, and _liveCount applies the same rule to the
+       live side. This is the predicate hydration, the reaper and the published counts already
+       use (_hybridTombstoned), so "live" means one thing everywhere. A snapshot that holds
+       genuinely missing records still differs by exactly those records and still prompts. */
+    function _snapLive(arr,name){
+      try{return (arr||[]).filter(function(r){return !(r&&r.id!=null&&_hybridTombstoned(name,String(r.id)));}).length;}
+      catch(_){return (arr||[]).length;}
+    }
+    var snapCusts=_snapLive(snap.D.customers,"customers");
+    var snapOrds=_snapLive(snap.D.orders,"orders");
+    var currCusts=D.customers?_liveCount("customers"):0;
+    var currOrds=D.orders?_liveCount("orders"):0;
     // NEVER consider a snapshot "better" if it has FEWER customers than live data —
     // customers are the foundational record; a higher order count in a stale local
     // snapshot must never be allowed to justify losing real customers added elsewhere.
@@ -11985,7 +12004,19 @@ async function checkAutoSaveRecovery(){
       msg+="\n\n\u26a0\ufe0f Restoring will REPLACE the live cloud data with this local snapshot.";
       msg+="\n\nRestore this data now?";
       if(await uiConfirm({title:"Restore auto-saved session?",message:msg,variant:"danger",confirmText:"Restore & replace"})){
+        /* A RESTORE NEVER UNDOES A DELETION OR A CLOSE (2026-09-29) — see the count note above.
+           The snapshot may predate them, so its maps lack the markers. The live markers are
+           carried over (a union: nothing the snapshot knew is lost), and any record they cover is
+           left out of the restored arrays. The records were deliberately deleted or are held in
+           the books; without this, a restore re-admits them and the next write sends them out. */
+        var _liveMarks=D;
+        ["deletedOrderIds","deletedInvoiceIds","deletedCustomerIds","archivedOrderIds","archivedInvoiceIds","closedPeriods"].forEach(function(m){
+          try{var lv=_liveMarks&&_liveMarks[m];if(lv&&typeof lv==="object")snap.D[m]=Object.assign({},(snap.D[m]&&typeof snap.D[m]==="object")?snap.D[m]:{},lv);}catch(_){}
+        });
         D=snap.D;
+        ["orders","invoices","customers"].forEach(function(n){
+          try{if(Array.isArray(D[n]))D[n]=D[n].filter(function(r){return !(r&&r.id!=null&&_hybridTombstoned(n,String(r.id)));});}catch(_){}
+        });
         if(!D.routes)D.routes=[];
         if(!D.complaints)D.complaints=[];
         if(!D.offers)D.offers=[];
