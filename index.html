@@ -22633,8 +22633,20 @@ function autoSaveLocal(){
        both, and nothing deletes lsKey() selectively.
        Kept deliberately tiny and versioned so a future reader can tell a pointer from a
        legacy full copy without guessing. Halves this app's localStorage footprint. */
-    localStorage.setItem("newdawn_autosave_shared",
-      JSON.stringify({__ndPtr:1,key:lsKey(),ts:snapshot.ts}));
+    /* NEVER POINT THE SHARED SLOT AT ITSELF (2026-09-29) — the note above is wrong on one path,
+       and it was hit in production. With nobody logged in (CU null) lsKey() IS
+       "newdawn_autosave_shared", so the line below overwrote the full copy just written there
+       with {__ndPtr:1,key:"newdawn_autosave_shared"} — a pointer to itself. The copy was gone,
+       and the next boot's local restore read a pointer with no data, took the FULL load from the
+       server (the director's 2026-09-29 boot: 2,902 documents billed, none from the local copy),
+       and the on-device safety copy of whatever changed after logout was lost. It happens
+       whenever a dirty() lands after logout: that night, the July close finished after the
+       director logged out. The cloud data was never affected — every write was confirmed.
+       With CU null the full copy already IS the shared slot, so no pointer is written. Proven by
+       _proofB_autosave_after_close.js §9. */
+    if(lsKey()!=="newdawn_autosave_shared")
+      localStorage.setItem("newdawn_autosave_shared",
+        JSON.stringify({__ndPtr:1,key:lsKey(),ts:snapshot.ts}));
     return true;
   }catch(e){
     if(!_autoSaveFailReported){
@@ -22900,6 +22912,10 @@ function autoSaveCheckLocal(){
       if(raw&&raw.indexOf("__ndPtr")!==-1){
         var _p=JSON.parse(raw);
         raw=(_p&&_p.__ndPtr&&_p.key)?localStorage.getItem(_p.key):null;
+        /* A pointer that leads to another pointer (the self-pointer written before the
+           2026-09-29 fix in autoSaveLocal) holds no data: treat it as absent, so the caller
+           falls through to sessionStorage below instead of receiving an object with no D. */
+        if(raw&&raw.indexOf("__ndPtr")!==-1&&raw.length<400)raw=null;
       }
     }catch(_){raw=null;}
     if(!raw){
