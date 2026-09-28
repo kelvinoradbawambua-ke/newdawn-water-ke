@@ -10617,6 +10617,133 @@ function _booksDueNote(){
     return html;
   }catch(_){return "";}
 }
+/* DUPLICATE INVOICES — FIND, AND REMOVE ONE ORDER AT A TIME (2026-09-28).
+   The repair half of the fix above _orderInvoiceMissingLocally, which stops new ones. On the
+   director's 28 Sep backup this finds exactly the three known orders, KSh 3,750.
+
+   WHAT COUNTS AS A DUPLICATE — deliberately narrow, so it can never touch a real invoice:
+   an order holding TWO OR MORE live (not voided) invoices where EVERY one is for the order's
+   own customer and for exactly the order's total. Anything else sharing the order (a
+   different amount, a different customer) marks the whole order "review by hand"; nothing
+   is removed there.
+   WHICH ONE STAYS: the one carrying money if exactly one does; otherwise the ORIGINAL (the
+   lowest id), which holds the terms the order was placed with (due = date + 7) rather than
+   the doorstep copy (due = the delivery day). The order's pointer is moved onto it.
+   WHICH ONES GO: only those with paid 0 and no payment rows. Two carrying money = by hand.
+
+   REMOVE, NEVER VOID. voidInvoice counts the balance as written-off bad debt AND sets the
+   ORDER's paid status to "Voided" (voidInvoice._confirm) — on a duplicate that would mark a
+   real, owed sale as written off. Removal uses the deletion tombstone, the same two lines the
+   cancel path uses (D.deletedInvoiceIds + filter): the reaper archives the document to
+   invoices_deleted and then deletes it, and every other device drops its copy through
+   _hybridPruneTombstoned (b16, so old phones included).
+   CHECKED AGAINST THE SERVER FIRST. This device's copy may be behind: a payment recorded on
+   a phone a minute ago may not be here yet. Every invoice involved is re-read from the server
+   (source:"server", by document id — always indexed) and the removal is refused unless the
+   server agrees each one to be removed has paid 0 and no payments, and the kept one exists.
+   Director only, one confirm per order, audit-logged with both ids and amounts. */
+function _duplicateInvoiceGroups(){
+  var out=[];
+  try{
+    var by={};
+    (D.invoices||[]).forEach(function(i){
+      if(!i||i.voided||i.id==null)return;
+      var k=_linkedOrderIdOf(i);if(k==null)return;
+      k=String(k);(by[k]=by[k]||[]).push(i);
+    });
+    var ordIdx=null;
+    Object.keys(by).forEach(function(k){
+      var a=by[k];if(a.length<2)return;
+      if(!ordIdx){ordIdx={};(D.orders||[]).forEach(function(o){if(o&&o.id!=null)ordIdx[String(o.id)]=o;});}
+      var o=ordIdx[k];if(!o)return;
+      var total=_round2((Number(o.qty)||0)*(Number(o.price)||0));
+      if(!(total>0))return;
+      var exact=a.every(function(i){return i.cId===o.cId&&_round2(Number(i.amount)||0)===total&&!i._numPending;});
+      var hasMoney=function(i){return (Number(i.paid)||0)>0||(Array.isArray(i.payments)&&i.payments.length>0);};
+      var withMoney=a.filter(hasMoney);
+      var g={oid:o.id,order:o,total:total,invoices:a.slice().sort(function(x,y){return Number(x.id)-Number(y.id);}),keep:null,remove:[],over:0,fixable:false,why:""};
+      if(!exact)g.why="the invoices differ in amount or customer";
+      else if(withMoney.length>1)g.why="more than one of them carries a payment";
+      else{
+        g.keep=withMoney.length?withMoney[0]:g.invoices[0];
+        g.remove=g.invoices.filter(function(i){return i!==g.keep;});
+        g.over=_round2(g.remove.reduce(function(s,i){return s+(Number(i.amount)||0);},0));
+        g.fixable=g.remove.length>0;
+      }
+      out.push(g);
+    });
+    out.sort(function(x,y){return Number(x.oid)-Number(y.oid);});
+  }catch(_){return [];}
+  return out;
+}
+function _dupInvoiceNote(){
+  try{
+    if(!CU||!can("rest"))return "";
+    var gs=_duplicateInvoiceGroups();if(!gs.length)return "";
+    var over=_round2(gs.reduce(function(s,g){return s+g.over;},0));
+    var rows=gs.map(function(g){
+      return "<div style=\"margin-top:6px;font-size:12px\">Order #"+g.oid+" &middot; "+custName(g.order.cId)+" &middot; KSh "+g.total.toLocaleString()+
+        " &mdash; invoices "+g.invoices.map(function(i){return "#"+i.id;}).join(" + ")+
+        (g.fixable?" <button class=\"btn bs\" style=\"margin-left:6px\" onclick=\"removeDuplicateInvoices("+g.oid+")\">Keep #"+g.keep.id+", remove #"+g.remove.map(function(i){return i.id;}).join(", #")+"</button>"
+                  :" <span style=\"color:var(--tx2)\">(review by hand: "+g.why+")</span>")+"</div>";
+    }).join("");
+    return "<div class=\"notif nr\" style=\"margin:8px 0\"><i class=\"ti ti-copy\"></i><div>"+
+      "<strong>Duplicate invoices — KSh "+over.toLocaleString()+" of debt is counted twice.</strong> "+
+      gs.length+" order(s) carry the same invoice more than once. Remove the copy; do NOT void it (voiding marks the order written off)."+rows+"</div></div>";
+  }catch(_){return "";}
+}
+var _dupRemoveBusy=false;
+async function removeDuplicateInvoices(oid){
+  if(!can("rest")){toast("Director only","err");return;}
+  if(_dupRemoveBusy)return;
+  function find(){return _duplicateInvoiceGroups().filter(function(g){return String(g.oid)===String(oid);})[0]||null;}
+  var g=find();
+  if(!g||!g.fixable){toast("Order #"+oid+" has nothing to remove automatically","err");return;}
+  if(!FB_INVOICES_COL){toast("Not connected to the cloud yet — try again in a moment","warn");return;}
+  _dupRemoveBusy=true;
+  try{
+    var ids=[g.keep].concat(g.remove).map(function(i){return String(i.id);});
+    var snaps;
+    try{
+      snaps=await Promise.all(ids.map(function(k){return _ndSettleWithin(FB_INVOICES_COL.doc(k).get({source:"server"}),10000,"invoice #"+k);}));
+    }catch(e){toast("Could not check the invoices with the server — nothing was changed. Try again when connected.","err");return;}
+    var srv={};snaps.forEach(function(s,n){srv[ids[n]]=s;});
+    var ks=srv[String(g.keep.id)];
+    if(!ks||!ks.exists){toast("Invoice #"+g.keep.id+" is not on the server yet — nothing was changed","err");return;}
+    var bad=g.remove.filter(function(i){
+      var s=srv[String(i.id)];if(!s||!s.exists)return false;   // already gone on the server: removing the local copy is correct
+      var v=s.data()||{};
+      return (Number(v.paid)||0)>0||(Array.isArray(v.payments)&&v.payments.length>0)||!!v.voided;
+    });
+    if(bad.length){toast("Invoice #"+bad.map(function(i){return i.id;}).join(", #")+" has a payment on the server — nothing was changed. Review it by hand.","err");return;}
+    var cu=(D.customers||[]).find(function(c){return c.id===g.order.cId;});
+    var ok=await uiConfirm({title:"Remove duplicate invoice"+(g.remove.length>1?"s":"")+" for order #"+g.oid+"?",
+      message:"Order #"+g.oid+" ("+(cu?unescapeForEdit(cu.name):"customer")+", KSh "+g.total.toLocaleString()+") has "+g.invoices.length+" identical invoices.\n\n"+
+        "KEEP  #"+g.keep.id+"  (due "+g.keep.due+", paid KSh "+(Number(g.keep.paid)||0).toLocaleString()+")\n"+
+        g.remove.map(function(i){return "REMOVE  #"+i.id+"  (due "+i.due+", paid KSh 0)";}).join("\n")+"\n\n"+
+        "The customer's debt falls by KSh "+g.over.toLocaleString()+". Revenue does not change. The removed invoice is kept in the permanent archive.",
+      variant:"warn",confirmText:"Remove duplicate",cancelText:"Cancel"});
+    if(!ok)return;
+    /* The dialog let the world move. Recompute and require the SAME decision, on the SAME ids. */
+    var g2=find();
+    if(!g2||!g2.fixable||String(g2.keep.id)!==String(g.keep.id)||
+       g2.remove.map(function(i){return String(i.id);}).join(",")!==g.remove.map(function(i){return String(i.id);}).join(",")){
+      toast("Order #"+oid+" changed while you were confirming — nothing was changed. Look again.","err");return;
+    }
+    if(!D.deletedInvoiceIds)D.deletedInvoiceIds={};
+    var gone={};
+    g2.remove.forEach(function(i){D.deletedInvoiceIds[i.id]=Date.now();gone[String(i.id)]=true;});
+    D.invoices=(D.invoices||[]).filter(function(i){return !(i&&gone[String(i.id)]);});
+    var prevPtr=g2.order.invoiceId;
+    g2.order.invoiceId=g2.keep.id;
+    auditLog("ORDER_UPDATED","DUPLICATE INVOICE REMOVED by "+CU.name+" ("+CU.role+"): order #"+g2.oid+" carried "+g2.invoices.length+
+      " identical invoices of KSh "+g2.total+". Kept #"+g2.keep.id+"; removed #"+g2.remove.map(function(i){return i.id;}).join(", #")+
+      " (paid 0 on the server). Debt reduced by KSh "+g2.over+"; revenue unchanged. Order pointer "+prevPtr+" -> "+g2.keep.id+".");
+    dirty();
+    try{refreshCurrentPage();}catch(_){}
+    toast("Order #"+g2.oid+": duplicate invoice removed — debt corrected by KSh "+g2.over.toLocaleString());
+  }finally{_dupRemoveBusy=false;}
+}
 function _updateBookIndex(period,archivedRecords,cb){
   var _cb=(typeof cb==="function")?cb:function(){};
   if(!FB_BOOKS_COL){_cb();return;}
@@ -13216,6 +13343,7 @@ function rDash(){
   pg.innerHTML=
     _custLoadingNote()+   // 2026-09-25 — partial customer load; see _custLoadingNote
     _booksDueNote()+      // 2026-09-25 — a month is due to close; see _booksDueNote
+    _dupInvoiceNote()+    // 2026-09-28 — an order carries the same invoice twice; see _duplicateInvoiceGroups
     /* ROUND-3 FINDING H — same banner as Reports. The dashboard reads through
        invoicesWithBooks(), so once a period is closed its figures are incomplete in
        exactly the same silent way. Placed immediately after the page header so it is
@@ -16042,6 +16170,23 @@ async function saveOrd(){
     var o=(D.orders||[]).find(function(x){return String(x.id)===String(editId);});
     if(!o){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}toast("Order not found","err");return;}
     if(o.status==="Delivered"||o.status==="Cancelled"){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}toast("This order can no longer be fully edited","err");return;}
+    /* DUPLICATE-INVOICE GUARD, EDIT TWIN (2026-09-28) — the same defect as completeDlv (see
+       the block above _orderInvoiceMissingLocally): both branches below mint a new invoice via
+       reserveNextInvoiceId() whenever linkedInv is not found ON THIS DEVICE, so editing an
+       order whose invoice has not arrived yet doubled its debt exactly as a delivery did.
+       Checked here, before the stock moves below, so a refusal changes nothing. Edits are made
+       by money roles at a desk, so "cannot be confirmed" refuses rather than guesses. */
+    if(_orderInvoiceMissingLocally(o)){
+      var _eid=o.id;
+      var _eSt=await _fetchOrderInvoice(o);
+      o=(D.orders||[]).find(function(x){return String(x.id)===String(_eid);});
+      var _eMsg=!o?"Order not found"
+        :(o.status==="Delivered"||o.status==="Cancelled")?"This order can no longer be fully edited"
+        :_eSt==="unknown"?"Invoice #"+o.invoiceId+" for this order has not reached this device and could not be checked. Nothing was changed — try again when connected."
+        :_eSt==="archived"?"Invoice #"+o.invoiceId+" for this order is in a closed month's books. Nothing was changed."
+        :"";
+      if(_eMsg){window._savingOrder=false;if(_placeOrderBtn){_placeOrderBtn.disabled=false;_placeOrderBtn.innerHTML="<i class=\"ti ti-check\"></i> Place order";}toast(_eMsg,"err");return;}
+    }
     var oldStock=(D.stock||[]).find(function(s){return (o.stockId&&s.id===o.stockId)||s.name===o.prod;});
     var newStock=(D.stock||[]).find(function(s){return s.name===pn;});
     if(oldStock===newStock){
@@ -16575,6 +16720,87 @@ function openDlv(oid){
   var oi=el("dlv-other-prod");if(oi)oi.value="";
   om("m-dlv");
 }
+/* ============================================================================
+   NEVER MINT A SECOND INVOICE FOR AN ORDER THAT ALREADY HAS ONE     (2026-09-28)
+
+   FOUND IN LIVE DATA — the director's 28 Sep 06:08 backup, reported as "292/50 was 250,
+   now 500; M679 was 3000, now 6000". Three orders, each carrying TWO identical unpaid
+   invoices, KSh 3,750 of debt counted twice:
+     #2711 M679        3,000  invoices 3690 (due 10-03) + 3691 (due 09-26)
+     #2712 292/50        250  invoices 3692 (due 10-03) + 3694 (due 09-26)
+     #2713 531/8         500  invoices 3693 (due 10-03) + 3695 (due 09-26)
+   No other order of the 1,326 in that backup has more than one invoice.
+
+   THE MECHANISM, proven by the due dates. Placement writes due = order date + 7 (10-03).
+   completeDlv's "create the invoice when ABSENT" branch writes due = tday() (09-26). So each
+   second invoice was minted AT DELIVERY by a device that held the order but not its invoice,
+   and the invoice ids interleave with the next orders' (#2714 took 3696), so each delivery
+   happened within minutes of placement. That branch then OVERWROTE o.invoiceId with the new
+   id, which is why the backup shows the orders pointing at the second invoice.
+   The order ALREADY CARRIED THE ANSWER: placement sets o.invoiceId (3690/3692/3693). The
+   branch never asked whether that invoice existed; it only asked whether THIS device had it.
+
+   WHY THE DEVICE LACKED IT is not recoverable from a backup — that needs the delivering
+   phone's own log — so this fix is deliberately independent of the reason: order and invoice
+   travel as separate documents on separate listeners, and ANY gap between them (a slow
+   invoice flush on the placing phone, a listener that had not caught up, a phone resumed from
+   sleep) reaches the same line. The same defect is in every build, including the live one.
+
+   THE RULE NOW: an invoice is minted only when the order has no invoice pointer, or when the
+   SERVER says the one it points at does not exist.
+     - invoice present locally (every normal delivery)  -> no lookup, no await, no read:
+       the common path executes in exactly the same order as before.
+     - pointer set, invoice absent locally              -> ONE document read by id (always
+       indexed; no query, so the index keep-list is untouched):
+         exists and belongs to this order  -> adopted into D through _hydrateById, the same
+                                              function the listeners use (tombstones honoured,
+                                              _updatedAt stripped, shadow advanced exactly as the
+                                              listener does, so it is not written back).
+         server says it does not exist     -> minted, exactly as before.
+         cannot be confirmed (offline, timeout, a cache that has never seen it)
+                                           -> NOT minted. The delivery still completes; the
+                                              order keeps its pointer, and the real invoice links
+                                              up the moment it arrives. The ONE case refused is
+                                              a money-handling user recording cash at the door,
+                                              because that cash needs an invoice to sit on.
+     - invoice deliberately deleted (tombstone)         -> minted, as before.
+     - invoice archived into a closed book              -> NOT minted (it exists, in the book).
+   Proven by _proofB_dup_invoice.js, which reproduces the duplicate on the live build first. */
+var INV_LOOKUP_TIMEOUT_MS=8000;
+var _invLookupBusy={};   // order id -> true while its invoice lookup is in flight (double-tap guard)
+function _orderInvoiceMissingLocally(o){
+  try{
+    if(!o||o.invoiceId==null||o.invoiceId==="")return false;
+    var k=String(o.invoiceId);
+    if((D.invoices||[]).some(function(i){return i&&String(i.id)===k;}))return false;
+    return _linkedInvoicesOf(o.id,D.invoices).length===0;
+  }catch(_){return false;}   // cannot tell -> the old behaviour, never a new block
+}
+/* "adopted" | "none" (minting is correct) | "archived" | "unknown" (do NOT mint). Never throws. */
+async function _fetchOrderInvoice(o){
+  try{
+    if(!o||o.invoiceId==null||o.invoiceId==="")return "none";
+    var k=String(o.invoiceId);
+    if(D.deletedInvoiceIds&&D.deletedInvoiceIds[k])return "none";
+    if(D.archivedInvoiceIds&&D.archivedInvoiceIds[k])return "archived";
+    if(!HYBRID_COLLECTIONS_LIVE||!FB_INVOICES_COL)return "none";   // main-document mode: D is the whole truth, as before
+    var snap=await _ndSettleWithin(FB_INVOICES_COL.doc(k).get(),INV_LOOKUP_TIMEOUT_MS,"invoice #"+k+" for order #"+o.id);
+    var fromCache=!!(snap&&snap.metadata&&snap.metadata.fromCache);
+    if(!snap||!snap.exists)return fromCache?"unknown":"none";      // a cache miss proves nothing
+    var v=snap.data();
+    if(!v||String(_linkedOrderIdOf(v))!==String(o.id))return "none";   // the pointer names another order's invoice
+    var _keep={};
+    _hydrateById(D.invoices,[snap],"invoices/order-lookup","invoices",fromCache,1,_keep);
+    var rec=(D.invoices||[]).find(function(i){return i&&String(i.id)===k;});
+    if(!rec)return "unknown";   // refused re-entry (tombstoned meanwhile) — do not mint over it
+    if(!_keep[k])_hybridShadow.invoices[k]=_stableStr(rec);
+    console.log("[NDINV] order #"+o.id+": invoice #"+k+" was not on this device — fetched it"+(fromCache?" from the local cache":" from the server")+" instead of creating a duplicate");
+    return "adopted";
+  }catch(e){
+    console.log("[NDINV] order #"+(o&&o.id)+": invoice #"+(o&&o.invoiceId)+" could not be checked ("+((e&&e.code)||(e&&e.message)||"unknown")+") — no new invoice will be created");
+    return "unknown";
+  }
+}
 async function completeDlv(){
   var oid=parseInt(el("dlv-oid").value);
   var o=(D.orders||[]).find(function(x){return x.id===oid;});if(!o)return;
@@ -16603,6 +16829,40 @@ async function completeDlv(){
   if(o.status==="Delivered"){
     toast("Order #"+oid+" is already delivered","err");
     return;
+  }
+  /* DUPLICATE-INVOICE GUARD (2026-09-28) — see the block above _orderInvoiceMissingLocally.
+     Placed here, ABOVE every mutation (the cash dialog, the stock deduction, the status flip),
+     so a refusal is a true no-op. Entered only when the order's invoice is missing on this
+     device; every normal delivery skips it without an await. */
+  var _dlvNoMint=false;
+  if(_orderInvoiceMissingLocally(o)){
+    if(_invLookupBusy[oid])return;   // a second tap while the first is still checking
+    _invLookupBusy[oid]=true;
+    var _invSt;
+    try{toast("Checking invoice #"+o.invoiceId+" for order #"+oid+"…","warn");}catch(_){}
+    try{_invSt=await _fetchOrderInvoice(o);}finally{delete _invLookupBusy[oid];}
+    /* The wait let the world move: another device may have delivered or cancelled it, and a
+       snapshot may have replaced the object. Re-read and re-apply the same guards. */
+    o=(D.orders||[]).find(function(x){return x.id===oid;});
+    if(!o)return;
+    if(o.status==="Cancelled"){toast("Order #"+oid+" was cancelled — it cannot be delivered","err");return;}
+    if(o.status==="Delivered"){toast("Order #"+oid+" is already delivered","err");return;}
+    if(!can("eOrd")&&o.driver&&o.driver!==CU.name){toast("Security: you are not assigned to Order #"+oid,"err");return;}
+    if(_invSt==="unknown"||_invSt==="archived"){
+      _dlvNoMint=true;
+      var _cashNow=0;
+      try{_cashNow=_round2(parseFloat(el("dlv-amt")&&el("dlv-amt").value)||0);}catch(_){_cashNow=0;}
+      /* Cash typed by a money role goes straight onto the invoice. With no invoice on this
+         device it would land on the order alone, with no payment row behind it, so it is
+         refused. Staff/driver cash is unaffected: it becomes a pendingPayments row keyed by
+         the ORDER, which the director's acknowledgement applies to the real invoice. */
+      if(can("mPaid")&&_cashNow>0){
+        toast(_invSt==="archived"
+          ?"Invoice #"+o.invoiceId+" is in a closed month's books, not on this device. Nothing was recorded — record the payment from Invoices."
+          :"Invoice #"+o.invoiceId+" has not reached this device and could not be checked. Nothing was recorded — try again when connected.","err");
+        return;
+      }
+    }
   }
   var isCat=o.prodConfirmed===false;
 
@@ -16906,7 +17166,11 @@ async function completeDlv(){
   // originally fixed for, just for exact orders instead. total>0 still gates it
   // (a genuine zero-value order needs no invoice), matching the prior condition;
   // an existing invoice still takes the else-branch, so nothing double-creates.
-  if(!inv&&total>0){
+  // _dlvNoMint (2026-09-28): "absent on THIS device" is not "absent" — see the block above
+  // _orderInvoiceMissingLocally. When the order's own invoice could not be confirmed missing,
+  // the delivery completes without minting a second one; the real invoice links on arrival.
+  if(_dlvNoMint&&!inv&&total>0)console.log("[NDINV] order #"+oid+" delivered WITHOUT creating an invoice — its invoice #"+o.invoiceId+" exists elsewhere or could not be checked; it links up when it arrives");
+  if(!inv&&total>0&&!_dlvNoMint){
     reserveNextInvoiceId().then(function(newInvId){
       inv={id:newInvId,orderId:oid,cId:o.cId,amount:total,paid:0,due:tday(),notes:"Order #"+oid,date:tday(),payments:[]};
       (D.invoices||[]).push(inv);
