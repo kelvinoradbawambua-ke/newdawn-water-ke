@@ -3304,6 +3304,32 @@ function _liveCount(name){
     return n;
   }catch(_){return ((D&&D[name])||[]).length;}   // never let counting break a read path
 }
+/* CUSTOMERS STILL LOADING — say so on the money screens (2026-09-25).
+   FOUND IN PRODUCTION: the director's Debts screen read "5 customers · KSh 9,950" while the
+   true figure was 34 customers · KSh 41,698. The log showed customers/all delivering 19
+   records from this device's cache, and the other 449 from the server some seconds later. Every
+   per-customer money figure is built by walking D.customers, so for those seconds the screen
+   showed a plausible, wrong number with nothing to say it was partial. Reproduced by running
+   the real rDebts on the director's backup with 19 customers loaded.
+   CUSTOMERS ONLY, deliberately, and measured rather than guessed. The same test on orders or
+   invoices would give FALSE warnings from 2026-09-30: their listeners take a 90-day window
+   (plus everything unsettled), the oldest orders are dated 2026-07-01, and _hydrateById never
+   removes a record that leaves a query. So a device left running holds more of them than a
+   freshly started one, and publishes that higher count. customers/all has no window, so two
+   complete devices cannot disagree except for the moment a new customer is in transit.
+   Uses the published count the main document already carries (_publishedCounts) and the same
+   _liveCount the delta gate trusts. No read, no write. Shown only to roles that see money. */
+function _custLoadingNote(){
+  try{
+    if(!(can("vDebt")||can("vRev")))return "";
+    var pub=_publishedCounts;
+    if(!pub||typeof pub.customers!=="number"||!isFinite(pub.customers)||pub.customers<=0)return "";
+    var have=_liveCount("customers");
+    if(have>=pub.customers)return "";
+    return "<div class=\"notif nw\" style=\"margin:8px 0\"><i class=\"ti ti-loader\"></i><div><strong>Customers still loading — "+
+      have+" of "+pub.customers+" so far.</strong> Debt and customer figures on this screen are incomplete until this message disappears.</div></div>";
+  }catch(_){return "";}
+}
 
 /* FIELD FIX (2026-08-03) — A RECORD DELETED ON ANOTHER DEVICE LINGERED UNTIL REFRESH.
 
@@ -3463,6 +3489,16 @@ function _hybridFlushDocs(writesOnly){
            left un-advanced so a later flush WOULD rewrite it; this re-arms the flag that
            actually causes a later flush to occur, so the retry stops depending on the
            user happening to do something else. Costs nothing when writes succeed. */
+        /* PERMANENT REFUSAL (2026-09-25). permission-denied is the server saying this state
+           will never be accepted — e.g. the rule that a Delivered or Cancelled order's status
+           is final. Retrying cannot succeed, and since _hydrateById now keeps an unsent edit,
+           the edit would be kept and re-sent forever. So hand the record back to the server:
+           the next snapshot adopts its version. Every other failure keeps the retry. */
+        if(e&&e.code==="permission-denied"){
+          try{_hybridForceRemote.orders[k]=true;}catch(_){}
+          console.log("[NDHYBRID] order #"+k+" write REFUSED by the server (permission-denied) — this device's change is dropped and the server's version will be adopted on the next snapshot");
+          return;
+        }
         _pendingLocalWrite=true;
         console.log("[NDHYBRID] order #"+k+" write failed ("+((e&&e.code)||"unknown")+") — shadow left stale and a retry re-armed");
       });
@@ -3493,6 +3529,12 @@ function _hybridFlushDocs(writesOnly){
       }).catch(function(e){
         // Same re-arm as the orders write above — an invoice is money, so a silently
         // forgotten failure here is worse, not better.
+        // Same permanent-refusal exit as the orders write above (2026-09-25).
+        if(e&&e.code==="permission-denied"){
+          try{_hybridForceRemote.invoices[k]=true;}catch(_){}
+          console.log("[NDHYBRID] invoice #"+k+" write REFUSED by the server (permission-denied) — this device's change is dropped and the server's version will be adopted on the next snapshot");
+          return;
+        }
         _pendingLocalWrite=true;
         console.log("[NDHYBRID] invoice #"+k+" write failed ("+((e&&e.code)||"unknown")+") — shadow left stale and a retry re-armed");
       });
@@ -3568,7 +3610,42 @@ var _HYDRATE_ORDER_FIELDS=["cId","driver","notes","deliver","prod","stockId","qt
                                 would make it last-writer-wins and could lose a payment
    See the block comment at the end of _mergeCustomerCredit for the full reasoning. */
 var _CUSTOMER_PROFILE_FIELDS=["name","phone","phone2","idno","estate","court","house","htype","road","zone","ctype","creditLimit","notes"];
-function _hydrateById(arr,docs,label,arrName,fromCache,changed){
+/* ============================================================================
+   AN UNSENT LOCAL EDIT MUST SURVIVE AN INCOMING SNAPSHOT                (2026-09-25)
+
+   REPRODUCED AGAINST THE REAL LIVE CODE (scratchpad race_unsent_edit.js, on the
+   1,596,756-byte build): a driver taps Delivered; completeDlv mutates the order and calls
+   dirty(), which waits 800 ms (a delivery is not a critical edit), or waits for
+   _cloudDataConfirmed after a phone wakes. If ANY change from another device reaches the
+   orders listener inside that window, Firestore hands back the complete query result, and
+   the update branch below copied every non-arbitrated field of every document over the
+   local record. status went back to "Pending", bottle_after back to null; deliveredAt and
+   completedBy stayed, because the older server document did not have them. The listener
+   then set the shadow to that reverted record, and the flush SENT it:
+       status Pending + deliveredAt + completedBy + bottle_after null
+   which is exactly the server document of order #2482 found on 2026-09-25.
+
+   THE RULE. A record whose current state differs from its shadow (the last state this
+   device persisted, or received and adopted) holds an edit that has not reached the server.
+   For such a record, a field this device changed since the shadow is KEPT; every other
+   field still takes the server's value. The shadow is not advanced for it, so the flush
+   sends it. That is the same latency-compensation contract Firestore itself gives writes
+   already issued; this only extends it back to the 800 ms before the write is issued.
+   UNCHANGED, deliberately: every field that already has a merge rule keeps it, because
+   those rules are the money logic. See _HYDRATE_MERGED below. A newer revision from another
+   device still wins an arbitrated field; payments still union; voided still ratchets.
+
+   THE ONE WAY OUT. If the server refuses the write permanently (permission-denied, e.g. the
+   2026-09-25 rule that a Delivered or Cancelled order's status is final), the flush marks
+   the record in _hybridForceRemote, and the next snapshot adopts the server's version. Without
+   that, a refused edit would be kept and re-sent on every flush for the rest of the session. */
+var _hybridForceRemote={orders:{},invoices:{},customers:{}};
+var _HYDRATE_MERGED={
+  orders:(function(){var m={_rev:1,_editedAt:1,_editedBy:1};_HYDRATE_ORDER_FIELDS.forEach(function(f){m[f]=1;});return m;})(),
+  invoices:{payments:1,paid:1,amount:1,voided:1,_rev:1,_editedAt:1,_editedBy:1},
+  customers:(function(){var m={credit:1,creditLog:1,_rev:1,_editedAt:1,_editedBy:1};_HYDRATE_CUST_FIELDS.forEach(function(f){m[f]=1;});return m;})()
+};
+function _hydrateById(arr,docs,label,arrName,fromCache,changed,keep){
   // Defensive: hydration runs inside an onSnapshot callback, where a throw would break the
   // listener for the rest of the session. Bad input is a no-op, never an exception.
   if(!arr||typeof arr.forEach!=="function")return 0;
@@ -3642,6 +3719,19 @@ function _hydrateById(arr,docs,label,arrName,fromCache,changed){
          two devices are therefore still last-writer-wins under cutover. Not a
          regression from the previous cutover behaviour, but not fixed either.
          ================================================================ */
+      /* UNSENT-EDIT CHECK (2026-09-25) — see the block above _hybridForceRemote. Taken BEFORE
+         any merge touches tgt, so it compares what this device holds against what it last
+         persisted. A record with no shadow entry has never been persisted from here and keeps
+         the old behaviour exactly. */
+      var _pend=false,_shObj=null;
+      try{
+        var _shMap=_hybridShadow?_hybridShadow[arrName]:null;
+        var _S=_shMap?_shMap[k]:undefined;
+        var _force=!!(_hybridForceRemote[arrName]&&_hybridForceRemote[arrName][k]);
+        if(typeof _S==="string"&&!_force&&_stableStr(tgt)!==_S){_shObj=JSON.parse(_S);_pend=!!_shObj;}
+        if(_force)delete _hybridForceRemote[arrName][k];
+      }catch(_){_pend=false;_shObj=null;}   // a failed check degrades to the old behaviour, never blocks hydration
+      var _merged=_HYDRATE_MERGED[arrName]||{};
       var rc=v;
       try{
         if(arrName==="customers"){
@@ -3661,8 +3751,12 @@ function _hydrateById(arr,docs,label,arrName,fromCache,changed){
       }catch(_){rc=v;}   // a merge failure must never stop hydration
       Object.keys(rc).forEach(function(f){
         if(f==="_updatedAt")return;
+        /* A field this device changed and has not yet sent is kept (2026-09-25). Fields with a
+           merge rule are excluded — rc already holds their merged answer. */
+        if(_pend&&!_merged[f]&&_stableStr(tgt[f])!==_stableStr(_shObj[f]))return;
         if(_stableStr(tgt[f])!==_stableStr(rc[f])){tgt[f]=rc[f];changed=true;}
       });
+      if(_pend&&keep)keep[k]=true;   // the caller must not advance the shadow for it
       if(changed)updated++;
     }else{
       /* FIX (2026-08-01): the update branch above skips _updatedAt, this one did not —
@@ -4206,13 +4300,29 @@ function _hybridStartListeners(){
         var _fromCache=true,_changed=null;
         try{_fromCache=!!(s.metadata&&s.metadata.fromCache);}catch(_){_fromCache=true;}
         try{_changed=(typeof s.docChanges==="function")?s.docChanges().length:null;}catch(_){_changed=null;}
-        var n=_hydrateById(D[arrName],docs,label,arrName,_fromCache,_changed);
+        var _keep={};
+        var n=_hydrateById(D[arrName],docs,label,arrName,_fromCache,_changed,_keep);
         // Keep the shadow in step with what the server told us, so hydration never
         // looks like a local edit and never triggers a write-back storm.
+        /* TWO CHANGES (2026-09-25).
+           1. ONE INDEX, NOT A SCAN PER DOCUMENT. This was (D[arrName]).filter(...)[0] inside
+              docs.forEach, and Firestore hands back the COMPLETE query result on every
+              delivery, so every change from any device cost docs x records String()
+              comparisons: 1,269 x 1,269 = 1.6M for orders/hot alone, measured 712 ms per
+              snapshot on a desktop and growing with the SQUARE of the data. With one index
+              it is 8.9 ms. Identical result: the index keeps the FIRST record per id,
+              exactly what filter(...)[0] returned. _proofB_snapshot_shadow.js proves both.
+           2. A record _hydrateById found holding an UNSENT local edit (_keep) is NOT
+              advanced: its shadow must still differ from it, or the flush would never send
+              the edit. See the block above _hybridForceRemote. */
+        var _recById={};
+        (D[arrName]||[]).forEach(function(r){if(r&&r.id!=null){var _rk=String(r.id);if(_recById[_rk]===undefined)_recById[_rk]=r;}});
         docs.forEach(function(d){
           var v=d.data();if(!v||v.id==null)return;
-          var rec=(D[arrName]||[]).filter(function(r){return r&&String(r.id)===String(v.id);})[0];
-          if(rec)_hybridShadow[arrName][String(v.id)]=_stableStr(rec);
+          var _vk=String(v.id);
+          if(_keep[_vk])return;
+          var rec=_recById[_vk];
+          if(rec)_hybridShadow[arrName][_vk]=_stableStr(rec);
         });
         if(n){try{refreshCurrentPage();}catch(_){}}
         // Delivery-driven, not subscribe-driven — see _maybeRecordFullLoadBaseline.
@@ -8139,6 +8249,27 @@ function startCloudListener(isWarmRefresh){
           if(!D.deletedInvoiceIds[k])D.deletedInvoiceIds[k]=data.D.deletedInvoiceIds[k];
         });
       }
+      /* CLOSED-MONTH MARKERS — the SAME union (2026-09-28). PROVEN MISSING by executing the real
+         listener in all three builds (1,561,324 / 1,596,756 / the candidate): a device that did
+         not run the close received a server snapshot carrying closedPeriods / archivedOrderIds /
+         archivedInvoiceIds and held NONE of them afterwards. _closePeriod is the only writer of
+         these maps, and nothing on the read side ever took them, so every other device's next
+         main-document write (payload D = its own D) sent them back to the server WITHOUT the
+         markers: the server copy flipped on each save, other money-role devices never learned a
+         month was closed, and the B5 water-cycle guard — which reads D.closedPeriods — was
+         disarmed everywhere but the closing device. The comment at archivedPeriodsLocal() says
+         "D.closedPeriods is the authority because it SYNCS"; this is what makes that true.
+         Additive, exactly like deletedInvoiceIds above: an entry is never removed here, so a
+         device can only learn a close, never unlearn one. pruneOldTombstones still ages the
+         per-record maps (marker-gated); the period markers are never pruned. */
+      ["closedPeriods","archivedOrderIds","archivedInvoiceIds"].forEach(function(mk){
+        try{
+          var rm=data.D[mk];
+          if(!rm||typeof rm!=="object")return;
+          if(!D[mk]||typeof D[mk]!=="object")D[mk]={};
+          Object.keys(rm).forEach(function(k){if(!D[mk][k])D[mk][k]=rm[k];});
+        }catch(_){}
+      });
       // RECOVERY-DUPLICATE DEDUP (2026-07-26): two directors recreating the
       // SAME missing order on two devices within one sync window each mint a
       // different, atomically-unique order id, but tagged with the same
@@ -9955,21 +10086,42 @@ function _postingDateIssue(dateStr){
 }
 /* Closed months that have gained records since they were closed. Drives the "re-close?"
    prompt in Books. Local data only — no reads. */
+/* CORRECTED 2026-09-25 — counted EVERY live record dated in a closed month, and Reports then said
+   "these were posted after the book was closed, so the closed book and these figures disagree".
+   Executed on the director's data, closing July left 19 July records live BY DESIGN — unpaid ones
+   (debt never leaves) and invoices that travel with a later month's order — so every close would
+   have raised that warning, falsely: nothing was posted afterwards and, with books merged into
+   every figure, nothing disagrees. A live record in a closed month is now counted only when it
+   is one of the two things the warning is for:
+     (a) a re-close would MOVE it — it has settled since the close (_recordsEligibleForPeriod,
+         the close's own rule); or
+     (b) it was POSTED INTO the month AFTER the close — its creation time (_ts) is later than the
+         month's close time (D.closedPeriods[p]). This is the back-dated entry round 5 (E.19)
+         exists to catch, and it is still caught even when it is unpaid and cannot move.
+   A record already live when the month was closed, and still not archivable, is neither.
+   Memoised: (a) scans invoices per order, so this runs at most once per day per change to the
+   live arrays or the closed months, not on every Reports render. */
+var _driftMemo={key:"",out:[]};
 function closedPeriodsWithDrift(){
   var out=[];
   try{
     var closed=archivedPeriodsLocal();
     if(!closed.length)return out;
-    var seen={};
-    (D.invoices||[]).forEach(function(i){
-      var p=bookPeriodOf(i&&i.date);
-      if(p&&closed.indexOf(p)>=0)seen[p]=(seen[p]||0)+1;
+    var key=tday()+"|"+closed.join(",")+"|"+(D.orders||[]).length+"|"+(D.invoices||[]).length;
+    if(_driftMemo.key===key)return _driftMemo.out;
+    closed.forEach(function(p){
+      var r=_recordsEligibleForPeriod(p),ids={};
+      r.orders.forEach(function(o){ids["o"+o.id]=true;});
+      r.invoices.forEach(function(i){ids["i"+i.id]=true;});
+      var at=Number(D.closedPeriods&&D.closedPeriods[p])||0,late=0;
+      if(at){
+        (D.orders||[]).forEach(function(o){if(o&&bookPeriodOf(o.date)===p&&!ids["o"+o.id]&&Number(o._ts)>at)late++;});
+        (D.invoices||[]).forEach(function(i){if(i&&bookPeriodOf(i.date)===p&&!ids["i"+i.id]&&Number(i._ts)>at)late++;});
+      }
+      var n=r.orders.length+r.invoices.length+late;
+      if(n)out.push({period:p,records:n});
     });
-    (D.orders||[]).forEach(function(o){
-      var p=bookPeriodOf(o&&o.date);
-      if(p&&closed.indexOf(p)>=0)seen[p]=(seen[p]||0)+1;
-    });
-    Object.keys(seen).sort().forEach(function(p){out.push({period:p,records:seen[p]});});
+    _driftMemo={key:key,out:out};
   }catch(_){}
   return out;
 }
@@ -10044,27 +10196,58 @@ function loadBooks(periods,cb){
         both places - exactly the state a half-finished close leaves behind - is
         counted ONCE and read from the live copy. Duplication can never inflate a
         figure, which is why the close is safe to interrupt. */
+/* CHRONOLOGICAL MERGE (2026-09-25). This used to APPEND the book records after the live ones.
+   Screens assume the array is oldest-first — the Invoices list is invoicesWithBooks().reverse()
+   — so after closing July its invoices were listed ABOVE September's, and ties in Reports came
+   out in a different order: executed on the director's data, the close changed two screens.
+   Measured: the live arrays are in exact (date, id-as-string) order, which is the order the
+   listeners deliver (Firestore sorts by the query field, then document id) — 0 exceptions in
+   1,267 orders and 1,268 invoices. So each book record is now placed where it would sit in
+   that order, WITHOUT reordering any live record: a single merge pass. With books sorted once
+   per load (_loadedBookArrays), and live already in order, the result is exactly the array the
+   device held before the close. Nothing loaded -> the untouched live copy, as before. */
+function _mergeKey(r){return String((r&&r.date)||"")+"|"+String(r&&r.id);}
 function _mergeById(liveArr,bookArr){
   var out=_hrArr(liveArr).slice();
   var _bk=_hrArr(bookArr);
   if(!_bk.length)return out;
   var seen={};
   out.forEach(function(r){ if(r&&r.id!=null)seen[String(r.id)]=true; });
+  var add=[];
   _bk.forEach(function(r){
     if(!r||r.id==null)return;
     if(seen[String(r.id)])return;          // live wins, always
     seen[String(r.id)]=true;
-    out.push(r);
+    add.push(r);
   });
-  return out;
+  if(!add.length)return out;
+  var res=[],j=0,ak=add.map(_mergeKey);
+  for(var i=0;i<out.length;i++){
+    var lk=_mergeKey(out[i]);
+    while(j<add.length&&ak[j]<lk){res.push(add[j]);j++;}
+    res.push(out[i]);
+  }
+  while(j<add.length){res.push(add[j]);j++;}
+  return res;
 }
+/* Sorted into (date, id) order ONCE per change to the loaded books (_booksVersion), so the merge
+   above stays one linear pass per render instead of a sort per render. A book can hold records
+   from other months (an invoice travels with its order's month), so the concatenation is sorted
+   as a whole, not per book. */
+var _bookArrMemo={ver:-1,orders:[],invoices:[]};
 function _loadedBookArrays(key){
-  var acc=[];
-  Object.keys(BOOK_CACHE).forEach(function(p){
-    var b=BOOK_CACHE[p];
-    if(b&&b[key]&&b[key].length)acc=acc.concat(b[key]);
-  });
-  return acc;
+  if(_bookArrMemo.ver!==_booksVersion){
+    var acc={orders:[],invoices:[]};
+    Object.keys(BOOK_CACHE).sort().forEach(function(p){
+      var b=BOOK_CACHE[p];
+      ["orders","invoices"].forEach(function(k){if(b&&b[k]&&b[k].length)acc[k]=acc[k].concat(b[k]);});
+    });
+    ["orders","invoices"].forEach(function(k){
+      acc[k].sort(function(a,b){var x=_mergeKey(a),y=_mergeKey(b);return x<y?-1:(x>y?1:0);});
+    });
+    _bookArrMemo={ver:_booksVersion,orders:acc.orders,invoices:acc.invoices};
+  }
+  return _bookArrMemo[key]||[];
 }
 function ordersWithBooks(){ return _mergeById(D.orders,_loadedBookArrays("orders")); }
 function invoicesWithBooks(){ return _mergeById(D.invoices,_loadedBookArrays("invoices")); }
@@ -10169,6 +10352,49 @@ function loadArchivedBooks(cb){
     });
   });
 }
+/* CLOSED MONTHS LOAD AUTOMATICALLY FOR THE ROLES THAT SEE MONEY (2026-09-25).
+   The director asked that closing a month leave every view EXACTLY as it was. Every money
+   screen already reads through ordersWithBooks()/invoicesWithBooks(), but a book was loaded
+   only when a director pressed "Load archived months" — once per session — so after the first
+   close each fresh session showed "archived month NOT included" until someone remembered.
+   This does that load on login, quietly: no toast, and NO audit entry (the audit log is a
+   bounded window the missing-order detector depends on; one entry per login would erode it).
+   COST, measured by _proofB_books_close.js §7: 1 read for the index per session (it is read
+   even while nothing is closed — see "THE INDEX IS THE AUTHORITY" below) + 1 per closed month,
+   and only for roles with vDebt or vRev. Staff and drivers never load books.
+   Books are not part of the sync path, so the per-snapshot listener cost is unaffected.
+   Bounded retry while the connection or the main document is not ready yet. */
+var _autoBooksTries=0;
+function _autoLoadClosedBooks(){
+  try{
+    if(!CU||!(can("vDebt")||can("vRev")))return;
+    if(!FB_READY||!FB_BOOKS_COL||!_cloudDataConfirmed){
+      if(++_autoBooksTries<=20)setTimeout(_autoLoadClosedBooks,3000);
+      return;
+    }
+    /* THE INDEX IS THE AUTHORITY, not this device's memory (2026-09-28). The first cut returned
+       early when archivedPeriodsLocal() was empty ("nothing closed: zero reads"). Executing the
+       real listener then proved that a device which did not run the close never learned it from
+       the main document (fixed at the snapshot union — see closedPeriods there), and a device's
+       own record of it lives in localStorage, which a cache clear erases. Either way the early
+       return would have left that device showing money figures WITHOUT the closed month, silently.
+       newdawn_books/index is written by every close and is the one place that cannot forget.
+       Cost: 1 read per session for money roles, even while nothing is closed; 0 for staff. */
+    var known=archivedPeriodsLocal();
+    loadBookIndex(function(idx){
+      var ps=(idx&&Array.isArray(idx.periods))?idx.periods.slice():[];
+      known.forEach(function(p){if(ps.indexOf(p)===-1)ps.push(p);});
+      ps.sort();
+      var need=ps.filter(function(p){return !(BOOK_CACHE[p]&&!BOOK_CACHE[p].missing);});
+      if(!need.length)return;
+      loadBooks(need,function(){
+        console.log("[NDBOOKS] closed month(s) loaded automatically for this session: "+need.join(", ")+
+          " — "+booksLoadedCount()+" book(s) now in every figure");
+        try{refreshCurrentPage();}catch(_){}
+      });
+    });
+  }catch(_){}
+}
 /* ============================================================================
    B5 GUARD — "can I see the WHOLE order history right now?"          (2026-07-30)
 
@@ -10207,12 +10433,30 @@ function _archivedHistoryFullyLoaded(){
        ever left per-record entries with no matching marker, those entries are never pruned
        (see the marker gate in pruneOldTombstones), so OR-ing the old test in keeps this
        guard armed for them too. It costs one Object.keys on a bounded map. */
+    /* 2026-09-28 — "nothing was ever archived" is no longer taken from this device's markers
+       alone. Executing the real listener proved another device's close never reached this one's
+       D (now fixed at the snapshot union), and a device's own record lives in localStorage, which
+       a cache clear erases. Either gap made this return TRUE on a device with a closed month it
+       had not loaded — exactly the B5 recount on truncated history this guard exists to stop.
+       So: every source of knowledge is consulted (synced markers, the local record, the book
+       index), and when none knows of a close, TRUE is returned only once the index has actually
+       been read (BOOK_INDEX_STATE "ready" — _autoLoadClosedBooks reads it at login for the
+       director, the only role that recounts). Without the books collection (monolith) the old
+       answer stands. */
+    var _idxP=(BOOK_INDEX&&Array.isArray(BOOK_INDEX.periods))?BOOK_INDEX.periods:[];
+    var _locP=archivedPeriodsLocal();
     var anyArchived=(D.closedPeriods&&Object.keys(D.closedPeriods).length>0)||
-                    (D.archivedOrderIds&&Object.keys(D.archivedOrderIds).length>0);
-    if(!anyArchived)return true;
+                    (D.archivedOrderIds&&Object.keys(D.archivedOrderIds).length>0)||
+                    _locP.length>0||_idxP.length>0;
+    if(!anyArchived){
+      if(FB_BOOKS_COL&&BOOK_INDEX_STATE!=="ready")return false;       // another device may have closed one — cannot prove
+      return true;
+    }
     if(!BOOK_INDEX||!Array.isArray(BOOK_INDEX.periods))return false;   // cannot prove -> refuse
-    for(var k=0;k<BOOK_INDEX.periods.length;k++){
-      var c=BOOK_CACHE[BOOK_INDEX.periods[k]];
+    var _need=_idxP.slice();
+    _locP.forEach(function(p){if(_need.indexOf(p)===-1)_need.push(p);});
+    for(var k=0;k<_need.length;k++){
+      var c=BOOK_CACHE[_need[k]];
       if(!c||c.missing)return false;                                   // a closed period is not loaded
     }
     return true;
@@ -10261,7 +10505,19 @@ function _isArchivableOrder(o,todayStr){
      NOW: every invoice linked to this order must itself be archivable — settled AND old
      enough. Any single unsettled or too-recent invoice keeps the whole pair live. */
   var invs=_linkedInvoicesOf(o.id);
-  if(!invs.length)return false;                         // RULE 3 — no invoice, cannot prove no debt
+  /* RULE 3 — no invoice. Was: never archivable ("cannot prove no debt"). That stays true for
+     every such order EXCEPT one the ORDER ITSELF proves is paid in full (2026-09-25). Found by
+     executing a July close on the director's data: order #1001 (2026-07-01, Delivered, Paid,
+     amtPaid 3,000 = qty x price, no invoice — the first order ever, before invoices were made
+     for every order) could never be archived, yet is settled, so from 2026-09-30 it falls out of
+     the 90-day window and a freshly started device would never show it again — in no screen,
+     no report, no book. No invoice means no receivable exists anywhere (custDebt and every debt
+     figure read invoices), so archiving it cannot remove a debt. Any invoice-less order that is
+     not provably paid (the six "Unpaid" ones with no invoice) still never moves. */
+  if(!invs.length){
+    var _tot=(Number(o.qty)||0)*(Number(o.price)||0);
+    return String(o.paid)==="Paid"&&_tot>0&&(Number(o.amtPaid)||0)>=_tot&&_olderThanArchiveAge(o.date,todayStr);
+  }
   for(var _k=0;_k<invs.length;_k++){
     if(!_isArchivableInvoice(invs[_k],todayStr))return false; // RULE 1+2 — pair moves together, and ALL of it must qualify
   }
@@ -10310,6 +10566,56 @@ function _eligiblePeriods(){
     }
   });
   return Object.keys(set).sort(); // ascending -> oldest period first
+}
+/* BOOKS-DUE REMINDER (2026-09-25). WHY IT EXISTS: the order/invoice listeners take a 90-day
+   window (HOT_WINDOW_DAYS) plus everything unsettled, so a freshly started device never loads a
+   PAID order older than 90 days — unless its month has been closed into a book, which the money
+   roles now load at login (_autoLoadClosedBooks). A record can only be archived once it is 60
+   days old (ARCHIVE_MIN_AGE_DAYS). So every paid record has a 30-day window, from day 60 to day
+   90, in which it must be closed or fresh devices silently stop counting it. Measured on the
+   director's 2026-09-25 backup: KSh 7,500 missing on 30 Sep, 313,450 by 31 Oct if nothing is
+   closed. For a 31-day month the first and last days' windows do not overlap, so one close per
+   month is NOT enough — a close archives what is eligible that day, and a second close later
+   picks up the rest (closing is idempotent: the book is merged by id, never overwritten).
+   WHAT IT SAYS: the number of paid orders that can be archived today, and the last safe day for
+   the oldest of them (its date + HOT_WINDOW_DAYS). Shown on the director's Dashboard only when
+   that day is within 7 days, or already past. Uses _isArchivableOrder itself — the exact rule
+   the close applies — so the count shown is what a close will move.
+   COST: _isArchivableOrder scans the invoices per order, so this is computed at most ONCE A DAY
+   per device (memo keyed on the date and the number of closed months), and only once the
+   collections are server-confirmed — never on a partial load, which would under-count. */
+var _booksDueMemo={key:"",html:""};
+function _booksDueNote(){
+  try{
+    if(!CU||CU.role!=="director")return "";
+    if(typeof _cloudServerConfirmed!=="undefined"&&!_cloudServerConfirmed)return "";
+    if(!_hybridInitialLoadDone())return "";
+    var today=tday();
+    var key=today+"|"+Object.keys(D.closedPeriods||{}).length;
+    if(_booksDueMemo.key===key)return _booksDueMemo.html;
+    var n=0,oldest=null,periods={};
+    (D.orders||[]).forEach(function(o){
+      if(!o||!_isArchivableOrder(o,today))return;
+      n++;periods[bookPeriodOf(o.date)]=true;
+      if(!oldest||String(o.date)<oldest)oldest=String(o.date);
+    });
+    var html="";
+    if(n&&oldest){
+      var last=new Date(oldest+"T12:00:00");last.setDate(last.getDate()+HOT_WINDOW_DAYS);
+      var lastDay=_ymd(last);
+      var daysLeft=Math.round((new Date(lastDay+"T12:00:00")-new Date(today+"T12:00:00"))/86400000);
+      if(daysLeft<=7){
+        var late=daysLeft<0;
+        html="<div class=\"notif "+(late?"nr":"nw")+"\" style=\"margin:8px 0\"><i class=\"ti ti-archive\"></i><div>"+
+          "<strong>"+(late?"Books overdue":"Books due")+" — close "+Object.keys(periods).sort().join(", ")+".</strong> "+
+          n+" paid order(s) can be archived now. "+(late?"Since "+lastDay+" the oldest are no longer counted on a freshly started device.":
+          "After "+lastDay+" (in "+daysLeft+" day"+(daysLeft===1?"":"s")+") the oldest stop being counted on a freshly started device.")+
+          " <button class=\"btn bs\" style=\"margin-left:6px\" onclick=\"showBooksPanel()\">Open Books</button></div></div>";
+      }
+    }
+    _booksDueMemo={key:key,html:html};
+    return html;
+  }catch(_){return "";}
 }
 function _updateBookIndex(period,archivedRecords,cb){
   var _cb=(typeof cb==="function")?cb:function(){};
@@ -10398,6 +10704,22 @@ function _closePeriod(period,cb){
   if(!period){_cb(new Error("period required"));return;}
   var _rec=_recordsEligibleForPeriod(period);
   var ordsToArchive=_rec.orders,invsToArchive=_rec.invoices;
+  /* ORPHANED INVOICES (2026-09-25) — found by executing a July+August close on the director's
+     data: 8 settled July invoices (6 paid in full, 2 voided) whose order NO LONGER EXISTS were
+     never archivable — the standalone branch above requires "no link at all", and a dead link is
+     not no link. Settled, they leave the 90-day window, and a freshly started device would never
+     show them again: 1,268 invoices on 31 Oct became 1,260.
+     "The order is gone" is NOT inferred from this device's memory — an order outside the window
+     is absent from memory yet exists. It is asked of the SERVER, one read per candidate: only a
+     confirmed non-existent order releases its settled, old-enough invoice into this period's
+     book. Any read that fails, or finds the order, keeps the invoice live exactly as before. */
+  var _orph=_orphanInvoiceCandidates(period,ordsToArchive,invsToArchive);
+  _verifyOrdersGone(_orph,function(confirmedOrphans){
+  if(confirmedOrphans.length){
+    invsToArchive=invsToArchive.concat(confirmedOrphans);
+    console.log("[NDBOOKS] "+confirmedOrphans.length+" settled invoice(s) whose order no longer exists (confirmed by the server) will be archived with "+period+": #"+
+      confirmedOrphans.map(function(i){return i.id;}).join(", #"));
+  }
   if(!ordsToArchive.length&&!invsToArchive.length){
     _cb(null,{period:period,archivedOrders:0,archivedInvoices:0,skipped:true});
     return;
@@ -10499,6 +10821,20 @@ function _closePeriod(period,cb){
         invsToArchive.forEach(function(i){D.archivedInvoiceIds[i.id]=_archTs;});
         D.orders=(D.orders||[]).filter(function(o){return !archOrdIds[String(o.id)];});
         D.invoices=(D.invoices||[]).filter(function(i){return !archInvIds[String(i.id)];});
+        /* FORGET THEM IN THE SHADOW TOO (2026-09-25) — found by reading this path against the
+           per-record collections, before it was ever run on live data. The two lines above take
+           ~370 July records out of D; the shadow still held every one, so the very next flush saw
+           ~370 records "in the shadow, absent from D", tripped HYBRID_MAX_DELETES_PER_FLUSH, logged
+           DELETE SWEEP REFUSED ... load failure, raised a SYNC_HEALTH report, and — because the
+           refusal leaves the shadow intact — REFUSED EVERY REAL DELETE in that collection for the
+           rest of the session. _hybridDropArchived already does exactly this for records it drops
+           ("not a deletion, they live in their book"); this is the same step at the other site.
+           The collection documents are NOT deleted: they stay, are refused re-entry by
+           _hybridTombstoned (archived ids), and leave the hot query at 90 days. */
+        try{
+          Object.keys(archOrdIds).forEach(function(k){delete _hybridShadow.orders[k];});
+          Object.keys(archInvIds).forEach(function(k){delete _hybridShadow.invoices[k];});
+        }catch(_){}
         dirty();
         _cb(null,{period:period,archivedOrders:ordsToArchive.length,archivedInvoices:invsToArchive.length});
       });
@@ -10508,6 +10844,42 @@ function _closePeriod(period,cb){
       _cb(e);
     });
   });
+  });   // _verifyOrdersGone (2026-09-25)
+}
+/* Settled, old-enough invoices dated in `period` whose linked order is neither being archived
+   now nor present anywhere this device can see (live or a loaded book). CANDIDATES ONLY — the
+   server decides (_verifyOrdersGone). */
+function _orphanInvoiceCandidates(period,ordsToArchive,invsToArchive){
+  try{
+    var today=tday(),taking={},already={},seen={};
+    (ordsToArchive||[]).forEach(function(o){taking[String(o.id)]=true;});
+    (invsToArchive||[]).forEach(function(i){already[String(i.id)]=true;});
+    ordersWithBooks().forEach(function(o){if(o&&o.id!=null)seen[String(o.id)]=true;});
+    return (D.invoices||[]).filter(function(inv){
+      if(!inv||already[String(inv.id)])return false;
+      if(bookPeriodOf(inv.date)!==period)return false;
+      if(!_isArchivableInvoice(inv,today))return false;
+      var oid=_linkedOrderIdOf(inv);
+      if(oid==null)return false;                       // unlinked: the standalone rule already decides
+      return !taking[String(oid)]&&!seen[String(oid)];
+    });
+  }catch(_){return [];}
+}
+/* One SERVER read per candidate. Only a document that the server says does not exist counts as
+   gone; a failed read, a timeout or an existing document keeps the invoice live. Never calls
+   back twice; calls back with [] when the collections are not in use. */
+function _verifyOrdersGone(cands,cb){
+  var _cb=(typeof cb==="function")?cb:function(){};   // same guard as loadBook/loadBookIndex
+  var list=Array.isArray(cands)?cands:[],gone=[],left=list.length,done=false;
+  function fin(){if(done)return;done=true;_cb(gone);}
+  if(!left||!FB_ORDERS_COL){fin();return;}
+  list.forEach(function(inv){
+    var oid=_linkedOrderIdOf(inv);
+    FB_ORDERS_COL.doc(String(oid)).get({source:"server"}).then(function(d){
+      if(d&&d.exists===false)gone.push(inv);
+    }).catch(function(){}).then(function(){if(--left===0)fin();});
+  });
+  setTimeout(fin,20000);   // never hold the close open on a stalled read
 }
 /* ── BOOKS PANEL — the director-facing trigger (2026-07-30) ──────────────────
    Everything above this point (read side + _closePeriod) was built and proven
@@ -11623,6 +11995,10 @@ function buildApp(){
   // requires genuine cloud confirmation (not just the old FB_READY timer),
   // and waits substantially longer to give other devices' concurrent writes
   // a real chance to arrive first.
+  /* 2026-09-25 — closed months load BEFORE the integrity check: runIntegrityCheck refuses to
+     recount water cycles unless every closed month is loaded (_archivedHistoryFullyLoaded), and
+     every money screen reads through the books. See _autoLoadClosedBooks. */
+  setTimeout(_autoLoadClosedBooks,3000);
   setTimeout(runIntegrityCheck,15000);
   _checkSetupWizardEligibility();
 }
@@ -12838,6 +13214,8 @@ function rDash(){
   }
   var _urgency={nr:0,nw:1,ni:2,nok:3};alerts.sort(function(a,b){return(_urgency[a.t]||2)-(_urgency[b.t]||2);});
   pg.innerHTML=
+    _custLoadingNote()+   // 2026-09-25 — partial customer load; see _custLoadingNote
+    _booksDueNote()+      // 2026-09-25 — a month is due to close; see _booksDueNote
     /* ROUND-3 FINDING H — same banner as Reports. The dashboard reads through
        invoicesWithBooks(), so once a period is closed its figures are incomplete in
        exactly the same silent way. Placed immediately after the page header so it is
@@ -13078,6 +13456,7 @@ function rCusts(q,pg,sort,type){
   // Partial render: only rebuild results, never destroy search input
   if(!el("cust-srch")){
   pg2.innerHTML=
+    "<div id=\"cust-loading\"></div>"+   // 2026-09-25 — refilled on every render below
     "<div class=\"ph\"><h1>Customers</h1><p id=\"cust-stats\">"+(D.customers||[]).length+" registered &middot; "+fil.length+(type2||q2?" matched":"")+"</p></div>"+
     "<div class=\"toolbar\">"+
       "<div class=\"srch\"><i class=\"ti ti-search\"></i><input id=\"cust-srch\" type=\"text\" placeholder=\"Search name, phone, court, house...\" oninput=\"rCusts(this.value,0)\" value=\""+q2+"\" autocomplete=\"off\" autocorrect=\"off\" spellcheck=\"false\" inputmode=\"search\" style=\"padding:8px 12px 8px 34px;border:1.5px solid var(--bd);border-radius:8px;font-size:12px;width:100%;font-family:inherit\"></div>"+
@@ -13095,6 +13474,8 @@ function rCusts(q,pg,sort,type){
     "<div id=\"cust-sort\"></div>"+
         "<div id=\"cust-results\"></div>";
   }
+  // 2026-09-25 — partial customer load; see _custLoadingNote. Every render, not just the first.
+  var _clN=el("cust-loading");if(_clN)_clN.innerHTML=_custLoadingNote();
   // Always rebuild sort buttons so active state reflects current sort
   var _cs=el("cust-sort");
   if(_cs)_cs.innerHTML=
@@ -13390,7 +13771,10 @@ function showCycleHistory(cId){
   var log=(cu.cycleHistory||[]).slice().reverse();
   var cyc=cu.waterCycle||0;
   // Calculate total delivered waters from all orders for this customer
-  var _wOrds=(D.orders||[]).filter(function(o){
+  /* ordersWithBooks, not D.orders (2026-09-25): once a month is closed its delivered orders live
+     in the book, and this total would under-count by exactly that month. With no book loaded
+     the two are identical. */
+  var _wOrds=ordersWithBooks().filter(function(o){
     return o.cId===cId&&o.status==="Delivered"
       &&is20ltr(o.prod);
   });
@@ -13591,7 +13975,19 @@ function showCreditLog(cId){
 }
 function showPayments(invId){
   if(!can("rest")){toast("Director only","err");return;}
-  var inv=(D.invoices||[]).find(function(x){return x.id===invId;});if(!inv){toast("Invoice not found","err");return;}
+  var inv=(D.invoices||[]).find(function(x){return x.id===invId;});
+  /* CLOSED-BOOK INVOICE (2026-09-25). The Invoices list reads invoicesWithBooks(), so once a
+     month is closed and its book loaded, its paid invoices are listed — and this dialog, which
+     read D.invoices only, answered "Invoice not found" for every one of them. It now finds the
+     invoice in the loaded books and shows its payments READ-ONLY: a closed book is immutable
+     (_closePeriod), and reversing a payment inside it would make the book and the live figures
+     disagree with no record of why. The Reverse buttons are therefore not offered for it. */
+  var _invClosed=false;
+  if(!inv){
+    inv=(typeof invoicesWithBooks==="function"?invoicesWithBooks():[]).find(function(x){return x&&x.id===invId;});
+    if(inv)_invClosed=true;
+  }
+  if(!inv){toast("Invoice not found","err");return;}
   var cu=(D.customers||[]).find(function(x){return x.id===inv.cId;});
   var pays=inv.payments||[];
   // Set modal title
@@ -13605,7 +14001,8 @@ function showPayments(invId){
     +"<div><strong>"+(cu?(can("vPhone")?cu.name:maskName(cu.name)):"Customer")+"</strong>"
     +" &nbsp;&middot;&nbsp; Invoice #"+invId
     +"<div style=\"font-size:11px;margin-top:2px\">Amount: KSh "+inv.amount.toLocaleString()+" &nbsp;&middot;&nbsp; Paid: KSh "+inv.paid.toLocaleString()+" &nbsp;&middot;&nbsp; Balance: <strong style=\"color:"+(inv.paid<inv.amount?"#c0392b":"#27ae60")+"\">KSh "+(inv.amount-inv.paid).toLocaleString()+"</strong></div>"
-    +"</div></div>";
+    +"</div></div>"
+    +(_invClosed?"<div class=\"notif nw\" style=\"margin-bottom:12px\"><i class=\"ti ti-archive\"></i><div>This invoice is in the closed books for <strong>"+bookPeriodOf(inv.date)+"</strong>. Its payments are shown for reference and cannot be reversed here.</div></div>":"");
   if(!pays.length){
     html+="<div class=\"te\"><i class=\"ti ti-cash-off\"></i><p>No payments recorded</p><span>Use the cash or partial payment buttons to record payments</span></div>";
   }else{
@@ -13618,8 +14015,8 @@ function showPayments(invId){
         +"<div><div style=\"font-weight:800;font-size:13px\">KSh "+p.amt.toLocaleString()+"</div>"
         +"<div style=\"font-size:11px;color:var(--tx2);margin-top:2px\">"
         +p.method+" &nbsp;&middot;&nbsp; "+p.date+(p.ref?" &nbsp;&middot;&nbsp; "+p.ref:"")+"</div></div></div>"
-        +"<button class=\"btn btn-xs btn-red\" onclick=\"showPayments._confirm("+invId+","+(p.pid!=null?p.pid:-1)+","+idx+")\" style=\"min-width:80px;justify-content:center\">"
-        +"<i class=\"ti ti-arrow-back-up\"></i> Reverse</button></div>";
+        +(_invClosed?"":"<button class=\"btn btn-xs btn-red\" onclick=\"showPayments._confirm("+invId+","+(p.pid!=null?p.pid:-1)+","+idx+")\" style=\"min-width:80px;justify-content:center\">"
+        +"<i class=\"ti ti-arrow-back-up\"></i> Reverse</button>")+"</div>";
     }).join("");
     html+="</div>";
   }
@@ -19715,6 +20112,7 @@ function rDebts(q,pg){
   var debtPaged=paginate(debtors,DEBT_PAGE);
   if(!el("debt-srch")){
     pg.innerHTML=
+      "<div id=\"debt-loading\"></div>"+   // 2026-09-25 — refilled on every render below
       "<div class=\"ph\"><h1>Debt Tracker</h1><p id=\"debt-stats\"></p></div>"
     +"<div id=\"debt-period-bar\"></div>"+
       "<div class=\"stats\" id=\"debt-cards\"></div>"+
@@ -19739,6 +20137,8 @@ function rDebts(q,pg){
         +";font-size:11px;font-weight:700;cursor:pointer;font-family:inherit\">"+lbl+"</button>";
     }).join("")
     +"</div></div>";
+  // 2026-09-25 — partial customer load; see _custLoadingNote. The screen this was found on.
+  var _dlN=el("debt-loading");if(_dlN)_dlN.innerHTML=_custLoadingNote();
   var _dstat=el("debt-stats");
   var _creditMode=q2==="__credit__";
   var _dPeriodLabel=DEBT_PERIOD==="today"?"today":DEBT_PERIOD==="week"?"this week":DEBT_PERIOD==="month"?"this month":"all time";
@@ -20293,6 +20693,7 @@ function rReports(){
   var zones=[].concat([],(D.customers||[]).map(function(c){return c.estate||c.zone||"";})).filter(function(z,i,a){return z&&a.indexOf(z)===i;});
   var _rptLabel="";if(RPT_FROM&&RPT_TO)_rptLabel=RPT_FROM+" to "+RPT_TO;else if(RPT_FROM)_rptLabel="From "+RPT_FROM;else if(RPT_TO)_rptLabel="Up to "+RPT_TO;
   pg.innerHTML=
+    _custLoadingNote()+   // 2026-09-25 — partial customer load; see _custLoadingNote
     "<div class=\"ph\"><h1>Business Reports</h1>"+
     /* ROUND-3 FINDING H — the banner is the fix. Before this, closing a period silently
        removed that month from every total on this screen with no indication at all. The
@@ -20301,8 +20702,9 @@ function rReports(){
     (_rptDrift.length?("<div class=\"notif nw\" style=\"margin:8px 0\">"+
       "<i class=\"ti ti-alert-triangle\"></i><div><strong>Closed months have new records.</strong> "+
       sanitizeInput(_rptDrift.map(function(x){return x.period+" ("+x.records+")";}).join(", "))+
-      " — these were posted after the book was closed, so the closed book and these figures "+
-      "disagree until you close those months again."+
+      " — posted, or fully settled, after the month was closed. These figures already include them; "+
+      "close those months again (Data → Books) so what has settled moves into the book before it "+
+      "leaves the 90-day window."+
       "</div></div>"):"")+
     (_rptGap?("<div class=\"notif nw\" style=\"margin:8px 0\">"+
       "<i class=\"ti ti-archive\"></i><div><strong>Figures exclude archived data.</strong> "+
@@ -22429,6 +22831,95 @@ function restoreXL(input){
     reader.readAsArrayBuffer(file);input.value="";
   });
 }
+/* ============================================================================
+   ONE WATER-CYCLE REBUILD                                          (2026-09-25)
+
+   DECISION-3's sealed domain, opened for THIS FIX ONLY on the director's explicit approval
+   on 2026-09-25, after the numbers below were put in front of them. Nothing else in the
+   water-cycle domain is opened by it: cycleHistory is still uncapped, and both safety rails
+   in runIntegrityCheck (RAIL 1: zero orders with held bottles is a load failure; RAIL 2:
+   wait for the collections to deliver) are untouched, byte for byte.
+
+   THE DEFECT, found from the director's 2026-09-25 backup and reproduced by executing the
+   real runIntegrityCheck on it. The history rebuild existed TWICE, in syncWaterCycles and in
+   runIntegrityCheck. Round-9 finding S (2026-08-13) fixed the duplicate-entry bug in the
+   first copy only. The second copy, which runs on EVERY director login, still did
+       cu.cycleHistory = newHistory.concat(manualEntries)
+   where manualEntries is every entry whose `by` is a person. completeDlv writes its entry
+   with by = the driver's name, so every organically recorded milestone was kept AND
+   regenerated as "System (sync)" beside it. Measured on the real data: 200 of 468 customers,
+   414 duplicate entries, 38 KB, growing ~6 entries a day (~203 KB a year) inside customer
+   records and every cloud backup, which is already at its 750 KB budget and dropping
+   settled history. Counts were never wrong: waterCycle is totalBottles % 8 and was correct
+   for all 468 customers. Only the history list was doubled.
+   The first copy had its own flaw: its dedupe kept the System entry and DROPPED the
+   driver's, erasing who recorded the milestone and when.
+
+   THE RULE, now in one place, used by both callers:
+     1. Derive the events from the delivered 20L orders, exactly as both copies did.
+     2. For each derived event, if a PERSON recorded the same (ordId, event), keep THAT
+        entry unchanged, so provenance survives. Matched in order, so one order that
+        crosses 8 twice keeps two entries on both sides.
+     3. Otherwise use the System entry.
+     4. A person entry with no ordId is a hand grant and is always kept. A person entry
+        whose (ordId, event) is NOT derived is an orphan that the order-recovery index at
+        ~15252 / ~18224 and cycleRef at ~20508 depend on, and is always kept.
+     5. A person entry whose (ordId, event) IS derived but was not matched is a surplus
+        copy of an event already represented, and is dropped. This is the only thing ever
+        removed that is not a System entry, and it is exactly finding S's rule.
+   Idempotent by construction: on its own output, step 2 matches every kept person entry
+   again and step 5 has nothing left, so a second run returns an identical array and the
+   caller writes nothing. _proofB_watercycle_dedupe.js executes all of this on the
+   director's real data, including the second run. */
+function _rebuildCycleHistory(existing,waterOrds){
+  /* Input it cannot interpret is returned UNTOUCHED — never thrown on, never "repaired". A
+     non-array history cannot be read, and a rebuild from it would overwrite it with a guess.
+     The two callers always pass an array (or an absent history) and a sorted array of orders;
+     this guard exists for anything else (harness.js calls every function with (1,1,1)). */
+  if(existing!=null&&!Array.isArray(existing))return existing;
+  if(!Array.isArray(waterOrds))return existing;
+  var derived=[],cum=0,cyc=0;
+  for(var oi=0;oi<waterOrds.length;oi++){
+    var ord=waterOrds[oi];var prev=cum;
+    cum+=(ord.qty||1);
+    if(prev<4&&cum>=4&&cum<8)derived.push({ts:ord.deliveredAt||ord.date||tday(),bottles:cum,event:"milestone_4",ordId:ord.id,qty:ord.qty,by:"System (sync)"});
+    while(cum>=8){cyc++;derived.push({ts:ord.deliveredAt||ord.date||tday(),bottles:8,event:"cycle_complete",cycleNum:cyc,ordId:ord.id,qty:ord.qty,by:"System (sync)"});cum-=8;}
+  }
+  var person=(existing||[]).filter(function(h){return !!(h&&h.by&&h.by!=="System (bootstrap)"&&h.by!=="System (sync)");});
+  var derivedKey={},pool={},used={};
+  derived.forEach(function(d){derivedKey[d.ordId+"|"+d.event]=true;});
+  person.forEach(function(h,i){if(h.ordId!=null){var k=h.ordId+"|"+h.event;(pool[k]||(pool[k]=[])).push(i);}});
+  var out=derived.map(function(d){
+    var q=pool[d.ordId+"|"+d.event];
+    if(q&&q.length){var i=q.shift();used[i]=true;return person[i];}
+    return d;
+  });
+  person.forEach(function(h,i){
+    if(used[i])return;
+    if(h.ordId==null){out.push(h);return;}
+    if(!derivedKey[h.ordId+"|"+h.event])out.push(h);
+  });
+  return out;
+}
+/* The one grouping pass both rebuild callers use. Moved here out of syncWaterCycles
+   (2026-08-19 efficiency fix, proven by _proofB_hotpath_index_equivalence.js section 2) so
+   runIntegrityCheck gets the same O(orders) pass instead of its per-customer filter, and so
+   the two can never again select different orders. Same three conditions, same strict
+   cId match via _pmTag, same stable sort; callers .slice() before sorting. */
+function _waterOrdersByCustomer(orders){
+  var by={};
+  for(var i=0;i<(orders||[]).length;i++){
+    var o=orders[i];
+    if(!o||o.status!=="Delivered"||!is20ltr(o.prod))continue;
+    var k=_pmTag(o.cId);
+    (by[k]||(by[k]=[])).push(o);
+  }
+  return by;
+}
+function _waterOrderCmp(a,b){
+  var da=a.deliveredAt||a.date||"";var db=b.deliveredAt||b.date||"";
+  return da>db?1:da<db?-1:0;
+}
 function syncWaterCycles(){
   // Lightweight water-only resync — no credit migration, no stock fixes
   // Safe to call after stock edit without racing the main dirty() write
@@ -22480,52 +22971,21 @@ function syncWaterCycles(){
      is deliberately not repeating them.) That lowers the blast radius but not the bar —
      cu.cycleHistory is a customer-visible record, so "equivalent" was not good enough here;
      it had to be identical. Proven by _proofB_hotpath_index_equivalence.js. */
-  var _wcByCust={};
-  for(var _wi=0;_wi<_wcOrders.length;_wi++){
-    var _wo=_wcOrders[_wi];
-    if(!_wo||_wo.status!=="Delivered"||!is20ltr(_wo.prod))continue;
-    var _wk=_pmTag(_wo.cId);
-    (_wcByCust[_wk]||(_wcByCust[_wk]=[])).push(_wo);
-  }
+  /* 2026-09-25: the grouping pass and the history rebuild now live in _waterOrdersByCustomer
+     and _rebuildCycleHistory, shared with runIntegrityCheck — see the block above them. The
+     round-9 finding S dedupe that used to be written out here is rule 5 of that block; the
+     one behavioural change is that a matched PERSON entry is now kept instead of the System
+     copy, so the driver's name and date survive. The gate below is unchanged: this function
+     still rebuilds only a customer whose count is wrong. */
+  var _wcByCust=_waterOrdersByCustomer(_wcOrders);
   var changed=0;
   (D.customers||[]).forEach(function(cu){
-    var waterOrds=(_wcByCust[_pmTag(cu.id)]||[]).slice().sort(function(a,b){
-      var da=a.deliveredAt||a.date||"";var db=b.deliveredAt||b.date||"";
-      return da>db?1:da<db?-1:0;
-    });
+    var waterOrds=(_wcByCust[_pmTag(cu.id)]||[]).slice().sort(_waterOrderCmp);
     var totalBottles=waterOrds.reduce(function(s,o){return s+(o.qty||1);},0);
     var correct=totalBottles%8;
     if(cu.waterCycle!==correct){
       cu.waterCycle=correct;
-      // Rebuild history
-      var newH=[];var cum=0;var cyc=0;
-      for(var oi=0;oi<waterOrds.length;oi++){
-        var ord=waterOrds[oi];var prev=cum;
-        cum+=(ord.qty||1);
-        if(prev<4&&cum>=4&&cum<8)newH.push({ts:ord.deliveredAt||ord.date||tday(),bottles:cum,event:"milestone_4",ordId:ord.id,qty:ord.qty,by:"System (sync)"});
-        while(cum>=8){cyc++;newH.push({ts:ord.deliveredAt||ord.date||tday(),bottles:8,event:"cycle_complete",cycleNum:cyc,ordId:ord.id,qty:ord.qty,by:"System (sync)"});cum-=8;}
-      }
-      /* (ordId,event) DEDUPE (2026-08-13, round-9 finding S). This used to keep every
-         entry whose `by` was not a System string. completeDlv writes its entries with
-         by:CU.name, so every organically-earned cycle looked hand-entered and was kept
-         FOREVER — and the rebuild then added its own entry for the same delivery, showing
-         the customer twice the entitlement they earned and over-issuing a free bottle.
-         The `by` field records WHO did something; it was being read to infer WHETHER the
-         entry was derived. Those are different questions and it only accidentally answered
-         the second one for entries the system itself wrote.
-         An old entry is now dropped ONLY when the rebuild has already produced one for the
-         same (ordId, event). An entry with no ordId is a genuine hand grant and is always
-         kept. Nothing is removed that the rebuild did not replace, so no ordId can leave
-         the order-recovery index that ~15252 and ~18224 scan. */
-      var _rebuilt={};
-      newH.forEach(function(x){if(x&&x.ordId!=null)_rebuilt[x.ordId+"|"+x.event]=true;});
-      var manual=(cu.cycleHistory||[]).filter(function(h){
-        if(!h||!h.by)return false;
-        if(h.by==="System (bootstrap)"||h.by==="System (sync)")return false;
-        if(h.ordId==null)return true;                       // hand-entered grant — always keep
-        return !_rebuilt[h.ordId+"|"+h.event];              // orphan (order gone) — keep for recovery
-      });
-      cu.cycleHistory=newH.concat(manual);
+      cu.cycleHistory=_rebuildCycleHistory(cu.cycleHistory,waterOrds);
       changed++;
     }
   });
@@ -22656,15 +23116,29 @@ function runIntegrityCheck(){
       issues.push("Water cycles NOT recomputed — the per-record collections had not delivered yet. Existing counts left untouched.");
     }
   }
+  /* 2026-09-25 — ONE REBUILD. This loop used to hold its own copy of the history rebuild,
+     ending in cu.cycleHistory=newHistory.concat(manualEntries), which kept a driver's entry
+     AND regenerated it as System (sync): 200 customers / 414 duplicates on the real data.
+     It now calls _rebuildCycleHistory, the same routine syncWaterCycles uses — see the block
+     above that function for the rule and the measurements. The two rails above this loop are
+     untouched. RECOVERABILITY still holds: person entries are taken from the EXISTING
+     cycleHistory before anything is assigned, and the rebuild keeps every one of them except
+     a surplus copy of an event already represented.
+     Two further changes, both measured:
+       - the per-customer filter over every order is replaced by the one grouping pass
+         syncWaterCycles already used (_waterOrdersByCustomer), so both callers select the
+         identical orders in the identical order;
+       - the history is assigned only when it actually differs (_stableStr, key-order
+         independent), and a history-only correction now calls dirty() itself. Before, a
+         changed history with an unchanged count was left for whatever flush happened next.
+         After one run the history is a fixed point, so this cannot repeat on later logins:
+         _proofB_watercycle_dedupe.js runs it twice on the real data and asserts the second
+         run changes nothing and calls dirty() zero times. */
+  var _wcHistFixed=0;
+  var _wcByCustIC=_wcLoaded?_waterOrdersByCustomer(_wcOrdersIC):{};
   (_wcLoaded?(D.customers||[]):[]).forEach(function(cu){
-    // Find ALL delivered 20ltr water orders for this customer, sorted by date
-    var waterOrds=_wcOrdersIC.filter(function(o){
-      return o.cId===cu.id&&o.status==="Delivered"&&is20ltr(o.prod);
-    }).sort(function(a,b){
-      var da=a.deliveredAt||a.date||"";
-      var db=b.deliveredAt||b.date||"";
-      return da>db?1:da<db?-1:0;
-    });
+    // ALL delivered 20ltr water orders for this customer, sorted by date
+    var waterOrds=(_wcByCustIC[_pmTag(cu.id)]||[]).slice().sort(_waterOrderCmp);
     // Sum total bottles from quantities
     var totalBottles=waterOrds.reduce(function(s,o){return s+(o.qty||1);},0);
     var correctCycle=totalBottles%8;
@@ -22672,31 +23146,12 @@ function runIntegrityCheck(){
     // Only update if changed — avoids unnecessary dirty/sync
     var changed=cu.waterCycle!==correctCycle;
     cu.waterCycle=correctCycle;
-    // Rebuild cycle history from scratch based on cumulative bottle counts
     if(!cu.cycleHistory)cu.cycleHistory=[];
-    // Build history entries for each cycle reset using cumulative bottle tally
-    var newHistory=[];
-    var cumBottles=0;
-    var cycleCount=0;
-    for(var oi=0;oi<waterOrds.length;oi++){
-      var ord=waterOrds[oi];
-      var prevCum=cumBottles;
-      cumBottles+=(ord.qty||1);
-      // Check if we crossed the 4-bottle milestone in this order
-      if(prevCum<4&&cumBottles>=4&&cumBottles<8){
-        // Keep existing milestone_4 entry if same order, else add
-        newHistory.push({ts:ord.deliveredAt||ord.date||tday(),bottles:cumBottles,event:"milestone_4",ordId:ord.id,qty:ord.qty,by:"System (sync)"});
-      }
-      // Check if we crossed an 8-bottle cycle completion
-      while(cumBottles>=8){
-        cycleCount++;
-        newHistory.push({ts:ord.deliveredAt||ord.date||tday(),bottles:8,event:"cycle_complete",cycleNum:cycleCount,ordId:ord.id,qty:ord.qty,by:"System (sync)"});
-        cumBottles-=8; // carry over excess
-      }
+    var _newHist=_rebuildCycleHistory(cu.cycleHistory,waterOrds);
+    if(_stableStr(_newHist)!==_stableStr(cu.cycleHistory)){
+      cu.cycleHistory=_newHist;
+      if(!changed)_wcHistFixed++;
     }
-    // Preserve any manual history entries (not system-generated)
-    var manualEntries=(cu.cycleHistory||[]).filter(function(h){return h.by&&h.by!=="System (bootstrap)"&&h.by!=="System (sync)";});
-    cu.cycleHistory=newHistory.concat(manualEntries);
     if(changed)bootstrapped++;
   });
   if(bootstrapped>0){
@@ -22704,6 +23159,11 @@ function runIntegrityCheck(){
     dirty();
     issues.push("Water cycle synced for "+bootstrapped+" customer(s) — quantities recomputed from delivered orders");
     if(el("pg-customers")&&el("pg-customers").classList.contains("act"))rCusts();
+  }
+  if(_wcHistFixed>0){
+    console.log("[NDSYNC] runIntegrityCheck water-cycle HISTORY corrected for "+_wcHistFixed+" customer(s) — duplicate entries removed, bottle counts unchanged");
+    dirty();
+    issues.push("Water cycle history de-duplicated for "+_wcHistFixed+" customer(s) — bottle counts unchanged");
   }
   /* Check 1: negative stock — THE MUTATION IS REMOVED (2026-08-24). REPORTED BY THE
      DIRECTOR FROM THE FIELD: staff can place an order when stock is low (correct), but the
